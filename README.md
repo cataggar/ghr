@@ -41,6 +41,16 @@ Follows [uv tool](https://docs.astral.sh/uv/) conventions.
 
 Override with `GHR_BIN_DIR`, `GHR_TOOL_DIR`, `GHR_CACHE_DIR`.
 
+## Install
+
+```sh
+# Recommended
+uv tool install ghr-bin
+
+# pip (requires pip >= 24.3)
+pip install ghr-bin
+```
+
 ## Build
 
 Requires [Zig](https://ziglang.org/) 0.15+.
