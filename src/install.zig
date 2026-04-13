@@ -306,23 +306,26 @@ fn linkToBin(
         exe_rel_path,
     }) catch return error.PathTooLong;
 
-    // Remove existing
-    bin_dir.deleteFile(exe_name) catch {};
-
     if (builtin.os.tag == .windows) {
-        // Copy on Windows (hardlinks/symlinks need admin or dev mode)
-        const src_file = std.fs.openFileAbsolute(src_path, .{}) catch return error.SourceNotFound;
-        defer src_file.close();
-        const dst_file = bin_dir.createFile(exe_name, .{}) catch return error.CreateFailed;
-        defer dst_file.close();
-        var buf: [8192]u8 = undefined;
-        var dst_buf: [8192]u8 = undefined;
-        var file_writer = dst_file.writer(&dst_buf);
-        var src_reader = src_file.reader(&buf);
-        _ = src_reader.interface.streamRemaining(&file_writer.interface) catch return error.CopyFailed;
-        file_writer.end() catch return error.CopyFailed;
+        // Create a .cmd wrapper that runs the exe in its original directory
+        // so it can find sibling DLLs.
+        var cmd_name_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
+            exe_name[0 .. exe_name.len - 4]
+        else
+            exe_name;
+        const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
+
+        bin_dir.deleteFile(cmd_name) catch {};
+        var cmd_file = bin_dir.createFile(cmd_name, .{}) catch return error.CreateFailed;
+        defer cmd_file.close();
+        var cmd_buf: [4096]u8 = undefined;
+        var cmd_w = cmd_file.writer(&cmd_buf);
+        cmd_w.interface.print("@\"{s}\" %*\r\n", .{src_path}) catch return error.WriteFailed;
+        cmd_w.end() catch return error.WriteFailed;
     } else {
         // Unix: symlink
+        bin_dir.deleteFile(exe_name) catch {};
         try bin_dir.symLink(src_path, exe_name, .{});
     }
     try w.print("  linked {s}\n", .{exe_name});
