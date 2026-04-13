@@ -1,0 +1,17 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+zig-pkg/
+
+# Python / PyPI
+dist/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Build outputs
+*.exe
+*.pdb
+*.obj
+*.o
