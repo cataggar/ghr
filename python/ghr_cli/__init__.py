@@ -4,37 +4,35 @@ from __future__ import annotations
 
 import os
 import sys
-import sysconfig
 
 
 def find_ghr_bin() -> str:
     """Return the ghr binary path."""
     exe = "ghr.exe" if sys.platform == "win32" else "ghr"
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), exe)
+    if os.path.isfile(path):
+        return path
+    raise FileNotFoundError(f"Could not find ghr binary at {path}")
 
-    targets = [
-        sysconfig.get_path("scripts"),
-        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
-    ]
 
-    # User scheme
-    if sys.version_info >= (3, 10):
-        user_scheme = sysconfig.get_preferred_scheme("user")
-    elif os.name == "nt":
-        user_scheme = "nt_user"
-    else:
-        user_scheme = "posix_user"
-    targets.append(sysconfig.get_path("scripts", scheme=user_scheme))
+def main() -> None:
+    """Entry point for the ``ghr`` console script."""
+    ghr = find_ghr_bin()
 
-    seen: list[str] = []
-    for target in targets:
-        if not target or target in seen:
-            continue
-        seen.append(target)
-        path = os.path.join(target, exe)
-        if os.path.isfile(path):
-            return path
+    # Ensure the binary is executable (pip may not preserve the bit).
+    if sys.platform != "win32" and not os.access(ghr, os.X_OK):
+        try:
+            os.chmod(ghr, os.stat(ghr).st_mode | 0o111)
+        except OSError:
+            raise SystemExit(
+                f"ghr binary is not executable and cannot be repaired:\n"
+                f"  {ghr}\n"
+                f"Run: chmod +x '{ghr}'"
+            )
 
-    locations = "\n".join(f" - {t}" for t in seen)
-    raise FileNotFoundError(
-        f"Could not find ghr binary in:\n{locations}\n"
-    )
+    args = [ghr, *sys.argv[1:]]
+    if sys.platform == "win32":
+        import subprocess
+
+        raise SystemExit(subprocess.call(args))
+    os.execv(ghr, args)
