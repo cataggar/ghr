@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const Dirs = @import("dirs.zig").Dirs;
+const install = @import("install.zig");
 
 pub const version = build_options.version;
 
@@ -40,14 +41,12 @@ pub fn main() !void {
     } else if (eql(cmd_str, "list")) {
         try cmdList(allocator, &stdout.interface);
     } else if (eql(cmd_str, "install")) {
-        if (args.next() == null) {
+        const spec = args.next() orelse {
             try stderr.interface.print("error: 'ghr install' requires <owner/repo[@tag]>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
-        }
-        try stderr.interface.print("error: install not yet implemented\n", .{});
-        try stderr.interface.flush();
-        std.process.exit(1);
+        };
+        try install.cmdInstall(allocator, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "uninstall")) {
         if (args.next() == null) {
             try stderr.interface.print("error: 'ghr uninstall' requires <name>\n", .{});
