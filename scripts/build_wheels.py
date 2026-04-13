@@ -81,7 +81,7 @@ def build_wheel(
     version: str, platform_key: str, platform_tag: str, exe_name: str,
     dist_dir: Path, release_version: str | None = None,
 ) -> Path:
-    """Build a single platform wheel with native binary in the package directory."""
+    """Build a single platform wheel with native binary in data/scripts/."""
     data = download_asset(release_version or version, platform_key)
 
     # Extract the binary from the tarball
@@ -97,16 +97,17 @@ def build_wheel(
     if binary_data is None:
         raise RuntimeError(f"Binary {exe_name} not found in archive for {platform_key}")
 
+    data_scripts_dir = f"{DIST_NAME}-{version}.data/scripts"
     dist_info_dir = f"{DIST_NAME}-{version}.dist-info"
 
     entries: list[tuple[str, bytes, bool]] = []
 
-    # Python package with find_ghr_bin helper and console_scripts entry point
+    # Python package with find_ghr_bin helper (like uv's _find_uv.py)
     init_py = Path(__file__).resolve().parent.parent / "python" / IMPORT_NAME / "__init__.py"
     entries.append((f"{IMPORT_NAME}/__init__.py", init_py.read_bytes(), False))
 
-    # Native binary inside the package directory (not .data/scripts/)
-    entries.append((f"{IMPORT_NAME}/{exe_name}", binary_data, True))
+    # Native binary goes in data/scripts/ — pip copies it directly to bin/Scripts
+    entries.append((f"{data_scripts_dir}/{exe_name}", binary_data, True))
 
     readme_path = Path(__file__).resolve().parent.parent / "README.md"
     readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
@@ -132,9 +133,6 @@ def build_wheel(
         f"Tag: py3-none-{platform_tag}\n"
     )
     entries.append((f"{dist_info_dir}/WHEEL", wheel_meta.encode(), False))
-
-    entry_points = "[console_scripts]\nghr = ghr_cli:main\n"
-    entries.append((f"{dist_info_dir}/entry_points.txt", entry_points.encode(), False))
 
     # Build RECORD
     records: list[str] = []

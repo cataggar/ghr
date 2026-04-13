@@ -70,7 +70,6 @@ jobs:
             *)           EXT="" ;;
           esac
           cp "zig-out/bin/ghr${EXT}" "$PKGNAME/bin/"
-          if [ "$EXT" = "" ]; then chmod +x "$PKGNAME/bin/ghr"; fi
           cp LICENSE README.md "$PKGNAME/" 2>/dev/null || true
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
           if command -v sha256sum &>/dev/null; then
