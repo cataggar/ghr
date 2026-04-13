@@ -1,36 +1,40 @@
 """ghr-bin — Install tools from GitHub releases."""
 
+from __future__ import annotations
+
 import os
-import subprocess
 import sys
-from pathlib import Path
+import sysconfig
 
 
-def _get_version() -> str:
-    try:
-        from importlib.metadata import version
+def find_ghr_bin() -> str:
+    """Return the ghr binary path."""
+    exe = "ghr.exe" if sys.platform == "win32" else "ghr"
 
-        return version("ghr-bin")
-    except Exception:
-        return "0.0.0"
+    targets = [
+        sysconfig.get_path("scripts"),
+        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
+    ]
 
-
-_EXT = ".exe" if sys.platform == "win32" else ""
-
-
-def _binary_path() -> Path:
-    """Return the path to the ghr binary."""
-    return Path(__file__).parent / f"ghr{_EXT}"
-
-
-def main() -> None:
-    """Run the ghr binary, replacing the current process on Unix."""
-    binary = _binary_path()
-    if not binary.exists():
-        print(f"ghr binary not found at {binary}", file=sys.stderr)
-        sys.exit(1)
-    args = [str(binary), *sys.argv[1:]]
-    if sys.platform != "win32":
-        os.execv(args[0], args)
+    # User scheme
+    if sys.version_info >= (3, 10):
+        user_scheme = sysconfig.get_preferred_scheme("user")
+    elif os.name == "nt":
+        user_scheme = "nt_user"
     else:
-        raise SystemExit(subprocess.call(args))
+        user_scheme = "posix_user"
+    targets.append(sysconfig.get_path("scripts", scheme=user_scheme))
+
+    seen: list[str] = []
+    for target in targets:
+        if not target or target in seen:
+            continue
+        seen.append(target)
+        path = os.path.join(target, exe)
+        if os.path.isfile(path):
+            return path
+
+    locations = "\n".join(f" - {t}" for t in seen)
+    raise FileNotFoundError(
+        f"Could not find ghr binary in:\n{locations}\n"
+    )

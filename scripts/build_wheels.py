@@ -24,27 +24,35 @@ GHR_REPO = "cataggar/ghr"
 PLATFORMS = {
     "linux-x64": {
         "tag": "manylinux_2_17_x86_64.manylinux2014_x86_64",
+        "exe": "ghr",
     },
     "linux-arm64": {
         "tag": "manylinux_2_17_aarch64.manylinux2014_aarch64",
+        "exe": "ghr",
     },
     "linux-musl-x64": {
         "tag": "musllinux_1_1_x86_64",
+        "exe": "ghr",
     },
     "linux-musl-arm64": {
         "tag": "musllinux_1_1_aarch64",
+        "exe": "ghr",
     },
     "macos-arm64": {
         "tag": "macosx_11_0_arm64",
+        "exe": "ghr",
     },
     "macos-x64": {
         "tag": "macosx_10_9_x86_64",
+        "exe": "ghr",
     },
     "windows-x64": {
         "tag": "win_amd64",
+        "exe": "ghr.exe",
     },
     "windows-arm64": {
         "tag": "win_arm64",
+        "exe": "ghr.exe",
     },
 }
 
@@ -69,53 +77,37 @@ def download_asset(release_version: str, platform_key: str) -> bytes:
     return resp.content
 
 
-def _is_executable(path: Path) -> bool:
-    """Check if a file should be marked executable in the wheel."""
-    name = path.name
-    if name.endswith((".exe", ".so", ".dylib")):
-        return True
-    if "." not in name:
-        return True
-    return False
-
-
 def build_wheel(
-    version: str, platform_key: str, platform_tag: str, dist_dir: Path,
-    release_version: str | None = None,
+    version: str, platform_key: str, platform_tag: str, exe_name: str,
+    dist_dir: Path, release_version: str | None = None,
 ) -> Path:
-    """Build a single platform wheel."""
+    """Build a single platform wheel with native binary in data/scripts/."""
     data = download_asset(release_version or version, platform_key)
 
+    # Extract the binary from the tarball
+    binary_data: bytes | None = None
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-        members = tf.getmembers()
-        bin_prefix = None
-        for m in members:
-            if "/bin/" in m.name and m.isfile():
-                bin_prefix = m.name.split("/bin/")[0] + "/bin/"
-                break
+        for m in tf.getmembers():
+            if m.isfile() and m.name.endswith(f"/bin/{exe_name}"):
+                f = tf.extractfile(m)
+                if f is not None:
+                    binary_data = f.read()
+                    break
 
-        entries: list[tuple[str, bytes, bool]] = []
+    if binary_data is None:
+        raise RuntimeError(f"Binary {exe_name} not found in archive for {platform_key}")
 
-        # Add __init__.py
-        init_py = Path(__file__).resolve().parent.parent / "python" / IMPORT_NAME / "__init__.py"
-        entries.append((f"{IMPORT_NAME}/__init__.py", init_py.read_bytes(), False))
-
-        # Add binaries from archive
-        if bin_prefix:
-            for m in members:
-                if m.name.startswith(bin_prefix) and m.isfile():
-                    rel = m.name[len(bin_prefix):]
-                    if not rel:
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    file_data = f.read()
-                    arcname = f"{IMPORT_NAME}/{rel}"
-                    entries.append((arcname, file_data, _is_executable(Path(rel))))
-
-    # dist-info directory
+    data_scripts_dir = f"{DIST_NAME}-{version}.data/scripts"
     dist_info_dir = f"{DIST_NAME}-{version}.dist-info"
+
+    entries: list[tuple[str, bytes, bool]] = []
+
+    # Python package with find_ghr_bin helper (like uv's _find_uv.py)
+    init_py = Path(__file__).resolve().parent.parent / "python" / IMPORT_NAME / "__init__.py"
+    entries.append((f"{IMPORT_NAME}/__init__.py", init_py.read_bytes(), False))
+
+    # Native binary goes in data/scripts/ — pip copies it directly to bin/Scripts
+    entries.append((f"{data_scripts_dir}/{exe_name}", binary_data, True))
 
     readme_path = Path(__file__).resolve().parent.parent / "README.md"
     readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
@@ -141,9 +133,6 @@ def build_wheel(
         f"Tag: py3-none-{platform_tag}\n"
     )
     entries.append((f"{dist_info_dir}/WHEEL", wheel_meta.encode(), False))
-
-    entry_points = "[console_scripts]\nghr = ghr_cli:main\n"
-    entries.append((f"{dist_info_dir}/entry_points.txt", entry_points.encode(), False))
 
     # Build RECORD
     records: list[str] = []
@@ -194,7 +183,10 @@ def main() -> None:
     wheels: list[Path] = []
     for platform_key, info in PLATFORMS.items():
         print(f"[{platform_key}]")
-        wheel = build_wheel(version, platform_key, info["tag"], dist_dir, raw_version)
+        wheel = build_wheel(
+            version, platform_key, info["tag"], info["exe"],
+            dist_dir, raw_version,
+        )
         wheels.append(wheel)
         print()
 
