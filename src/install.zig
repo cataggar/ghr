@@ -182,25 +182,36 @@ fn downloadAsset(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     url: []const u8,
-) ![]u8 {
-    // Pre-allocate for large files (grows as needed)
-    var body_writer = try std.Io.Writer.Allocating.initCapacity(allocator, 64 * 1024 * 1024);
-
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
+    dest_path: []const u8,
+) !void {
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(.GET, uri, .{
+        .redirect_behavior = @enumFromInt(3),
         .extra_headers = &.{
             .{ .name = "User-Agent", .value = "ghr/" ++ version },
         },
-        .response_writer = &body_writer.writer,
-        .raw_uri = true,
-        .keep_alive = false,
     });
+    defer req.deinit();
 
-    if (result.status != .ok) {
-        allocator.free(body_writer.writer.buffer);
-        return error.DownloadFailed;
-    }
-    return body_writer.toOwnedSlice();
+    try req.sendBodiless();
+
+    var redirect_buf: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buf);
+
+    if (response.head.status != .ok) return error.DownloadFailed;
+
+    var transfer_buf: [8192]u8 = undefined;
+    var body_reader = response.reader(&transfer_buf);
+
+    var file = try std.fs.createFileAbsolute(dest_path, .{});
+    defer file.close();
+    var file_buf: [8192]u8 = undefined;
+    var file_writer = file.writer(&file_buf);
+
+    const n = body_reader.streamRemaining(&file_writer.interface) catch return error.DownloadFailed;
+    try file_writer.end();
+    _ = n;
+    _ = allocator;
 }
 
 /// Validate that a zip entry path is safe (no path traversal).
@@ -226,8 +237,7 @@ fn extractZip(dest_dir: std.fs.Dir, file: *std.fs.File, diag: ?*std.zip.Diagnost
     });
 }
 
-fn extractTarGz(data: []const u8, dest_dir: std.fs.Dir) !void {
-    _ = data;
+fn extractTarGz(dest_dir: std.fs.Dir) !void {
     _ = dest_dir;
     return error.TarGzNotYetSupported;
 }
@@ -363,7 +373,10 @@ pub fn cmdInstall(
     try w.flush();
 
     // Set up HTTP client
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .tls_buffer_size = 16384 * 2,
+    };
     defer client.deinit();
 
     // Get release info
@@ -398,22 +411,38 @@ pub fn cmdInstall(
     try w.print("downloading {s} ...\n", .{asset.name});
     try w.flush();
 
-    // Download
-    const data = downloadAsset(allocator, &client, asset.browser_download_url) catch |err| {
-        try err_w.print("error: download failed: {}\n", .{err});
-        try err_w.flush();
-        std.process.exit(1);
-    };
-    defer allocator.free(data);
-
-    try w.print("downloaded {d:.1} MB\n", .{@as(f64, @floatFromInt(data.len)) / 1024.0 / 1024.0});
-
-    // Stage extraction in cache dir
     // Ensure cache directory tree exists
     if (std.fs.path.dirname(d.cache)) |parent| {
         std.fs.makeDirAbsolute(parent) catch {};
     }
     std.fs.makeDirAbsolute(d.cache) catch {};
+
+    // Download to cache file
+    const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        d.cache, std.fs.path.sep, asset.name,
+    });
+    defer allocator.free(download_path);
+
+    downloadAsset(allocator, &client, asset.browser_download_url, download_path) catch |err| {
+        try err_w.print("error: download failed: {}\n", .{err});
+        try err_w.flush();
+        std.process.exit(1);
+    };
+    defer std.fs.deleteFileAbsolute(download_path) catch {};
+
+    // Get file size for display
+    {
+        const stat = std.fs.openFileAbsolute(download_path, .{}) catch null;
+        if (stat) |f| {
+            defer f.close();
+            const size = f.getEndPos() catch 0;
+            if (size > 0) {
+                try w.print("downloaded {d:.1} MB\n", .{@as(f64, @floatFromInt(size)) / 1024.0 / 1024.0});
+            }
+        }
+    }
+
+    // Stage extraction
     const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging-{s}-{s}", .{
         d.cache, std.fs.path.sep, spec.owner, spec.repo,
     });
@@ -431,22 +460,7 @@ pub fn cmdInstall(
     try w.flush();
 
     if (std.mem.endsWith(u8, asset.name, ".zip")) {
-        // Write to temp file (std.zip requires a File.Reader)
-        const tmp_path = try std.fmt.allocPrint(allocator, "{s}{c}download.zip", .{
-            d.cache, std.fs.path.sep,
-        });
-        defer allocator.free(tmp_path);
-        {
-            var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
-            defer tmp_file.close();
-            var tmp_buf: [8192]u8 = undefined;
-            var tmp_w = tmp_file.writer(&tmp_buf);
-            try tmp_w.interface.writeAll(data);
-            try tmp_w.end();
-        }
-        defer std.fs.deleteFileAbsolute(tmp_path) catch {};
-
-        var zip_file = try std.fs.openFileAbsolute(tmp_path, .{});
+        var zip_file = try std.fs.openFileAbsolute(download_path, .{});
         defer zip_file.close();
 
         extractZip(staging_dir, &zip_file, null) catch |err| {
@@ -455,7 +469,7 @@ pub fn cmdInstall(
             std.process.exit(1);
         };
     } else if (std.mem.endsWith(u8, asset.name, ".tar.gz") or std.mem.endsWith(u8, asset.name, ".tgz")) {
-        extractTarGz(data, staging_dir) catch |err| {
+        extractTarGz(staging_dir) catch |err| {
             try err_w.print("error: extraction failed: {}\n", .{err});
             try err_w.flush();
             std.process.exit(1);
@@ -483,11 +497,24 @@ pub fn cmdInstall(
 
     // Remove old install if present
     std.fs.deleteTreeAbsolute(tool_path) catch {};
-    // Ensure owner dir exists
+    // Ensure tools and owner dirs exist (create full path)
     const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
         d.tools, std.fs.path.sep, spec.owner,
     });
     defer allocator.free(owner_path);
+    // Create all parent directories
+    var dir = std.fs.openDirAbsolute(std.fs.path.dirname(d.tools) orelse ".", .{}) catch blk: {
+        // Create parents manually
+        if (std.fs.path.dirname(d.tools)) |parent| {
+            if (std.fs.path.dirname(parent)) |grandparent| {
+                std.fs.makeDirAbsolute(grandparent) catch {};
+            }
+            std.fs.makeDirAbsolute(parent) catch {};
+        }
+        std.fs.makeDirAbsolute(d.tools) catch {};
+        break :blk try std.fs.openDirAbsolute(d.tools, .{});
+    };
+    dir.close();
     std.fs.makeDirAbsolute(d.tools) catch {};
     std.fs.makeDirAbsolute(owner_path) catch {};
 
