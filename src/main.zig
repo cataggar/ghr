@@ -11,9 +11,10 @@ const Writer = Io.Writer;
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
-    const environ = init.minimal.environ;
+    const environ = init.environ_map;
 
-    var args = std.process.Args.Iterator.init(init.minimal.args);
+    var args = try init.minimal.args.iterateAllocator(allocator);
+    defer args.deinit();
     _ = args.skip();
 
     var stdout_buf: [4096]u8 = undefined;
@@ -85,7 +86,7 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 fn cmdDir(
     allocator: std.mem.Allocator,
-    environ: std.process.Environ,
+    environ: *const std.process.Environ.Map,
     args: *std.process.Args.Iterator,
     w: *Writer,
     err_w: *Writer,
@@ -109,7 +110,7 @@ fn cmdDir(
     }
 }
 
-fn cmdList(allocator: std.mem.Allocator, environ: std.process.Environ, io: Io, w: *Writer) !void {
+fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, io: Io, w: *Writer) !void {
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
