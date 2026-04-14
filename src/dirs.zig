@@ -23,56 +23,49 @@ pub const Dirs = struct {
     }
 };
 
-fn getEnv(allocator: std.mem.Allocator, key: []const u8) ?[]const u8 {
-    return std.process.getEnvVarOwned(allocator, key) catch return null;
+fn getEnv(key: [:0]const u8) ?[]const u8 {
+    const val = std.c.getenv(key) orelse return null;
+    return std.mem.sliceTo(val, 0);
 }
 
-fn homeDir(allocator: std.mem.Allocator) ![]const u8 {
-    const key = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-    return std.process.getEnvVarOwned(allocator, key) catch return error.HomeNotFound;
+fn homeDir() ![]const u8 {
+    const key: [:0]const u8 = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    return getEnv(key) orelse error.HomeNotFound;
 }
 
 fn binDir(allocator: std.mem.Allocator) ![]const u8 {
-    if (getEnv(allocator, "GHR_BIN_DIR")) |v| return v;
-    const h = try homeDir(allocator);
-    defer allocator.free(h);
+    if (getEnv("GHR_BIN_DIR")) |v| return allocator.dupe(u8, v);
+    const h = try homeDir();
     return std.fs.path.join(allocator, &.{ h, ".local", "bin" });
 }
 
 fn toolsDir(allocator: std.mem.Allocator) ![]const u8 {
-    if (getEnv(allocator, "GHR_TOOL_DIR")) |v| return v;
+    if (getEnv("GHR_TOOL_DIR")) |v| return allocator.dupe(u8, v);
     if (builtin.os.tag == .windows) {
-        const appdata = getEnv(allocator, "APPDATA") orelse return error.AppDataNotFound;
-        defer allocator.free(appdata);
+        const appdata = getEnv("APPDATA") orelse return error.AppDataNotFound;
         return std.fs.path.join(allocator, &.{ appdata, "ghr", "data", "tools" });
     }
-    if (getEnv(allocator, "XDG_DATA_HOME")) |xdg| {
-        defer allocator.free(xdg);
+    if (getEnv("XDG_DATA_HOME")) |xdg| {
         return std.fs.path.join(allocator, &.{ xdg, "ghr", "tools" });
     }
-    const h = try homeDir(allocator);
-    defer allocator.free(h);
+    const h = try homeDir();
     return std.fs.path.join(allocator, &.{ h, ".local", "share", "ghr", "tools" });
 }
 
 fn cacheDir(allocator: std.mem.Allocator) ![]const u8 {
-    if (getEnv(allocator, "GHR_CACHE_DIR")) |v| return v;
+    if (getEnv("GHR_CACHE_DIR")) |v| return allocator.dupe(u8, v);
     if (builtin.os.tag == .windows) {
-        const localappdata = getEnv(allocator, "LOCALAPPDATA") orelse return error.LocalAppDataNotFound;
-        defer allocator.free(localappdata);
+        const localappdata = getEnv("LOCALAPPDATA") orelse return error.LocalAppDataNotFound;
         return std.fs.path.join(allocator, &.{ localappdata, "ghr", "cache" });
     }
     if (comptime builtin.os.tag.isDarwin()) {
-        const h = try homeDir(allocator);
-        defer allocator.free(h);
+        const h = try homeDir();
         return std.fs.path.join(allocator, &.{ h, "Library", "Caches", "ghr" });
     }
-    if (getEnv(allocator, "XDG_CACHE_HOME")) |xdg| {
-        defer allocator.free(xdg);
+    if (getEnv("XDG_CACHE_HOME")) |xdg| {
         return std.fs.path.join(allocator, &.{ xdg, "ghr" });
     }
-    const h = try homeDir(allocator);
-    defer allocator.free(h);
+    const h = try homeDir();
     return std.fs.path.join(allocator, &.{ h, ".cache", "ghr" });
 }
 

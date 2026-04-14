@@ -5,21 +5,22 @@ const install = @import("install.zig");
 
 pub const version = build_options.version;
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+const Io = std.Io;
+const Writer = Io.Writer;
 
-    var args = std.process.argsWithAllocator(allocator) catch @panic("failed to read args");
-    defer args.deinit();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout = Io.File.stdout().writer(io, &stdout_buf);
     defer stdout.interface.flush() catch {};
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr = Io.File.stderr().writer(io, &stderr_buf);
     defer stderr.interface.flush() catch {};
 
     const cmd_str = args.next() orelse {
@@ -39,7 +40,7 @@ pub fn main() !void {
     if (eql(cmd_str, "dir")) {
         try cmdDir(allocator, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
-        try cmdList(allocator, &stdout.interface);
+        try cmdList(allocator, io, &stdout.interface);
     } else if (eql(cmd_str, "install")) {
         var debug = false;
         var spec: ?[]const u8 = null;
@@ -55,14 +56,14 @@ pub fn main() !void {
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try install.cmdInstall(allocator, spec_val, &stdout.interface, &stderr.interface, debug);
+        try install.cmdInstall(allocator, io, spec_val, &stdout.interface, &stderr.interface, debug);
     } else if (eql(cmd_str, "uninstall")) {
         const spec = args.next() orelse {
             try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try install.cmdUninstall(allocator, spec, &stdout.interface, &stderr.interface);
+        try install.cmdUninstall(allocator, io, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "upgrade")) {
         try stderr.interface.print("error: upgrade not yet implemented\n", .{});
         try stderr.interface.flush();
@@ -83,9 +84,9 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 fn cmdDir(
     allocator: std.mem.Allocator,
-    args: *std.process.ArgIterator,
-    w: *std.io.Writer,
-    err_w: *std.io.Writer,
+    args: *std.process.Args.Iterator,
+    w: *Writer,
+    err_w: *Writer,
 ) !void {
     const d = try Dirs.detect(allocator);
     defer d.deinit();
@@ -106,26 +107,26 @@ fn cmdDir(
     }
 }
 
-fn cmdList(allocator: std.mem.Allocator, w: *std.io.Writer) !void {
+fn cmdList(allocator: std.mem.Allocator, io: Io, w: *Writer) !void {
     const d = try Dirs.detect(allocator);
     defer d.deinit();
 
-    var dir = std.fs.openDirAbsolute(d.tools, .{ .iterate = true }) catch {
+    var dir = Io.Dir.openDirAbsolute(io, d.tools, .{ .iterate = true }) catch {
         try w.print("No tools installed.\n", .{});
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var found = false;
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        var owner_dir = dir.openDir(entry.name, .{ .iterate = true }) catch continue;
-        defer owner_dir.close();
+        var owner_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer owner_dir.close(io);
         var repo_iter = owner_dir.iterate();
-        while (try repo_iter.next()) |repo_entry| {
+        while (try repo_iter.next(io)) |repo_entry| {
             if (repo_entry.kind != .directory) continue;
-            const tag = readToolTag(allocator, owner_dir, repo_entry.name);
+            const tag = readToolTag(allocator, io, owner_dir, repo_entry.name);
             defer if (tag) |t| allocator.free(t);
             if (tag) |t| {
                 try w.print("{s}/{s} @ {s}\n", .{ entry.name, repo_entry.name, t });
@@ -141,11 +142,11 @@ fn cmdList(allocator: std.mem.Allocator, w: *std.io.Writer) !void {
     }
 }
 
-fn readToolTag(allocator: std.mem.Allocator, owner_dir: std.fs.Dir, repo_name: []const u8) ?[]const u8 {
-    var repo_dir = owner_dir.openDir(repo_name, .{}) catch return null;
-    defer repo_dir.close();
+fn readToolTag(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_name: []const u8) ?[]const u8 {
+    var repo_dir = owner_dir.openDir(io, repo_name, .{}) catch return null;
+    defer repo_dir.close(io);
 
-    const json_bytes = repo_dir.readFileAlloc(allocator, "ghr.json", 8192) catch return null;
+    const json_bytes = repo_dir.readFileAlloc(io, "ghr.json", allocator, Io.Limit.limited(8192)) catch return null;
     defer allocator.free(json_bytes);
 
     const parsed = std.json.parseFromSlice(
@@ -159,7 +160,7 @@ fn readToolTag(allocator: std.mem.Allocator, owner_dir: std.fs.Dir, repo_name: [
     return allocator.dupe(u8, parsed.value.tag) catch return null;
 }
 
-fn printUsage(w: *std.io.Writer) !void {
+fn printUsage(w: *Writer) !void {
     try w.print(
         \\ghr - Install tools from GitHub releases
         \\

@@ -3,7 +3,20 @@ const builtin = @import("builtin");
 const Dirs = @import("dirs.zig").Dirs;
 const version = @import("build_options").version;
 
-const Writer = std.io.Writer;
+const Io = std.Io;
+const Dir = Io.Dir;
+const File = Io.File;
+const Writer = Io.Writer;
+
+/// Delete an absolute path's directory tree. Zig 0.16 removed Dir.deleteTreeAbsolute,
+/// so we open the parent dir and call deleteTree on the basename.
+fn deleteTreeAbsolute(io: Io, abs_path: []const u8) !void {
+    const parent = std.fs.path.dirname(abs_path) orelse return error.InvalidPath;
+    const basename = std.fs.path.basename(abs_path);
+    var dir = try Dir.openDirAbsolute(io, parent, .{});
+    defer dir.close(io);
+    try dir.deleteTree(io, basename);
+}
 
 /// Parsed "owner/repo[@tag]" specification.
 const Spec = struct {
@@ -148,6 +161,7 @@ fn isInstallableAsset(name: []const u8) bool {
     if (std.mem.endsWith(u8, name, ".zip")) return true;
     if (std.mem.endsWith(u8, name, ".tar.gz")) return true;
     if (std.mem.endsWith(u8, name, ".tgz")) return true;
+    if (std.mem.endsWith(u8, name, ".tar.xz")) return true;
     return false;
 }
 
@@ -215,6 +229,7 @@ fn findBestAsset(assets: []const Asset) !Asset {
 
 fn downloadAsset(
     allocator: std.mem.Allocator,
+    io: Io,
     _: *std.http.Client,
     url: []const u8,
     dest_path: []const u8,
@@ -225,24 +240,23 @@ fn downloadAsset(
     while (attempts < max_retries) : (attempts += 1) {
         if (attempts > 0) {
             // Exponential backoff: 1s, 2s, 4s, 8s
-            const delay_ns: u64 = @as(u64, 1_000_000_000) << @intCast(attempts - 1);
-            debugLog(debug_w, "  retrying in {d}s ...\n", .{delay_ns / 1_000_000_000});
-            std.Thread.sleep(delay_ns);
-            std.fs.deleteFileAbsolute(dest_path) catch {};
+            const delay_s: i64 = @as(i64, 1) << @intCast(attempts - 1);
+            debugLog(debug_w, "  retrying in {d}s ...\n", .{delay_s});
+            io.sleep(Io.Duration.fromSeconds(delay_s), .real) catch {};
+            Dir.deleteFileAbsolute(io, dest_path) catch {};
         }
 
         // Fresh client per attempt to get a new connection and SAS token
         var client: std.http.Client = .{
             .allocator = allocator,
-            .tls_buffer_size = 16384 * 2,
-            .read_buffer_size = 16384,
+            .io = io,
         };
         defer client.deinit();
 
-        var file = std.fs.createFileAbsolute(dest_path, .{}) catch return error.DownloadFailed;
-        defer file.close();
+        var file = Dir.createFileAbsolute(io, dest_path, .{}) catch return error.DownloadFailed;
+        defer file.close(io);
         var file_buf: [8192]u8 = undefined;
-        var file_writer = file.writer(&file_buf);
+        var file_writer = file.writer(io, &file_buf);
 
         const result = client.fetch(.{
             .location = .{ .url = url },
@@ -320,62 +334,71 @@ fn isSafePath(name: []const u8) bool {
     return true;
 }
 
-fn extractZip(dest_dir: std.fs.Dir, file: *std.fs.File, diag: ?*std.zip.Diagnostics) !void {
+fn extractZip(io: Io, dest_dir: Dir, file: *File) !void {
     var buf: [8192]u8 = undefined;
-    var reader = file.reader(&buf);
+    var reader = file.reader(io, &buf);
     try std.zip.extract(dest_dir, &reader, .{
         .allow_backslashes = true,
-        .diagnostics = diag,
     });
 }
 
-fn extractTarGz(dest_dir: std.fs.Dir, file: *std.fs.File) !void {
+fn extractTarGz(io: Io, dest_dir: Dir, file: *File) !void {
     var file_buf: [8192]u8 = undefined;
-    var file_reader = file.reader(&file_buf);
+    var file_reader = file.reader(io, &file_buf);
     var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(
         &file_reader.interface,
         .gzip,
         &decompress_buf,
     );
-    try std.tar.pipeToFileSystem(dest_dir, &decompress.reader, .{});
+    try std.tar.extract(io, dest_dir, &decompress.reader, .{});
+}
+
+fn extractTarXz(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *File) !void {
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_buf);
+    var xz_buf: [8192]u8 = undefined;
+    var xz_decompress = try std.compress.xz.Decompress.init(&file_reader.interface, allocator, &xz_buf);
+    defer xz_decompress.deinit();
+    try std.tar.extract(io, dest_dir, &xz_decompress.reader, .{});
 }
 
 /// Scan directory recursively for executable files and return their relative paths.
-fn findExecutables(allocator: std.mem.Allocator, dir: std.fs.Dir) !std.ArrayListUnmanaged([]const u8) {
+fn findExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
-    try scanForExecutables(allocator, dir, &result, "");
+    try scanForExecutables(allocator, io, dir, &result, "");
     return result;
 }
 
 fn scanForExecutables(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: Io,
+    dir: Dir,
     result: *std.ArrayListUnmanaged([]const u8),
     prefix: []const u8,
 ) !void {
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         const rel_name = if (prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name })
         else
             try allocator.dupe(u8, entry.name);
 
         if (entry.kind == .directory) {
-            if (isMacAppBundle(dir, entry.name)) {
+            if (isMacAppBundle(io, dir, entry.name)) {
                 // Only scan Contents/MacOS/ inside .app bundles
-                try scanAppBundle(allocator, dir, entry.name, result, rel_name);
+                try scanAppBundle(allocator, io, dir, entry.name, result, rel_name);
                 allocator.free(rel_name);
             } else if (isLibraryDir(entry.name)) {
                 // Skip directories that contain shared libraries, not executables
                 allocator.free(rel_name);
             } else {
-                var sub = dir.openDir(entry.name, .{ .iterate = true }) catch {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch {
                     allocator.free(rel_name);
                     continue;
                 };
-                defer sub.close();
-                try scanForExecutables(allocator, sub, result, rel_name);
+                defer sub.close(io);
+                try scanForExecutables(allocator, io, sub, result, rel_name);
                 allocator.free(rel_name);
             }
         } else if (entry.kind == .file) {
@@ -386,11 +409,11 @@ fn scanForExecutables(
             const is_exe = if (builtin.os.tag == .windows)
                 std.mem.endsWith(u8, entry.name, ".exe")
             else blk: {
-                const stat = dir.statFile(entry.name) catch {
+                const stat = dir.statFile(io, entry.name, .{}) catch {
                     allocator.free(rel_name);
                     continue;
                 };
-                break :blk (stat.mode & 0o111) != 0;
+                break :blk (@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0;
             };
             if (is_exe) {
                 try result.append(allocator, rel_name);
@@ -404,40 +427,41 @@ fn scanForExecutables(
 }
 
 /// Check if a directory is a macOS .app bundle (has Contents/MacOS/ inside).
-fn isMacAppBundle(parent: std.fs.Dir, name: []const u8) bool {
+fn isMacAppBundle(io: Io, parent: Dir, name: []const u8) bool {
     if (!std.mem.endsWith(u8, name, ".app")) return false;
     // Verify it has the expected bundle structure
-    var app_dir = parent.openDir(name, .{}) catch return false;
-    defer app_dir.close();
-    app_dir.access("Contents/MacOS", .{}) catch return false;
+    var app_dir = parent.openDir(io, name, .{}) catch return false;
+    defer app_dir.close(io);
+    app_dir.access(io, "Contents/MacOS", .{}) catch return false;
     return true;
 }
 
 /// Scan only the Contents/MacOS/ directory inside a .app bundle for executables.
 fn scanAppBundle(
     allocator: std.mem.Allocator,
-    parent: std.fs.Dir,
+    io: Io,
+    parent: Dir,
     app_name: []const u8,
     result: *std.ArrayListUnmanaged([]const u8),
     app_prefix: []const u8,
 ) !void {
     const macos_rel = try std.fmt.allocPrint(allocator, "{s}/Contents/MacOS", .{app_name});
     defer allocator.free(macos_rel);
-    var macos_dir = parent.openDir(macos_rel, .{ .iterate = true }) catch return;
-    defer macos_dir.close();
+    var macos_dir = parent.openDir(io, macos_rel, .{ .iterate = true }) catch return;
+    defer macos_dir.close(io);
 
     const prefix = try std.fmt.allocPrint(allocator, "{s}/Contents/MacOS", .{app_prefix});
     defer allocator.free(prefix);
 
     var iter = macos_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (isSharedLibrary(entry.name)) continue;
         const is_exe = if (builtin.os.tag == .windows)
             std.mem.endsWith(u8, entry.name, ".exe")
         else blk: {
-            const stat = macos_dir.statFile(entry.name) catch continue;
-            break :blk (stat.mode & 0o111) != 0;
+            const stat = macos_dir.statFile(io, entry.name, .{}) catch continue;
+            break :blk (@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0;
         };
         if (is_exe) {
             const rel_name = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name });
@@ -448,13 +472,14 @@ fn scanAppBundle(
 
 /// Link or copy an executable to the bin directory.
 fn linkToBin(
+    io: Io,
     tool_dir_path: []const u8,
-    bin_dir: std.fs.Dir,
+    bin_dir: Dir,
     exe_rel_path: []const u8,
     w: *Writer,
 ) !void {
     const exe_name = std.fs.path.basename(exe_rel_path);
-    var src_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var src_path_buf: [Dir.max_path_bytes]u8 = undefined;
     const src_path = std.fmt.bufPrint(&src_path_buf, "{s}{c}{s}", .{
         tool_dir_path,
         std.fs.path.sep,
@@ -464,59 +489,60 @@ fn linkToBin(
     if (builtin.os.tag == .windows) {
         // Create a .cmd wrapper that runs the exe in its original directory
         // so it can find sibling DLLs.
-        var cmd_name_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
         const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
             exe_name[0 .. exe_name.len - 4]
         else
             exe_name;
         const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
 
-        bin_dir.deleteFile(cmd_name) catch {};
-        var cmd_file = bin_dir.createFile(cmd_name, .{}) catch return error.CreateFailed;
-        defer cmd_file.close();
+        bin_dir.deleteFile(io, cmd_name) catch {};
+        var cmd_file = bin_dir.createFile(io, cmd_name, .{}) catch return error.CreateFailed;
+        defer cmd_file.close(io);
         var cmd_buf: [4096]u8 = undefined;
-        var cmd_w = cmd_file.writer(&cmd_buf);
+        var cmd_w = cmd_file.writer(io, &cmd_buf);
         cmd_w.interface.print("@\"{s}\" %*\r\n", .{src_path}) catch return error.WriteFailed;
         cmd_w.end() catch return error.WriteFailed;
     } else {
         // Unix: symlink
-        bin_dir.deleteFile(exe_name) catch {};
-        try bin_dir.symLink(src_path, exe_name, .{});
+        bin_dir.deleteFile(io, exe_name) catch {};
+        try bin_dir.symLink(io, src_path, exe_name, .{});
     }
     try w.print("  linked {s}\n", .{exe_name});
 }
 
 /// Find .app bundles recursively in a directory. Returns relative paths from the root.
-fn findAppBundles(allocator: std.mem.Allocator, dir: std.fs.Dir) !std.ArrayListUnmanaged([]const u8) {
+fn findAppBundles(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
-    try scanForAppBundles(allocator, dir, &result, "");
+    try scanForAppBundles(allocator, io, dir, &result, "");
     return result;
 }
 
 fn scanForAppBundles(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: Io,
+    dir: Dir,
     result: *std.ArrayListUnmanaged([]const u8),
     prefix: []const u8,
 ) !void {
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
         const rel_name = if (prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
         else
             try allocator.dupe(u8, entry.name);
 
-        if (isMacAppBundle(dir, entry.name)) {
+        if (isMacAppBundle(io, dir, entry.name)) {
             try result.append(allocator, rel_name);
             // Don't recurse into .app bundles
         } else {
-            var sub = dir.openDir(entry.name, .{ .iterate = true }) catch {
+            var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch {
                 allocator.free(rel_name);
                 continue;
             };
-            defer sub.close();
-            try scanForAppBundles(allocator, sub, result, rel_name);
+            defer sub.close(io);
+            try scanForAppBundles(allocator, io, sub, result, rel_name);
             allocator.free(rel_name);
         }
     }
@@ -529,20 +555,20 @@ const ghr_marker = "Contents/.ghr-source";
 /// Symlinks are not indexed by Spotlight, so a real copy is required.
 fn installAppBundles(
     allocator: std.mem.Allocator,
+    io: Io,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
     w: *Writer,
 ) !void {
     if (app_paths.len == 0) return;
 
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
-    defer allocator.free(home);
+    const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return, 0);
     const apps_dir_path = try std.fmt.allocPrint(allocator, "{s}/Applications", .{home});
     defer allocator.free(apps_dir_path);
-    std.fs.makeDirAbsolute(apps_dir_path) catch {};
+    Dir.createDirAbsolute(io, apps_dir_path, .default_dir) catch {};
 
-    var apps_dir = std.fs.openDirAbsolute(apps_dir_path, .{}) catch return;
-    defer apps_dir.close();
+    var apps_dir = Dir.openDirAbsolute(io, apps_dir_path, .{}) catch return;
+    defer apps_dir.close(io);
 
     for (app_paths) |rel_path| {
         const app_name = std.fs.path.basename(rel_path);
@@ -550,12 +576,12 @@ fn installAppBundles(
         defer allocator.free(app_src);
 
         // If an existing app is present, only replace it if we own it (has our marker or is a legacy symlink)
-        const existing = apps_dir.statFile(app_name) catch null;
+        const existing = apps_dir.statFile(io, app_name, .{}) catch null;
         if (existing) |_| {
-            if (isLegacyAppSymlink(allocator, apps_dir, app_name, tool_dir_path, rel_path)) {
-                apps_dir.deleteFile(app_name) catch continue;
-            } else if (isOwnedAppBundle(apps_dir, app_name, tool_dir_path)) {
-                apps_dir.deleteTree(app_name) catch continue;
+            if (isLegacyAppSymlink(allocator, io, apps_dir, app_name, tool_dir_path, rel_path)) {
+                apps_dir.deleteFile(io, app_name) catch continue;
+            } else if (isOwnedAppBundle(io, apps_dir, app_name, tool_dir_path)) {
+                apps_dir.deleteTree(io, app_name) catch continue;
             } else {
                 w.print("  skipped ~/Applications/{s} (not owned by ghr)\n", .{app_name}) catch {};
                 continue;
@@ -565,32 +591,32 @@ fn installAppBundles(
         // Copy to a staging name, then rename for atomicity
         const staging_name = std.fmt.allocPrint(allocator, ".ghr-staging-{s}", .{app_name}) catch continue;
         defer allocator.free(staging_name);
-        apps_dir.deleteTree(staging_name) catch {};
+        apps_dir.deleteTree(io, staging_name) catch {};
 
         // Open source .app directory
-        var src_dir = std.fs.openDirAbsolute(app_src, .{ .iterate = true }) catch continue;
-        defer src_dir.close();
+        var src_dir = Dir.openDirAbsolute(io, app_src, .{ .iterate = true }) catch continue;
+        defer src_dir.close(io);
 
         // Create staging directory and copy
-        apps_dir.makeDir(staging_name) catch continue;
-        var staging_dir = apps_dir.openDir(staging_name, .{}) catch continue;
-        defer staging_dir.close();
+        apps_dir.createDir(io, staging_name, .default_dir) catch continue;
+        var staging_dir = apps_dir.openDir(io, staging_name, .{}) catch continue;
+        defer staging_dir.close(io);
 
-        copyDirRecursive(src_dir, staging_dir) catch {
-            apps_dir.deleteTree(staging_name) catch {};
+        copyDirRecursive(io, src_dir, staging_dir) catch {
+            apps_dir.deleteTree(io, staging_name) catch {};
             continue;
         };
 
         // Write ownership marker (remove first in case archive contained one as a symlink)
-        staging_dir.deleteFile(ghr_marker) catch {};
-        writeMarkerFile(staging_dir, tool_dir_path) catch {
-            apps_dir.deleteTree(staging_name) catch {};
+        staging_dir.deleteFile(io, ghr_marker) catch {};
+        writeMarkerFile(io, staging_dir, tool_dir_path) catch {
+            apps_dir.deleteTree(io, staging_name) catch {};
             continue;
         };
 
         // Atomic rename into place
-        apps_dir.rename(staging_name, app_name) catch {
-            apps_dir.deleteTree(staging_name) catch {};
+        apps_dir.rename(staging_name, apps_dir, app_name, io) catch {
+            apps_dir.deleteTree(io, staging_name) catch {};
             continue;
         };
 
@@ -601,100 +627,102 @@ fn installAppBundles(
 /// Remove ~/Applications .app bundles owned by this tool.
 fn uninstallAppBundles(
     allocator: std.mem.Allocator,
+    io: Io,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
     w: *Writer,
 ) void {
     if (app_paths.len == 0) return;
 
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
-    defer allocator.free(home);
+    const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return, 0);
     const apps_dir_path = std.fmt.allocPrint(allocator, "{s}/Applications", .{home}) catch return;
     defer allocator.free(apps_dir_path);
 
-    var apps_dir = std.fs.openDirAbsolute(apps_dir_path, .{}) catch return;
-    defer apps_dir.close();
+    var apps_dir = Dir.openDirAbsolute(io, apps_dir_path, .{}) catch return;
+    defer apps_dir.close(io);
 
     for (app_paths) |rel_path| {
         const app_name = std.fs.path.basename(rel_path);
 
         // Handle legacy symlinks from older ghr versions
-        if (isLegacyAppSymlink(allocator, apps_dir, app_name, tool_dir_path, rel_path)) {
-            apps_dir.deleteFile(app_name) catch continue;
+        if (isLegacyAppSymlink(allocator, io, apps_dir, app_name, tool_dir_path, rel_path)) {
+            apps_dir.deleteFile(io, app_name) catch continue;
             w.print("  uninstalled ~/Applications/{s}\n", .{app_name}) catch {};
             continue;
         }
 
-        if (!isOwnedAppBundle(apps_dir, app_name, tool_dir_path)) continue;
+        if (!isOwnedAppBundle(io, apps_dir, app_name, tool_dir_path)) continue;
 
-        apps_dir.deleteTree(app_name) catch continue;
+        apps_dir.deleteTree(io, app_name) catch continue;
         w.print("  uninstalled ~/Applications/{s}\n", .{app_name}) catch {};
     }
 }
 
 /// Check if an .app bundle in ~/Applications is owned by ghr for the given tool path.
-fn isOwnedAppBundle(apps_dir: std.fs.Dir, app_name: []const u8, tool_dir_path: []const u8) bool {
+fn isOwnedAppBundle(io: Io, apps_dir: Dir, app_name: []const u8, tool_dir_path: []const u8) bool {
     // Build path to marker: <app_name>/Contents/.ghr-source
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const marker_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ app_name, ghr_marker }) catch return false;
 
     // Verify marker is a regular file, not a symlink
-    const stat = apps_dir.statFile(marker_path) catch return false;
+    const stat = apps_dir.statFile(io, marker_path, .{}) catch return false;
     if (stat.kind == .sym_link) return false;
 
     // Read and compare source path
-    var content_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const file = apps_dir.openFile(marker_path, .{}) catch return false;
-    defer file.close();
-    const len = file.readAll(&content_buf) catch return false;
+    var content_buf: [Dir.max_path_bytes]u8 = undefined;
+    const file = apps_dir.openFile(io, marker_path, .{}) catch return false;
+    defer file.close(io);
+    const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
     return std.mem.eql(u8, content_buf[0..len], tool_dir_path);
 }
 
 /// Check if an entry is a legacy symlink (from older ghr versions) pointing to our tool.
 fn isLegacyAppSymlink(
     allocator: std.mem.Allocator,
-    apps_dir: std.fs.Dir,
+    io: Io,
+    apps_dir: Dir,
     app_name: []const u8,
     tool_dir_path: []const u8,
     rel_path: []const u8,
 ) bool {
-    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const link_target = apps_dir.readLink(app_name, &link_buf) catch return false;
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const len = apps_dir.readLink(io, app_name, &link_buf) catch return false;
+    const link_target = link_buf[0..len];
     const expected = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path }) catch return false;
     defer allocator.free(expected);
     return std.mem.eql(u8, link_target, expected);
 }
 
 /// Write the ghr ownership marker file.
-fn writeMarkerFile(dir: std.fs.Dir, tool_dir_path: []const u8) !void {
-    var file = try dir.createFile(ghr_marker, .{});
-    defer file.close();
-    try file.writeAll(tool_dir_path);
+fn writeMarkerFile(io: Io, dir: Dir, tool_dir_path: []const u8) !void {
+    var file = try dir.createFile(io, ghr_marker, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, tool_dir_path);
 }
 
 /// Recursively copy a directory tree, preserving symlinks without following them.
-fn copyDirRecursive(src_dir: std.fs.Dir, dest_dir: std.fs.Dir) !void {
+fn copyDirRecursive(io: Io, src_dir: Dir, dest_dir: Dir) !void {
     var iter = src_dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         switch (entry.kind) {
             .file => {
-                try src_dir.copyFile(entry.name, dest_dir, entry.name, .{});
+                try src_dir.copyFile(entry.name, dest_dir, entry.name, io, .{});
             },
             .directory => {
-                dest_dir.makeDir(entry.name) catch |err| switch (err) {
+                dest_dir.createDir(io, entry.name, .default_dir) catch |err| switch (err) {
                     error.PathAlreadyExists => {},
                     else => return err,
                 };
-                var child_src = try src_dir.openDir(entry.name, .{ .iterate = true });
-                defer child_src.close();
-                var child_dest = try dest_dir.openDir(entry.name, .{});
-                defer child_dest.close();
-                try copyDirRecursive(child_src, child_dest);
+                var child_src = try src_dir.openDir(io, entry.name, .{ .iterate = true });
+                defer child_src.close(io);
+                var child_dest = try dest_dir.openDir(io, entry.name, .{});
+                defer child_dest.close(io);
+                try copyDirRecursive(io, child_src, child_dest);
             },
             .sym_link => {
-                var buf: [std.fs.max_path_bytes]u8 = undefined;
-                const target = try src_dir.readLink(entry.name, &buf);
-                dest_dir.symLink(target, entry.name, .{}) catch {};
+                var buf: [Dir.max_path_bytes]u8 = undefined;
+                const len = try src_dir.readLink(io, entry.name, &buf);
+                dest_dir.symLink(io, buf[0..len], entry.name, .{}) catch {};
             },
             else => {},
         }
@@ -704,17 +732,19 @@ fn copyDirRecursive(src_dir: std.fs.Dir, dest_dir: std.fs.Dir) !void {
 /// Write ghr.json metadata.
 fn writeMetadata(
     allocator: std.mem.Allocator,
-    tool_dir: std.fs.Dir,
+    io: Io,
+    tool_dir: Dir,
     tag: []const u8,
     asset_name: []const u8,
     bins: []const []const u8,
     apps: []const []const u8,
 ) !void {
-    var file = try tool_dir.createFile("ghr.json", .{});
-    defer file.close();
+    _ = allocator;
+    var file = try tool_dir.createFile(io, "ghr.json", .{});
+    defer file.close(io);
     var buf: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const w = stream.writer();
+    var fw = file.writer(io, &buf);
+    const w = &fw.interface;
     try w.print("{{\"tag\":\"{s}\",\"asset\":\"{s}\",\"bins\":[", .{ tag, asset_name });
     for (bins, 0..) |bin, i| {
         if (i > 0) try w.print(",", .{});
@@ -726,9 +756,7 @@ fn writeMetadata(
         try w.print("\"{s}\"", .{app});
     }
     try w.print("]}}\n", .{});
-    const written = stream.getWritten();
-    try file.writeAll(written);
-    _ = allocator;
+    try fw.end();
 }
 
 /// Metadata stored in ghr.json.
@@ -740,13 +768,13 @@ const Metadata = struct {
 };
 
 /// Read ghr.json metadata from a tool directory.
-fn readMetadata(allocator: std.mem.Allocator, tool_dir_path: []const u8) ?struct {
+fn readMetadata(allocator: std.mem.Allocator, io: Io, tool_dir_path: []const u8) ?struct {
     parsed: std.json.Parsed(Metadata),
     body: []const u8,
 } {
     const json_path = std.fmt.allocPrint(allocator, "{s}/ghr.json", .{tool_dir_path}) catch return null;
     defer allocator.free(json_path);
-    const body = std.fs.cwd().readFileAlloc(allocator, json_path, 65536) catch return null;
+    const body = Dir.cwd().readFileAlloc(io, json_path, allocator, Io.Limit.limited(65536)) catch return null;
     const parsed = std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true }) catch {
         allocator.free(body);
         return null;
@@ -757,35 +785,38 @@ fn readMetadata(allocator: std.mem.Allocator, tool_dir_path: []const u8) ?struct
 /// Clean up old install's bin symlinks and app bundles before replacing.
 fn cleanupOldInstall(
     allocator: std.mem.Allocator,
+    io: Io,
     tool_path: []const u8,
     bin_path: []const u8,
     w: *Writer,
 ) void {
-    const meta = readMetadata(allocator, tool_path) orelse return;
+    const meta = readMetadata(allocator, io, tool_path) orelse return;
     defer meta.parsed.deinit();
     defer allocator.free(meta.body);
 
     // Remove old bin symlinks
-    var bin_dir = std.fs.openDirAbsolute(bin_path, .{}) catch return;
-    defer bin_dir.close();
+    var bin_dir = Dir.openDirAbsolute(io, bin_path, .{}) catch return;
+    defer bin_dir.close(io);
     for (meta.parsed.value.bins) |exe_rel| {
         const exe_name = std.fs.path.basename(exe_rel);
         // Verify the symlink points to our tool dir before removing
-        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const link_target = bin_dir.readLink(exe_name, &link_buf) catch continue;
+        var link_buf: [Dir.max_path_bytes]u8 = undefined;
+        const len = bin_dir.readLink(io, exe_name, &link_buf) catch continue;
+        const link_target = link_buf[0..len];
         if (std.mem.startsWith(u8, link_target, tool_path)) {
-            bin_dir.deleteFile(exe_name) catch {};
+            bin_dir.deleteFile(io, exe_name) catch {};
         }
     }
 
     // Remove old app bundle copies (macOS)
     if (comptime builtin.os.tag.isDarwin()) {
-        uninstallAppBundles(allocator, meta.parsed.value.apps, tool_path, w);
+        uninstallAppBundles(allocator, io, meta.parsed.value.apps, tool_path, w);
     }
 }
 
 pub fn cmdUninstall(
     allocator: std.mem.Allocator,
+    io: Io,
     spec_str: []const u8,
     w: *Writer,
     err_w: *Writer,
@@ -805,31 +836,32 @@ pub fn cmdUninstall(
     defer allocator.free(tool_path);
 
     // Check the tool exists
-    std.fs.accessAbsolute(tool_path, .{}) catch {
+    Dir.accessAbsolute(io, tool_path, .{}) catch {
         try err_w.print("error: {s}/{s} is not installed\n", .{ spec.owner, spec.repo });
         try err_w.flush();
         std.process.exit(1);
     };
 
     // Read metadata to know what to clean up
-    const meta = readMetadata(allocator, tool_path);
+    const meta = readMetadata(allocator, io, tool_path);
     defer if (meta) |m| {
         m.parsed.deinit();
         allocator.free(m.body);
     };
 
     // Remove bin symlinks
-    var bin_dir = std.fs.openDirAbsolute(d.bin, .{}) catch null;
-    defer if (bin_dir) |*bd| bd.close();
+    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch null;
+    defer if (bin_dir) |*bd| bd.close(io);
 
     if (meta) |m| {
         for (m.parsed.value.bins) |exe_rel| {
             const exe_name = std.fs.path.basename(exe_rel);
             if (bin_dir) |bd| {
-                var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const link_target = bd.readLink(exe_name, &link_buf) catch continue;
+                var link_buf: [Dir.max_path_bytes]u8 = undefined;
+                const len = bd.readLink(io, exe_name, &link_buf) catch continue;
+                const link_target = link_buf[0..len];
                 if (std.mem.startsWith(u8, link_target, tool_path)) {
-                    bd.deleteFile(exe_name) catch continue;
+                    bd.deleteFile(io, exe_name) catch continue;
                     try w.print("  unlinked {s}\n", .{exe_name});
                 }
             }
@@ -837,12 +869,12 @@ pub fn cmdUninstall(
 
         // Remove app bundle copies (macOS)
         if (comptime builtin.os.tag.isDarwin()) {
-            uninstallAppBundles(allocator, m.parsed.value.apps, tool_path, w);
+            uninstallAppBundles(allocator, io, m.parsed.value.apps, tool_path, w);
         }
     }
 
     // Delete the tool directory
-    std.fs.deleteTreeAbsolute(tool_path) catch {
+    deleteTreeAbsolute(io, tool_path) catch {
         try err_w.print("error: failed to remove {s}\n", .{tool_path});
         try err_w.flush();
         std.process.exit(1);
@@ -853,6 +885,7 @@ pub fn cmdUninstall(
 
 pub fn cmdInstall(
     allocator: std.mem.Allocator,
+    io: Io,
     spec_str: []const u8,
     w: *Writer,
     err_w: *Writer,
@@ -875,8 +908,7 @@ pub fn cmdInstall(
     // Set up HTTP client
     var client: std.http.Client = .{
         .allocator = allocator,
-        .tls_buffer_size = 16384 * 2,
-        .read_buffer_size = 16384,
+        .io = io,
     };
     defer client.deinit();
 
@@ -914,9 +946,9 @@ pub fn cmdInstall(
 
     // Ensure cache directory tree exists
     if (std.fs.path.dirname(d.cache)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch {};
+        Dir.createDirAbsolute(io, parent, .default_dir) catch {};
     }
-    std.fs.makeDirAbsolute(d.cache) catch {};
+    Dir.createDirAbsolute(io, d.cache, .default_dir) catch {};
 
     // Download to cache file
     const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
@@ -929,20 +961,20 @@ pub fn cmdInstall(
     debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
     debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
 
-    downloadAsset(allocator, &client, asset.browser_download_url, download_path, debug_w) catch |err| {
+    downloadAsset(allocator, io, &client, asset.browser_download_url, download_path, debug_w) catch |err| {
         try err_w.print("error: download failed: {}\n", .{err});
         try err_w.print("  url: {s}\n", .{asset.browser_download_url});
         try err_w.flush();
         std.process.exit(1);
     };
-    defer std.fs.deleteFileAbsolute(download_path) catch {};
+    defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
     // Get file size for display
     {
-        const stat = std.fs.openFileAbsolute(download_path, .{}) catch null;
+        const stat = Dir.openFileAbsolute(io, download_path, .{}) catch null;
         if (stat) |f| {
-            defer f.close();
-            const size = f.getEndPos() catch 0;
+            defer f.close(io);
+            const size = f.length(io) catch 0;
             if (size > 0) {
                 try w.print("downloaded {d:.1} MB\n", .{@as(f64, @floatFromInt(size)) / 1024.0 / 1024.0});
             }
@@ -956,30 +988,39 @@ pub fn cmdInstall(
     defer allocator.free(staging_path);
 
     // Clean up any leftover staging dir
-    std.fs.deleteTreeAbsolute(staging_path) catch {};
-    try std.fs.makeDirAbsolute(staging_path);
+    deleteTreeAbsolute(io, staging_path) catch {};
+    try Dir.createDirAbsolute(io, staging_path, .default_dir);
 
-    var staging_dir = try std.fs.openDirAbsolute(staging_path, .{ .iterate = true });
-    defer staging_dir.close();
+    var staging_dir = try Dir.openDirAbsolute(io, staging_path, .{ .iterate = true });
+    defer staging_dir.close(io);
 
     // Extract
     try w.print("extracting ...\n", .{});
     try w.flush();
 
     if (std.mem.endsWith(u8, asset.name, ".zip")) {
-        var zip_file = try std.fs.openFileAbsolute(download_path, .{});
-        defer zip_file.close();
+        var zip_file = try Dir.openFileAbsolute(io, download_path, .{});
+        defer zip_file.close(io);
 
-        extractZip(staging_dir, &zip_file, null) catch |err| {
+        extractZip(io, staging_dir, &zip_file) catch |err| {
             try err_w.print("error: extraction failed: {}\n", .{err});
             try err_w.flush();
             std.process.exit(1);
         };
     } else if (std.mem.endsWith(u8, asset.name, ".tar.gz") or std.mem.endsWith(u8, asset.name, ".tgz")) {
-        var tar_file = try std.fs.openFileAbsolute(download_path, .{});
-        defer tar_file.close();
+        var tar_file = try Dir.openFileAbsolute(io, download_path, .{});
+        defer tar_file.close(io);
 
-        extractTarGz(staging_dir, &tar_file) catch |err| {
+        extractTarGz(io, staging_dir, &tar_file) catch |err| {
+            try err_w.print("error: extraction failed: {}\n", .{err});
+            try err_w.flush();
+            std.process.exit(1);
+        };
+    } else if (std.mem.endsWith(u8, asset.name, ".tar.xz")) {
+        var xz_file = try Dir.openFileAbsolute(io, download_path, .{});
+        defer xz_file.close(io);
+
+        extractTarXz(allocator, io, staging_dir, &xz_file) catch |err| {
             try err_w.print("error: extraction failed: {}\n", .{err});
             try err_w.flush();
             std.process.exit(1);
@@ -987,7 +1028,7 @@ pub fn cmdInstall(
     }
 
     // Find executables
-    var exes = try findExecutables(allocator, staging_dir);
+    var exes = try findExecutables(allocator, io, staging_dir);
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
@@ -1002,7 +1043,7 @@ pub fn cmdInstall(
     // Find .app bundles (macOS)
     var apps: std.ArrayListUnmanaged([]const u8) = .empty;
     if (comptime builtin.os.tag.isDarwin()) {
-        apps = try findAppBundles(allocator, staging_dir);
+        apps = try findAppBundles(allocator, io, staging_dir);
     }
     defer {
         for (apps.items) |a| allocator.free(a);
@@ -1016,31 +1057,31 @@ pub fn cmdInstall(
     defer allocator.free(tool_path);
 
     // Clean up old install's symlinks before deleting
-    cleanupOldInstall(allocator, tool_path, d.bin, w);
-    std.fs.deleteTreeAbsolute(tool_path) catch {};
+    cleanupOldInstall(allocator, io, tool_path, d.bin, w);
+    deleteTreeAbsolute(io, tool_path) catch {};
     // Ensure tools and owner dirs exist (create full path)
     const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
         d.tools, std.fs.path.sep, spec.owner,
     });
     defer allocator.free(owner_path);
     // Create all parent directories
-    var dir = std.fs.openDirAbsolute(std.fs.path.dirname(d.tools) orelse ".", .{}) catch blk: {
+    var dir = Dir.openDirAbsolute(io, std.fs.path.dirname(d.tools) orelse ".", .{}) catch blk: {
         // Create parents manually
         if (std.fs.path.dirname(d.tools)) |parent| {
             if (std.fs.path.dirname(parent)) |grandparent| {
-                std.fs.makeDirAbsolute(grandparent) catch {};
+                Dir.createDirAbsolute(io, grandparent, .default_dir) catch {};
             }
-            std.fs.makeDirAbsolute(parent) catch {};
+            Dir.createDirAbsolute(io, parent, .default_dir) catch {};
         }
-        std.fs.makeDirAbsolute(d.tools) catch {};
-        break :blk try std.fs.openDirAbsolute(d.tools, .{});
+        Dir.createDirAbsolute(io, d.tools, .default_dir) catch {};
+        break :blk try Dir.openDirAbsolute(io, d.tools, .{});
     };
-    dir.close();
-    std.fs.makeDirAbsolute(d.tools) catch {};
-    std.fs.makeDirAbsolute(owner_path) catch {};
+    dir.close(io);
+    Dir.createDirAbsolute(io, d.tools, .default_dir) catch {};
+    Dir.createDirAbsolute(io, owner_path, .default_dir) catch {};
 
     // Rename staging to final
-    std.fs.renameAbsolute(staging_path, tool_path) catch {
+    Dir.renameAbsolute(staging_path, tool_path, io) catch {
         // Cross-device: fall back to copy
         // For now, error out
         try err_w.print("error: failed to move staging directory to tool directory\n", .{});
@@ -1049,31 +1090,31 @@ pub fn cmdInstall(
     };
 
     // Re-open the tool dir for metadata and linking
-    var tool_dir = try std.fs.openDirAbsolute(tool_path, .{});
-    defer tool_dir.close();
+    var tool_dir = try Dir.openDirAbsolute(io, tool_path, .{});
+    defer tool_dir.close(io);
 
     // Write metadata
     const bins_slice = exes.items;
     const apps_slice = apps.items;
-    writeMetadata(allocator, tool_dir, tag_name, asset.name, bins_slice, apps_slice) catch |err| {
+    writeMetadata(allocator, io, tool_dir, tag_name, asset.name, bins_slice, apps_slice) catch |err| {
         try err_w.print("warning: failed to write metadata: {}\n", .{err});
     };
 
     // Create bin dir and link executables
-    std.fs.makeDirAbsolute(d.bin) catch {};
-    var bin_dir = try std.fs.openDirAbsolute(d.bin, .{});
-    defer bin_dir.close();
+    Dir.createDirAbsolute(io, d.bin, .default_dir) catch {};
+    var bin_dir = try Dir.openDirAbsolute(io, d.bin, .{});
+    defer bin_dir.close(io);
 
     try w.print("linking executables:\n", .{});
     for (exes.items) |exe_name| {
-        linkToBin(tool_path, bin_dir, exe_name, w) catch |err| {
+        linkToBin(io, tool_path, bin_dir, exe_name, w) catch |err| {
             try err_w.print("warning: failed to link {s}: {}\n", .{ exe_name, err });
         };
     }
 
     // On macOS, copy .app bundles into ~/Applications for Spotlight discovery
     if (comptime builtin.os.tag.isDarwin()) {
-        installAppBundles(allocator, apps_slice, tool_path, w) catch |err| {
+        installAppBundles(allocator, io, apps_slice, tool_path, w) catch |err| {
             try err_w.print("warning: failed to install .app bundle: {}\n", .{err});
         };
     }
@@ -1120,19 +1161,21 @@ test "isInstallableAsset" {
     try std.testing.expect(isInstallableAsset("foo.zip"));
     try std.testing.expect(isInstallableAsset("foo.tar.gz"));
     try std.testing.expect(isInstallableAsset("foo.tgz"));
+    try std.testing.expect(isInstallableAsset("foo.tar.xz"));
     try std.testing.expect(!isInstallableAsset("checksums.txt"));
     try std.testing.expect(!isInstallableAsset("foo.sha256"));
 }
 
 /// Create a tar.gz test fixture using the system tar command.
-fn createTestTarGz(tmp: *std.testing.TmpDir, names: []const []const u8, contents: []const []const u8) !std.fs.File {
+fn createTestTarGz(tmp: *std.testing.TmpDir, names: []const []const u8, contents: []const []const u8) !File {
+    const tio = std.testing.io;
     for (names, contents) |name, content| {
         if (std.fs.path.dirname(name)) |parent| {
-            tmp.dir.makePath(parent) catch {};
+            tmp.dir.createDirPath(tio, parent) catch {};
         }
-        var f = try tmp.dir.createFile(name, .{ .mode = 0o755 });
-        try f.writeAll(content);
-        f.close();
+        var f = try tmp.dir.createFile(tio, name, .{ .permissions = .executable_file });
+        try f.writeStreamingAll(tio, content);
+        f.close(tio);
     }
 
     // Build argv: tar czf archive.tar.gz <names...>
@@ -1141,19 +1184,21 @@ fn createTestTarGz(tmp: *std.testing.TmpDir, names: []const []const u8, contents
     try argv.appendSlice(std.testing.allocator, &.{ "tar", "czf", "archive.tar.gz" });
     try argv.appendSlice(std.testing.allocator, names);
 
-    var tar = std.process.Child.init(argv.items, std.testing.allocator);
-    tar.cwd_dir = tmp.dir;
-    _ = try tar.spawnAndWait();
+    var child = try std.process.spawn(tio, .{
+        .argv = argv.items,
+        .cwd = .{ .dir = tmp.dir },
+    });
+    _ = try child.wait(tio);
 
     // Remove source files so extraction starts clean
     for (names) |name| {
-        tmp.dir.deleteFile(name) catch {};
+        tmp.dir.deleteFile(tio, name) catch {};
         if (std.fs.path.dirname(name)) |parent| {
-            tmp.dir.deleteDir(parent) catch {};
+            tmp.dir.deleteDir(tio, parent) catch {};
         }
     }
 
-    return try tmp.dir.openFile("archive.tar.gz", .{});
+    return try tmp.dir.openFile(tio, "archive.tar.gz", .{});
 }
 
 test "extractTarGz extracts files with correct contents" {
@@ -1161,16 +1206,16 @@ test "extractTarGz extracts files with correct contents" {
     defer tmp.cleanup();
 
     var file = try createTestTarGz(&tmp, &.{ "myapp/README.md", "myapp/myapp" }, &.{ "readme\n", "#!/bin/sh\necho hello\n" });
-    defer file.close();
+    defer file.close(std.testing.io);
 
-    extractTarGz(tmp.dir, &file) catch |err| return err;
+    extractTarGz(std.testing.io, tmp.dir, &file) catch |err| return err;
 
     // Verify files exist
-    try std.testing.expect((try tmp.dir.statFile("myapp/README.md")).kind == .file);
-    try std.testing.expect((try tmp.dir.statFile("myapp/myapp")).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "myapp/README.md", .{})).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "myapp/myapp", .{})).kind == .file);
 
     // Verify contents
-    const content = try tmp.dir.readFileAlloc(std.testing.allocator, "myapp/README.md", 256);
+    const content = try tmp.dir.readFileAlloc(std.testing.io, "myapp/README.md", std.testing.allocator, Io.Limit.limited(256));
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("readme\n", content);
 }
@@ -1180,11 +1225,60 @@ test "extractTarGz handles single file archive" {
     defer tmp.cleanup();
 
     var file = try createTestTarGz(&tmp, &.{"tool"}, &.{"binary"});
-    defer file.close();
+    defer file.close(std.testing.io);
 
-    extractTarGz(tmp.dir, &file) catch |err| return err;
+    extractTarGz(std.testing.io, tmp.dir, &file) catch |err| return err;
 
-    try std.testing.expect((try tmp.dir.statFile("tool")).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "tool", .{})).kind == .file);
+}
+
+fn createTestTarXz(tmp: *std.testing.TmpDir, names: []const []const u8, contents: []const []const u8) !File {
+    const tio = std.testing.io;
+    for (names, contents) |name, content| {
+        if (std.fs.path.dirname(name)) |parent| {
+            tmp.dir.createDirPath(tio, parent) catch {};
+        }
+        var f = try tmp.dir.createFile(tio, name, .{ .permissions = .executable_file });
+        try f.writeStreamingAll(tio, content);
+        f.close(tio);
+    }
+
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(std.testing.allocator);
+    try argv.appendSlice(std.testing.allocator, &.{ "tar", "cJf", "archive.tar.xz" });
+    try argv.appendSlice(std.testing.allocator, names);
+
+    var child = try std.process.spawn(tio, .{
+        .argv = argv.items,
+        .cwd = .{ .dir = tmp.dir },
+    });
+    _ = try child.wait(tio);
+
+    for (names) |name| {
+        tmp.dir.deleteFile(tio, name) catch {};
+        if (std.fs.path.dirname(name)) |parent| {
+            tmp.dir.deleteDir(tio, parent) catch {};
+        }
+    }
+
+    return try tmp.dir.openFile(tio, "archive.tar.xz", .{});
+}
+
+test "extractTarXz extracts files with correct contents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try createTestTarXz(&tmp, &.{ "myapp/README.md", "myapp/myapp" }, &.{ "readme\n", "#!/bin/sh\necho hello\n" });
+    defer file.close(std.testing.io);
+
+    extractTarXz(std.testing.io, tmp.dir, &file) catch |err| return err;
+
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "myapp/README.md", .{})).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "myapp/myapp", .{})).kind == .file);
+
+    const content = try tmp.dir.readFileAlloc(std.testing.io, "myapp/README.md", std.testing.allocator, Io.Limit.limited(256));
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("readme\n", content);
 }
 
 test "findExecutables discovers executable files" {
@@ -1192,15 +1286,15 @@ test "findExecutables discovers executable files" {
     defer tmp.cleanup();
 
     // Create an executable file
-    const exe_file = try tmp.dir.createFile("myapp", .{ .mode = 0o755 });
-    exe_file.close();
+    const exe_file = try tmp.dir.createFile(std.testing.io, "myapp", .{ .permissions = .executable_file });
+    exe_file.close(std.testing.io);
 
     // Create a non-executable file
-    const txt_file = try tmp.dir.createFile("readme.txt", .{ .mode = 0o644 });
-    txt_file.close();
+    const txt_file = try tmp.dir.createFile(std.testing.io, "readme.txt", .{});
+    txt_file.close(std.testing.io);
 
     const allocator = std.testing.allocator;
-    var exes = try findExecutables(allocator, tmp.dir);
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
@@ -1216,12 +1310,12 @@ test "findExecutables discovers nested executables" {
     defer tmp.cleanup();
 
     // Create nested structure
-    try tmp.dir.makePath("bin");
-    const exe_file = try tmp.dir.createFile("bin/tool", .{ .mode = 0o755 });
-    exe_file.close();
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    const exe_file = try tmp.dir.createFile(std.testing.io, "bin/tool", .{ .permissions = .executable_file });
+    exe_file.close(std.testing.io);
 
     const allocator = std.testing.allocator;
-    var exes = try findExecutables(allocator, tmp.dir);
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
@@ -1235,11 +1329,11 @@ test "findExecutables returns empty for no executables" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const txt_file = try tmp.dir.createFile("readme.txt", .{ .mode = 0o644 });
-    txt_file.close();
+    const txt_file = try tmp.dir.createFile(std.testing.io, "readme.txt", .{});
+    txt_file.close(std.testing.io);
 
     const allocator = std.testing.allocator;
-    var exes = try findExecutables(allocator, tmp.dir);
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
@@ -1274,16 +1368,16 @@ test "isMacAppBundle detects valid .app bundles" {
     defer tmp.cleanup();
 
     // Valid .app bundle
-    try tmp.dir.makePath("MyApp.app/Contents/MacOS");
-    try std.testing.expect(isMacAppBundle(tmp.dir, "MyApp.app"));
+    try tmp.dir.createDirPath(std.testing.io, "MyApp.app/Contents/MacOS");
+    try std.testing.expect(isMacAppBundle(std.testing.io, tmp.dir, "MyApp.app"));
 
     // Not a .app (wrong extension)
-    try tmp.dir.makePath("notapp/Contents/MacOS");
-    try std.testing.expect(!isMacAppBundle(tmp.dir, "notapp"));
+    try tmp.dir.createDirPath(std.testing.io, "notapp/Contents/MacOS");
+    try std.testing.expect(!isMacAppBundle(std.testing.io, tmp.dir, "notapp"));
 
     // .app without Contents/MacOS
-    try tmp.dir.makePath("Broken.app/Contents");
-    try std.testing.expect(!isMacAppBundle(tmp.dir, "Broken.app"));
+    try tmp.dir.createDirPath(std.testing.io, "Broken.app/Contents");
+    try std.testing.expect(!isMacAppBundle(std.testing.io, tmp.dir, "Broken.app"));
 }
 
 test "findExecutables only scans Contents/MacOS in .app bundles" {
@@ -1293,23 +1387,23 @@ test "findExecutables only scans Contents/MacOS in .app bundles" {
     const allocator = std.testing.allocator;
 
     // Create a .app bundle with main executable and framework binaries
-    try tmp.dir.makePath("MyApp.app/Contents/MacOS");
-    try tmp.dir.makePath("MyApp.app/Contents/Frameworks/QtCore.framework/Versions/A");
-    try tmp.dir.makePath("MyApp.app/Contents/PlugIns/platforms");
+    try tmp.dir.createDirPath(std.testing.io, "MyApp.app/Contents/MacOS");
+    try tmp.dir.createDirPath(std.testing.io, "MyApp.app/Contents/Frameworks/QtCore.framework/Versions/A");
+    try tmp.dir.createDirPath(std.testing.io, "MyApp.app/Contents/PlugIns/platforms");
 
     // Main executable
-    const main_exe = try tmp.dir.createFile("MyApp.app/Contents/MacOS/myapp", .{ .mode = 0o755 });
-    main_exe.close();
+    const main_exe = try tmp.dir.createFile(std.testing.io, "MyApp.app/Contents/MacOS/myapp", .{ .permissions = .executable_file });
+    main_exe.close(std.testing.io);
 
     // Framework binary (should NOT be found)
-    const fw_exe = try tmp.dir.createFile("MyApp.app/Contents/Frameworks/QtCore.framework/Versions/A/QtCore", .{ .mode = 0o755 });
-    fw_exe.close();
+    const fw_exe = try tmp.dir.createFile(std.testing.io, "MyApp.app/Contents/Frameworks/QtCore.framework/Versions/A/QtCore", .{ .permissions = .executable_file });
+    fw_exe.close(std.testing.io);
 
     // Plugin binary (should NOT be found)
-    const plugin_exe = try tmp.dir.createFile("MyApp.app/Contents/PlugIns/platforms/libqcocoa.dylib", .{ .mode = 0o755 });
-    plugin_exe.close();
+    const plugin_exe = try tmp.dir.createFile(std.testing.io, "MyApp.app/Contents/PlugIns/platforms/libqcocoa.dylib", .{ .permissions = .executable_file });
+    plugin_exe.close(std.testing.io);
 
-    var exes = try findExecutables(allocator, tmp.dir);
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
@@ -1327,15 +1421,15 @@ test "findExecutables handles .app bundle alongside regular executables" {
     const allocator = std.testing.allocator;
 
     // A .app bundle
-    try tmp.dir.makePath("MyApp.app/Contents/MacOS");
-    const app_exe = try tmp.dir.createFile("MyApp.app/Contents/MacOS/myapp", .{ .mode = 0o755 });
-    app_exe.close();
+    try tmp.dir.createDirPath(std.testing.io, "MyApp.app/Contents/MacOS");
+    const app_exe = try tmp.dir.createFile(std.testing.io, "MyApp.app/Contents/MacOS/myapp", .{ .permissions = .executable_file });
+    app_exe.close(std.testing.io);
 
     // A regular executable next to the .app
-    const cli_exe = try tmp.dir.createFile("mytool", .{ .mode = 0o755 });
-    cli_exe.close();
+    const cli_exe = try tmp.dir.createFile(std.testing.io, "mytool", .{ .permissions = .executable_file });
+    cli_exe.close(std.testing.io);
 
-    var exes = try findExecutables(allocator, tmp.dir);
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
@@ -1382,17 +1476,17 @@ test "findExecutables skips shared libraries" {
     const allocator = std.testing.allocator;
 
     // Real executable
-    const exe = try tmp.dir.createFile("pencil2d", .{ .mode = 0o755 });
-    exe.close();
+    const exe = try tmp.dir.createFile(std.testing.io, "pencil2d", .{ .permissions = .executable_file });
+    exe.close(std.testing.io);
 
     // Shared libraries (should be skipped)
-    try tmp.dir.makePath("lib");
-    const dylib = try tmp.dir.createFile("lib/libfoo.dylib", .{ .mode = 0o755 });
-    dylib.close();
-    const so = try tmp.dir.createFile("lib/libbar.so", .{ .mode = 0o755 });
-    so.close();
+    try tmp.dir.createDirPath(std.testing.io, "lib");
+    const dylib = try tmp.dir.createFile(std.testing.io, "lib/libfoo.dylib", .{ .permissions = .executable_file });
+    dylib.close(std.testing.io);
+    const so = try tmp.dir.createFile(std.testing.io, "lib/libbar.so", .{ .permissions = .executable_file });
+    so.close(std.testing.io);
 
-    var exes = try findExecutables(allocator, tmp.dir);
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
