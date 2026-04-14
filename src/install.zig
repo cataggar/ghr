@@ -196,43 +196,54 @@ fn findBestAsset(assets: []const Asset) !Asset {
 
 fn downloadAsset(
     allocator: std.mem.Allocator,
-    client: *std.http.Client,
+    _: *std.http.Client,
     url: []const u8,
     dest_path: []const u8,
 ) !void {
-    const uri = try std.Uri.parse(url);
-    var req = try client.request(.GET, uri, .{
-        .redirect_behavior = @enumFromInt(3),
-        .extra_headers = &.{
-            .{ .name = "User-Agent", .value = "ghr/" ++ version },
-        },
-    });
-    defer req.deinit();
+    var attempts: u8 = 0;
+    while (attempts < 2) : (attempts += 1) {
+        if (attempts > 0) {
+            std.fs.deleteFileAbsolute(dest_path) catch {};
+        }
 
-    try req.sendBodiless();
+        // Fresh client per attempt to get a new connection and SAS token
+        var client: std.http.Client = .{
+            .allocator = allocator,
+            .tls_buffer_size = 16384 * 2,
+        };
+        defer client.deinit();
 
-    var redirect_buf: [16 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
+        var file = std.fs.createFileAbsolute(dest_path, .{}) catch return error.DownloadFailed;
+        defer file.close();
+        var file_buf: [8192]u8 = undefined;
+        var file_writer = file.writer(&file_buf);
 
-    if (response.head.status != .ok) {
-        std.log.err("download failed with HTTP {d} ({s})", .{
-            @intFromEnum(response.head.status),
-            @tagName(response.head.status),
-        });
-        return error.DownloadFailed;
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .extra_headers = &.{
+                .{ .name = "User-Agent", .value = "ghr/" ++ version },
+            },
+            .response_writer = &file_writer.interface,
+        }) catch {
+            if (attempts == 0) continue;
+            return error.DownloadFailed;
+        };
+
+        file_writer.end() catch {
+            if (attempts == 0) continue;
+            return error.DownloadFailed;
+        };
+
+        if (result.status != .ok) {
+            if (attempts == 0) continue;
+            std.log.err("download failed with HTTP {d} ({s})", .{
+                @intFromEnum(result.status),
+                @tagName(result.status),
+            });
+            return error.DownloadFailed;
+        }
+        return;
     }
-
-    var transfer_buf: [8192]u8 = undefined;
-    var body_reader = response.reader(&transfer_buf);
-
-    var file = try std.fs.createFileAbsolute(dest_path, .{});
-    defer file.close();
-    var file_buf: [8192]u8 = undefined;
-    var file_writer = file.writer(&file_buf);
-
-    _ = body_reader.streamRemaining(&file_writer.interface) catch return error.DownloadFailed;
-    try file_writer.end();
-    _ = allocator;
 }
 
 /// Validate that a zip entry path is safe (no path traversal).
