@@ -151,6 +151,25 @@ fn isInstallableAsset(name: []const u8) bool {
     return false;
 }
 
+/// Returns true if the file is a shared library (not a program executable).
+fn isSharedLibrary(name: []const u8) bool {
+    if (std.mem.endsWith(u8, name, ".dylib")) return true;
+    if (std.mem.endsWith(u8, name, ".dll")) return true;
+    // Check for .so or .so.N.N.N patterns
+    if (std.mem.endsWith(u8, name, ".so")) return true;
+    if (std.mem.indexOf(u8, name, ".so.") != null) return true;
+    return false;
+}
+
+/// Returns true if the directory contains shared libraries rather than executables.
+fn isLibraryDir(name: []const u8) bool {
+    if (std.mem.endsWith(u8, name, ".framework")) return true;
+    if (std.mem.eql(u8, name, "lib")) return true;
+    if (std.mem.eql(u8, name, "Frameworks")) return true;
+    if (std.mem.eql(u8, name, "PlugIns")) return true;
+    return false;
+}
+
 fn findBestAsset(assets: []const Asset) !Asset {
     const plat = currentPlatformKeywords();
     var best: ?Asset = null;
@@ -306,6 +325,9 @@ fn scanForExecutables(
                 // Only scan Contents/MacOS/ inside .app bundles
                 try scanAppBundle(allocator, dir, entry.name, result, rel_name);
                 allocator.free(rel_name);
+            } else if (isLibraryDir(entry.name)) {
+                // Skip directories that contain shared libraries, not executables
+                allocator.free(rel_name);
             } else {
                 var sub = dir.openDir(entry.name, .{ .iterate = true }) catch {
                     allocator.free(rel_name);
@@ -316,6 +338,10 @@ fn scanForExecutables(
                 allocator.free(rel_name);
             }
         } else if (entry.kind == .file) {
+            if (isSharedLibrary(entry.name)) {
+                allocator.free(rel_name);
+                continue;
+            }
             const is_exe = if (builtin.os.tag == .windows)
                 std.mem.endsWith(u8, entry.name, ".exe")
             else blk: {
@@ -365,6 +391,7 @@ fn scanAppBundle(
     var iter = macos_dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind != .file) continue;
+        if (isSharedLibrary(entry.name)) continue;
         const is_exe = if (builtin.os.tag == .windows)
             std.mem.endsWith(u8, entry.name, ".exe")
         else blk: {
@@ -917,4 +944,52 @@ test "findExecutables handles .app bundle alongside regular executables" {
     }.lt);
     try std.testing.expectEqualStrings("MyApp.app/Contents/MacOS/myapp", exes.items[0]);
     try std.testing.expectEqualStrings("mytool", exes.items[1]);
+}
+
+test "isSharedLibrary identifies shared libraries" {
+    try std.testing.expect(isSharedLibrary("libfoo.dylib"));
+    try std.testing.expect(isSharedLibrary("Qt6Core.dll"));
+    try std.testing.expect(isSharedLibrary("libfoo.so"));
+    try std.testing.expect(isSharedLibrary("libfoo.so.1"));
+    try std.testing.expect(isSharedLibrary("libfoo.so.1.2.3"));
+    try std.testing.expect(!isSharedLibrary("myapp"));
+    try std.testing.expect(!isSharedLibrary("myapp.exe"));
+    try std.testing.expect(!isSharedLibrary("README.md"));
+}
+
+test "isLibraryDir identifies library directories" {
+    try std.testing.expect(isLibraryDir("QtCore.framework"));
+    try std.testing.expect(isLibraryDir("lib"));
+    try std.testing.expect(isLibraryDir("Frameworks"));
+    try std.testing.expect(isLibraryDir("PlugIns"));
+    try std.testing.expect(!isLibraryDir("bin"));
+    try std.testing.expect(!isLibraryDir("Contents"));
+    try std.testing.expect(!isLibraryDir("MacOS"));
+}
+
+test "findExecutables skips shared libraries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+
+    // Real executable
+    const exe = try tmp.dir.createFile("pencil2d", .{ .mode = 0o755 });
+    exe.close();
+
+    // Shared libraries (should be skipped)
+    try tmp.dir.makePath("lib");
+    const dylib = try tmp.dir.createFile("lib/libfoo.dylib", .{ .mode = 0o755 });
+    dylib.close();
+    const so = try tmp.dir.createFile("lib/libbar.so", .{ .mode = 0o755 });
+    so.close();
+
+    var exes = try findExecutables(allocator, tmp.dir);
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("pencil2d", exes.items[0]);
 }
