@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const Environ = std.process.Environ;
+const EnvironMap = std.process.Environ.Map;
 
 pub const Dirs = struct {
     bin: []const u8,
@@ -8,7 +8,7 @@ pub const Dirs = struct {
     cache: []const u8,
     allocator: std.mem.Allocator,
 
-    pub fn detect(allocator: std.mem.Allocator, environ: Environ) !Dirs {
+    pub fn detect(allocator: std.mem.Allocator, environ: *const EnvironMap) !Dirs {
         const bin = try binDir(allocator, environ);
         errdefer allocator.free(bin);
         const tools = try toolsDir(allocator, environ);
@@ -24,22 +24,22 @@ pub const Dirs = struct {
     }
 };
 
-fn getEnv(environ: Environ, key: []const u8) ?[]const u8 {
-    return environ.getPosix(key);
+fn getEnv(environ: *const EnvironMap, key: []const u8) ?[]const u8 {
+    return environ.get(key);
 }
 
-fn homeDir(environ: Environ) ![]const u8 {
+fn homeDir(environ: *const EnvironMap) ![]const u8 {
     const key = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
     return getEnv(environ, key) orelse error.HomeNotFound;
 }
 
-fn binDir(allocator: std.mem.Allocator, environ: Environ) ![]const u8 {
+fn binDir(allocator: std.mem.Allocator, environ: *const EnvironMap) ![]const u8 {
     if (getEnv(environ, "GHR_BIN_DIR")) |v| return allocator.dupe(u8, v);
     const h = try homeDir(environ);
     return std.fs.path.join(allocator, &.{ h, ".local", "bin" });
 }
 
-fn toolsDir(allocator: std.mem.Allocator, environ: Environ) ![]const u8 {
+fn toolsDir(allocator: std.mem.Allocator, environ: *const EnvironMap) ![]const u8 {
     if (getEnv(environ, "GHR_TOOL_DIR")) |v| return allocator.dupe(u8, v);
     if (builtin.os.tag == .windows) {
         const appdata = getEnv(environ, "APPDATA") orelse return error.AppDataNotFound;
@@ -52,7 +52,7 @@ fn toolsDir(allocator: std.mem.Allocator, environ: Environ) ![]const u8 {
     return std.fs.path.join(allocator, &.{ h, ".local", "share", "ghr", "tools" });
 }
 
-fn cacheDir(allocator: std.mem.Allocator, environ: Environ) ![]const u8 {
+fn cacheDir(allocator: std.mem.Allocator, environ: *const EnvironMap) ![]const u8 {
     if (getEnv(environ, "GHR_CACHE_DIR")) |v| return allocator.dupe(u8, v);
     if (builtin.os.tag == .windows) {
         const localappdata = getEnv(environ, "LOCALAPPDATA") orelse return error.LocalAppDataNotFound;
@@ -71,7 +71,9 @@ fn cacheDir(allocator: std.mem.Allocator, environ: Environ) ![]const u8 {
 
 test "detect dirs" {
     const allocator = std.testing.allocator;
-    const d = try Dirs.detect(allocator, std.testing.process.environ());
+    var env_map = try std.testing.environ.createMap(allocator);
+    defer env_map.deinit();
+    const d = try Dirs.detect(allocator, &env_map);
     defer d.deinit();
     try std.testing.expect(d.bin.len > 0);
     try std.testing.expect(d.tools.len > 0);

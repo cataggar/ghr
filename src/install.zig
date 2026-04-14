@@ -8,6 +8,7 @@ const Dir = Io.Dir;
 const File = Io.File;
 const Writer = Io.Writer;
 const Environ = std.process.Environ;
+const EnvironMap = Environ.Map;
 
 /// Delete an absolute path's directory tree. Zig 0.16 removed Dir.deleteTreeAbsolute,
 /// so we open the parent dir and call deleteTree on the basename.
@@ -559,14 +560,14 @@ const ghr_marker = "Contents/.ghr-source";
 fn installAppBundles(
     allocator: std.mem.Allocator,
     io: Io,
-    environ: Environ,
+    environ: *const EnvironMap,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
     w: *Writer,
 ) !void {
     if (app_paths.len == 0) return;
 
-    const home = environ.getPosix("HOME") orelse return;
+    const home = environ.get("HOME") orelse return;
     const apps_dir_path = try std.fmt.allocPrint(allocator, "{s}/Applications", .{home});
     defer allocator.free(apps_dir_path);
     Dir.createDirAbsolute(io, apps_dir_path, .default_dir) catch {};
@@ -632,14 +633,14 @@ fn installAppBundles(
 fn uninstallAppBundles(
     allocator: std.mem.Allocator,
     io: Io,
-    environ: Environ,
+    environ: *const EnvironMap,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
     w: *Writer,
 ) void {
     if (app_paths.len == 0) return;
 
-    const home = environ.getPosix("HOME") orelse return;
+    const home = environ.get("HOME") orelse return;
     const apps_dir_path = std.fmt.allocPrint(allocator, "{s}/Applications", .{home}) catch return;
     defer allocator.free(apps_dir_path);
 
@@ -791,7 +792,7 @@ fn readMetadata(allocator: std.mem.Allocator, io: Io, tool_dir_path: []const u8)
 fn cleanupOldInstall(
     allocator: std.mem.Allocator,
     io: Io,
-    environ: Environ,
+    environ: *const EnvironMap,
     tool_path: []const u8,
     bin_path: []const u8,
     w: *Writer,
@@ -823,7 +824,7 @@ fn cleanupOldInstall(
 pub fn cmdUninstall(
     allocator: std.mem.Allocator,
     io: Io,
-    environ: Environ,
+    environ: *const EnvironMap,
     spec_str: []const u8,
     w: *Writer,
     err_w: *Writer,
@@ -893,7 +894,7 @@ pub fn cmdUninstall(
 pub fn cmdInstall(
     allocator: std.mem.Allocator,
     io: Io,
-    environ: Environ,
+    environ: *const EnvironMap,
     spec_str: []const u8,
     w: *Writer,
     err_w: *Writer,
