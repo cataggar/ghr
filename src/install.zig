@@ -219,9 +219,13 @@ fn downloadAsset(
     url: []const u8,
     dest_path: []const u8,
 ) !void {
+    const max_retries: u8 = 5;
     var attempts: u8 = 0;
-    while (attempts < 2) : (attempts += 1) {
+    while (attempts < max_retries) : (attempts += 1) {
         if (attempts > 0) {
+            // Exponential backoff: 1s, 2s, 4s
+            const delay_ns: u64 = @as(u64, 1_000_000_000) << @intCast(attempts - 1);
+            std.Thread.sleep(delay_ns);
             std.fs.deleteFileAbsolute(dest_path) catch {};
         }
 
@@ -244,17 +248,17 @@ fn downloadAsset(
             },
             .response_writer = &file_writer.interface,
         }) catch {
-            if (attempts == 0) continue;
+            if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
 
         file_writer.end() catch {
-            if (attempts == 0) continue;
+            if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
 
         if (result.status != .ok) {
-            if (attempts == 0) continue;
+            if (isTransientStatus(result.status) and attempts + 1 < max_retries) continue;
             std.log.err("download failed with HTTP {d} ({s})", .{
                 @intFromEnum(result.status),
                 @tagName(result.status),
@@ -263,6 +267,20 @@ fn downloadAsset(
         }
         return;
     }
+}
+
+fn isTransientStatus(status: std.http.Status) bool {
+    return switch (status) {
+        .bad_request, // GitHub CDN transiently returns 400
+        .request_timeout,
+        .too_many_requests,
+        .internal_server_error,
+        .bad_gateway,
+        .service_unavailable,
+        .gateway_timeout,
+        => true,
+        else => false,
+    };
 }
 
 /// Validate that a zip entry path is safe (no path traversal).
