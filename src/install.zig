@@ -302,13 +302,19 @@ fn scanForExecutables(
             try allocator.dupe(u8, entry.name);
 
         if (entry.kind == .directory) {
-            var sub = dir.openDir(entry.name, .{ .iterate = true }) catch {
+            if (isMacAppBundle(dir, entry.name)) {
+                // Only scan Contents/MacOS/ inside .app bundles
+                try scanAppBundle(allocator, dir, entry.name, result, rel_name);
                 allocator.free(rel_name);
-                continue;
-            };
-            defer sub.close();
-            try scanForExecutables(allocator, sub, result, rel_name);
-            allocator.free(rel_name);
+            } else {
+                var sub = dir.openDir(entry.name, .{ .iterate = true }) catch {
+                    allocator.free(rel_name);
+                    continue;
+                };
+                defer sub.close();
+                try scanForExecutables(allocator, sub, result, rel_name);
+                allocator.free(rel_name);
+            }
         } else if (entry.kind == .file) {
             const is_exe = if (builtin.os.tag == .windows)
                 std.mem.endsWith(u8, entry.name, ".exe")
@@ -326,6 +332,48 @@ fn scanForExecutables(
             }
         } else {
             allocator.free(rel_name);
+        }
+    }
+}
+
+/// Check if a directory is a macOS .app bundle (has Contents/MacOS/ inside).
+fn isMacAppBundle(parent: std.fs.Dir, name: []const u8) bool {
+    if (!std.mem.endsWith(u8, name, ".app")) return false;
+    // Verify it has the expected bundle structure
+    var app_dir = parent.openDir(name, .{}) catch return false;
+    defer app_dir.close();
+    app_dir.access("Contents/MacOS", .{}) catch return false;
+    return true;
+}
+
+/// Scan only the Contents/MacOS/ directory inside a .app bundle for executables.
+fn scanAppBundle(
+    allocator: std.mem.Allocator,
+    parent: std.fs.Dir,
+    app_name: []const u8,
+    result: *std.ArrayListUnmanaged([]const u8),
+    app_prefix: []const u8,
+) !void {
+    const macos_rel = try std.fmt.allocPrint(allocator, "{s}/Contents/MacOS", .{app_name});
+    defer allocator.free(macos_rel);
+    var macos_dir = parent.openDir(macos_rel, .{ .iterate = true }) catch return;
+    defer macos_dir.close();
+
+    const prefix = try std.fmt.allocPrint(allocator, "{s}/Contents/MacOS", .{app_prefix});
+    defer allocator.free(prefix);
+
+    var iter = macos_dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const is_exe = if (builtin.os.tag == .windows)
+            std.mem.endsWith(u8, entry.name, ".exe")
+        else blk: {
+            const stat = macos_dir.statFile(entry.name) catch continue;
+            break :blk (stat.mode & 0o111) != 0;
+        };
+        if (is_exe) {
+            const rel_name = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name });
+            try result.append(allocator, rel_name);
         }
     }
 }
@@ -784,4 +832,89 @@ test "ParsedRelease deinit frees all memory" {
 
     // deinit should free everything with no leaks (testing.allocator will catch leaks)
     pr.deinit();
+}
+
+test "isMacAppBundle detects valid .app bundles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Valid .app bundle
+    try tmp.dir.makePath("MyApp.app/Contents/MacOS");
+    try std.testing.expect(isMacAppBundle(tmp.dir, "MyApp.app"));
+
+    // Not a .app (wrong extension)
+    try tmp.dir.makePath("notapp/Contents/MacOS");
+    try std.testing.expect(!isMacAppBundle(tmp.dir, "notapp"));
+
+    // .app without Contents/MacOS
+    try tmp.dir.makePath("Broken.app/Contents");
+    try std.testing.expect(!isMacAppBundle(tmp.dir, "Broken.app"));
+}
+
+test "findExecutables only scans Contents/MacOS in .app bundles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+
+    // Create a .app bundle with main executable and framework binaries
+    try tmp.dir.makePath("MyApp.app/Contents/MacOS");
+    try tmp.dir.makePath("MyApp.app/Contents/Frameworks/QtCore.framework/Versions/A");
+    try tmp.dir.makePath("MyApp.app/Contents/PlugIns/platforms");
+
+    // Main executable
+    const main_exe = try tmp.dir.createFile("MyApp.app/Contents/MacOS/myapp", .{ .mode = 0o755 });
+    main_exe.close();
+
+    // Framework binary (should NOT be found)
+    const fw_exe = try tmp.dir.createFile("MyApp.app/Contents/Frameworks/QtCore.framework/Versions/A/QtCore", .{ .mode = 0o755 });
+    fw_exe.close();
+
+    // Plugin binary (should NOT be found)
+    const plugin_exe = try tmp.dir.createFile("MyApp.app/Contents/PlugIns/platforms/libqcocoa.dylib", .{ .mode = 0o755 });
+    plugin_exe.close();
+
+    var exes = try findExecutables(allocator, tmp.dir);
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    // Should only find the main executable, not framework/plugin binaries
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("MyApp.app/Contents/MacOS/myapp", exes.items[0]);
+}
+
+test "findExecutables handles .app bundle alongside regular executables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const allocator = std.testing.allocator;
+
+    // A .app bundle
+    try tmp.dir.makePath("MyApp.app/Contents/MacOS");
+    const app_exe = try tmp.dir.createFile("MyApp.app/Contents/MacOS/myapp", .{ .mode = 0o755 });
+    app_exe.close();
+
+    // A regular executable next to the .app
+    const cli_exe = try tmp.dir.createFile("mytool", .{ .mode = 0o755 });
+    cli_exe.close();
+
+    var exes = try findExecutables(allocator, tmp.dir);
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    // Should find both
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+
+    // Sort for deterministic comparison
+    std.mem.sort([]const u8, exes.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    try std.testing.expectEqualStrings("MyApp.app/Contents/MacOS/myapp", exes.items[0]);
+    try std.testing.expectEqualStrings("mytool", exes.items[1]);
 }
