@@ -7,6 +7,7 @@ const Io = std.Io;
 const Dir = Io.Dir;
 const File = Io.File;
 const Writer = Io.Writer;
+const Environ = std.process.Environ;
 
 /// Delete an absolute path's directory tree. Zig 0.16 removed Dir.deleteTreeAbsolute,
 /// so we open the parent dir and call deleteTree on the basename.
@@ -558,13 +559,14 @@ const ghr_marker = "Contents/.ghr-source";
 fn installAppBundles(
     allocator: std.mem.Allocator,
     io: Io,
+    environ: Environ,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
     w: *Writer,
 ) !void {
     if (app_paths.len == 0) return;
 
-    const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return, 0);
+    const home = environ.getPosix("HOME") orelse return;
     const apps_dir_path = try std.fmt.allocPrint(allocator, "{s}/Applications", .{home});
     defer allocator.free(apps_dir_path);
     Dir.createDirAbsolute(io, apps_dir_path, .default_dir) catch {};
@@ -630,13 +632,14 @@ fn installAppBundles(
 fn uninstallAppBundles(
     allocator: std.mem.Allocator,
     io: Io,
+    environ: Environ,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
     w: *Writer,
 ) void {
     if (app_paths.len == 0) return;
 
-    const home = std.mem.sliceTo(std.c.getenv("HOME") orelse return, 0);
+    const home = environ.getPosix("HOME") orelse return;
     const apps_dir_path = std.fmt.allocPrint(allocator, "{s}/Applications", .{home}) catch return;
     defer allocator.free(apps_dir_path);
 
@@ -788,6 +791,7 @@ fn readMetadata(allocator: std.mem.Allocator, io: Io, tool_dir_path: []const u8)
 fn cleanupOldInstall(
     allocator: std.mem.Allocator,
     io: Io,
+    environ: Environ,
     tool_path: []const u8,
     bin_path: []const u8,
     w: *Writer,
@@ -812,13 +816,14 @@ fn cleanupOldInstall(
 
     // Remove old app bundle copies (macOS)
     if (comptime builtin.os.tag.isDarwin()) {
-        uninstallAppBundles(allocator, io, meta.parsed.value.apps, tool_path, w);
+        uninstallAppBundles(allocator, io, environ, meta.parsed.value.apps, tool_path, w);
     }
 }
 
 pub fn cmdUninstall(
     allocator: std.mem.Allocator,
     io: Io,
+    environ: Environ,
     spec_str: []const u8,
     w: *Writer,
     err_w: *Writer,
@@ -829,7 +834,7 @@ pub fn cmdUninstall(
         std.process.exit(1);
     };
 
-    const d = try Dirs.detect(allocator);
+    const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
     const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
@@ -871,7 +876,7 @@ pub fn cmdUninstall(
 
         // Remove app bundle copies (macOS)
         if (comptime builtin.os.tag.isDarwin()) {
-            uninstallAppBundles(allocator, io, m.parsed.value.apps, tool_path, w);
+            uninstallAppBundles(allocator, io, environ, m.parsed.value.apps, tool_path, w);
         }
     }
 
@@ -888,6 +893,7 @@ pub fn cmdUninstall(
 pub fn cmdInstall(
     allocator: std.mem.Allocator,
     io: Io,
+    environ: Environ,
     spec_str: []const u8,
     w: *Writer,
     err_w: *Writer,
@@ -899,7 +905,7 @@ pub fn cmdInstall(
         std.process.exit(1);
     };
 
-    const d = try Dirs.detect(allocator);
+    const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
     try w.print("resolving {s}/{s}", .{ spec.owner, spec.repo });
@@ -1060,7 +1066,7 @@ pub fn cmdInstall(
     defer allocator.free(tool_path);
 
     // Clean up old install's symlinks before deleting
-    cleanupOldInstall(allocator, io, tool_path, d.bin, w);
+    cleanupOldInstall(allocator, io, environ, tool_path, d.bin, w);
     deleteTreeAbsolute(io, tool_path) catch {};
     // Ensure tools and owner dirs exist (create full path)
     const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
@@ -1117,7 +1123,7 @@ pub fn cmdInstall(
 
     // On macOS, copy .app bundles into ~/Applications for Spotlight discovery
     if (comptime builtin.os.tag.isDarwin()) {
-        installAppBundles(allocator, io, apps_slice, tool_path, w) catch |err| {
+        installAppBundles(allocator, io, environ, apps_slice, tool_path, w) catch |err| {
             try err_w.print("warning: failed to install .app bundle: {}\n", .{err});
         };
     }

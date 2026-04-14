@@ -11,6 +11,7 @@ const Writer = Io.Writer;
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
+    const environ = init.minimal.environ;
 
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip();
@@ -38,9 +39,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (eql(cmd_str, "dir")) {
-        try cmdDir(allocator, &args, &stdout.interface, &stderr.interface);
+        try cmdDir(allocator, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
-        try cmdList(allocator, io, &stdout.interface);
+        try cmdList(allocator, environ, io, &stdout.interface);
     } else if (eql(cmd_str, "install")) {
         var debug = false;
         var spec: ?[]const u8 = null;
@@ -56,14 +57,14 @@ pub fn main(init: std.process.Init) !void {
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try install.cmdInstall(allocator, io, spec_val, &stdout.interface, &stderr.interface, debug);
+        try install.cmdInstall(allocator, io, environ, spec_val, &stdout.interface, &stderr.interface, debug);
     } else if (eql(cmd_str, "uninstall")) {
         const spec = args.next() orelse {
             try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try install.cmdUninstall(allocator, io, spec, &stdout.interface, &stderr.interface);
+        try install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "upgrade")) {
         try stderr.interface.print("error: upgrade not yet implemented\n", .{});
         try stderr.interface.flush();
@@ -84,11 +85,12 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 fn cmdDir(
     allocator: std.mem.Allocator,
+    environ: std.process.Environ,
     args: *std.process.Args.Iterator,
     w: *Writer,
     err_w: *Writer,
 ) !void {
-    const d = try Dirs.detect(allocator);
+    const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
     const flag = args.next();
@@ -107,8 +109,8 @@ fn cmdDir(
     }
 }
 
-fn cmdList(allocator: std.mem.Allocator, io: Io, w: *Writer) !void {
-    const d = try Dirs.detect(allocator);
+fn cmdList(allocator: std.mem.Allocator, environ: std.process.Environ, io: Io, w: *Writer) !void {
+    const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
     var dir = Io.Dir.openDirAbsolute(io, d.tools, .{ .iterate = true }) catch {

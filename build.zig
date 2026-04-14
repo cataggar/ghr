@@ -16,7 +16,6 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
-            .link_libc = true,
             .imports = &.{
                 .{ .name = "build_options", .module = exe_options.createModule() },
             },
