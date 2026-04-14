@@ -41,12 +41,21 @@ pub fn main() !void {
     } else if (eql(cmd_str, "list")) {
         try cmdList(allocator, &stdout.interface);
     } else if (eql(cmd_str, "install")) {
-        const spec = args.next() orelse {
+        var debug = false;
+        var spec: ?[]const u8 = null;
+        while (args.next()) |arg| {
+            if (eql(arg, "--debug")) {
+                debug = true;
+            } else if (spec == null) {
+                spec = arg;
+            }
+        }
+        const spec_val = spec orelse {
             try stderr.interface.print("error: 'ghr install' requires <owner/repo[@tag]>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try install.cmdInstall(allocator, spec, &stdout.interface, &stderr.interface);
+        try install.cmdInstall(allocator, spec_val, &stdout.interface, &stderr.interface, debug);
     } else if (eql(cmd_str, "uninstall")) {
         const spec = args.next() orelse {
             try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
@@ -167,6 +176,7 @@ fn printUsage(w: *std.io.Writer) !void {
         \\OPTIONS:
         \\    -h, --help      Print help
         \\    -V, --version   Print version
+        \\    --debug         Show diagnostic output for debugging
         \\
     , .{});
 }
