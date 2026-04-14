@@ -445,6 +445,108 @@ fn linkToBin(
     try w.print("  linked {s}\n", .{exe_name});
 }
 
+/// Find .app bundles recursively in a directory. Returns relative paths from the root.
+fn findAppBundles(allocator: std.mem.Allocator, dir: std.fs.Dir) !std.ArrayListUnmanaged([]const u8) {
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    try scanForAppBundles(allocator, dir, &result, "");
+    return result;
+}
+
+fn scanForAppBundles(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    result: *std.ArrayListUnmanaged([]const u8),
+    prefix: []const u8,
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const rel_name = if (prefix.len > 0)
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
+        else
+            try allocator.dupe(u8, entry.name);
+
+        if (isMacAppBundle(dir, entry.name)) {
+            try result.append(allocator, rel_name);
+            // Don't recurse into .app bundles
+        } else {
+            var sub = dir.openDir(entry.name, .{ .iterate = true }) catch {
+                allocator.free(rel_name);
+                continue;
+            };
+            defer sub.close();
+            try scanForAppBundles(allocator, sub, result, rel_name);
+            allocator.free(rel_name);
+        }
+    }
+}
+
+/// On macOS, symlink .app bundles into ~/Applications for Spotlight and Launchpad discovery.
+fn linkAppBundles(
+    allocator: std.mem.Allocator,
+    app_paths: []const []const u8,
+    tool_dir_path: []const u8,
+    w: *Writer,
+) !void {
+    if (app_paths.len == 0) return;
+
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
+    defer allocator.free(home);
+    const apps_dir_path = try std.fmt.allocPrint(allocator, "{s}/Applications", .{home});
+    defer allocator.free(apps_dir_path);
+    std.fs.makeDirAbsolute(apps_dir_path) catch {};
+
+    var apps_dir = std.fs.openDirAbsolute(apps_dir_path, .{}) catch return;
+    defer apps_dir.close();
+
+    for (app_paths) |rel_path| {
+        const app_name = std.fs.path.basename(rel_path);
+        const app_src = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path }) catch continue;
+        defer allocator.free(app_src);
+
+        // Only replace existing symlinks, never regular directories
+        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (apps_dir.readLink(app_name, &link_buf)) |_| {
+            apps_dir.deleteFile(app_name) catch {};
+        } else |_| {}
+
+        apps_dir.symLink(app_src, app_name, .{ .is_directory = true }) catch continue;
+        try w.print("  linked ~/Applications/{s}\n", .{app_name});
+    }
+}
+
+/// Remove ~/Applications symlinks that point into the given tool directory.
+fn unlinkAppBundles(
+    allocator: std.mem.Allocator,
+    app_paths: []const []const u8,
+    tool_dir_path: []const u8,
+    w: *Writer,
+) void {
+    if (app_paths.len == 0) return;
+
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
+    defer allocator.free(home);
+    const apps_dir_path = std.fmt.allocPrint(allocator, "{s}/Applications", .{home}) catch return;
+    defer allocator.free(apps_dir_path);
+
+    var apps_dir = std.fs.openDirAbsolute(apps_dir_path, .{}) catch return;
+    defer apps_dir.close();
+
+    for (app_paths) |rel_path| {
+        const app_name = std.fs.path.basename(rel_path);
+        const expected_target = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path }) catch continue;
+        defer allocator.free(expected_target);
+
+        // Only remove if it's a symlink pointing to our tool directory
+        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const link_target = apps_dir.readLink(app_name, &link_buf) catch continue;
+        if (std.mem.eql(u8, link_target, expected_target)) {
+            apps_dir.deleteFile(app_name) catch continue;
+            w.print("  unlinked ~/Applications/{s}\n", .{app_name}) catch {};
+        }
+    }
+}
+
 /// Write ghr.json metadata.
 fn writeMetadata(
     allocator: std.mem.Allocator,
@@ -452,6 +554,7 @@ fn writeMetadata(
     tag: []const u8,
     asset_name: []const u8,
     bins: []const []const u8,
+    apps: []const []const u8,
 ) !void {
     var file = try tool_dir.createFile("ghr.json", .{});
     defer file.close();
@@ -463,10 +566,135 @@ fn writeMetadata(
         if (i > 0) try w.print(",", .{});
         try w.print("\"{s}\"", .{bin});
     }
+    try w.print("],\"apps\":[", .{});
+    for (apps, 0..) |app, i| {
+        if (i > 0) try w.print(",", .{});
+        try w.print("\"{s}\"", .{app});
+    }
     try w.print("]}}\n", .{});
     const written = stream.getWritten();
     try file.writeAll(written);
     _ = allocator;
+}
+
+/// Metadata stored in ghr.json.
+const Metadata = struct {
+    tag: []const u8,
+    asset: []const u8,
+    bins: []const []const u8 = &.{},
+    apps: []const []const u8 = &.{},
+};
+
+/// Read ghr.json metadata from a tool directory.
+fn readMetadata(allocator: std.mem.Allocator, tool_dir_path: []const u8) ?struct {
+    parsed: std.json.Parsed(Metadata),
+    body: []const u8,
+} {
+    const json_path = std.fmt.allocPrint(allocator, "{s}/ghr.json", .{tool_dir_path}) catch return null;
+    defer allocator.free(json_path);
+    const body = std.fs.cwd().readFileAlloc(allocator, json_path, 65536) catch return null;
+    const parsed = std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true }) catch {
+        allocator.free(body);
+        return null;
+    };
+    return .{ .parsed = parsed, .body = body };
+}
+
+/// Clean up old install's bin symlinks and app bundles before replacing.
+fn cleanupOldInstall(
+    allocator: std.mem.Allocator,
+    tool_path: []const u8,
+    bin_path: []const u8,
+    w: *Writer,
+) void {
+    const meta = readMetadata(allocator, tool_path) orelse return;
+    defer meta.parsed.deinit();
+    defer allocator.free(meta.body);
+
+    // Remove old bin symlinks
+    var bin_dir = std.fs.openDirAbsolute(bin_path, .{}) catch return;
+    defer bin_dir.close();
+    for (meta.parsed.value.bins) |exe_rel| {
+        const exe_name = std.fs.path.basename(exe_rel);
+        // Verify the symlink points to our tool dir before removing
+        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const link_target = bin_dir.readLink(exe_name, &link_buf) catch continue;
+        if (std.mem.startsWith(u8, link_target, tool_path)) {
+            bin_dir.deleteFile(exe_name) catch {};
+        }
+    }
+
+    // Remove old app bundle symlinks (macOS)
+    if (comptime builtin.os.tag.isDarwin()) {
+        unlinkAppBundles(allocator, meta.parsed.value.apps, tool_path, w);
+    }
+}
+
+pub fn cmdUninstall(
+    allocator: std.mem.Allocator,
+    spec_str: []const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !void {
+    const spec = parseSpec(spec_str) catch {
+        try err_w.print("error: invalid spec '{s}', expected owner/repo\n", .{spec_str});
+        try err_w.flush();
+        std.process.exit(1);
+    };
+
+    const d = try Dirs.detect(allocator);
+    defer d.deinit();
+
+    const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
+        d.tools, std.fs.path.sep, spec.owner, std.fs.path.sep, spec.repo,
+    });
+    defer allocator.free(tool_path);
+
+    // Check the tool exists
+    std.fs.accessAbsolute(tool_path, .{}) catch {
+        try err_w.print("error: {s}/{s} is not installed\n", .{ spec.owner, spec.repo });
+        try err_w.flush();
+        std.process.exit(1);
+    };
+
+    // Read metadata to know what to clean up
+    const meta = readMetadata(allocator, tool_path);
+    defer if (meta) |m| {
+        m.parsed.deinit();
+        allocator.free(m.body);
+    };
+
+    // Remove bin symlinks
+    var bin_dir = std.fs.openDirAbsolute(d.bin, .{}) catch null;
+    defer if (bin_dir) |*bd| bd.close();
+
+    if (meta) |m| {
+        for (m.parsed.value.bins) |exe_rel| {
+            const exe_name = std.fs.path.basename(exe_rel);
+            if (bin_dir) |bd| {
+                var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const link_target = bd.readLink(exe_name, &link_buf) catch continue;
+                if (std.mem.startsWith(u8, link_target, tool_path)) {
+                    bd.deleteFile(exe_name) catch continue;
+                    try w.print("  unlinked {s}\n", .{exe_name});
+                }
+            }
+        }
+
+        // Remove app bundle symlinks (macOS)
+        if (comptime builtin.os.tag.isDarwin()) {
+            unlinkAppBundles(allocator, m.parsed.value.apps, tool_path, w);
+        }
+    }
+
+    // Delete the tool directory
+    std.fs.deleteTreeAbsolute(tool_path) catch {
+        try err_w.print("error: failed to remove {s}\n", .{tool_path});
+        try err_w.flush();
+        std.process.exit(1);
+    };
+
+    try w.print("uninstalled {s}/{s}\n", .{ spec.owner, spec.repo });
 }
 
 pub fn cmdInstall(
@@ -610,13 +838,24 @@ pub fn cmdInstall(
         std.process.exit(1);
     }
 
+    // Find .app bundles (macOS)
+    var apps: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (comptime builtin.os.tag.isDarwin()) {
+        apps = try findAppBundles(allocator, staging_dir);
+    }
+    defer {
+        for (apps.items) |a| allocator.free(a);
+        apps.deinit(allocator);
+    }
+
     // Move staging to final tool dir
     const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
         d.tools, std.fs.path.sep, spec.owner, std.fs.path.sep, spec.repo,
     });
     defer allocator.free(tool_path);
 
-    // Remove old install if present
+    // Clean up old install's symlinks before deleting
+    cleanupOldInstall(allocator, tool_path, d.bin, w);
     std.fs.deleteTreeAbsolute(tool_path) catch {};
     // Ensure tools and owner dirs exist (create full path)
     const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
@@ -654,7 +893,8 @@ pub fn cmdInstall(
 
     // Write metadata
     const bins_slice = exes.items;
-    writeMetadata(allocator, tool_dir, tag_name, asset.name, bins_slice) catch |err| {
+    const apps_slice = apps.items;
+    writeMetadata(allocator, tool_dir, tag_name, asset.name, bins_slice, apps_slice) catch |err| {
         try err_w.print("warning: failed to write metadata: {}\n", .{err});
     };
 
@@ -667,6 +907,13 @@ pub fn cmdInstall(
     for (exes.items) |exe_name| {
         linkToBin(tool_path, bin_dir, exe_name, w) catch |err| {
             try err_w.print("warning: failed to link {s}: {}\n", .{ exe_name, err });
+        };
+    }
+
+    // On macOS, symlink .app bundles into ~/Applications for Spotlight discovery
+    if (comptime builtin.os.tag.isDarwin()) {
+        linkAppBundles(allocator, apps_slice, tool_path, w) catch |err| {
+            try err_w.print("warning: failed to link .app bundle: {}\n", .{err});
         };
     }
 

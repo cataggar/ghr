@@ -48,14 +48,12 @@ pub fn main() !void {
         };
         try install.cmdInstall(allocator, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "uninstall")) {
-        if (args.next() == null) {
-            try stderr.interface.print("error: 'ghr uninstall' requires <name>\n", .{});
+        const spec = args.next() orelse {
+            try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
-        }
-        try stderr.interface.print("error: uninstall not yet implemented\n", .{});
-        try stderr.interface.flush();
-        std.process.exit(1);
+        };
+        try install.cmdUninstall(allocator, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "upgrade")) {
         try stderr.interface.print("error: upgrade not yet implemented\n", .{});
         try stderr.interface.flush();
@@ -161,7 +159,7 @@ fn printUsage(w: *std.io.Writer) !void {
         \\
         \\COMMANDS:
         \\    install <owner/repo[@tag]>   Install a tool from a GitHub release
-        \\    uninstall <name>             Remove an installed tool
+        \\    uninstall <owner/repo>       Remove an installed tool
         \\    list                         List installed tools
         \\    upgrade [name]               Upgrade installed tools
         \\    dir [--bin] [--cache]        Show ghr directories
