@@ -237,9 +237,16 @@ fn extractZip(dest_dir: std.fs.Dir, file: *std.fs.File, diag: ?*std.zip.Diagnost
     });
 }
 
-fn extractTarGz(dest_dir: std.fs.Dir) !void {
-    _ = dest_dir;
-    return error.TarGzNotYetSupported;
+fn extractTarGz(dest_dir: std.fs.Dir, file: *std.fs.File) !void {
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(&file_buf);
+    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(
+        &file_reader.interface,
+        .gzip,
+        &decompress_buf,
+    );
+    try std.tar.pipeToFileSystem(dest_dir, &decompress.reader, .{});
 }
 
 /// Scan directory recursively for executable files and return their relative paths.
@@ -472,7 +479,10 @@ pub fn cmdInstall(
             std.process.exit(1);
         };
     } else if (std.mem.endsWith(u8, asset.name, ".tar.gz") or std.mem.endsWith(u8, asset.name, ".tgz")) {
-        extractTarGz(staging_dir) catch |err| {
+        var tar_file = try std.fs.openFileAbsolute(download_path, .{});
+        defer tar_file.close();
+
+        extractTarGz(staging_dir, &tar_file) catch |err| {
             try err_w.print("error: extraction failed: {}\n", .{err});
             try err_w.flush();
             std.process.exit(1);
