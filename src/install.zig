@@ -59,13 +59,24 @@ fn urlEncode(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return buf.toOwnedSlice(allocator);
 }
 
+const ParsedRelease = struct {
+    parsed: std.json.Parsed(Release),
+    body: []u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *ParsedRelease) void {
+        self.parsed.deinit();
+        self.allocator.free(self.body);
+    }
+};
+
 fn getRelease(
     allocator: std.mem.Allocator,
     client: *std.http.Client,
     owner: []const u8,
     repo: []const u8,
     tag: ?[]const u8,
-) !std.json.Parsed(Release) {
+) !ParsedRelease {
     const url = if (tag) |t| blk: {
         const encoded_tag = try urlEncode(allocator, t);
         defer allocator.free(encoded_tag);
@@ -74,6 +85,7 @@ fn getRelease(
     defer allocator.free(url);
 
     var body_writer = std.Io.Writer.Allocating.init(allocator);
+    errdefer body_writer.deinit();
 
     const result = try client.fetch(.{
         .location = .{ .url = url },
@@ -88,9 +100,13 @@ fn getRelease(
         return error.GitHubApiError;
     }
 
-    const body = body_writer.writer.buffer[0..body_writer.writer.end];
-    if (body.len == 0) return error.EmptyResponse;
-    return std.json.parseFromSlice(Release, allocator, body, .{ .ignore_unknown_fields = true });
+    const body = try body_writer.toOwnedSlice();
+    if (body.len == 0) {
+        allocator.free(body);
+        return error.EmptyResponse;
+    }
+    const parsed = try std.json.parseFromSlice(Release, allocator, body, .{ .ignore_unknown_fields = true });
+    return .{ .parsed = parsed, .body = body, .allocator = allocator };
 }
 
 fn currentPlatformKeywords() struct { os: []const []const u8, arch: []const []const u8 } {
@@ -237,9 +253,16 @@ fn extractZip(dest_dir: std.fs.Dir, file: *std.fs.File, diag: ?*std.zip.Diagnost
     });
 }
 
-fn extractTarGz(dest_dir: std.fs.Dir) !void {
-    _ = dest_dir;
-    return error.TarGzNotYetSupported;
+fn extractTarGz(dest_dir: std.fs.Dir, file: *std.fs.File) !void {
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(&file_buf);
+    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(
+        &file_reader.interface,
+        .gzip,
+        &decompress_buf,
+    );
+    try std.tar.pipeToFileSystem(dest_dir, &decompress.reader, .{});
 }
 
 /// Scan directory recursively for executable files and return their relative paths.
@@ -383,7 +406,7 @@ pub fn cmdInstall(
     defer client.deinit();
 
     // Get release info
-    const release = getRelease(allocator, &client, spec.owner, spec.repo, spec.tag) catch |err| {
+    var release = getRelease(allocator, &client, spec.owner, spec.repo, spec.tag) catch |err| {
         switch (err) {
             error.GitHubApiError => {
                 try err_w.print("error: release not found for {s}/{s}", .{ spec.owner, spec.repo });
@@ -397,14 +420,14 @@ pub fn cmdInstall(
     };
     defer release.deinit();
 
-    const tag_name = release.value.tag_name;
+    const tag_name = release.parsed.value.tag_name;
     try w.print("found release {s}\n", .{tag_name});
 
     // Find matching asset
-    const asset = findBestAsset(release.value.assets) catch {
+    const asset = findBestAsset(release.parsed.value.assets) catch {
         try err_w.print("error: no matching asset for this platform\n", .{});
         try err_w.print("available assets:\n", .{});
-        for (release.value.assets) |a| {
+        for (release.parsed.value.assets) |a| {
             try err_w.print("  {s}\n", .{a.name});
         }
         try err_w.flush();
@@ -472,7 +495,10 @@ pub fn cmdInstall(
             std.process.exit(1);
         };
     } else if (std.mem.endsWith(u8, asset.name, ".tar.gz") or std.mem.endsWith(u8, asset.name, ".tgz")) {
-        extractTarGz(staging_dir) catch |err| {
+        var tar_file = try std.fs.openFileAbsolute(download_path, .{});
+        defer tar_file.close();
+
+        extractTarGz(staging_dir, &tar_file) catch |err| {
             try err_w.print("error: extraction failed: {}\n", .{err});
             try err_w.flush();
             std.process.exit(1);
@@ -596,4 +622,149 @@ test "isInstallableAsset" {
     try std.testing.expect(isInstallableAsset("foo.tgz"));
     try std.testing.expect(!isInstallableAsset("checksums.txt"));
     try std.testing.expect(!isInstallableAsset("foo.sha256"));
+}
+
+/// Create a tar.gz test fixture using the system tar command.
+fn createTestTarGz(tmp: *std.testing.TmpDir, names: []const []const u8, contents: []const []const u8) !std.fs.File {
+    for (names, contents) |name, content| {
+        if (std.fs.path.dirname(name)) |parent| {
+            tmp.dir.makePath(parent) catch {};
+        }
+        var f = try tmp.dir.createFile(name, .{ .mode = 0o755 });
+        try f.writeAll(content);
+        f.close();
+    }
+
+    // Build argv: tar czf archive.tar.gz <names...>
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(std.testing.allocator);
+    try argv.appendSlice(std.testing.allocator, &.{ "tar", "czf", "archive.tar.gz" });
+    try argv.appendSlice(std.testing.allocator, names);
+
+    var tar = std.process.Child.init(argv.items, std.testing.allocator);
+    tar.cwd_dir = tmp.dir;
+    _ = try tar.spawnAndWait();
+
+    // Remove source files so extraction starts clean
+    for (names) |name| {
+        tmp.dir.deleteFile(name) catch {};
+        if (std.fs.path.dirname(name)) |parent| {
+            tmp.dir.deleteDir(parent) catch {};
+        }
+    }
+
+    return try tmp.dir.openFile("archive.tar.gz", .{});
+}
+
+test "extractTarGz extracts files with correct contents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try createTestTarGz(&tmp, &.{ "myapp/README.md", "myapp/myapp" }, &.{ "readme\n", "#!/bin/sh\necho hello\n" });
+    defer file.close();
+
+    extractTarGz(tmp.dir, &file) catch |err| return err;
+
+    // Verify files exist
+    try std.testing.expect((try tmp.dir.statFile("myapp/README.md")).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile("myapp/myapp")).kind == .file);
+
+    // Verify contents
+    const content = try tmp.dir.readFileAlloc(std.testing.allocator, "myapp/README.md", 256);
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("readme\n", content);
+}
+
+test "extractTarGz handles single file archive" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try createTestTarGz(&tmp, &.{"tool"}, &.{"binary"});
+    defer file.close();
+
+    extractTarGz(tmp.dir, &file) catch |err| return err;
+
+    try std.testing.expect((try tmp.dir.statFile("tool")).kind == .file);
+}
+
+test "findExecutables discovers executable files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create an executable file
+    const exe_file = try tmp.dir.createFile("myapp", .{ .mode = 0o755 });
+    exe_file.close();
+
+    // Create a non-executable file
+    const txt_file = try tmp.dir.createFile("readme.txt", .{ .mode = 0o644 });
+    txt_file.close();
+
+    const allocator = std.testing.allocator;
+    var exes = try findExecutables(allocator, tmp.dir);
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    // Should find the executable but not the text file
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("myapp", exes.items[0]);
+}
+
+test "findExecutables discovers nested executables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create nested structure
+    try tmp.dir.makePath("bin");
+    const exe_file = try tmp.dir.createFile("bin/tool", .{ .mode = 0o755 });
+    exe_file.close();
+
+    const allocator = std.testing.allocator;
+    var exes = try findExecutables(allocator, tmp.dir);
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("bin/tool", exes.items[0]);
+}
+
+test "findExecutables returns empty for no executables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const txt_file = try tmp.dir.createFile("readme.txt", .{ .mode = 0o644 });
+    txt_file.close();
+
+    const allocator = std.testing.allocator;
+    var exes = try findExecutables(allocator, tmp.dir);
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), exes.items.len);
+}
+
+test "ParsedRelease deinit frees all memory" {
+    const allocator = std.testing.allocator;
+
+    // Simulate what getRelease does: parse JSON from a body buffer
+    const json_body = try allocator.dupe(u8,
+        \\{"tag_name":"v1.0.0","assets":[{"name":"app.tar.gz","browser_download_url":"https://example.com/app.tar.gz"}]}
+    );
+
+    const parsed = try std.json.parseFromSlice(Release, allocator, json_body, .{ .ignore_unknown_fields = true });
+
+    var pr: ParsedRelease = .{ .parsed = parsed, .body = json_body, .allocator = allocator };
+
+    // Verify parsed data is accessible
+    try std.testing.expectEqualStrings("v1.0.0", pr.parsed.value.tag_name);
+    try std.testing.expectEqual(@as(usize, 1), pr.parsed.value.assets.len);
+    try std.testing.expectEqualStrings("app.tar.gz", pr.parsed.value.assets[0].name);
+
+    // deinit should free everything with no leaks (testing.allocator will catch leaks)
+    pr.deinit();
 }
