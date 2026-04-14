@@ -522,8 +522,12 @@ fn scanForAppBundles(
     }
 }
 
-/// On macOS, symlink .app bundles into ~/Applications for Spotlight and Launchpad discovery.
-fn linkAppBundles(
+/// Marker file placed inside copied .app bundles to track ghr ownership.
+const ghr_marker = "Contents/.ghr-source";
+
+/// On macOS, copy .app bundles into ~/Applications for Spotlight and Launchpad discovery.
+/// Symlinks are not indexed by Spotlight, so a real copy is required.
+fn installAppBundles(
     allocator: std.mem.Allocator,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
@@ -545,19 +549,57 @@ fn linkAppBundles(
         const app_src = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path }) catch continue;
         defer allocator.free(app_src);
 
-        // Only replace existing symlinks, never regular directories
-        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (apps_dir.readLink(app_name, &link_buf)) |_| {
-            apps_dir.deleteFile(app_name) catch {};
-        } else |_| {}
+        // If an existing app is present, only replace it if we own it (has our marker or is a legacy symlink)
+        const existing = apps_dir.statFile(app_name) catch null;
+        if (existing) |_| {
+            if (isLegacyAppSymlink(allocator, apps_dir, app_name, tool_dir_path, rel_path)) {
+                apps_dir.deleteFile(app_name) catch continue;
+            } else if (isOwnedAppBundle(apps_dir, app_name, tool_dir_path)) {
+                apps_dir.deleteTree(app_name) catch continue;
+            } else {
+                w.print("  skipped ~/Applications/{s} (not owned by ghr)\n", .{app_name}) catch {};
+                continue;
+            }
+        }
 
-        apps_dir.symLink(app_src, app_name, .{ .is_directory = true }) catch continue;
-        try w.print("  linked ~/Applications/{s}\n", .{app_name});
+        // Copy to a staging name, then rename for atomicity
+        const staging_name = std.fmt.allocPrint(allocator, ".ghr-staging-{s}", .{app_name}) catch continue;
+        defer allocator.free(staging_name);
+        apps_dir.deleteTree(staging_name) catch {};
+
+        // Open source .app directory
+        var src_dir = std.fs.openDirAbsolute(app_src, .{ .iterate = true }) catch continue;
+        defer src_dir.close();
+
+        // Create staging directory and copy
+        apps_dir.makeDir(staging_name) catch continue;
+        var staging_dir = apps_dir.openDir(staging_name, .{}) catch continue;
+        defer staging_dir.close();
+
+        copyDirRecursive(src_dir, staging_dir) catch {
+            apps_dir.deleteTree(staging_name) catch {};
+            continue;
+        };
+
+        // Write ownership marker (remove first in case archive contained one as a symlink)
+        staging_dir.deleteFile(ghr_marker) catch {};
+        writeMarkerFile(staging_dir, tool_dir_path) catch {
+            apps_dir.deleteTree(staging_name) catch {};
+            continue;
+        };
+
+        // Atomic rename into place
+        apps_dir.rename(staging_name, app_name) catch {
+            apps_dir.deleteTree(staging_name) catch {};
+            continue;
+        };
+
+        try w.print("  installed ~/Applications/{s}\n", .{app_name});
     }
 }
 
-/// Remove ~/Applications symlinks that point into the given tool directory.
-fn unlinkAppBundles(
+/// Remove ~/Applications .app bundles owned by this tool.
+fn uninstallAppBundles(
     allocator: std.mem.Allocator,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
@@ -575,15 +617,86 @@ fn unlinkAppBundles(
 
     for (app_paths) |rel_path| {
         const app_name = std.fs.path.basename(rel_path);
-        const expected_target = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path }) catch continue;
-        defer allocator.free(expected_target);
 
-        // Only remove if it's a symlink pointing to our tool directory
-        var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const link_target = apps_dir.readLink(app_name, &link_buf) catch continue;
-        if (std.mem.eql(u8, link_target, expected_target)) {
+        // Handle legacy symlinks from older ghr versions
+        if (isLegacyAppSymlink(allocator, apps_dir, app_name, tool_dir_path, rel_path)) {
             apps_dir.deleteFile(app_name) catch continue;
-            w.print("  unlinked ~/Applications/{s}\n", .{app_name}) catch {};
+            w.print("  uninstalled ~/Applications/{s}\n", .{app_name}) catch {};
+            continue;
+        }
+
+        if (!isOwnedAppBundle(apps_dir, app_name, tool_dir_path)) continue;
+
+        apps_dir.deleteTree(app_name) catch continue;
+        w.print("  uninstalled ~/Applications/{s}\n", .{app_name}) catch {};
+    }
+}
+
+/// Check if an .app bundle in ~/Applications is owned by ghr for the given tool path.
+fn isOwnedAppBundle(apps_dir: std.fs.Dir, app_name: []const u8, tool_dir_path: []const u8) bool {
+    // Build path to marker: <app_name>/Contents/.ghr-source
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const marker_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ app_name, ghr_marker }) catch return false;
+
+    // Verify marker is a regular file, not a symlink
+    const stat = apps_dir.statFile(marker_path) catch return false;
+    if (stat.kind == .sym_link) return false;
+
+    // Read and compare source path
+    var content_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file = apps_dir.openFile(marker_path, .{}) catch return false;
+    defer file.close();
+    const len = file.readAll(&content_buf) catch return false;
+    return std.mem.eql(u8, content_buf[0..len], tool_dir_path);
+}
+
+/// Check if an entry is a legacy symlink (from older ghr versions) pointing to our tool.
+fn isLegacyAppSymlink(
+    allocator: std.mem.Allocator,
+    apps_dir: std.fs.Dir,
+    app_name: []const u8,
+    tool_dir_path: []const u8,
+    rel_path: []const u8,
+) bool {
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const link_target = apps_dir.readLink(app_name, &link_buf) catch return false;
+    const expected = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path }) catch return false;
+    defer allocator.free(expected);
+    return std.mem.eql(u8, link_target, expected);
+}
+
+/// Write the ghr ownership marker file.
+fn writeMarkerFile(dir: std.fs.Dir, tool_dir_path: []const u8) !void {
+    var file = try dir.createFile(ghr_marker, .{});
+    defer file.close();
+    try file.writeAll(tool_dir_path);
+}
+
+/// Recursively copy a directory tree, preserving symlinks without following them.
+fn copyDirRecursive(src_dir: std.fs.Dir, dest_dir: std.fs.Dir) !void {
+    var iter = src_dir.iterate();
+    while (try iter.next()) |entry| {
+        switch (entry.kind) {
+            .file => {
+                try src_dir.copyFile(entry.name, dest_dir, entry.name, .{});
+            },
+            .directory => {
+                dest_dir.makeDir(entry.name) catch |err| switch (err) {
+                    error.PathAlreadyExists => {},
+                    else => return err,
+                };
+                var child_src = try src_dir.openDir(entry.name, .{ .iterate = true });
+                defer child_src.close();
+                var child_dest = try dest_dir.openDir(entry.name, .{});
+                defer child_dest.close();
+                try copyDirRecursive(child_src, child_dest);
+            },
+            .sym_link => {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                const target = try src_dir.readLink(entry.name, &buf);
+                dest_dir.symLink(target, entry.name, .{}) catch {};
+            },
+            else => {},
         }
     }
 }
@@ -665,9 +778,9 @@ fn cleanupOldInstall(
         }
     }
 
-    // Remove old app bundle symlinks (macOS)
+    // Remove old app bundle copies (macOS)
     if (comptime builtin.os.tag.isDarwin()) {
-        unlinkAppBundles(allocator, meta.parsed.value.apps, tool_path, w);
+        uninstallAppBundles(allocator, meta.parsed.value.apps, tool_path, w);
     }
 }
 
@@ -722,9 +835,9 @@ pub fn cmdUninstall(
             }
         }
 
-        // Remove app bundle symlinks (macOS)
+        // Remove app bundle copies (macOS)
         if (comptime builtin.os.tag.isDarwin()) {
-            unlinkAppBundles(allocator, m.parsed.value.apps, tool_path, w);
+            uninstallAppBundles(allocator, m.parsed.value.apps, tool_path, w);
         }
     }
 
@@ -958,10 +1071,10 @@ pub fn cmdInstall(
         };
     }
 
-    // On macOS, symlink .app bundles into ~/Applications for Spotlight discovery
+    // On macOS, copy .app bundles into ~/Applications for Spotlight discovery
     if (comptime builtin.os.tag.isDarwin()) {
-        linkAppBundles(allocator, apps_slice, tool_path, w) catch |err| {
-            try err_w.print("warning: failed to link .app bundle: {}\n", .{err});
+        installAppBundles(allocator, apps_slice, tool_path, w) catch |err| {
+            try err_w.print("warning: failed to install .app bundle: {}\n", .{err});
         };
     }
 
