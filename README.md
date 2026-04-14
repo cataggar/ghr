@@ -9,7 +9,6 @@ ghr install <owner/repo[@tag]>   Install a tool from a GitHub release
 ghr uninstall <name>             Remove an installed tool
 ghr list                         List installed tools
 ghr upgrade [name]               Upgrade installed tools
-ghr run <owner/repo[@tag]>       Run a tool without installing
 ghr dir [--bin] [--cache]        Show ghr directories
 ```
 

@@ -60,15 +60,6 @@ pub fn main() !void {
         try stderr.interface.print("error: upgrade not yet implemented\n", .{});
         try stderr.interface.flush();
         std.process.exit(1);
-    } else if (eql(cmd_str, "run")) {
-        if (args.next() == null) {
-            try stderr.interface.print("error: 'ghr run' requires <owner/repo[@tag]>\n", .{});
-            try stderr.interface.flush();
-            std.process.exit(1);
-        }
-        try stderr.interface.print("error: run not yet implemented\n", .{});
-        try stderr.interface.flush();
-        std.process.exit(1);
     } else if (eql(cmd_str, "help")) {
         try printUsage(&stdout.interface);
     } else {
@@ -173,7 +164,6 @@ fn printUsage(w: *std.io.Writer) !void {
         \\    uninstall <name>             Remove an installed tool
         \\    list                         List installed tools
         \\    upgrade [name]               Upgrade installed tools
-        \\    run <owner/repo[@tag]>       Run a tool without installing
         \\    dir [--bin] [--cache]        Show ghr directories
         \\
         \\OPTIONS:
