@@ -218,13 +218,15 @@ fn downloadAsset(
     _: *std.http.Client,
     url: []const u8,
     dest_path: []const u8,
+    debug_w: ?*Writer,
 ) !void {
     const max_retries: u8 = 5;
     var attempts: u8 = 0;
     while (attempts < max_retries) : (attempts += 1) {
         if (attempts > 0) {
-            // Exponential backoff: 1s, 2s, 4s
+            // Exponential backoff: 1s, 2s, 4s, 8s
             const delay_ns: u64 = @as(u64, 1_000_000_000) << @intCast(attempts - 1);
+            debugLog(debug_w, "  retrying in {d}s ...\n", .{delay_ns / 1_000_000_000});
             std.Thread.sleep(delay_ns);
             std.fs.deleteFileAbsolute(dest_path) catch {};
         }
@@ -233,6 +235,7 @@ fn downloadAsset(
         var client: std.http.Client = .{
             .allocator = allocator,
             .tls_buffer_size = 16384 * 2,
+            .read_buffer_size = 16384,
         };
         defer client.deinit();
 
@@ -247,25 +250,45 @@ fn downloadAsset(
                 .{ .name = "User-Agent", .value = "ghr/" ++ version },
             },
             .response_writer = &file_writer.interface,
-        }) catch {
+        }) catch |err| {
+            debugLog(debug_w, "  attempt {d}/{d} fetch error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
 
-        file_writer.end() catch {
+        file_writer.end() catch |err| {
+            debugLog(debug_w, "  attempt {d}/{d} write error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
 
         if (result.status != .ok) {
-            if (isTransientStatus(result.status) and attempts + 1 < max_retries) continue;
+            if (isTransientStatus(result.status)) {
+                debugLog(debug_w, "  attempt {d}/{d} HTTP {d} ({s})\n", .{
+                    attempts + 1,
+                    max_retries,
+                    @intFromEnum(result.status),
+                    @tagName(result.status),
+                });
+                if (attempts + 1 < max_retries) continue;
+            }
             std.log.err("download failed with HTTP {d} ({s})", .{
                 @intFromEnum(result.status),
                 @tagName(result.status),
             });
             return error.DownloadFailed;
         }
+        if (attempts > 0) {
+            debugLog(debug_w, "  succeeded on attempt {d}/{d}\n", .{ attempts + 1, max_retries });
+        }
         return;
+    }
+}
+
+fn debugLog(w: ?*Writer, comptime fmt: []const u8, args: anytype) void {
+    if (w) |writer| {
+        writer.print(fmt, args) catch {};
+        writer.flush() catch {};
     }
 }
 
@@ -720,6 +743,7 @@ pub fn cmdInstall(
     spec_str: []const u8,
     w: *Writer,
     err_w: *Writer,
+    debug: bool,
 ) !void {
     const spec = parseSpec(spec_str) catch {
         try err_w.print("error: invalid spec '{s}', expected owner/repo[@tag]\n", .{spec_str});
@@ -739,6 +763,7 @@ pub fn cmdInstall(
     var client: std.http.Client = .{
         .allocator = allocator,
         .tls_buffer_size = 16384 * 2,
+        .read_buffer_size = 16384,
     };
     defer client.deinit();
 
@@ -786,7 +811,12 @@ pub fn cmdInstall(
     });
     defer allocator.free(download_path);
 
-    downloadAsset(allocator, &client, asset.browser_download_url, download_path) catch |err| {
+    const debug_w: ?*Writer = if (debug) err_w else null;
+
+    debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
+    debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
+
+    downloadAsset(allocator, &client, asset.browser_download_url, download_path, debug_w) catch |err| {
         try err_w.print("error: download failed: {}\n", .{err});
         try err_w.print("  url: {s}\n", .{asset.browser_download_url});
         try err_w.flush();

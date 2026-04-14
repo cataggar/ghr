@@ -16,3 +16,4 @@ __pycache__/
 *.obj
 *.o
 ghr
+ghr_debug
