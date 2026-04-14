@@ -357,8 +357,10 @@ fn extractTarGz(io: Io, dest_dir: Dir, file: *File) !void {
 fn extractTarXz(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *File) !void {
     var file_buf: [8192]u8 = undefined;
     var file_reader = file.reader(io, &file_buf);
-    var xz_buf: [8192]u8 = undefined;
-    var xz_decompress = try std.compress.xz.Decompress.init(&file_reader.interface, allocator, &xz_buf);
+    // xz.Decompress takes ownership of the buffer and may resize it via the allocator,
+    // so it must be heap-allocated (not stack).
+    const xz_buf = try allocator.alloc(u8, 8192);
+    var xz_decompress = try std.compress.xz.Decompress.init(&file_reader.interface, allocator, xz_buf);
     defer xz_decompress.deinit();
     try std.tar.extract(io, dest_dir, &xz_decompress.reader, .{});
 }
@@ -958,6 +960,7 @@ pub fn cmdInstall(
 
     const debug_w: ?*Writer = if (debug) err_w else null;
 
+    debugLog(debug_w, "debug: ghr {s}\n", .{version});
     debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
     debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
 
