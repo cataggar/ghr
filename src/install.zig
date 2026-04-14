@@ -211,10 +211,16 @@ fn downloadAsset(
 
     try req.sendBodiless();
 
-    var redirect_buf: [8 * 1024]u8 = undefined;
+    var redirect_buf: [16 * 1024]u8 = undefined;
     var response = try req.receiveHead(&redirect_buf);
 
-    if (response.head.status != .ok) return error.DownloadFailed;
+    if (response.head.status != .ok) {
+        std.log.err("download failed with HTTP {d} ({s})", .{
+            @intFromEnum(response.head.status),
+            @tagName(response.head.status),
+        });
+        return error.DownloadFailed;
+    }
 
     var transfer_buf: [8192]u8 = undefined;
     var body_reader = response.reader(&transfer_buf);
@@ -224,9 +230,8 @@ fn downloadAsset(
     var file_buf: [8192]u8 = undefined;
     var file_writer = file.writer(&file_buf);
 
-    const n = body_reader.streamRemaining(&file_writer.interface) catch return error.DownloadFailed;
+    _ = body_reader.streamRemaining(&file_writer.interface) catch return error.DownloadFailed;
     try file_writer.end();
-    _ = n;
     _ = allocator;
 }
 
@@ -451,6 +456,7 @@ pub fn cmdInstall(
 
     downloadAsset(allocator, &client, asset.browser_download_url, download_path) catch |err| {
         try err_w.print("error: download failed: {}\n", .{err});
+        try err_w.print("  url: {s}\n", .{asset.browser_download_url});
         try err_w.flush();
         std.process.exit(1);
     };
