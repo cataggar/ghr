@@ -14,7 +14,7 @@ ghr dir [--bin] [--cache]        Show ghr directories
 
 ## Install
 
-It can be installed using uv, using pip, or manually from releases.
+It can be installed using uv, pip, or downloaded from releases.
 
 ```sh
 # uv
