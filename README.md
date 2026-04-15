@@ -43,11 +43,21 @@ Override with `GHR_BIN_DIR`, `GHR_TOOL_DIR`, `GHR_CACHE_DIR`.
 ## Install
 
 ```sh
-# Recommended
+# uv (recommended)
 uv tool install ghr-bin
 
-# pip (requires pip >= 24.3)
+# pip
 pip install ghr-bin
+```
+
+## Uninstall
+
+```sh
+# uv
+uv tool uninstall ghr-bin
+
+# pip
+pip uninstall ghr-bin
 ```
 
 ## Build
