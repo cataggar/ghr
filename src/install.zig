@@ -20,7 +20,12 @@ fn deleteTreeAbsolute(io: Io, abs_path: []const u8) !void {
     try dir.deleteTree(io, basename);
 }
 
-/// Parsed "owner/repo[@tag]" specification.
+/// HTTP write buffer size for download clients. GitHub release downloads redirect
+/// to CDN URLs with long signed query strings (~900 bytes). The default
+/// write_buffer_size of 1024 is too small, causing the request to be truncated
+/// and the CDN to return HTTP 400. We use 4096 to accommodate these URLs plus
+/// the request line and headers.
+const http_write_buffer_size = 4096;
 const Spec = struct {
     owner: []const u8,
     repo: []const u8,
@@ -292,7 +297,7 @@ fn downloadAsset(
         var client: std.http.Client = .{
             .allocator = allocator,
             .io = io,
-            .write_buffer_size = 4096,
+            .write_buffer_size = http_write_buffer_size,
         };
         defer client.deinit();
 
@@ -1148,7 +1153,7 @@ pub fn cmdInstall(
     var client: std.http.Client = .{
         .allocator = allocator,
         .io = io,
-        .write_buffer_size = 4096,
+        .write_buffer_size = http_write_buffer_size,
     };
     defer client.deinit();
 
@@ -1774,6 +1779,45 @@ test "isTransientStatus" {
     try std.testing.expect(!isTransientStatus(.ok));
     try std.testing.expect(!isTransientStatus(.not_found));
     try std.testing.expect(!isTransientStatus(.forbidden));
+}
+
+test "http_write_buffer_size accommodates GitHub CDN redirect URLs" {
+    // GitHub release downloads redirect to CDN URLs with long signed query strings.
+    // The HTTP write buffer must hold the full request line + headers for the redirect.
+    // A typical redirect URL path+query is ~900 bytes. With request line overhead
+    // ("GET " + " HTTP/1.1\r\n") and headers (Host, User-Agent, Accept-Encoding,
+    // Connection), the total request can reach ~1100 bytes.
+    const typical_cdn_path = "/github-production-release-asset/1234567890/" ++
+        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" ++
+        "?sp=r&sv=2018-11-09&sr=b&spr=https" ++
+        "&se=2026-04-15T07%3A04%3A01Z" ++
+        "&rscd=attachment%3B+filename%3Dzig-aarch64-macos-0.16.0.tar.xz" ++
+        "&rsct=application%2Foctet-stream" ++
+        "&skoid=96c2d410-5711-43a1-aedd-ab1947aa7ab0" ++
+        "&sktid=398a6654-997b-47e9-b12b-9515b896b4de" ++
+        "&skt=2026-04-15T06%3A03%3A53Z" ++
+        "&ske=2026-04-15T07%3A04%3A01Z" ++
+        "&sks=b&skv=2018-11-09" ++
+        "&sig=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop%2Bqrstuv%3D" ++
+        "&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9" ++
+        ".eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmVsZWFzZS1hc3NldHMu" ++
+        "Z2l0aHVidXNlcmNvbnRlbnQuY29tIiwia2V5Ijoia2V5MSIsImV4cCI6MT" ++
+        "c3NjIzNTg1MiwibmJmIjoxNzc2MjM0MDUyLCJwYXRoIjoicmVsZWFzZW" ++
+        "Fzc2V0cHJvZHVjdGlvbi5ibG9iLmNvcmUud2luZG93cy5uZXQifQ" ++
+        ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0" ++
+        "&response-content-disposition=attachment%3B%20filename%3Dzig-aarch64-macos-0.16.0.tar.xz" ++
+        "&response-content-type=application%2Foctet-stream";
+
+    // Simulate the HTTP request line + minimal headers
+    const request_line_overhead = "GET ".len + " HTTP/1.1\r\n".len;
+    const host_header = "Host: release-assets.githubusercontent.com\r\n";
+    const user_agent_header = "User-Agent: ghr/" ++ version ++ "\r\n";
+    const min_request_size = request_line_overhead + typical_cdn_path.len +
+        host_header.len + user_agent_header.len + "\r\n".len;
+
+    try std.testing.expect(http_write_buffer_size >= min_request_size);
+    // Verify the default of 1024 would NOT be sufficient (this is the bug we fixed)
+    try std.testing.expect(1024 < min_request_size);
 }
 
 test "writeJsonEscaped escapes backslashes and quotes" {
