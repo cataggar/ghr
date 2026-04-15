@@ -369,6 +369,36 @@ fn isTransientStatus(status: std.http.Status) bool {
     };
 }
 
+/// Run `gh auth token` to get a GitHub token from the gh CLI.
+/// Returns null if gh is not installed or the command fails.
+fn ghAuthToken(allocator: std.mem.Allocator, io: Io) ?[]const u8 {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "gh", "auth", "token" },
+        .stdout_limit = Io.Limit.limited(256),
+        .stderr_limit = Io.Limit.limited(0),
+    }) catch return null;
+    defer allocator.free(result.stderr);
+
+    if (result.term != .exited or result.term.exited != 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    // Trim trailing newline/whitespace and return owned copy
+    const trimmed = std.mem.trimEnd(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    const token = allocator.dupe(u8, trimmed) catch {
+        allocator.free(result.stdout);
+        return null;
+    };
+    allocator.free(result.stdout);
+    return token;
+}
+
 /// Validate that a zip entry path is safe (no path traversal).
 fn isSafePath(name: []const u8) bool {
     if (name.len == 0) return false;
@@ -1077,6 +1107,7 @@ pub fn cmdInstall(
     w: *Writer,
     err_w: *Writer,
     debug: bool,
+    no_auth: bool,
 ) !void {
     const spec = parseSpec(spec_str) catch {
         try err_w.print("error: invalid spec '{s}', expected owner/repo[@tag]\n", .{spec_str});
@@ -1087,8 +1118,17 @@ pub fn cmdInstall(
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
-    // Check for GitHub auth token (GH_TOKEN, then GITHUB_TOKEN)
-    const token = environ.get("GH_TOKEN") orelse environ.get("GITHUB_TOKEN");
+    // Resolve auth token: env vars first, then `gh auth token` as fallback
+    const token = if (no_auth)
+        @as(?[]const u8, null)
+    else
+        environ.get("GH_TOKEN") orelse environ.get("GITHUB_TOKEN") orelse ghAuthToken(allocator, io);
+    defer if (token) |t| {
+        // Only free if we allocated it (from ghAuthToken), not if it's from environ
+        if (environ.get("GH_TOKEN") == null and environ.get("GITHUB_TOKEN") == null) {
+            allocator.free(t);
+        }
+    };
     const auth_header: ?[]const u8 = if (token) |t|
         try std.fmt.allocPrint(allocator, "Bearer {s}", .{t})
     else
@@ -1154,7 +1194,8 @@ pub fn cmdInstall(
     const debug_w: ?*Writer = if (debug) err_w else null;
 
     debugLog(debug_w, "debug: ghr {s}\n", .{version});
-    debugLog(debug_w, "debug: auth: {s}\n", .{if (token != null) "GH_TOKEN" else if (environ.get("GITHUB_TOKEN") != null) "GITHUB_TOKEN" else "none"});
+    const auth_source: []const u8 = if (no_auth) "disabled" else if (environ.get("GH_TOKEN") != null) "GH_TOKEN" else if (environ.get("GITHUB_TOKEN") != null) "GITHUB_TOKEN" else if (token != null) "gh" else "none";
+    debugLog(debug_w, "debug: auth: {s}\n", .{auth_source});
     debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
     debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
 
@@ -1691,4 +1732,160 @@ test "findExecutables skips shared libraries" {
 
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("pencil2d", exes.items[0]);
+}
+
+test "urlEncode handles special characters" {
+    const allocator = std.testing.allocator;
+
+    const plain = try urlEncode(allocator, "v1.0.0");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("v1.0.0", plain);
+
+    const plus = try urlEncode(allocator, "v1.0.0+build");
+    defer allocator.free(plus);
+    try std.testing.expectEqualStrings("v1.0.0%2Bbuild", plus);
+
+    const space = try urlEncode(allocator, "my tag");
+    defer allocator.free(space);
+    try std.testing.expectEqualStrings("my%20tag", space);
+
+    const multi = try urlEncode(allocator, "a+b&c#d");
+    defer allocator.free(multi);
+    try std.testing.expectEqualStrings("a%2Bb%26c%23d", multi);
+
+    const percent = try urlEncode(allocator, "100%done");
+    defer allocator.free(percent);
+    try std.testing.expectEqualStrings("100%25done", percent);
+}
+
+test "isTransientStatus" {
+    try std.testing.expect(isTransientStatus(.bad_request));
+    try std.testing.expect(isTransientStatus(.request_timeout));
+    try std.testing.expect(isTransientStatus(.too_many_requests));
+    try std.testing.expect(isTransientStatus(.internal_server_error));
+    try std.testing.expect(isTransientStatus(.bad_gateway));
+    try std.testing.expect(isTransientStatus(.service_unavailable));
+    try std.testing.expect(isTransientStatus(.gateway_timeout));
+    try std.testing.expect(!isTransientStatus(.ok));
+    try std.testing.expect(!isTransientStatus(.not_found));
+    try std.testing.expect(!isTransientStatus(.forbidden));
+}
+
+test "writeJsonEscaped escapes backslashes and quotes" {
+    const allocator = std.testing.allocator;
+    var collected = std.Io.Writer.Allocating.init(allocator);
+    defer collected.deinit();
+
+    try writeJsonEscaped(&collected.writer, "no special chars");
+    const plain = try collected.toOwnedSlice();
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("no special chars", plain);
+
+    var collected2 = std.Io.Writer.Allocating.init(allocator);
+    defer collected2.deinit();
+    try writeJsonEscaped(&collected2.writer, "path\\to\\file");
+    const escaped = try collected2.toOwnedSlice();
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings("path\\\\to\\\\file", escaped);
+
+    var collected3 = std.Io.Writer.Allocating.init(allocator);
+    defer collected3.deinit();
+    try writeJsonEscaped(&collected3.writer, "say \"hello\"");
+    const quoted = try collected3.toOwnedSlice();
+    defer allocator.free(quoted);
+    try std.testing.expectEqualStrings("say \\\"hello\\\"", quoted);
+}
+
+test "writeMetadata and readMetadata round-trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bins = [_][]const u8{ "sub\\dir\\tool.exe", "other.exe" };
+    const apps = [_][]const u8{};
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.0.0", "tool-windows.zip", &bins, &apps);
+
+    // Verify it's valid JSON by reading it back
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
+    defer allocator.free(body);
+
+    // Backslashes must be escaped in JSON
+    try std.testing.expect(std.mem.indexOf(u8, body, "sub\\\\dir\\\\tool.exe") != null);
+
+    // Parse it back
+    const parsed = try std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("v1.0.0", parsed.value.tag);
+    try std.testing.expectEqualStrings("tool-windows.zip", parsed.value.asset);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.bins.len);
+    try std.testing.expectEqualStrings("sub\\dir\\tool.exe", parsed.value.bins[0]);
+    try std.testing.expectEqualStrings("other.exe", parsed.value.bins[1]);
+}
+
+test "readMetadata returns null for missing file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Get absolute path for the tmp dir
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const tmp_path = tmp.dir.realpath(std.testing.io, ".", &path_buf) catch return;
+    const result = readMetadata(allocator, std.testing.io, tmp_path);
+    try std.testing.expect(result == null);
+}
+
+test "shimPointsToToolDir validates path boundaries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create a .shim file pointing to a tool path
+    var f = try tmp.dir.createFile(std.testing.io, "tool.shim", .{});
+    var buf: [256]u8 = undefined;
+    var fw = f.writer(std.testing.io, &buf);
+    try fw.interface.print("C:\\tools\\owner\\repo\\bin\\tool.exe", .{});
+    try fw.end();
+    f.close(std.testing.io);
+
+    // Exact tool path prefix should match
+    try std.testing.expect(shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "tool.shim",
+        "C:\\tools\\owner\\repo",
+    ));
+
+    // Partial prefix that doesn't end at path boundary should NOT match
+    try std.testing.expect(!shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "tool.shim",
+        "C:\\tools\\owner\\rep",
+    ));
+
+    // Non-matching prefix
+    try std.testing.expect(!shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "tool.shim",
+        "C:\\other\\path",
+    ));
+
+    // Missing .shim file
+    try std.testing.expect(!shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "nonexistent.shim",
+        "C:\\tools\\owner\\repo",
+    ));
+}
+
+test "ghAuthToken returns token when gh is available" {
+    const allocator = std.testing.allocator;
+    const token = ghAuthToken(allocator, std.testing.io);
+    // gh may or may not be installed in the test environment;
+    // just verify no crash and that if returned, it's non-empty
+    if (token) |t| {
+        defer allocator.free(t);
+        try std.testing.expect(t.len > 0);
+    }
 }
