@@ -1,6 +1,6 @@
 # ghr
 
-Install tools from GitHub releases.
+An installer for GitHub releases.
 
 ## Usage
 
@@ -12,14 +12,26 @@ ghr upgrade [name]               Upgrade installed tools
 ghr dir [--bin] [--cache]        Show ghr directories
 ```
 
+## Install
+
+It can be installed using uv, using pip, or manually from releases.
+
+```sh
+# uv
+uv tool install ghr-bin
+
+# pip
+python3 -m pip install ghr-bin
+```
+
 ### Examples
 
 ```sh
 # Install latest release
 ghr install ctaggart/zig
 
-# Install a specific tag (URL-encoded '+' handled transparently)
-ghr install ctaggart/zig@v0.16.0-dev.3153+d6f43caad
+# Install a specific tag
+ghr install ctaggart/zig@v0.16.0
 
 # Show where tools are stored
 ghr dir
@@ -40,16 +52,6 @@ Follows [uv tool](https://docs.astral.sh/uv/) conventions.
 
 Override with `GHR_BIN_DIR`, `GHR_TOOL_DIR`, `GHR_CACHE_DIR`.
 
-## Install
-
-```sh
-# uv (recommended)
-uv tool install ghr-bin
-
-# pip
-pip install ghr-bin
-```
-
 ## Uninstall
 
 ```sh
@@ -57,17 +59,7 @@ pip install ghr-bin
 uv tool uninstall ghr-bin
 
 # pip
-pip uninstall ghr-bin
-```
-
-## Build
-
-Requires [Zig](https://ziglang.org/) 0.15+.
-
-```sh
-zig build
-zig build run -- --help
-zig build test
+python -m pip uninstall ghr-bin -y
 ```
 
 ## License
