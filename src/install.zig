@@ -476,6 +476,7 @@ fn scanAppBundle(
 
 /// Link or copy an executable to the bin directory.
 fn linkToBin(
+    allocator: std.mem.Allocator,
     io: Io,
     tool_dir_path: []const u8,
     bin_dir: Dir,
@@ -491,22 +492,55 @@ fn linkToBin(
     }) catch return error.PathTooLong;
 
     if (builtin.os.tag == .windows) {
-        // Create a .cmd wrapper that runs the exe in its original directory
-        // so it can find sibling DLLs.
-        var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        // Use a shim .exe + .shim file instead of a .cmd wrapper.
+        // This works in cmd, PowerShell, Nushell, and any other shell,
+        // unlike .cmd wrappers which only work in cmd.exe.
+        // This is the same technique used by npm and Scoop on Windows.
         const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
             exe_name[0 .. exe_name.len - 4]
         else
             exe_name;
-        const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
 
+        // Write the .shim file with the target path
+        var shim_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const shim_name = std.fmt.bufPrint(&shim_name_buf, "{s}.shim", .{stem}) catch return error.PathTooLong;
+        bin_dir.deleteFile(io, shim_name) catch {};
+        var shim_file = bin_dir.createFile(io, shim_name, .{}) catch return error.CreateFailed;
+        defer shim_file.close(io);
+        var shim_buf: [4096]u8 = undefined;
+        var shim_w = shim_file.writer(io, &shim_buf);
+        shim_w.interface.print("{s}", .{src_path}) catch return error.WriteFailed;
+        shim_w.end() catch return error.WriteFailed;
+
+        // Copy shim.exe as <name>.exe
+        const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe"))
+            exe_name
+        else blk: {
+            var name_buf: [Dir.max_path_bytes]u8 = undefined;
+            break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return error.PathTooLong;
+        };
+        bin_dir.deleteFile(io, shim_exe_name) catch {};
+
+        // Find shim.exe next to ghr.exe
+        const ghr_dir_path = getGhrDir(allocator, io) catch {
+            // Fall back to .cmd if shim.exe not available
+            return createCmdWrapper(io, bin_dir, stem, src_path);
+        };
+        defer allocator.free(ghr_dir_path);
+
+        var ghr_dir = Dir.openDirAbsolute(io, ghr_dir_path, .{}) catch {
+            return createCmdWrapper(io, bin_dir, stem, src_path);
+        };
+        defer ghr_dir.close(io);
+
+        ghr_dir.copyFile("shim.exe", bin_dir, shim_exe_name, io, .{}) catch {
+            return createCmdWrapper(io, bin_dir, stem, src_path);
+        };
+
+        // Clean up any legacy .cmd wrapper from previous installs
+        var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
         bin_dir.deleteFile(io, cmd_name) catch {};
-        var cmd_file = bin_dir.createFile(io, cmd_name, .{}) catch return error.CreateFailed;
-        defer cmd_file.close(io);
-        var cmd_buf: [4096]u8 = undefined;
-        var cmd_w = cmd_file.writer(io, &cmd_buf);
-        cmd_w.interface.print("@\"{s}\" %*\r\n", .{src_path}) catch return error.WriteFailed;
-        cmd_w.end() catch return error.WriteFailed;
     } else {
         // Unix: symlink
         bin_dir.deleteFile(io, exe_name) catch {};
@@ -514,6 +548,39 @@ fn linkToBin(
     }
     try w.print("  linked {s}\n", .{exe_name});
 }
+
+/// Fall back to .cmd wrapper when shim.exe is not available.
+fn createCmdWrapper(io: Io, bin_dir: Dir, stem: []const u8, src_path: []const u8) !void {
+    var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
+    bin_dir.deleteFile(io, cmd_name) catch {};
+    var cmd_file = bin_dir.createFile(io, cmd_name, .{}) catch return error.CreateFailed;
+    defer cmd_file.close(io);
+    var cmd_buf: [4096]u8 = undefined;
+    var cmd_w = cmd_file.writer(io, &cmd_buf);
+    cmd_w.interface.print("@\"{s}\" %*\r\n", .{src_path}) catch return error.WriteFailed;
+    cmd_w.end() catch return error.WriteFailed;
+}
+
+/// Get the directory containing the ghr executable.
+fn getGhrDir(allocator: std.mem.Allocator, io: Io) ![]const u8 {
+    _ = io;
+    var path_buf_w: [std.Io.Dir.max_path_bytes / 2]u16 = undefined;
+    const len = GetModuleFileNameW(null, &path_buf_w, @intCast(path_buf_w.len));
+    if (len == 0) return error.SelfPathNotFound;
+    const self_path_w = path_buf_w[0..len];
+    var self_path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const self_path_len = std.unicode.wtf16LeToWtf8(&self_path_buf, self_path_w);
+    const self_path = self_path_buf[0..self_path_len];
+    const dir = std.fs.path.dirname(self_path) orelse return error.SelfPathNotFound;
+    return allocator.dupe(u8, dir);
+}
+
+extern "kernel32" fn GetModuleFileNameW(
+    hModule: ?std.os.windows.HANDLE,
+    lpFilename: [*]u16,
+    nSize: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.DWORD;
 
 /// Find .app bundles recursively in a directory. Returns relative paths from the root.
 fn findAppBundles(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
@@ -754,15 +821,30 @@ fn writeMetadata(
     try w.print("{{\"tag\":\"{s}\",\"asset\":\"{s}\",\"bins\":[", .{ tag, asset_name });
     for (bins, 0..) |bin, i| {
         if (i > 0) try w.print(",", .{});
-        try w.print("\"{s}\"", .{bin});
+        try w.print("\"", .{});
+        try writeJsonEscaped(w, bin);
+        try w.print("\"", .{});
     }
     try w.print("],\"apps\":[", .{});
     for (apps, 0..) |app, i| {
         if (i > 0) try w.print(",", .{});
-        try w.print("\"{s}\"", .{app});
+        try w.print("\"", .{});
+        try writeJsonEscaped(w, app);
+        try w.print("\"", .{});
     }
     try w.print("]}}\n", .{});
     try fw.end();
+}
+
+/// Write a string with JSON escaping (backslashes and quotes).
+fn writeJsonEscaped(w: *Writer, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '\\' => try w.print("\\\\", .{}),
+            '"' => try w.print("\\\"", .{}),
+            else => try w.print("{c}", .{c}),
+        }
+    }
 }
 
 /// Metadata stored in ghr.json.
@@ -778,9 +860,9 @@ fn readMetadata(allocator: std.mem.Allocator, io: Io, tool_dir_path: []const u8)
     parsed: std.json.Parsed(Metadata),
     body: []const u8,
 } {
-    const json_path = std.fmt.allocPrint(allocator, "{s}/ghr.json", .{tool_dir_path}) catch return null;
-    defer allocator.free(json_path);
-    const body = Dir.cwd().readFileAlloc(io, json_path, allocator, Io.Limit.limited(65536)) catch return null;
+    var dir = Dir.openDirAbsolute(io, tool_dir_path, .{}) catch return null;
+    defer dir.close(io);
+    const body = dir.readFileAlloc(io, "ghr.json", allocator, Io.Limit.limited(65536)) catch return null;
     const parsed = std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true }) catch {
         allocator.free(body);
         return null;
@@ -801,17 +883,22 @@ fn cleanupOldInstall(
     defer meta.parsed.deinit();
     defer allocator.free(meta.body);
 
-    // Remove old bin symlinks
     var bin_dir = Dir.openDirAbsolute(io, bin_path, .{}) catch return;
     defer bin_dir.close(io);
     for (meta.parsed.value.bins) |exe_rel| {
         const exe_name = std.fs.path.basename(exe_rel);
-        // Verify the symlink points to our tool dir before removing
-        var link_buf: [Dir.max_path_bytes]u8 = undefined;
-        const len = bin_dir.readLink(io, exe_name, &link_buf) catch continue;
-        const link_target = link_buf[0..len];
-        if (std.mem.startsWith(u8, link_target, tool_path)) {
-            bin_dir.deleteFile(io, exe_name) catch {};
+        if (builtin.os.tag == .windows) {
+            cleanupWindowsBinEntry(io, bin_dir, exe_name, tool_path);
+        } else {
+            // Verify the symlink points to our tool dir before removing
+            var link_buf: [Dir.max_path_bytes]u8 = undefined;
+            const len = bin_dir.readLink(io, exe_name, &link_buf) catch continue;
+            const link_target = link_buf[0..len];
+            if (std.mem.startsWith(u8, link_target, tool_path) and
+                (link_target.len == tool_path.len or link_target[tool_path.len] == '/'))
+            {
+                bin_dir.deleteFile(io, exe_name) catch {};
+            }
         }
     }
 
@@ -819,6 +906,43 @@ fn cleanupOldInstall(
     if (comptime builtin.os.tag.isDarwin()) {
         uninstallAppBundles(allocator, io, environ, meta.parsed.value.apps, tool_path, w);
     }
+}
+
+/// Remove shim .exe + .shim files or legacy .cmd for a single bin entry on Windows.
+fn cleanupWindowsBinEntry(io: Io, bin_dir: Dir, exe_name: []const u8, tool_path: []const u8) void {
+    const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
+        exe_name[0 .. exe_name.len - 4]
+    else
+        exe_name;
+
+    // Remove .shim file if it points to our tool dir
+    var shim_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const shim_name = std.fmt.bufPrint(&shim_name_buf, "{s}.shim", .{stem}) catch return;
+    if (shimPointsToToolDir(io, bin_dir, shim_name, tool_path)) {
+        bin_dir.deleteFile(io, shim_name) catch {};
+        // Remove the companion shim .exe
+        const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe")) exe_name else blk: {
+            var name_buf: [Dir.max_path_bytes]u8 = undefined;
+            break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return;
+        };
+        bin_dir.deleteFile(io, shim_exe_name) catch {};
+    }
+
+    // Also remove legacy .cmd wrapper if present
+    var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return;
+    bin_dir.deleteFile(io, cmd_name) catch {};
+}
+
+/// Check if a .shim file's target path starts with tool_path.
+fn shimPointsToToolDir(io: Io, bin_dir: Dir, shim_name: []const u8, tool_path: []const u8) bool {
+    var content_buf: [Dir.max_path_bytes]u8 = undefined;
+    const file = bin_dir.openFile(io, shim_name, .{}) catch return false;
+    defer file.close(io);
+    const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
+    const content = std.mem.trim(u8, content_buf[0..len], &[_]u8{ ' ', '\t', '\r', '\n' });
+    return std.mem.startsWith(u8, content, tool_path) and
+        (content.len == tool_path.len or content[tool_path.len] == '\\' or content[tool_path.len] == '/');
 }
 
 pub fn cmdUninstall(
@@ -865,12 +989,19 @@ pub fn cmdUninstall(
         for (m.parsed.value.bins) |exe_rel| {
             const exe_name = std.fs.path.basename(exe_rel);
             if (bin_dir) |bd| {
-                var link_buf: [Dir.max_path_bytes]u8 = undefined;
-                const len = bd.readLink(io, exe_name, &link_buf) catch continue;
-                const link_target = link_buf[0..len];
-                if (std.mem.startsWith(u8, link_target, tool_path)) {
-                    bd.deleteFile(io, exe_name) catch continue;
+                if (builtin.os.tag == .windows) {
+                    cleanupWindowsBinEntry(io, bd, exe_name, tool_path);
                     try w.print("  unlinked {s}\n", .{exe_name});
+                } else {
+                    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+                    const len = bd.readLink(io, exe_name, &link_buf) catch continue;
+                    const link_target = link_buf[0..len];
+                    if (std.mem.startsWith(u8, link_target, tool_path) and
+                        (link_target.len == tool_path.len or link_target[tool_path.len] == '/'))
+                    {
+                        bd.deleteFile(io, exe_name) catch continue;
+                        try w.print("  unlinked {s}\n", .{exe_name});
+                    }
                 }
             }
         }
@@ -1117,7 +1248,7 @@ pub fn cmdInstall(
 
     try w.print("linking executables:\n", .{});
     for (exes.items) |exe_name| {
-        linkToBin(io, tool_path, bin_dir, exe_name, w) catch |err| {
+        linkToBin(allocator, io, tool_path, bin_dir, exe_name, w) catch |err| {
             try err_w.print("warning: failed to link {s}: {}\n", .{ exe_name, err });
         };
     }

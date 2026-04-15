@@ -156,7 +156,7 @@ fn readToolTag(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_nam
         struct { tag: []const u8 },
         allocator,
         json_bytes,
-        .{},
+        .{ .ignore_unknown_fields = true },
     ) catch return null;
     defer parsed.deinit();
 
