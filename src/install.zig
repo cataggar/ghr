@@ -91,6 +91,7 @@ fn getRelease(
     owner: []const u8,
     repo: []const u8,
     tag: ?[]const u8,
+    auth_header: ?[]const u8,
 ) !ParsedRelease {
     const url = if (tag) |t| blk: {
         const encoded_tag = try urlEncode(allocator, t);
@@ -102,16 +103,51 @@ fn getRelease(
     var body_writer = std.Io.Writer.Allocating.init(allocator);
     errdefer body_writer.deinit();
 
+    const headers_with_auth = [_]std.http.Header{
+        .{ .name = "Accept", .value = "application/vnd.github+json" },
+        .{ .name = "User-Agent", .value = "ghr/" ++ version },
+        .{ .name = "Authorization", .value = auth_header orelse "" },
+    };
+    const headers_without_auth = [_]std.http.Header{
+        .{ .name = "Accept", .value = "application/vnd.github+json" },
+        .{ .name = "User-Agent", .value = "ghr/" ++ version },
+    };
+    const headers: []const std.http.Header = if (auth_header != null)
+        &headers_with_auth
+    else
+        &headers_without_auth;
+
     const result = try client.fetch(.{
         .location = .{ .url = url },
-        .extra_headers = &.{
-            .{ .name = "Accept", .value = "application/vnd.github+json" },
-            .{ .name = "User-Agent", .value = "ghr/" ++ version },
-        },
+        .extra_headers = headers,
         .response_writer = &body_writer.writer,
     });
 
     if (result.status != .ok) {
+        // Try to extract error message from response body
+        const err_body = body_writer.toOwnedSlice() catch null;
+        defer if (err_body) |b| allocator.free(b);
+
+        if (err_body) |b| {
+            if (std.json.parseFromSlice(
+                struct { message: []const u8, documentation_url: []const u8 = "" },
+                allocator,
+                b,
+                .{ .ignore_unknown_fields = true },
+            )) |parsed| {
+                defer parsed.deinit();
+                const msg = parsed.value.message;
+                // GitHub returns "API rate limit exceeded" for 403 when rate limited
+                if (result.status == .forbidden or result.status == .too_many_requests) {
+                    std.log.err("GitHub API: {s}", .{msg});
+                    if (auth_header == null) {
+                        std.log.err("hint: set GH_TOKEN for higher rate limits (5000/hr vs 60/hr)", .{});
+                    }
+                } else {
+                    std.log.err("GitHub API HTTP {d}: {s}", .{ @intFromEnum(result.status), msg });
+                }
+            } else |_| {}
+        }
         return error.GitHubApiError;
     }
 
@@ -236,6 +272,7 @@ fn downloadAsset(
     url: []const u8,
     dest_path: []const u8,
     debug_w: ?*Writer,
+    auth_header: ?[]const u8,
 ) !void {
     const max_retries: u8 = 5;
     var attempts: u8 = 0;
@@ -260,11 +297,21 @@ fn downloadAsset(
         var file_buf: [8192]u8 = undefined;
         var file_writer = file.writer(io, &file_buf);
 
+        const headers_with_auth = [_]std.http.Header{
+            .{ .name = "User-Agent", .value = "ghr/" ++ version },
+            .{ .name = "Authorization", .value = auth_header orelse "" },
+        };
+        const headers_without_auth = [_]std.http.Header{
+            .{ .name = "User-Agent", .value = "ghr/" ++ version },
+        };
+        const headers: []const std.http.Header = if (auth_header != null)
+            &headers_with_auth
+        else
+            &headers_without_auth;
+
         const result = client.fetch(.{
             .location = .{ .url = url },
-            .extra_headers = &.{
-                .{ .name = "User-Agent", .value = "ghr/" ++ version },
-            },
+            .extra_headers = headers,
             .response_writer = &file_writer.interface,
         }) catch |err| {
             debugLog(debug_w, "  attempt {d}/{d} fetch error: {}\n", .{ attempts + 1, max_retries, err });
@@ -1040,6 +1087,14 @@ pub fn cmdInstall(
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
+    // Check for GitHub auth token (GH_TOKEN, then GITHUB_TOKEN)
+    const token = environ.get("GH_TOKEN") orelse environ.get("GITHUB_TOKEN");
+    const auth_header: ?[]const u8 = if (token) |t|
+        try std.fmt.allocPrint(allocator, "Bearer {s}", .{t})
+    else
+        null;
+    defer if (auth_header) |h| allocator.free(h);
+
     try w.print("resolving {s}/{s}", .{ spec.owner, spec.repo });
     if (spec.tag) |t| try w.print("@{s}", .{t});
     try w.print(" ...\n", .{});
@@ -1053,7 +1108,7 @@ pub fn cmdInstall(
     defer client.deinit();
 
     // Get release info
-    var release = getRelease(allocator, &client, spec.owner, spec.repo, spec.tag) catch |err| {
+    var release = getRelease(allocator, &client, spec.owner, spec.repo, spec.tag, auth_header) catch |err| {
         switch (err) {
             error.GitHubApiError => {
                 try err_w.print("error: release not found for {s}/{s}", .{ spec.owner, spec.repo });
@@ -1099,10 +1154,11 @@ pub fn cmdInstall(
     const debug_w: ?*Writer = if (debug) err_w else null;
 
     debugLog(debug_w, "debug: ghr {s}\n", .{version});
+    debugLog(debug_w, "debug: auth: {s}\n", .{if (token != null) "GH_TOKEN" else if (environ.get("GITHUB_TOKEN") != null) "GITHUB_TOKEN" else "none"});
     debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
     debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
 
-    downloadAsset(allocator, io, &client, asset.browser_download_url, download_path, debug_w) catch |err| {
+    downloadAsset(allocator, io, &client, asset.browser_download_url, download_path, debug_w, auth_header) catch |err| {
         try err_w.print("error: download failed: {}\n", .{err});
         try err_w.print("  url: {s}\n", .{asset.browser_download_url});
         try err_w.flush();
