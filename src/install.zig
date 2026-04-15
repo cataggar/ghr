@@ -301,11 +301,6 @@ fn downloadAsset(
         };
         defer client.deinit();
 
-        var file = Dir.createFileAbsolute(io, dest_path, .{}) catch return error.DownloadFailed;
-        defer file.close(io);
-        var file_buf: [8192]u8 = undefined;
-        var file_writer = file.writer(io, &file_buf);
-
         const headers_with_auth = [_]std.http.Header{
             .{ .name = "User-Agent", .value = "ghr/" ++ version },
             .{ .name = "Authorization", .value = auth_header orelse "" },
@@ -313,17 +308,75 @@ fn downloadAsset(
         const headers_without_auth = [_]std.http.Header{
             .{ .name = "User-Agent", .value = "ghr/" ++ version },
         };
-        const headers: []const std.http.Header = if (auth_header != null)
+        const extra_headers: []const std.http.Header = if (auth_header != null)
             &headers_with_auth
         else
             &headers_without_auth;
 
-        const result = client.fetch(.{
-            .location = .{ .url = url },
-            .extra_headers = headers,
-            .response_writer = &file_writer.interface,
+        const uri = std.Uri.parse(url) catch {
+            debugLog(debug_w, "  invalid URL: {s}\n", .{url});
+            return error.DownloadFailed;
+        };
+
+        var req = client.request(.GET, uri, .{
+            .redirect_behavior = @enumFromInt(3),
+            .extra_headers = extra_headers,
         }) catch |err| {
-            debugLog(debug_w, "  attempt {d}/{d} fetch error: {}\n", .{ attempts + 1, max_retries, err });
+            debugLog(debug_w, "  attempt {d}/{d} request error: {}\n", .{ attempts + 1, max_retries, err });
+            if (attempts + 1 < max_retries) continue;
+            return error.DownloadFailed;
+        };
+        defer req.deinit();
+
+        req.sendBodiless() catch |err| {
+            debugLog(debug_w, "  attempt {d}/{d} send error: {}\n", .{ attempts + 1, max_retries, err });
+            if (attempts + 1 < max_retries) continue;
+            return error.DownloadFailed;
+        };
+
+        const redirect_buffer = allocator.alloc(u8, 8 * 1024) catch return error.DownloadFailed;
+        defer allocator.free(redirect_buffer);
+
+        var response = req.receiveHead(redirect_buffer) catch |err| {
+            debugLog(debug_w, "  attempt {d}/{d} receiveHead error: {}\n", .{ attempts + 1, max_retries, err });
+            if (attempts + 1 < max_retries) continue;
+            return error.DownloadFailed;
+        };
+
+        if (response.head.status != .ok) {
+            if (isTransientStatus(response.head.status)) {
+                debugLog(debug_w, "  attempt {d}/{d} HTTP {d} ({s})\n", .{
+                    attempts + 1,
+                    max_retries,
+                    @intFromEnum(response.head.status),
+                    @tagName(response.head.status),
+                });
+                // Log request details to help diagnose CDN errors
+                debugLogRequest(debug_w, &req, &response);
+                // Discard body to leave connection in clean state
+                const body_reader = response.reader(&.{});
+                _ = body_reader.discardRemaining() catch {};
+                if (attempts + 1 < max_retries) continue;
+            }
+            std.log.err("download failed with HTTP {d} ({s})", .{
+                @intFromEnum(response.head.status),
+                @tagName(response.head.status),
+            });
+            return error.DownloadFailed;
+        }
+
+        // Write response body to file
+        var file = Dir.createFileAbsolute(io, dest_path, .{}) catch return error.DownloadFailed;
+        defer file.close(io);
+        var file_buf: [8192]u8 = undefined;
+        var file_writer = file.writer(io, &file_buf);
+
+        var transfer_buffer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
+
+        _ = reader.streamRemaining(&file_writer.interface) catch |err| {
+            debugLog(debug_w, "  attempt {d}/{d} body read error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
@@ -334,27 +387,35 @@ fn downloadAsset(
             return error.DownloadFailed;
         };
 
-        if (result.status != .ok) {
-            if (isTransientStatus(result.status)) {
-                debugLog(debug_w, "  attempt {d}/{d} HTTP {d} ({s})\n", .{
-                    attempts + 1,
-                    max_retries,
-                    @intFromEnum(result.status),
-                    @tagName(result.status),
-                });
-                if (attempts + 1 < max_retries) continue;
-            }
-            std.log.err("download failed with HTTP {d} ({s})", .{
-                @intFromEnum(result.status),
-                @tagName(result.status),
-            });
-            return error.DownloadFailed;
-        }
         if (attempts > 0) {
             debugLog(debug_w, "  succeeded on attempt {d}/{d}\n", .{ attempts + 1, max_retries });
         }
         return;
     }
+}
+
+/// Log request and response details on failure for debugging.
+fn debugLogRequest(w: ?*Writer, req: *const std.http.Client.Request, response: *const std.http.Client.Response) void {
+    if (w == null) return;
+    const writer = w.?;
+
+    // Log the final URL (after redirects)
+    writer.print("  debug: final url: ", .{}) catch {};
+    req.uri.format(writer) catch {};
+    writer.print("\n", .{}) catch {};
+
+    // Log request headers that were sent
+    for (req.extra_headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "Authorization")) {
+            writer.print("  debug: request header: {s}: Bearer ***\n", .{header.name}) catch {};
+        } else {
+            writer.print("  debug: request header: {s}: {s}\n", .{ header.name, header.value }) catch {};
+        }
+    }
+
+    // Log response headers
+    writer.print("  debug: response headers:\n{s}\n", .{response.head.bytes}) catch {};
+    writer.flush() catch {};
 }
 
 fn debugLog(w: ?*Writer, comptime fmt: []const u8, args: anytype) void {
