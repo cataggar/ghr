@@ -569,6 +569,7 @@ fn linkToBin(
     exe_rel_path: []const u8,
     w: *Writer,
 ) !void {
+    _ = allocator;
     const exe_name = std.fs.path.basename(exe_rel_path);
     var src_path_buf: [Dir.max_path_bytes]u8 = undefined;
     const src_path = std.fmt.bufPrint(&src_path_buf, "{s}{c}{s}", .{
@@ -579,9 +580,11 @@ fn linkToBin(
 
     if (builtin.os.tag == .windows) {
         // Use a shim .exe + .shim file instead of a .cmd wrapper.
-        // This works in cmd, PowerShell, Nushell, and any other shell,
-        // unlike .cmd wrappers which only work in cmd.exe.
+        // The shim is embedded in ghr at build time so it's always available,
+        // regardless of how ghr is installed (PyPI, GitHub release, etc.).
         // This is the same technique used by npm and Scoop on Windows.
+        const shim_exe_bytes = @import("shim_exe").bytes;
+
         const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
             exe_name[0 .. exe_name.len - 4]
         else
@@ -598,7 +601,7 @@ fn linkToBin(
         shim_w.interface.print("{s}", .{src_path}) catch return error.WriteFailed;
         shim_w.end() catch return error.WriteFailed;
 
-        // Copy shim.exe as <name>.exe
+        // Write the embedded shim exe as <name>.exe
         const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe"))
             exe_name
         else blk: {
@@ -606,22 +609,9 @@ fn linkToBin(
             break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return error.PathTooLong;
         };
         bin_dir.deleteFile(io, shim_exe_name) catch {};
-
-        // Find shim.exe next to ghr.exe
-        const ghr_dir_path = getGhrDir(allocator, io) catch {
-            // Fall back to .cmd if shim.exe not available
-            return createCmdWrapper(io, bin_dir, stem, src_path);
-        };
-        defer allocator.free(ghr_dir_path);
-
-        var ghr_dir = Dir.openDirAbsolute(io, ghr_dir_path, .{}) catch {
-            return createCmdWrapper(io, bin_dir, stem, src_path);
-        };
-        defer ghr_dir.close(io);
-
-        ghr_dir.copyFile("shim.exe", bin_dir, shim_exe_name, io, .{}) catch {
-            return createCmdWrapper(io, bin_dir, stem, src_path);
-        };
+        var exe_file = bin_dir.createFile(io, shim_exe_name, .{}) catch return error.CreateFailed;
+        defer exe_file.close(io);
+        exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
 
         // Clean up any legacy .cmd wrapper from previous installs
         var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
@@ -634,39 +624,6 @@ fn linkToBin(
     }
     try w.print("  linked {s}\n", .{exe_name});
 }
-
-/// Fall back to .cmd wrapper when shim.exe is not available.
-fn createCmdWrapper(io: Io, bin_dir: Dir, stem: []const u8, src_path: []const u8) !void {
-    var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
-    const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
-    bin_dir.deleteFile(io, cmd_name) catch {};
-    var cmd_file = bin_dir.createFile(io, cmd_name, .{}) catch return error.CreateFailed;
-    defer cmd_file.close(io);
-    var cmd_buf: [4096]u8 = undefined;
-    var cmd_w = cmd_file.writer(io, &cmd_buf);
-    cmd_w.interface.print("@\"{s}\" %*\r\n", .{src_path}) catch return error.WriteFailed;
-    cmd_w.end() catch return error.WriteFailed;
-}
-
-/// Get the directory containing the ghr executable.
-fn getGhrDir(allocator: std.mem.Allocator, io: Io) ![]const u8 {
-    _ = io;
-    var path_buf_w: [std.Io.Dir.max_path_bytes / 2]u16 = undefined;
-    const len = GetModuleFileNameW(null, &path_buf_w, @intCast(path_buf_w.len));
-    if (len == 0) return error.SelfPathNotFound;
-    const self_path_w = path_buf_w[0..len];
-    var self_path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const self_path_len = std.unicode.wtf16LeToWtf8(&self_path_buf, self_path_w);
-    const self_path = self_path_buf[0..self_path_len];
-    const dir = std.fs.path.dirname(self_path) orelse return error.SelfPathNotFound;
-    return allocator.dupe(u8, dir);
-}
-
-extern "kernel32" fn GetModuleFileNameW(
-    hModule: ?std.os.windows.HANDLE,
-    lpFilename: [*]u16,
-    nSize: std.os.windows.DWORD,
-) callconv(.winapi) std.os.windows.DWORD;
 
 /// Find .app bundles recursively in a directory. Returns relative paths from the root.
 fn findAppBundles(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {

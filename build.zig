@@ -9,23 +9,6 @@ pub fn build(b: *std.Build) void {
     const exe_options = b.addOptions();
     exe_options.addOption([]const u8, "version", version_str);
 
-    // On Windows, build a small shim exe that replaces .cmd wrappers.
-    // The shim reads a companion .shim file to find the real executable.
-    // This is the same technique used by npm and Scoop on Windows.
-    const resolved_target = target.result;
-    if (resolved_target.os.tag == .windows) {
-        const shim = b.addExecutable(.{
-            .name = "shim",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/shim.zig"),
-                .target = target,
-                .optimize = .ReleaseSmall,
-                .strip = true,
-            }),
-        });
-        b.installArtifact(shim);
-    }
-
     const exe = b.addExecutable(.{
         .name = "ghr",
         .root_module = b.createModule(.{
@@ -39,6 +22,34 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
+
+    // On Windows, build a small shim exe and embed it inside ghr.
+    // The shim reads a companion .shim file to find the real executable.
+    // This is the same technique used by npm and Scoop on Windows.
+    const resolved_target = target.result;
+    if (resolved_target.os.tag == .windows) {
+        const shim = b.addExecutable(.{
+            .name = "shim",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/shim.zig"),
+                .target = target,
+                .optimize = .ReleaseSmall,
+                .strip = true,
+            }),
+        });
+        // Embed the compiled shim binary so it's always available at runtime,
+        // regardless of how ghr is installed (PyPI, GitHub release, etc.)
+        exe.root_module.addAnonymousImport("shim_exe", .{
+            .root_source_file = b.addWriteFiles().add(
+                "shim_exe.zig",
+                "pub const bytes = @embedFile(\"shim.exe\");",
+            ),
+            .imports = &.{.{
+                .name = "shim.exe",
+                .module = b.createModule(.{ .root_source_file = shim.getEmittedBin() }),
+            }},
+        });
+    }
 
     const run_step = b.step("run", "Run ghr");
     const run_cmd = b.addRunArtifact(exe);
