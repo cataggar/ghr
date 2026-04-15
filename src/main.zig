@@ -45,10 +45,13 @@ pub fn main(init: std.process.Init) !void {
         try cmdList(allocator, environ, io, &stdout.interface);
     } else if (eql(cmd_str, "install")) {
         var debug = false;
+        var no_auth = false;
         var spec: ?[]const u8 = null;
         while (args.next()) |arg| {
             if (eql(arg, "--debug")) {
                 debug = true;
+            } else if (eql(arg, "--no-auth")) {
+                no_auth = true;
             } else if (spec == null) {
                 spec = arg;
             }
@@ -58,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try install.cmdInstall(allocator, io, environ, spec_val, &stdout.interface, &stderr.interface, debug);
+        try install.cmdInstall(allocator, io, environ, spec_val, &stdout.interface, &stderr.interface, debug, no_auth);
     } else if (eql(cmd_str, "uninstall")) {
         const spec = args.next() orelse {
             try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
@@ -156,7 +159,7 @@ fn readToolTag(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_nam
         struct { tag: []const u8 },
         allocator,
         json_bytes,
-        .{},
+        .{ .ignore_unknown_fields = true },
     ) catch return null;
     defer parsed.deinit();
 
@@ -181,6 +184,7 @@ fn printUsage(w: *Writer) !void {
         \\    -h, --help      Print help
         \\    -V, --version   Print version
         \\    --debug         Show diagnostic output for debugging
+        \\    --no-auth       Skip GitHub authentication
         \\
     , .{});
 }

@@ -9,6 +9,23 @@ pub fn build(b: *std.Build) void {
     const exe_options = b.addOptions();
     exe_options.addOption([]const u8, "version", version_str);
 
+    // On Windows, build a small shim exe that replaces .cmd wrappers.
+    // The shim reads a companion .shim file to find the real executable.
+    // This is the same technique used by npm and Scoop on Windows.
+    const resolved_target = target.result;
+    if (resolved_target.os.tag == .windows) {
+        const shim = b.addExecutable(.{
+            .name = "shim",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/shim.zig"),
+                .target = target,
+                .optimize = .ReleaseSmall,
+                .strip = true,
+            }),
+        });
+        b.installArtifact(shim);
+    }
+
     const exe = b.addExecutable(.{
         .name = "ghr",
         .root_module = b.createModule(.{

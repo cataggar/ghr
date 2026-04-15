@@ -91,6 +91,7 @@ fn getRelease(
     owner: []const u8,
     repo: []const u8,
     tag: ?[]const u8,
+    auth_header: ?[]const u8,
 ) !ParsedRelease {
     const url = if (tag) |t| blk: {
         const encoded_tag = try urlEncode(allocator, t);
@@ -102,16 +103,51 @@ fn getRelease(
     var body_writer = std.Io.Writer.Allocating.init(allocator);
     errdefer body_writer.deinit();
 
+    const headers_with_auth = [_]std.http.Header{
+        .{ .name = "Accept", .value = "application/vnd.github+json" },
+        .{ .name = "User-Agent", .value = "ghr/" ++ version },
+        .{ .name = "Authorization", .value = auth_header orelse "" },
+    };
+    const headers_without_auth = [_]std.http.Header{
+        .{ .name = "Accept", .value = "application/vnd.github+json" },
+        .{ .name = "User-Agent", .value = "ghr/" ++ version },
+    };
+    const headers: []const std.http.Header = if (auth_header != null)
+        &headers_with_auth
+    else
+        &headers_without_auth;
+
     const result = try client.fetch(.{
         .location = .{ .url = url },
-        .extra_headers = &.{
-            .{ .name = "Accept", .value = "application/vnd.github+json" },
-            .{ .name = "User-Agent", .value = "ghr/" ++ version },
-        },
+        .extra_headers = headers,
         .response_writer = &body_writer.writer,
     });
 
     if (result.status != .ok) {
+        // Try to extract error message from response body
+        const err_body = body_writer.toOwnedSlice() catch null;
+        defer if (err_body) |b| allocator.free(b);
+
+        if (err_body) |b| {
+            if (std.json.parseFromSlice(
+                struct { message: []const u8, documentation_url: []const u8 = "" },
+                allocator,
+                b,
+                .{ .ignore_unknown_fields = true },
+            )) |parsed| {
+                defer parsed.deinit();
+                const msg = parsed.value.message;
+                // GitHub returns "API rate limit exceeded" for 403 when rate limited
+                if (result.status == .forbidden or result.status == .too_many_requests) {
+                    std.log.err("GitHub API: {s}", .{msg});
+                    if (auth_header == null) {
+                        std.log.err("hint: set GH_TOKEN for higher rate limits (5000/hr vs 60/hr)", .{});
+                    }
+                } else {
+                    std.log.err("GitHub API HTTP {d}: {s}", .{ @intFromEnum(result.status), msg });
+                }
+            } else |_| {}
+        }
         return error.GitHubApiError;
     }
 
@@ -236,6 +272,7 @@ fn downloadAsset(
     url: []const u8,
     dest_path: []const u8,
     debug_w: ?*Writer,
+    auth_header: ?[]const u8,
 ) !void {
     const max_retries: u8 = 5;
     var attempts: u8 = 0;
@@ -260,11 +297,21 @@ fn downloadAsset(
         var file_buf: [8192]u8 = undefined;
         var file_writer = file.writer(io, &file_buf);
 
+        const headers_with_auth = [_]std.http.Header{
+            .{ .name = "User-Agent", .value = "ghr/" ++ version },
+            .{ .name = "Authorization", .value = auth_header orelse "" },
+        };
+        const headers_without_auth = [_]std.http.Header{
+            .{ .name = "User-Agent", .value = "ghr/" ++ version },
+        };
+        const headers: []const std.http.Header = if (auth_header != null)
+            &headers_with_auth
+        else
+            &headers_without_auth;
+
         const result = client.fetch(.{
             .location = .{ .url = url },
-            .extra_headers = &.{
-                .{ .name = "User-Agent", .value = "ghr/" ++ version },
-            },
+            .extra_headers = headers,
             .response_writer = &file_writer.interface,
         }) catch |err| {
             debugLog(debug_w, "  attempt {d}/{d} fetch error: {}\n", .{ attempts + 1, max_retries, err });
@@ -320,6 +367,36 @@ fn isTransientStatus(status: std.http.Status) bool {
         => true,
         else => false,
     };
+}
+
+/// Run `gh auth token` to get a GitHub token from the gh CLI.
+/// Returns null if gh is not installed or the command fails.
+fn ghAuthToken(allocator: std.mem.Allocator, io: Io) ?[]const u8 {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "gh", "auth", "token" },
+        .stdout_limit = Io.Limit.limited(256),
+        .stderr_limit = Io.Limit.limited(0),
+    }) catch return null;
+    defer allocator.free(result.stderr);
+
+    if (result.term != .exited or result.term.exited != 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    // Trim trailing newline/whitespace and return owned copy
+    const trimmed = std.mem.trimEnd(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len == 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+
+    const token = allocator.dupe(u8, trimmed) catch {
+        allocator.free(result.stdout);
+        return null;
+    };
+    allocator.free(result.stdout);
+    return token;
 }
 
 /// Validate that a zip entry path is safe (no path traversal).
@@ -476,6 +553,7 @@ fn scanAppBundle(
 
 /// Link or copy an executable to the bin directory.
 fn linkToBin(
+    allocator: std.mem.Allocator,
     io: Io,
     tool_dir_path: []const u8,
     bin_dir: Dir,
@@ -491,22 +569,55 @@ fn linkToBin(
     }) catch return error.PathTooLong;
 
     if (builtin.os.tag == .windows) {
-        // Create a .cmd wrapper that runs the exe in its original directory
-        // so it can find sibling DLLs.
-        var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        // Use a shim .exe + .shim file instead of a .cmd wrapper.
+        // This works in cmd, PowerShell, Nushell, and any other shell,
+        // unlike .cmd wrappers which only work in cmd.exe.
+        // This is the same technique used by npm and Scoop on Windows.
         const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
             exe_name[0 .. exe_name.len - 4]
         else
             exe_name;
-        const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
 
+        // Write the .shim file with the target path
+        var shim_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const shim_name = std.fmt.bufPrint(&shim_name_buf, "{s}.shim", .{stem}) catch return error.PathTooLong;
+        bin_dir.deleteFile(io, shim_name) catch {};
+        var shim_file = bin_dir.createFile(io, shim_name, .{}) catch return error.CreateFailed;
+        defer shim_file.close(io);
+        var shim_buf: [4096]u8 = undefined;
+        var shim_w = shim_file.writer(io, &shim_buf);
+        shim_w.interface.print("{s}", .{src_path}) catch return error.WriteFailed;
+        shim_w.end() catch return error.WriteFailed;
+
+        // Copy shim.exe as <name>.exe
+        const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe"))
+            exe_name
+        else blk: {
+            var name_buf: [Dir.max_path_bytes]u8 = undefined;
+            break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return error.PathTooLong;
+        };
+        bin_dir.deleteFile(io, shim_exe_name) catch {};
+
+        // Find shim.exe next to ghr.exe
+        const ghr_dir_path = getGhrDir(allocator, io) catch {
+            // Fall back to .cmd if shim.exe not available
+            return createCmdWrapper(io, bin_dir, stem, src_path);
+        };
+        defer allocator.free(ghr_dir_path);
+
+        var ghr_dir = Dir.openDirAbsolute(io, ghr_dir_path, .{}) catch {
+            return createCmdWrapper(io, bin_dir, stem, src_path);
+        };
+        defer ghr_dir.close(io);
+
+        ghr_dir.copyFile("shim.exe", bin_dir, shim_exe_name, io, .{}) catch {
+            return createCmdWrapper(io, bin_dir, stem, src_path);
+        };
+
+        // Clean up any legacy .cmd wrapper from previous installs
+        var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
         bin_dir.deleteFile(io, cmd_name) catch {};
-        var cmd_file = bin_dir.createFile(io, cmd_name, .{}) catch return error.CreateFailed;
-        defer cmd_file.close(io);
-        var cmd_buf: [4096]u8 = undefined;
-        var cmd_w = cmd_file.writer(io, &cmd_buf);
-        cmd_w.interface.print("@\"{s}\" %*\r\n", .{src_path}) catch return error.WriteFailed;
-        cmd_w.end() catch return error.WriteFailed;
     } else {
         // Unix: symlink
         bin_dir.deleteFile(io, exe_name) catch {};
@@ -514,6 +625,39 @@ fn linkToBin(
     }
     try w.print("  linked {s}\n", .{exe_name});
 }
+
+/// Fall back to .cmd wrapper when shim.exe is not available.
+fn createCmdWrapper(io: Io, bin_dir: Dir, stem: []const u8, src_path: []const u8) !void {
+    var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
+    bin_dir.deleteFile(io, cmd_name) catch {};
+    var cmd_file = bin_dir.createFile(io, cmd_name, .{}) catch return error.CreateFailed;
+    defer cmd_file.close(io);
+    var cmd_buf: [4096]u8 = undefined;
+    var cmd_w = cmd_file.writer(io, &cmd_buf);
+    cmd_w.interface.print("@\"{s}\" %*\r\n", .{src_path}) catch return error.WriteFailed;
+    cmd_w.end() catch return error.WriteFailed;
+}
+
+/// Get the directory containing the ghr executable.
+fn getGhrDir(allocator: std.mem.Allocator, io: Io) ![]const u8 {
+    _ = io;
+    var path_buf_w: [std.Io.Dir.max_path_bytes / 2]u16 = undefined;
+    const len = GetModuleFileNameW(null, &path_buf_w, @intCast(path_buf_w.len));
+    if (len == 0) return error.SelfPathNotFound;
+    const self_path_w = path_buf_w[0..len];
+    var self_path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const self_path_len = std.unicode.wtf16LeToWtf8(&self_path_buf, self_path_w);
+    const self_path = self_path_buf[0..self_path_len];
+    const dir = std.fs.path.dirname(self_path) orelse return error.SelfPathNotFound;
+    return allocator.dupe(u8, dir);
+}
+
+extern "kernel32" fn GetModuleFileNameW(
+    hModule: ?std.os.windows.HANDLE,
+    lpFilename: [*]u16,
+    nSize: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.DWORD;
 
 /// Find .app bundles recursively in a directory. Returns relative paths from the root.
 fn findAppBundles(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
@@ -754,15 +898,30 @@ fn writeMetadata(
     try w.print("{{\"tag\":\"{s}\",\"asset\":\"{s}\",\"bins\":[", .{ tag, asset_name });
     for (bins, 0..) |bin, i| {
         if (i > 0) try w.print(",", .{});
-        try w.print("\"{s}\"", .{bin});
+        try w.print("\"", .{});
+        try writeJsonEscaped(w, bin);
+        try w.print("\"", .{});
     }
     try w.print("],\"apps\":[", .{});
     for (apps, 0..) |app, i| {
         if (i > 0) try w.print(",", .{});
-        try w.print("\"{s}\"", .{app});
+        try w.print("\"", .{});
+        try writeJsonEscaped(w, app);
+        try w.print("\"", .{});
     }
     try w.print("]}}\n", .{});
     try fw.end();
+}
+
+/// Write a string with JSON escaping (backslashes and quotes).
+fn writeJsonEscaped(w: *Writer, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '\\' => try w.print("\\\\", .{}),
+            '"' => try w.print("\\\"", .{}),
+            else => try w.print("{c}", .{c}),
+        }
+    }
 }
 
 /// Metadata stored in ghr.json.
@@ -778,9 +937,9 @@ fn readMetadata(allocator: std.mem.Allocator, io: Io, tool_dir_path: []const u8)
     parsed: std.json.Parsed(Metadata),
     body: []const u8,
 } {
-    const json_path = std.fmt.allocPrint(allocator, "{s}/ghr.json", .{tool_dir_path}) catch return null;
-    defer allocator.free(json_path);
-    const body = Dir.cwd().readFileAlloc(io, json_path, allocator, Io.Limit.limited(65536)) catch return null;
+    var dir = Dir.openDirAbsolute(io, tool_dir_path, .{}) catch return null;
+    defer dir.close(io);
+    const body = dir.readFileAlloc(io, "ghr.json", allocator, Io.Limit.limited(65536)) catch return null;
     const parsed = std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true }) catch {
         allocator.free(body);
         return null;
@@ -801,17 +960,22 @@ fn cleanupOldInstall(
     defer meta.parsed.deinit();
     defer allocator.free(meta.body);
 
-    // Remove old bin symlinks
     var bin_dir = Dir.openDirAbsolute(io, bin_path, .{}) catch return;
     defer bin_dir.close(io);
     for (meta.parsed.value.bins) |exe_rel| {
         const exe_name = std.fs.path.basename(exe_rel);
-        // Verify the symlink points to our tool dir before removing
-        var link_buf: [Dir.max_path_bytes]u8 = undefined;
-        const len = bin_dir.readLink(io, exe_name, &link_buf) catch continue;
-        const link_target = link_buf[0..len];
-        if (std.mem.startsWith(u8, link_target, tool_path)) {
-            bin_dir.deleteFile(io, exe_name) catch {};
+        if (builtin.os.tag == .windows) {
+            cleanupWindowsBinEntry(io, bin_dir, exe_name, tool_path);
+        } else {
+            // Verify the symlink points to our tool dir before removing
+            var link_buf: [Dir.max_path_bytes]u8 = undefined;
+            const len = bin_dir.readLink(io, exe_name, &link_buf) catch continue;
+            const link_target = link_buf[0..len];
+            if (std.mem.startsWith(u8, link_target, tool_path) and
+                (link_target.len == tool_path.len or link_target[tool_path.len] == '/'))
+            {
+                bin_dir.deleteFile(io, exe_name) catch {};
+            }
         }
     }
 
@@ -819,6 +983,43 @@ fn cleanupOldInstall(
     if (comptime builtin.os.tag.isDarwin()) {
         uninstallAppBundles(allocator, io, environ, meta.parsed.value.apps, tool_path, w);
     }
+}
+
+/// Remove shim .exe + .shim files or legacy .cmd for a single bin entry on Windows.
+fn cleanupWindowsBinEntry(io: Io, bin_dir: Dir, exe_name: []const u8, tool_path: []const u8) void {
+    const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
+        exe_name[0 .. exe_name.len - 4]
+    else
+        exe_name;
+
+    // Remove .shim file if it points to our tool dir
+    var shim_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const shim_name = std.fmt.bufPrint(&shim_name_buf, "{s}.shim", .{stem}) catch return;
+    if (shimPointsToToolDir(io, bin_dir, shim_name, tool_path)) {
+        bin_dir.deleteFile(io, shim_name) catch {};
+        // Remove the companion shim .exe
+        const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe")) exe_name else blk: {
+            var name_buf: [Dir.max_path_bytes]u8 = undefined;
+            break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return;
+        };
+        bin_dir.deleteFile(io, shim_exe_name) catch {};
+    }
+
+    // Also remove legacy .cmd wrapper if present
+    var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return;
+    bin_dir.deleteFile(io, cmd_name) catch {};
+}
+
+/// Check if a .shim file's target path starts with tool_path.
+fn shimPointsToToolDir(io: Io, bin_dir: Dir, shim_name: []const u8, tool_path: []const u8) bool {
+    var content_buf: [Dir.max_path_bytes]u8 = undefined;
+    const file = bin_dir.openFile(io, shim_name, .{}) catch return false;
+    defer file.close(io);
+    const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
+    const content = std.mem.trim(u8, content_buf[0..len], &[_]u8{ ' ', '\t', '\r', '\n' });
+    return std.mem.startsWith(u8, content, tool_path) and
+        (content.len == tool_path.len or content[tool_path.len] == '\\' or content[tool_path.len] == '/');
 }
 
 pub fn cmdUninstall(
@@ -865,12 +1066,19 @@ pub fn cmdUninstall(
         for (m.parsed.value.bins) |exe_rel| {
             const exe_name = std.fs.path.basename(exe_rel);
             if (bin_dir) |bd| {
-                var link_buf: [Dir.max_path_bytes]u8 = undefined;
-                const len = bd.readLink(io, exe_name, &link_buf) catch continue;
-                const link_target = link_buf[0..len];
-                if (std.mem.startsWith(u8, link_target, tool_path)) {
-                    bd.deleteFile(io, exe_name) catch continue;
+                if (builtin.os.tag == .windows) {
+                    cleanupWindowsBinEntry(io, bd, exe_name, tool_path);
                     try w.print("  unlinked {s}\n", .{exe_name});
+                } else {
+                    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+                    const len = bd.readLink(io, exe_name, &link_buf) catch continue;
+                    const link_target = link_buf[0..len];
+                    if (std.mem.startsWith(u8, link_target, tool_path) and
+                        (link_target.len == tool_path.len or link_target[tool_path.len] == '/'))
+                    {
+                        bd.deleteFile(io, exe_name) catch continue;
+                        try w.print("  unlinked {s}\n", .{exe_name});
+                    }
                 }
             }
         }
@@ -899,6 +1107,7 @@ pub fn cmdInstall(
     w: *Writer,
     err_w: *Writer,
     debug: bool,
+    no_auth: bool,
 ) !void {
     const spec = parseSpec(spec_str) catch {
         try err_w.print("error: invalid spec '{s}', expected owner/repo[@tag]\n", .{spec_str});
@@ -908,6 +1117,23 @@ pub fn cmdInstall(
 
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
+
+    // Resolve auth token: env vars first, then `gh auth token` as fallback
+    const token = if (no_auth)
+        @as(?[]const u8, null)
+    else
+        environ.get("GH_TOKEN") orelse environ.get("GITHUB_TOKEN") orelse ghAuthToken(allocator, io);
+    defer if (token) |t| {
+        // Only free if we allocated it (from ghAuthToken), not if it's from environ
+        if (environ.get("GH_TOKEN") == null and environ.get("GITHUB_TOKEN") == null) {
+            allocator.free(t);
+        }
+    };
+    const auth_header: ?[]const u8 = if (token) |t|
+        try std.fmt.allocPrint(allocator, "Bearer {s}", .{t})
+    else
+        null;
+    defer if (auth_header) |h| allocator.free(h);
 
     try w.print("resolving {s}/{s}", .{ spec.owner, spec.repo });
     if (spec.tag) |t| try w.print("@{s}", .{t});
@@ -922,7 +1148,7 @@ pub fn cmdInstall(
     defer client.deinit();
 
     // Get release info
-    var release = getRelease(allocator, &client, spec.owner, spec.repo, spec.tag) catch |err| {
+    var release = getRelease(allocator, &client, spec.owner, spec.repo, spec.tag, auth_header) catch |err| {
         switch (err) {
             error.GitHubApiError => {
                 try err_w.print("error: release not found for {s}/{s}", .{ spec.owner, spec.repo });
@@ -968,10 +1194,12 @@ pub fn cmdInstall(
     const debug_w: ?*Writer = if (debug) err_w else null;
 
     debugLog(debug_w, "debug: ghr {s}\n", .{version});
+    const auth_source: []const u8 = if (no_auth) "disabled" else if (environ.get("GH_TOKEN") != null) "GH_TOKEN" else if (environ.get("GITHUB_TOKEN") != null) "GITHUB_TOKEN" else if (token != null) "gh" else "none";
+    debugLog(debug_w, "debug: auth: {s}\n", .{auth_source});
     debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
     debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
 
-    downloadAsset(allocator, io, &client, asset.browser_download_url, download_path, debug_w) catch |err| {
+    downloadAsset(allocator, io, &client, asset.browser_download_url, download_path, debug_w, auth_header) catch |err| {
         try err_w.print("error: download failed: {}\n", .{err});
         try err_w.print("  url: {s}\n", .{asset.browser_download_url});
         try err_w.flush();
@@ -1117,7 +1345,7 @@ pub fn cmdInstall(
 
     try w.print("linking executables:\n", .{});
     for (exes.items) |exe_name| {
-        linkToBin(io, tool_path, bin_dir, exe_name, w) catch |err| {
+        linkToBin(allocator, io, tool_path, bin_dir, exe_name, w) catch |err| {
             try err_w.print("warning: failed to link {s}: {}\n", .{ exe_name, err });
         };
     }
@@ -1504,4 +1732,160 @@ test "findExecutables skips shared libraries" {
 
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("pencil2d", exes.items[0]);
+}
+
+test "urlEncode handles special characters" {
+    const allocator = std.testing.allocator;
+
+    const plain = try urlEncode(allocator, "v1.0.0");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("v1.0.0", plain);
+
+    const plus = try urlEncode(allocator, "v1.0.0+build");
+    defer allocator.free(plus);
+    try std.testing.expectEqualStrings("v1.0.0%2Bbuild", plus);
+
+    const space = try urlEncode(allocator, "my tag");
+    defer allocator.free(space);
+    try std.testing.expectEqualStrings("my%20tag", space);
+
+    const multi = try urlEncode(allocator, "a+b&c#d");
+    defer allocator.free(multi);
+    try std.testing.expectEqualStrings("a%2Bb%26c%23d", multi);
+
+    const percent = try urlEncode(allocator, "100%done");
+    defer allocator.free(percent);
+    try std.testing.expectEqualStrings("100%25done", percent);
+}
+
+test "isTransientStatus" {
+    try std.testing.expect(isTransientStatus(.bad_request));
+    try std.testing.expect(isTransientStatus(.request_timeout));
+    try std.testing.expect(isTransientStatus(.too_many_requests));
+    try std.testing.expect(isTransientStatus(.internal_server_error));
+    try std.testing.expect(isTransientStatus(.bad_gateway));
+    try std.testing.expect(isTransientStatus(.service_unavailable));
+    try std.testing.expect(isTransientStatus(.gateway_timeout));
+    try std.testing.expect(!isTransientStatus(.ok));
+    try std.testing.expect(!isTransientStatus(.not_found));
+    try std.testing.expect(!isTransientStatus(.forbidden));
+}
+
+test "writeJsonEscaped escapes backslashes and quotes" {
+    const allocator = std.testing.allocator;
+    var collected = std.Io.Writer.Allocating.init(allocator);
+    defer collected.deinit();
+
+    try writeJsonEscaped(&collected.writer, "no special chars");
+    const plain = try collected.toOwnedSlice();
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("no special chars", plain);
+
+    var collected2 = std.Io.Writer.Allocating.init(allocator);
+    defer collected2.deinit();
+    try writeJsonEscaped(&collected2.writer, "path\\to\\file");
+    const escaped = try collected2.toOwnedSlice();
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings("path\\\\to\\\\file", escaped);
+
+    var collected3 = std.Io.Writer.Allocating.init(allocator);
+    defer collected3.deinit();
+    try writeJsonEscaped(&collected3.writer, "say \"hello\"");
+    const quoted = try collected3.toOwnedSlice();
+    defer allocator.free(quoted);
+    try std.testing.expectEqualStrings("say \\\"hello\\\"", quoted);
+}
+
+test "writeMetadata and readMetadata round-trip" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bins = [_][]const u8{ "sub\\dir\\tool.exe", "other.exe" };
+    const apps = [_][]const u8{};
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.0.0", "tool-windows.zip", &bins, &apps);
+
+    // Verify it's valid JSON by reading it back
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
+    defer allocator.free(body);
+
+    // Backslashes must be escaped in JSON
+    try std.testing.expect(std.mem.indexOf(u8, body, "sub\\\\dir\\\\tool.exe") != null);
+
+    // Parse it back
+    const parsed = try std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("v1.0.0", parsed.value.tag);
+    try std.testing.expectEqualStrings("tool-windows.zip", parsed.value.asset);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.bins.len);
+    try std.testing.expectEqualStrings("sub\\dir\\tool.exe", parsed.value.bins[0]);
+    try std.testing.expectEqualStrings("other.exe", parsed.value.bins[1]);
+}
+
+test "readMetadata returns null for missing file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Get absolute path for the tmp dir
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const tmp_path = tmp.dir.realpath(std.testing.io, ".", &path_buf) catch return;
+    const result = readMetadata(allocator, std.testing.io, tmp_path);
+    try std.testing.expect(result == null);
+}
+
+test "shimPointsToToolDir validates path boundaries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create a .shim file pointing to a tool path
+    var f = try tmp.dir.createFile(std.testing.io, "tool.shim", .{});
+    var buf: [256]u8 = undefined;
+    var fw = f.writer(std.testing.io, &buf);
+    try fw.interface.print("C:\\tools\\owner\\repo\\bin\\tool.exe", .{});
+    try fw.end();
+    f.close(std.testing.io);
+
+    // Exact tool path prefix should match
+    try std.testing.expect(shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "tool.shim",
+        "C:\\tools\\owner\\repo",
+    ));
+
+    // Partial prefix that doesn't end at path boundary should NOT match
+    try std.testing.expect(!shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "tool.shim",
+        "C:\\tools\\owner\\rep",
+    ));
+
+    // Non-matching prefix
+    try std.testing.expect(!shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "tool.shim",
+        "C:\\other\\path",
+    ));
+
+    // Missing .shim file
+    try std.testing.expect(!shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "nonexistent.shim",
+        "C:\\tools\\owner\\repo",
+    ));
+}
+
+test "ghAuthToken returns token when gh is available" {
+    const allocator = std.testing.allocator;
+    const token = ghAuthToken(allocator, std.testing.io);
+    // gh may or may not be installed in the test environment;
+    // just verify no crash and that if returned, it's non-empty
+    if (token) |t| {
+        defer allocator.free(t);
+        try std.testing.expect(t.len > 0);
+    }
 }
