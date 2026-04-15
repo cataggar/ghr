@@ -23,9 +23,9 @@ fn deleteTreeAbsolute(io: Io, abs_path: []const u8) !void {
 /// HTTP write buffer size for download clients. GitHub release downloads redirect
 /// to CDN URLs with long signed query strings (~900 bytes). The default
 /// write_buffer_size of 1024 is too small, causing the request to be truncated
-/// and the CDN to return HTTP 400. We use 4096 to accommodate these URLs plus
-/// the request line and headers.
-const http_write_buffer_size = 4096;
+/// and the CDN to return HTTP 400. We use 8192 to accommodate these URLs plus
+/// the request line, headers, and TLS framing overhead.
+const http_write_buffer_size = 8192;
 const Spec = struct {
     owner: []const u8,
     repo: []const u8,
