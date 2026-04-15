@@ -285,10 +285,14 @@ fn downloadAsset(
             Dir.deleteFileAbsolute(io, dest_path) catch {};
         }
 
-        // Fresh client per attempt to get a new connection and SAS token
+        // Fresh client per attempt to get a new connection and SAS token.
+        // GitHub redirects to CDN URLs with long signed query strings (~900 bytes),
+        // so we need a larger write buffer than the 1024-byte default to avoid
+        // truncating the request and getting HTTP 400.
         var client: std.http.Client = .{
             .allocator = allocator,
             .io = io,
+            .write_buffer_size = 4096,
         };
         defer client.deinit();
 
@@ -1144,6 +1148,7 @@ pub fn cmdInstall(
     var client: std.http.Client = .{
         .allocator = allocator,
         .io = io,
+        .write_buffer_size = 4096,
     };
     defer client.deinit();
 
