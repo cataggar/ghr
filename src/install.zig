@@ -353,9 +353,22 @@ fn downloadAsset(
                 });
                 // Log request details to help diagnose CDN errors
                 debugLogRequest(debug_w, &req, &response);
-                // Discard body to leave connection in clean state
-                const body_reader = response.reader(&.{});
-                _ = body_reader.discardRemaining() catch {};
+                // Read and log error response body in debug mode
+                var err_transfer_buf: [64]u8 = undefined;
+                const body_reader = response.reader(&err_transfer_buf);
+                if (debug_w) |dw| {
+                    var body_w = Writer.Allocating.init(allocator);
+                    defer body_w.deinit();
+                    _ = body_reader.streamRemaining(&body_w.writer) catch {};
+                    if (body_w.toOwnedSlice()) |body| {
+                        defer allocator.free(body);
+                        if (body.len > 0)
+                            dw.print("  debug: response body ({d} bytes):\n{s}\n", .{ body.len, body }) catch {};
+                    } else |_| {}
+                    dw.flush() catch {};
+                } else {
+                    _ = body_reader.discardRemaining() catch {};
+                }
                 if (attempts + 1 < max_retries) continue;
             }
             std.log.err("download failed with HTTP {d} ({s})", .{
