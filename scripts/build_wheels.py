@@ -102,7 +102,9 @@ def build_wheel(
     else:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             for name in zf.namelist():
-                if name.endswith(f"/bin/{exe_name}"):
+                # PowerShell's Compress-Archive uses backslashes in zip entries
+                normalized = name.replace("\\", "/")
+                if normalized.endswith(f"/bin/{exe_name}"):
                     binary_data = zf.read(name)
                     break
 
