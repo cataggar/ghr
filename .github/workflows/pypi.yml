@@ -1,8 +1,9 @@
 name: Publish to PyPI
 
 on:
-  release:
-    types: [released]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
@@ -16,7 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      !contains(github.event.release.tag_name, 'dev')
+      (github.event.workflow_run.conclusion == 'success' &&
+       !contains(github.event.workflow_run.head_branch, 'dev'))
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -26,7 +28,7 @@ jobs:
           if [ -n "${{ inputs.version }}" ]; then
             V="${{ inputs.version }}"
           else
-            V="${{ github.event.release.tag_name }}"
+            V="${{ github.event.workflow_run.head_branch }}"
           fi
           echo "version=${V#v}" >> "$GITHUB_OUTPUT"
       - name: Build wheels
