@@ -77,6 +77,22 @@ jobs:
           else
             shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
           fi
+          # Create .zip with just the executable for winget
+          case "${{ matrix.target }}" in
+            *-windows)
+              ZIPNAME="$PKGNAME.zip"
+              if command -v zip &>/dev/null; then
+                zip -j "$ZIPNAME" "$PKGNAME/bin/ghr.exe"
+              else
+                powershell -Command "Compress-Archive -Path '$PKGNAME/bin/ghr.exe' -DestinationPath '$ZIPNAME'"
+              fi
+              if command -v sha256sum &>/dev/null; then
+                sha256sum "$ZIPNAME" > "$ZIPNAME.sha256"
+              else
+                shasum -a 256 "$ZIPNAME" > "$ZIPNAME.sha256"
+              fi
+              ;;
+          esac
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -84,7 +100,9 @@ jobs:
           name: ${{ matrix.name }}
           path: |
             ghr-*.tar.gz
-            ghr-*.sha256
+            ghr-*.tar.gz.sha256
+            ghr-*.zip
+            ghr-*.zip.sha256
 
   release:
     name: Create Release
@@ -108,6 +126,7 @@ jobs:
         with:
           subject-path: |
             ghr-*.tar.gz
+            ghr-*.zip
 
       - name: Create release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
@@ -124,6 +143,8 @@ jobs:
             ```
           files: |
             ghr-*.tar.gz
-            ghr-*.sha256
+            ghr-*.tar.gz.sha256
+            ghr-*.zip
+            ghr-*.zip.sha256
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}

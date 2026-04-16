@@ -1385,7 +1385,7 @@ pub fn cmdInstall(
         };
     }
 
-    try w.print("installed {s}/{s} @ {s}\n", .{ spec.owner, spec.repo, tag_name });
+    try w.print("installed {s}/{s}@{s}\n", .{ spec.owner, spec.repo, tag_name });
 }
 
 test "parseSpec with tag" {
