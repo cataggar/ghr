@@ -283,17 +283,12 @@ fn downloadAsset(
     var attempts: u8 = 0;
     while (attempts < max_retries) : (attempts += 1) {
         if (attempts > 0) {
-            // Exponential backoff: 1s, 2s, 4s, 8s
             const delay_s: i64 = @as(i64, 1) << @intCast(attempts - 1);
             debugLog(debug_w, "  retrying in {d}s ...\n", .{delay_s});
             io.sleep(Io.Duration.fromSeconds(delay_s), .real) catch {};
             Dir.deleteFileAbsolute(io, dest_path) catch {};
         }
 
-        // Fresh client per attempt to get a new connection and SAS token.
-        // GitHub redirects to CDN URLs with long signed query strings (~900 bytes),
-        // so we need a larger write buffer than the 1024-byte default to avoid
-        // truncating the request and getting HTTP 400.
         var client: std.http.Client = .{
             .allocator = allocator,
             .io = io,
@@ -301,119 +296,187 @@ fn downloadAsset(
         };
         defer client.deinit();
 
-        const headers_with_auth = [_]std.http.Header{
+        const ua_only = [_]std.http.Header{
+            .{ .name = "User-Agent", .value = "ghr/" ++ version },
+        };
+        const ua_and_auth = [_]std.http.Header{
             .{ .name = "User-Agent", .value = "ghr/" ++ version },
             .{ .name = "Authorization", .value = auth_header orelse "" },
         };
-        const headers_without_auth = [_]std.http.Header{
-            .{ .name = "User-Agent", .value = "ghr/" ++ version },
-        };
-        const extra_headers: []const std.http.Header = if (auth_header != null)
-            &headers_with_auth
-        else
-            &headers_without_auth;
 
         const uri = std.Uri.parse(url) catch {
             debugLog(debug_w, "  invalid URL: {s}\n", .{url});
             return error.DownloadFailed;
         };
 
+        // Use unhandled redirects so we can strip Authorization on
+        // cross-domain redirect (github.com -> CDN). Zig 0.16's
+        // privileged_headers field is not written by sendHead.
         var req = client.request(.GET, uri, .{
-            .redirect_behavior = @enumFromInt(3),
-            .extra_headers = extra_headers,
+            .redirect_behavior = .unhandled,
+            .extra_headers = if (auth_header != null) &ua_and_auth else &ua_only,
         }) catch |err| {
             debugLog(debug_w, "  attempt {d}/{d} request error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
-        defer req.deinit();
-
         req.sendBodiless() catch |err| {
+            req.deinit();
             debugLog(debug_w, "  attempt {d}/{d} send error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
 
-        const redirect_buffer = allocator.alloc(u8, 8 * 1024) catch return error.DownloadFailed;
-        defer allocator.free(redirect_buffer);
+        const head_buf = allocator.alloc(u8, 8 * 1024) catch return error.DownloadFailed;
+        defer allocator.free(head_buf);
 
-        var response = req.receiveHead(redirect_buffer) catch |err| {
+        var response = req.receiveHead(head_buf) catch |err| {
+            req.deinit();
             debugLog(debug_w, "  attempt {d}/{d} receiveHead error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
 
-        if (response.head.status != .ok) {
-            if (isTransientStatus(response.head.status)) {
-                debugLog(debug_w, "  attempt {d}/{d} HTTP {d} ({s})\n", .{
-                    attempts + 1,
-                    max_retries,
-                    @intFromEnum(response.head.status),
-                    @tagName(response.head.status),
-                });
-                // Log request details to help diagnose CDN errors
-                debugLogRequest(debug_w, &req, &response);
-                // Discard body to leave connection in clean state
-                const body_reader = response.reader(&.{});
-                _ = body_reader.discardRemaining() catch {};
-                if (attempts + 1 < max_retries) continue;
-            }
-            std.log.err("download failed with HTTP {d} ({s})", .{
-                @intFromEnum(response.head.status),
-                @tagName(response.head.status),
-            });
-            return error.DownloadFailed;
+        if (response.head.status.class() != .redirect) {
+            defer req.deinit();
+            const result = handleDownloadResponse(allocator, io, &response, dest_path, debug_w, attempts, max_retries) catch |err| {
+                if (err == error.DownloadFailed) return err;
+                return err;
+            };
+            if (result) return; // success
+            continue; // retry
         }
 
-        // Write response body to file
-        var file = Dir.createFileAbsolute(io, dest_path, .{}) catch return error.DownloadFailed;
-        defer file.close(io);
-        var file_buf: [8192]u8 = undefined;
-        var file_writer = file.writer(io, &file_buf);
+        // Follow redirect without Authorization header
+        const location = response.head.location orelse {
+            req.deinit();
+            debugLog(debug_w, "  redirect without Location header\n", .{});
+            return error.DownloadFailed;
+        };
+        const redirect_url = try allocator.dupe(u8, location);
+        defer allocator.free(redirect_url);
 
-        var transfer_buffer: [64]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
+        // Discard redirect body and release connection
+        var redir_buf: [64]u8 = undefined;
+        const redir_reader = response.reader(&redir_buf);
+        _ = redir_reader.discardRemaining() catch {};
+        req.deinit();
 
-        _ = reader.streamRemaining(&file_writer.interface) catch |err| {
-            debugLog(debug_w, "  attempt {d}/{d} body read error: {}\n", .{ attempts + 1, max_retries, err });
+        debugLog(debug_w, "  debug: redirect: {s}\n", .{redirect_url});
+
+        var cdn_client: std.http.Client = .{
+            .allocator = allocator,
+            .io = io,
+            .write_buffer_size = http_write_buffer_size,
+        };
+        defer cdn_client.deinit();
+
+        const cdn_uri = std.Uri.parse(redirect_url) catch {
+            debugLog(debug_w, "  invalid redirect URL\n", .{});
+            return error.DownloadFailed;
+        };
+
+        var cdn_req = cdn_client.request(.GET, cdn_uri, .{
+            .redirect_behavior = @enumFromInt(3),
+            .extra_headers = &ua_only,
+        }) catch |err| {
+            debugLog(debug_w, "  attempt {d}/{d} CDN request error: {}\n", .{ attempts + 1, max_retries, err });
+            if (attempts + 1 < max_retries) continue;
+            return error.DownloadFailed;
+        };
+        defer cdn_req.deinit();
+
+        cdn_req.sendBodiless() catch |err| {
+            debugLog(debug_w, "  attempt {d}/{d} CDN send error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
 
-        file_writer.end() catch |err| {
-            debugLog(debug_w, "  attempt {d}/{d} write error: {}\n", .{ attempts + 1, max_retries, err });
+        const cdn_head_buf = allocator.alloc(u8, 8 * 1024) catch return error.DownloadFailed;
+        defer allocator.free(cdn_head_buf);
+
+        var cdn_response = cdn_req.receiveHead(cdn_head_buf) catch |err| {
+            debugLog(debug_w, "  attempt {d}/{d} CDN receiveHead error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
             return error.DownloadFailed;
         };
 
-        if (attempts > 0) {
-            debugLog(debug_w, "  succeeded on attempt {d}/{d}\n", .{ attempts + 1, max_retries });
-        }
-        return;
+        const result = handleDownloadResponse(allocator, io, &cdn_response, dest_path, debug_w, attempts, max_retries) catch |err| {
+            if (err == error.DownloadFailed) return err;
+            return err;
+        };
+        if (result) return;
+        continue;
     }
 }
 
-/// Log request and response details on failure for debugging.
-fn debugLogRequest(w: ?*Writer, req: *const std.http.Client.Request, response: *const std.http.Client.Response) void {
-    if (w == null) return;
-    const writer = w.?;
+/// Handle the download response: check status, write body to file.
+/// Returns true on success, false to retry.
+fn handleDownloadResponse(
+    allocator: std.mem.Allocator,
+    io: Io,
+    response: *std.http.Client.Response,
+    dest_path: []const u8,
+    debug_w: ?*Writer,
+    attempt: u8,
+    max_retries: u8,
+) !bool {
+    if (response.head.status != .ok) {
+        var err_buf: [64]u8 = undefined;
+        const body_reader = response.reader(&err_buf);
+        var body_w = Writer.Allocating.init(allocator);
+        defer body_w.deinit();
+        _ = body_reader.streamRemaining(&body_w.writer) catch {};
+        const err_body = body_w.toOwnedSlice() catch null;
+        defer if (err_body) |b| allocator.free(b);
 
-    // Log the final URL (after redirects)
-    writer.print("  debug: final url: ", .{}) catch {};
-    req.uri.format(writer) catch {};
-    writer.print("\n", .{}) catch {};
-
-    // Log request headers that were sent
-    for (req.extra_headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "Authorization")) {
-            writer.print("  debug: request header: {s}: Bearer ***\n", .{header.name}) catch {};
-        } else {
-            writer.print("  debug: request header: {s}: {s}\n", .{ header.name, header.value }) catch {};
+        if (response.head.status == .bad_request) {
+            std.log.err("download failed with HTTP 400 (bad_request)", .{});
+            if (err_body) |b| {
+                if (b.len > 0) std.log.err("{s}", .{b});
+            }
+            return error.DownloadFailed;
         }
+
+        if (isTransientStatus(response.head.status)) {
+            debugLog(debug_w, "  attempt {d}/{d} HTTP {d} ({s})\n", .{
+                attempt + 1, max_retries,
+                @intFromEnum(response.head.status), @tagName(response.head.status),
+            });
+            if (debug_w) |dw| {
+                if (err_body) |b| {
+                    if (b.len > 0)
+                        dw.print("  debug: response body ({d} bytes):\n{s}\n", .{ b.len, b }) catch {};
+                }
+                dw.flush() catch {};
+            }
+            if (attempt + 1 < max_retries) return false;
+        }
+        std.log.err("download failed with HTTP {d} ({s})", .{
+            @intFromEnum(response.head.status), @tagName(response.head.status),
+        });
+        return error.DownloadFailed;
     }
 
-    // Log response headers
+    var file = Dir.createFileAbsolute(io, dest_path, .{}) catch return error.DownloadFailed;
+    defer file.close(io);
+    var file_buf: [8192]u8 = undefined;
+    var file_writer = file.writer(io, &file_buf);
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
+
+    _ = reader.streamRemaining(&file_writer.interface) catch return error.DownloadFailed;
+    file_writer.end() catch return error.DownloadFailed;
+
+    return true;
+}
+
+/// Log response details on failure for debugging.
+fn debugLogResponse(w: ?*Writer, response: *const std.http.Client.Response) void {
+    if (w == null) return;
+    const writer = w.?;
     writer.print("  debug: response headers:\n{s}\n", .{response.head.bytes}) catch {};
     writer.flush() catch {};
 }
@@ -427,7 +490,6 @@ fn debugLog(w: ?*Writer, comptime fmt: []const u8, args: anytype) void {
 
 fn isTransientStatus(status: std.http.Status) bool {
     return switch (status) {
-        .bad_request, // GitHub CDN transiently returns 400
         .request_timeout,
         .too_many_requests,
         .internal_server_error,
@@ -1787,7 +1849,7 @@ test "urlEncode handles special characters" {
 }
 
 test "isTransientStatus" {
-    try std.testing.expect(isTransientStatus(.bad_request));
+    try std.testing.expect(!isTransientStatus(.bad_request));
     try std.testing.expect(isTransientStatus(.request_timeout));
     try std.testing.expect(isTransientStatus(.too_many_requests));
     try std.testing.expect(isTransientStatus(.internal_server_error));
