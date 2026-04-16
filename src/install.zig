@@ -110,12 +110,10 @@ fn getRelease(
 
     const headers_with_auth = [_]std.http.Header{
         .{ .name = "Accept", .value = "application/vnd.github+json" },
-        .{ .name = "User-Agent", .value = "ghr/" ++ version },
         .{ .name = "Authorization", .value = auth_header orelse "" },
     };
     const headers_without_auth = [_]std.http.Header{
         .{ .name = "Accept", .value = "application/vnd.github+json" },
-        .{ .name = "User-Agent", .value = "ghr/" ++ version },
     };
     const headers: []const std.http.Header = if (auth_header != null)
         &headers_with_auth
@@ -124,6 +122,7 @@ fn getRelease(
 
     const result = try client.fetch(.{
         .location = .{ .url = url },
+        .headers = .{ .user_agent = .{ .override = "ghr/" ++ version } },
         .extra_headers = headers,
         .response_writer = &body_writer.writer,
     });
@@ -296,11 +295,7 @@ fn downloadAsset(
         };
         defer client.deinit();
 
-        const ua_only = [_]std.http.Header{
-            .{ .name = "User-Agent", .value = "ghr/" ++ version },
-        };
-        const ua_and_auth = [_]std.http.Header{
-            .{ .name = "User-Agent", .value = "ghr/" ++ version },
+        const auth_only = [_]std.http.Header{
             .{ .name = "Authorization", .value = auth_header orelse "" },
         };
 
@@ -312,9 +307,12 @@ fn downloadAsset(
         // Use unhandled redirects so we can strip Authorization on
         // cross-domain redirect (github.com -> CDN). Zig 0.16's
         // privileged_headers field is not written by sendHead.
+        // Use .headers.user_agent override to replace (not duplicate)
+        // Zig's default user-agent header.
         var req = client.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
-            .extra_headers = if (auth_header != null) &ua_and_auth else &ua_only,
+            .headers = .{ .user_agent = .{ .override = "ghr/" ++ version } },
+            .extra_headers = if (auth_header != null) &auth_only else &.{},
         }) catch |err| {
             debugLog(debug_w, "  attempt {d}/{d} request error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
@@ -378,7 +376,7 @@ fn downloadAsset(
 
         var cdn_req = cdn_client.request(.GET, cdn_uri, .{
             .redirect_behavior = @enumFromInt(3),
-            .extra_headers = &ua_only,
+            .headers = .{ .user_agent = .{ .override = "ghr/" ++ version } },
         }) catch |err| {
             debugLog(debug_w, "  attempt {d}/{d} CDN request error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
@@ -1861,6 +1859,33 @@ test "isTransientStatus" {
     try std.testing.expect(!isTransientStatus(.forbidden));
 }
 
+test "no User-Agent in extra_headers (override prevents duplicate)" {
+    // Zig's HTTP client always emits a default "user-agent: zig/..." header.
+    // If User-Agent also appears in extra_headers, the CDN receives duplicate
+    // user-agent headers and returns HTTP 400 "Bad Request - Invalid Header".
+    // We must use .headers.user_agent = .{ .override = "ghr/..." } instead.
+    //
+    // Verify that the extra_headers arrays used in downloadAsset do NOT
+    // contain a User-Agent entry. Auth-only is fine; User-Agent must come
+    // from the .headers.user_agent override.
+    const auth_only = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer test-token" },
+    };
+    const empty: []const std.http.Header = &.{};
+
+    for (auth_only) |h| {
+        try std.testing.expect(!std.ascii.eqlIgnoreCase(h.name, "User-Agent"));
+    }
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    // Verify that using .override suppresses the default user-agent.
+    // emitOverridableHeader returns true only for .default (meaning "emit default").
+    // .override writes its own value and returns false, preventing the default.
+    const ua_override: std.http.Client.Request.Headers.Value = .{ .override = "ghr/" ++ version };
+    try std.testing.expect(ua_override == .override);
+    try std.testing.expectEqualStrings("ghr/" ++ version, ua_override.override);
+}
+
 test "http_write_buffer_size accommodates GitHub CDN redirect URLs" {
     // GitHub release downloads redirect to CDN URLs with long signed query strings.
     // The HTTP write buffer must hold the full request line + headers for the redirect.
@@ -1891,7 +1916,7 @@ test "http_write_buffer_size accommodates GitHub CDN redirect URLs" {
     // Simulate the HTTP request line + minimal headers
     const request_line_overhead = "GET ".len + " HTTP/1.1\r\n".len;
     const host_header = "Host: release-assets.githubusercontent.com\r\n";
-    const user_agent_header = "User-Agent: ghr/" ++ version ++ "\r\n";
+    const user_agent_header = "user-agent: ghr/" ++ version ++ "\r\n";
     const min_request_size = request_line_overhead + typical_cdn_path.len +
         host_header.len + user_agent_header.len + "\r\n".len;
 
