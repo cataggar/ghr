@@ -67,14 +67,19 @@ def sha256_digest(data: bytes) -> str:
     return urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
 
 
-def download_asset(release_version: str, platform_key: str) -> bytes:
-    """Download a ghr release asset."""
-    asset_name = f"ghr-{release_version}-{platform_key}.tar.gz"
-    url = f"https://github.com/{GHR_REPO}/releases/download/v{release_version}/{asset_name}"
-    print(f"  Downloading {asset_name} ...")
-    resp = requests.get(url, allow_redirects=True, timeout=300)
-    resp.raise_for_status()
-    return resp.content
+def download_asset(release_version: str, platform_key: str) -> tuple[bytes, str]:
+    """Download a ghr release asset. Returns (data, format) where format is 'tar.gz' or 'zip'."""
+    for fmt in ("tar.gz", "zip"):
+        asset_name = f"ghr-{release_version}-{platform_key}.{fmt}"
+        url = f"https://github.com/{GHR_REPO}/releases/download/v{release_version}/{asset_name}"
+        print(f"  Downloading {asset_name} ...")
+        resp = requests.get(url, allow_redirects=True, timeout=300)
+        if resp.status_code == 200:
+            return resp.content, fmt
+        if resp.status_code != 404:
+            resp.raise_for_status()
+        print(f"    not found, trying next format...")
+    raise RuntimeError(f"No release asset found for {platform_key} v{release_version}")
 
 
 def build_wheel(
@@ -82,16 +87,23 @@ def build_wheel(
     dist_dir: Path, release_version: str | None = None,
 ) -> Path:
     """Build a single platform wheel with native binary in data/scripts/."""
-    data = download_asset(release_version or version, platform_key)
+    data, fmt = download_asset(release_version or version, platform_key)
 
-    # Extract the binary from the tarball
+    # Extract the binary from the archive
     binary_data: bytes | None = None
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-        for m in tf.getmembers():
-            if m.isfile() and m.name.endswith(f"/bin/{exe_name}"):
-                f = tf.extractfile(m)
-                if f is not None:
-                    binary_data = f.read()
+    if fmt == "tar.gz":
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            for m in tf.getmembers():
+                if m.isfile() and m.name.endswith(f"/bin/{exe_name}"):
+                    f = tf.extractfile(m)
+                    if f is not None:
+                        binary_data = f.read()
+                        break
+    else:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in zf.namelist():
+                if name.endswith(f"/bin/{exe_name}"):
+                    binary_data = zf.read(name)
                     break
 
     if binary_data is None:
