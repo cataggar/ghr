@@ -28,10 +28,10 @@ python3 -m pip install ghr-bin
 
 ```sh
 # Install latest release
-ghr install ctaggart/zig
+ghr install burntsushi/ripgrep
 
 # Install a specific tag
-ghr install ctaggart/zig@v0.16.0
+ghr install burntsushi/ripgrep@15.1.0
 
 # Show where tools are stored
 ghr dir
