@@ -71,25 +71,25 @@ jobs:
           esac
           cp "zig-out/bin/ghr${EXT}" "$PKGNAME/bin/"
           cp LICENSE README.md "$PKGNAME/" 2>/dev/null || true
-          tar czf "$PKGNAME.tar.gz" "$PKGNAME"
-          if command -v sha256sum &>/dev/null; then
-            sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-          else
-            shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-          fi
-          # Create .zip with just the executable for winget
           case "${{ matrix.target }}" in
             *-windows)
-              ZIPNAME="$PKGNAME.zip"
               if command -v zip &>/dev/null; then
-                zip -j "$ZIPNAME" "$PKGNAME/bin/ghr.exe"
+                zip -r "$PKGNAME.zip" "$PKGNAME"
               else
-                powershell -Command "Compress-Archive -Path '$PKGNAME/bin/ghr.exe' -DestinationPath '$ZIPNAME'"
+                powershell -Command "Compress-Archive -Path '$PKGNAME' -DestinationPath '$PKGNAME.zip'"
               fi
               if command -v sha256sum &>/dev/null; then
-                sha256sum "$ZIPNAME" > "$ZIPNAME.sha256"
+                sha256sum "$PKGNAME.zip" > "$PKGNAME.zip.sha256"
               else
-                shasum -a 256 "$ZIPNAME" > "$ZIPNAME.sha256"
+                shasum -a 256 "$PKGNAME.zip" > "$PKGNAME.zip.sha256"
+              fi
+              ;;
+            *)
+              tar czf "$PKGNAME.tar.gz" "$PKGNAME"
+              if command -v sha256sum &>/dev/null; then
+                sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
+              else
+                shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
               fi
               ;;
           esac
