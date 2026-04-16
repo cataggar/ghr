@@ -135,7 +135,7 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
             const tag = readToolTag(allocator, io, owner_dir, repo_entry.name);
             defer if (tag) |t| allocator.free(t);
             if (tag) |t| {
-                try w.print("{s}/{s} @ {s}\n", .{ entry.name, repo_entry.name, t });
+                try w.print("{s}/{s}@{s}\n", .{ entry.name, repo_entry.name, t });
             } else {
                 try w.print("{s}/{s}\n", .{ entry.name, repo_entry.name });
             }

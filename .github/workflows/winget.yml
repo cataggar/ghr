@@ -1,0 +1,40 @@
+name: Publish to winget
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.2.0)"
+        required: true
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    environment: winget
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.release.tag_name, 'dev')
+    steps:
+      - name: Extract version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="${{ github.event.release.tag_name }}"
+          fi
+          echo "version=${V#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to winget
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: cataggar.ghr
+          version: ${{ steps.version.outputs.version }}
+          release-tag: v${{ steps.version.outputs.version }}
+          installers-regex: '\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}
