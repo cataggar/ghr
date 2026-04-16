@@ -40,7 +40,7 @@ jobs:
           - os: ubuntu-22.04
             target: aarch64-linux-musl
             name: linux-musl-arm64
-          - os: ubuntu-22.04
+          - os: windows-latest
             target: aarch64-windows
             name: windows-arm64
 
@@ -59,6 +59,27 @@ jobs:
 
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ steps.version.outputs.version }}"
+
+      - name: Azure login (for signing)
+        if: endsWith(matrix.target, '-windows')
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binary with Trusted Signing
+        if: endsWith(matrix.target, '-windows')
+        uses: azure/trusted-signing-action@0d74250c4f7cd3bb9cbeaf18a5b0b3f18cc7d17c # v0.5.9
+        with:
+          endpoint: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.TRUSTED_SIGNING_PROFILE }}
+          files-folder: zig-out/bin
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Package
         shell: bash
