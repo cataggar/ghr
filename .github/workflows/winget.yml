@@ -1,8 +1,10 @@
 name: Publish to winget
 
 on:
-  release:
-    types: [released]
+  # Disabled until initial manual submission to winget-pkgs is published.
+  # After that, re-enable by uncommenting the release trigger.
+  # release:
+  #   types: [released]
   workflow_dispatch:
     inputs:
       version:
