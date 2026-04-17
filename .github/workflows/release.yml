@@ -70,7 +70,7 @@ jobs:
 
       - name: Sign Windows binary with Trusted Signing
         if: endsWith(matrix.target, '-windows')
-        uses: azure/trusted-signing-action@0d74250c4f7cd3bb9cbeaf18a5b0b3f18cc7d17c # v0.5.9
+        uses: azure/trusted-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16 # v1.2.0
         with:
           endpoint: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
