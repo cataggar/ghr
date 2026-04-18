@@ -214,13 +214,17 @@ fn readFileAllOptional(
     io: Io,
     path: []const u8,
 ) !?[]u8 {
-    const f = Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+    const parent_path = std.fs.path.dirname(path) orelse return null;
+    const basename = std.fs.path.basename(path);
+    var parent = Dir.openDirAbsolute(io, parent_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer f.close(io);
-    // 1 MiB cap for rc files is plenty.
-    return try f.readToEndAlloc(io, allocator, Io.Limit.limited(1024 * 1024));
+    defer parent.close(io);
+    return parent.readFileAlloc(io, basename, allocator, Io.Limit.limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
 }
 
 fn writeFileAtomic(
@@ -251,26 +255,30 @@ fn writeFileAtomic(
 
 fn ensureParentDir(io: Io, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
-    Dir.makeDirAbsolute(io, parent) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => |e| return e,
-    };
+    makeDirRecursiveAbs(io, parent) catch {};
 }
 
 fn makeDirRecursiveAbs(io: Io, path: []const u8) !void {
-    Dir.makeDirAbsolute(io, path) catch |err| switch (err) {
+    Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         error.FileNotFound => {
             const parent = std.fs.path.dirname(path) orelse return err;
             try makeDirRecursiveAbs(io, parent);
-            try Dir.makeDirAbsolute(io, path);
+            Dir.createDirAbsolute(io, path, .default_dir) catch |err2| switch (err2) {
+                error.PathAlreadyExists => return,
+                else => return err2,
+            };
         },
         else => |e| return e,
     };
 }
 
 fn pathExists(io: Io, path: []const u8) bool {
-    _ = Dir.cwd().statFile(io, path, .{}) catch return false;
+    const parent_path = std.fs.path.dirname(path) orelse return false;
+    const basename = std.fs.path.basename(path);
+    var parent = Dir.openDirAbsolute(io, parent_path, .{}) catch return false;
+    defer parent.close(io);
+    _ = parent.statFile(io, basename, .{}) catch return false;
     return true;
 }
 
