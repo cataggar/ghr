@@ -196,6 +196,27 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Like containsIgnoreCase, but requires a left word-boundary: the character
+/// preceding the match (if any) must not be an ASCII letter. This prevents
+/// short keywords like "win" from matching inside unrelated words like
+/// "darwin" (where the 'r' precedes 'win').
+fn containsIgnoreCaseBounded(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (i > 0 and std.ascii.isAlphabetic(haystack[i - 1])) continue;
+        var match = true;
+        for (0..needle.len) |j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 /// Returns true if the asset looks installable (zip, tar.gz, tgz).
 fn isInstallableAsset(name: []const u8) bool {
     const lower_buf = name; // we'll check case-insensitively
@@ -236,13 +257,13 @@ fn findBestAsset(assets: []const Asset) !Asset {
 
         var score: u32 = 0;
         for (plat.os) |kw| {
-            if (containsIgnoreCase(asset.name, kw)) {
+            if (containsIgnoreCaseBounded(asset.name, kw)) {
                 score += 10;
                 break;
             }
         }
         for (plat.arch) |kw| {
-            if (containsIgnoreCase(asset.name, kw)) {
+            if (containsIgnoreCaseBounded(asset.name, kw)) {
                 score += 5;
                 break;
             }
@@ -1481,6 +1502,27 @@ test "containsIgnoreCase" {
     try std.testing.expect(containsIgnoreCase("pencil2d-Windows.zip", "windows"));
     try std.testing.expect(containsIgnoreCase("pencil2d-LINUX.tar.gz", "linux"));
     try std.testing.expect(!containsIgnoreCase("pencil2d-macos.zip", "windows"));
+}
+
+test "containsIgnoreCaseBounded enforces left word boundary" {
+    // "win" should match at a boundary (start or non-letter prefix)
+    try std.testing.expect(containsIgnoreCaseBounded("tool-win64.zip", "win"));
+    try std.testing.expect(containsIgnoreCaseBounded("Win32.zip", "win"));
+    try std.testing.expect(containsIgnoreCaseBounded("pc-windows-msvc.zip", "windows"));
+    // but NOT inside a larger word like "darwin"
+    try std.testing.expect(!containsIgnoreCaseBounded("x86_64-apple-darwin.tar.gz", "win"));
+    try std.testing.expect(!containsIgnoreCaseBounded("darwin.zip", "win"));
+}
+
+test "findBestAsset prefers windows over darwin on Windows" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const assets = [_]Asset{
+        .{ .name = "ripgrep-15.1.0-x86_64-apple-darwin.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-15.1.0-x86_64-pc-windows-gnu.zip", .browser_download_url = "" },
+        .{ .name = "ripgrep-15.1.0-x86_64-pc-windows-msvc.zip", .browser_download_url = "" },
+    };
+    const best = try findBestAsset(&assets);
+    try std.testing.expect(std.mem.indexOf(u8, best.name, "windows") != null);
 }
 
 test "isInstallableAsset" {
