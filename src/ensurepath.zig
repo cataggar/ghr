@@ -641,6 +641,8 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
 
     pub fn run(
         allocator: std.mem.Allocator,
+        io: Io,
+        environ: *const EnvironMap,
         dirs: Dirs,
         dry_run: bool,
         out_w: *Writer,
@@ -713,6 +715,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
 
         if (try windowsPathContainsExpanded(allocator, existing_utf8, bin_expanded)) {
             try out_w.print("  up-to-date: already on user PATH\n", .{});
+            try maybeProcessNushell(allocator, io, environ, dirs, dry_run, out_w);
             return;
         }
 
@@ -729,6 +732,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
 
         if (dry_run) {
             try out_w.print("  would-update: prepend bin dir to user PATH\n    new value: {s}\n", .{new_value});
+            try maybeProcessNushell(allocator, io, environ, dirs, dry_run, out_w);
             return;
         }
 
@@ -764,7 +768,45 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
             &result,
         );
 
+        try maybeProcessNushell(allocator, io, environ, dirs, dry_run, out_w);
+
         try out_w.print("\nopen a new terminal for the change to take effect.\n", .{});
+    }
+
+    fn maybeProcessNushell(
+        allocator: std.mem.Allocator,
+        io: Io,
+        environ: *const EnvironMap,
+        dirs: Dirs,
+        dry_run: bool,
+        out_w: *Writer,
+    ) !void {
+        const appdata = environ.get("APPDATA") orelse return;
+        const nu_dir = try std.fs.path.join(allocator, &.{ appdata, "nushell" });
+        defer allocator.free(nu_dir);
+        // Only touch nushell's config if it already exists — don't create it
+        // for users who don't use nushell.
+        if (!pathExists(io, nu_dir)) return;
+
+        const nu_env = try std.fs.path.join(allocator, &.{ nu_dir, "env.nu" });
+        defer allocator.free(nu_env);
+
+        if (!binIsNushellSafe(dirs.bin)) {
+            try out_w.print("  skipping: {s} (bin path contains ' which nushell single-quoted literals cannot escape)\n", .{nu_env});
+            return;
+        }
+
+        const nushell_block = try buildNushellBlock(allocator, dirs.bin);
+        defer allocator.free(nushell_block);
+
+        const target = UnixTarget{
+            .path = @constCast(nu_env),
+            .kind = .nushell,
+            .create_if_missing = true,
+        };
+        processUnixTarget(allocator, io, target, "", nushell_block, dry_run, out_w) catch |err| {
+            try out_w.print("  error processing {s}: {s}\n", .{ nu_env, @errorName(err) });
+        };
     }
 } else struct {};
 
@@ -782,7 +824,7 @@ pub fn cmdEnsurePath(
     defer dirs.deinit();
 
     if (builtin.os.tag == .windows) {
-        try windows_impl.run(allocator, dirs, dry_run, stdout);
+        try windows_impl.run(allocator, io, environ, dirs, dry_run, stdout);
     } else {
         try runUnix(allocator, io, environ, dirs, dry_run, stdout);
     }
