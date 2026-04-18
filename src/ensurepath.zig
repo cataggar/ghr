@@ -38,6 +38,16 @@ fn validateBinWindows(bin: []const u8) !void {
     }
 }
 
+/// Nushell `'...'` single-quoted literals have no escape sequences, so we
+/// cannot embed a single quote or newline. Newlines are already rejected by
+/// `validateBinPosix`; this additionally forbids the single quote.
+fn binIsNushellSafe(bin: []const u8) bool {
+    for (bin) |c| {
+        if (c == '\'') return false;
+    }
+    return true;
+}
+
 /// Escape a string so that it can be safely embedded inside a POSIX shell
 /// double-quoted literal. Inside `"..."` only `\`, `"`, `$`, and `` ` `` are
 /// special and must be backslash-escaped.
@@ -54,19 +64,12 @@ fn shellEscapeDoubleQuoted(allocator: std.mem.Allocator, bin: []const u8) ![]u8 
     return out.toOwnedSlice(allocator);
 }
 
-/// Escape a string so it can be safely embedded inside a fish single-quoted
-/// literal. Fish only treats `\` and `'` specially inside `'...'`.
-fn fishEscapeSingleQuoted(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(allocator);
-    for (bin) |c| {
-        switch (c) {
-            '\\', '\'' => try out.append(allocator, '\\'),
-            else => {},
-        }
-        try out.append(allocator, c);
-    }
-    return out.toOwnedSlice(allocator);
+/// Escape a string so it can be safely embedded inside a nushell single-quoted
+/// literal. Nushell's `'...'` literals have **no** escape sequences, so a
+/// single quote or newline cannot be represented inside one — we reject such
+/// inputs earlier via `validateBinNushell`.
+fn nushellEscapeSingleQuoted(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
+    return allocator.dupe(u8, bin);
 }
 
 fn buildPosixBlock(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
@@ -79,12 +82,12 @@ fn buildPosixBlock(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
     );
 }
 
-fn buildFishBlock(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
-    const esc = try fishEscapeSingleQuoted(allocator, bin);
+fn buildNushellBlock(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
+    const esc = try nushellEscapeSingleQuoted(allocator, bin);
     defer allocator.free(esc);
     return std.fmt.allocPrint(
         allocator,
-        "{s}\nif not contains -- '{s}' $PATH\n    set -gx PATH '{s}' $PATH\nend\n{s}\n",
+        "{s}\nif ('{s}' not-in $env.PATH) {{\n    $env.PATH = ($env.PATH | prepend '{s}')\n}}\n{s}\n",
         .{ begin_marker, esc, esc, end_marker },
     );
 }
@@ -292,7 +295,7 @@ fn basenameOf(s: []const u8) []const u8 {
 
 // --- Unix implementation ---
 
-const UnixTargetKind = enum { posix, fish };
+const UnixTargetKind = enum { posix, nushell };
 
 const UnixTarget = struct {
     path: []u8, // owned
@@ -321,6 +324,7 @@ fn addTargetOnce(
 fn buildUnixTargets(
     allocator: std.mem.Allocator,
     io: Io,
+    environ: *const EnvironMap,
     home: []const u8,
     shell: ?[]const u8,
 ) !std.ArrayListUnmanaged(UnixTarget) {
@@ -333,7 +337,7 @@ fn buildUnixTargets(
     const shell_name: []const u8 = if (shell) |s| basenameOf(s) else "";
     const is_bash = std.mem.eql(u8, shell_name, "bash");
     const is_zsh = std.mem.eql(u8, shell_name, "zsh");
-    const is_fish = std.mem.eql(u8, shell_name, "fish");
+    const is_nu = std.mem.eql(u8, shell_name, "nu");
 
     const bash_profile = try joinHome(allocator, home, ".bash_profile");
     defer allocator.free(bash_profile);
@@ -343,16 +347,23 @@ fn buildUnixTargets(
     defer allocator.free(zprofile);
     const profile = try joinHome(allocator, home, ".profile");
     defer allocator.free(profile);
-    const fish_conf = try std.fs.path.join(allocator, &.{ home, ".config", "fish", "conf.d", "ghr.fish" });
-    defer allocator.free(fish_conf);
-    const fish_dir = try std.fs.path.join(allocator, &.{ home, ".config", "fish" });
-    defer allocator.free(fish_dir);
+
+    // Nushell honours $XDG_CONFIG_HOME; fall back to ~/.config.
+    const config_home: []u8 = if (environ.get("XDG_CONFIG_HOME")) |xdg|
+        try allocator.dupe(u8, xdg)
+    else
+        try joinHome(allocator, home, ".config");
+    defer allocator.free(config_home);
+    const nu_dir = try std.fs.path.join(allocator, &.{ config_home, "nushell" });
+    defer allocator.free(nu_dir);
+    const nu_env = try std.fs.path.join(allocator, &.{ nu_dir, "env.nu" });
+    defer allocator.free(nu_env);
 
     const bash_profile_exists = pathExists(io, bash_profile);
     const bashrc_exists = pathExists(io, bashrc);
     const zprofile_exists = pathExists(io, zprofile);
     const profile_exists = pathExists(io, profile);
-    const fish_dir_exists = pathExists(io, fish_dir);
+    const nu_dir_exists = pathExists(io, nu_dir);
 
     // bash rc files
     if (bash_profile_exists) {
@@ -377,9 +388,9 @@ fn buildUnixTargets(
         try addTargetOnce(allocator, &out, profile, .posix, false);
     }
 
-    // fish
-    if (is_fish or fish_dir_exists) {
-        try addTargetOnce(allocator, &out, fish_conf, .fish, true);
+    // nushell
+    if (is_nu or nu_dir_exists) {
+        try addTargetOnce(allocator, &out, nu_env, .nushell, true);
     }
 
     return out;
@@ -390,13 +401,13 @@ fn processUnixTarget(
     io: Io,
     target: UnixTarget,
     posix_block: []const u8,
-    fish_block: []const u8,
+    nushell_block: []const u8,
     dry_run: bool,
     out_w: *Writer,
 ) !void {
     const desired = switch (target.kind) {
         .posix => posix_block,
-        .fish => fish_block,
+        .nushell => nushell_block,
     };
 
     const existing_opt = try readFileAllOptional(allocator, io, target.path);
@@ -431,10 +442,10 @@ fn processUnixTarget(
         },
     }
 
-    // Ensure parent directory exists (matters for ~/.config/fish/conf.d/ghr.fish).
+    // Ensure parent directory exists (matters for ~/.config/nushell/env.nu).
     try ensureParentDir(io, target.path);
     const parent_path = std.fs.path.dirname(target.path) orelse ".";
-    // For nested fish conf dir, parent may itself not exist.
+    // For nested config dirs, parent may itself not exist.
     makeDirRecursiveAbs(io, parent_path) catch {};
 
     try writeFileAtomic(io, target.path, res.new_contents);
@@ -467,13 +478,13 @@ fn runUnix(
 
     const posix_block = try buildPosixBlock(allocator, dirs.bin);
     defer allocator.free(posix_block);
-    const fish_block = try buildFishBlock(allocator, dirs.bin);
-    defer allocator.free(fish_block);
+    const nushell_block = try buildNushellBlock(allocator, dirs.bin);
+    defer allocator.free(nushell_block);
 
     const home = environ.get("HOME") orelse return error.HomeNotFound;
     const shell = environ.get("SHELL");
 
-    var targets = try buildUnixTargets(allocator, io, home, shell);
+    var targets = try buildUnixTargets(allocator, io, environ, home, shell);
     defer {
         for (targets.items) |t| allocator.free(t.path);
         targets.deinit(allocator);
@@ -488,7 +499,11 @@ fn runUnix(
     }
 
     for (targets.items) |t| {
-        processUnixTarget(allocator, io, t, posix_block, fish_block, dry_run, out_w) catch |err| {
+        if (t.kind == .nushell and !binIsNushellSafe(dirs.bin)) {
+            try out_w.print("  skipping: {s} (bin path contains ' which nushell single-quoted literals cannot escape)\n", .{t.path});
+            continue;
+        }
+        processUnixTarget(allocator, io, t, posix_block, nushell_block, dry_run, out_w) catch |err| {
             try out_w.print("  error processing {s}: {s}\n", .{ t.path, @errorName(err) });
         };
     }
@@ -797,11 +812,19 @@ test "shellEscapeDoubleQuoted escapes shell metachars" {
     try std.testing.expectEqualStrings("a\\\\b\\\"c\\$d\\`e", out);
 }
 
-test "fishEscapeSingleQuoted escapes backslash and single quote" {
+test "binIsNushellSafe rejects single quote" {
+    try std.testing.expect(binIsNushellSafe("/home/u/.local/bin"));
+    try std.testing.expect(!binIsNushellSafe("/home/o'connor/.local/bin"));
+}
+
+test "buildNushellBlock produces a prepend guard" {
     const a = std.testing.allocator;
-    const out = try fishEscapeSingleQuoted(a, "a\\b'c");
+    const out = try buildNushellBlock(a, "/home/u/.local/bin");
     defer a.free(out);
-    try std.testing.expectEqualStrings("a\\\\b\\'c", out);
+    try std.testing.expect(std.mem.startsWith(u8, out, begin_marker));
+    try std.testing.expect(std.mem.indexOf(u8, out, "'/home/u/.local/bin' not-in $env.PATH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$env.PATH | prepend '/home/u/.local/bin'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, end_marker) != null);
 }
 
 test "buildPosixBlock round-trips trivially" {
