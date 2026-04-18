@@ -14,7 +14,7 @@ ghr dir [--bin] [--cache]        Show ghr directories
 
 ## Install
 
-It can be installed using uv, pip, or downloaded from releases.
+It can be installed using uv, pip, winget, or downloaded from releases.
 
 ```sh
 # uv
@@ -22,6 +22,9 @@ uv tool install ghr-bin
 
 # pip
 python3 -m pip install ghr-bin
+
+# winget
+winget install ghr
 ```
 
 ### Examples
@@ -60,6 +63,9 @@ uv tool uninstall ghr-bin
 
 # pip
 python -m pip uninstall ghr-bin -y
+
+# winget
+winget uninstall ghr
 ```
 
 ## License
