@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const Dirs = @import("dirs.zig").Dirs;
 const install = @import("install.zig");
+const ensurepath = @import("ensurepath.zig");
 
 pub const version = build_options.version;
 
@@ -73,6 +74,18 @@ pub fn main(init: std.process.Init) !void {
         try stderr.interface.print("error: upgrade not yet implemented\n", .{});
         try stderr.interface.flush();
         std.process.exit(1);
+    } else if (eql(cmd_str, "ensurepath")) {
+        var dry_run = false;
+        while (args.next()) |arg| {
+            if (eql(arg, "--dry-run")) {
+                dry_run = true;
+            } else {
+                try stderr.interface.print("error: unknown flag '{s}' for 'ghr ensurepath'\n", .{arg});
+                try stderr.interface.flush();
+                std.process.exit(1);
+            }
+        }
+        try ensurepath.cmdEnsurePath(allocator, io, environ, dry_run, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "help")) {
         try printUsage(&stdout.interface);
     } else {
@@ -178,6 +191,7 @@ fn printUsage(w: *Writer) !void {
         \\    uninstall <owner/repo>       Remove an installed tool
         \\    list                         List installed tools
         \\    upgrade [name]               Upgrade installed tools
+        \\    ensurepath [--dry-run]       Add ghr's bin dir to your user PATH
         \\    dir [--bin] [--cache]        Show ghr directories
         \\
         \\OPTIONS:
