@@ -43,8 +43,36 @@ pub fn cmdUpload(
     stdout: *Writer,
     stderr: *Writer,
 ) !void {
+    return cmdUploadInner(allocator, io, environ, null, args, stdout, stderr);
+}
+
+/// Same as `cmdUpload`, but with a single already-consumed argument to
+/// process first. Used by legacy dispatch when the very first token was a
+/// tcnksm/ghr-style flag.
+pub fn cmdUploadWithFirst(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    first_arg: []const u8,
+    args: *std.process.Args.Iterator,
+    stdout: *Writer,
+    stderr: *Writer,
+) !void {
+    return cmdUploadInner(allocator, io, environ, first_arg, args, stdout, stderr);
+}
+
+fn cmdUploadInner(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    first_arg: ?[]const u8,
+    args: *std.process.Args.Iterator,
+    stdout: *Writer,
+    stderr: *Writer,
+) !void {
     var opts = Options{};
-    parseArgs(args, &opts) catch |err| switch (err) {
+    var src = ArgSource{ .first = first_arg, .iter = args };
+    parseArgs(&src, &opts) catch |err| switch (err) {
         error.MissingValue, error.UnknownFlag, error.MissingTag => {
             try printUsage(stderr);
             try stderr.flush();
@@ -185,7 +213,23 @@ pub fn cmdUpload(
 
 // --- arg parsing ---
 
-fn parseArgs(args: *std.process.Args.Iterator, opts: *Options) !void {
+/// Arg source that supports a single pushed-back "first" token, then falls
+/// through to the underlying iterator. Used to let main.zig legacy-dispatch
+/// into upload without losing the first token it has already consumed.
+const ArgSource = struct {
+    first: ?[]const u8,
+    iter: *std.process.Args.Iterator,
+
+    fn next(self: *ArgSource) ?[]const u8 {
+        if (self.first) |a| {
+            self.first = null;
+            return a;
+        }
+        return self.iter.next();
+    }
+};
+
+fn parseArgs(args: *ArgSource, opts: *Options) !void {
     var positional_idx: u2 = 0;
     while (args.next()) |arg| {
         if (arg.len == 0) continue;
@@ -194,7 +238,6 @@ fn parseArgs(args: *std.process.Args.Iterator, opts: *Options) !void {
             // both single- and double-dash forms.
             const name = if (arg.len >= 2 and arg[1] == '-') arg[2..] else arg[1..];
             if (eql(name, "h") or eql(name, "help")) {
-                // caller will re-print usage via error
                 return error.UnknownFlag;
             } else if (eql(name, "t") or eql(name, "token")) {
                 opts.token = args.next() orelse return error.MissingValue;
@@ -236,6 +279,34 @@ fn parseArgs(args: *std.process.Args.Iterator, opts: *Options) !void {
         }
     }
     if (opts.tag.len == 0) return error.MissingTag;
+}
+
+/// Returns true if `arg` looks like a tcnksm/ghr-style upload flag. Used by
+/// main.zig to detect legacy no-subcommand invocations (e.g. `ghr -t TOKEN
+/// -replace v1.0.0 dist/`) and route them to `ghr upload` with a warning.
+pub fn isLegacyUploadFlag(arg: []const u8) bool {
+    if (arg.len < 2 or arg[0] != '-') return false;
+    const name = if (arg.len >= 2 and arg[1] == '-') arg[2..] else arg[1..];
+    const flags = [_][]const u8{
+        "t",          "token",
+        "u",          "user",
+        "username",   "owner",
+        "r",          "repo",
+        "repository", "c",
+        "commitish",  "target",
+        "n",          "name",
+        "title",      "b",
+        "body",       "p",
+        "parallel",   "parallelism",
+        "delete",     "recreate",
+        "replace",    "draft",
+        "soft",       "prerelease",
+        "generatenotes", "generate-notes",
+    };
+    for (flags) |f| {
+        if (eql(name, f)) return true;
+    }
+    return false;
 }
 
 fn printUsage(w: *Writer) !void {
