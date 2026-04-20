@@ -217,15 +217,28 @@ fn containsIgnoreCaseBounded(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Returns true if the asset looks installable (zip, tar.gz, tgz).
+/// Returns true if the asset looks installable: archives, Windows .exe, or
+/// bare binaries (extensionless files common in Go/Rust releases).
 fn isInstallableAsset(name: []const u8) bool {
-    const lower_buf = name; // we'll check case-insensitively
-    _ = lower_buf;
+    // Archives
     if (std.mem.endsWith(u8, name, ".zip")) return true;
     if (std.mem.endsWith(u8, name, ".tar.gz")) return true;
     if (std.mem.endsWith(u8, name, ".tgz")) return true;
     if (std.mem.endsWith(u8, name, ".tar.xz")) return true;
-    return false;
+    // Windows executables
+    if (std.mem.endsWith(u8, name, ".exe")) return true;
+    // Reject known non-installable extensions
+    const non_installable = [_][]const u8{
+        ".json", ".txt", ".pub", ".sig", ".asc", ".pem", ".md",
+        ".sha256", ".sha512", ".md5", ".minisig",
+        ".rpm",  ".deb",  ".apk", ".msi", ".pkg", ".dmg",
+        ".yml",  ".yaml",
+    };
+    for (non_installable) |ext| {
+        if (std.mem.endsWith(u8, name, ext)) return false;
+    }
+    // Accept as potential bare binary
+    return true;
 }
 
 /// Returns true if the file is a shared library (not a program executable).
@@ -247,8 +260,12 @@ fn isLibraryDir(name: []const u8) bool {
     return false;
 }
 
-fn findBestAsset(assets: []const Asset) !Asset {
-    const plat = currentPlatformKeywords();
+const PlatformKeywords = struct {
+    os: []const []const u8,
+    arch: []const []const u8,
+};
+
+fn findBestAssetForKeywords(assets: []const Asset, plat: PlatformKeywords) !Asset {
     var best: ?Asset = null;
     var best_score: u32 = 0;
 
@@ -288,6 +305,11 @@ fn findBestAsset(assets: []const Asset) !Asset {
     }
 
     return best orelse error.NoMatchingAsset;
+}
+
+fn findBestAsset(assets: []const Asset) !Asset {
+    const plat = currentPlatformKeywords();
+    return findBestAssetForKeywords(assets, .{ .os = plat.os, .arch = plat.arch });
 }
 
 fn downloadAsset(
@@ -593,6 +615,26 @@ fn extractTarXz(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *File
     var xz_decompress = try std.compress.xz.Decompress.init(&file_reader.interface, allocator, xz_buf);
     defer xz_decompress.deinit();
     try std.tar.extract(io, dest_dir, &xz_decompress.reader, .{});
+}
+
+/// Copy a bare executable from the cache into the staging directory,
+/// renaming it to `dest_name` and setting executable permissions.
+fn stageBareExecutable(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_path: []const u8,
+    asset_name: []const u8,
+    staging_dir: Dir,
+    dest_name: []const u8,
+) !void {
+    var cache_dir = try Dir.openDirAbsolute(io, cache_path, .{});
+    defer cache_dir.close(io);
+    const content = try cache_dir.readFileAlloc(io, asset_name, allocator, Io.Limit.limited(256 * 1024 * 1024));
+    defer allocator.free(content);
+
+    var dest = try staging_dir.createFile(io, dest_name, .{ .permissions = .executable_file });
+    defer dest.close(io);
+    try dest.writeStreamingAll(io, content);
 }
 
 /// Scan directory recursively for executable files and return their relative paths.
@@ -1372,6 +1414,16 @@ pub fn cmdInstall(
             try err_w.flush();
             std.process.exit(1);
         };
+    } else {
+        // Bare executable (e.g., cosign-windows-amd64.exe or cosign-linux-amd64).
+        // Name it after the repo so the linked command is clean (e.g., "cosign").
+        const exe_name = if (builtin.os.tag == .windows)
+            try std.fmt.allocPrint(allocator, "{s}.exe", .{spec.repo})
+        else
+            try allocator.dupe(u8, spec.repo);
+        defer allocator.free(exe_name);
+
+        try stageBareExecutable(allocator, io, d.cache, asset.name, staging_dir, exe_name);
     }
 
     // Find executables
@@ -1514,24 +1566,116 @@ test "containsIgnoreCaseBounded enforces left word boundary" {
     try std.testing.expect(!containsIgnoreCaseBounded("darwin.zip", "win"));
 }
 
-test "findBestAsset prefers windows over darwin on Windows" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+test "findBestAsset prefers windows over darwin" {
     const assets = [_]Asset{
         .{ .name = "ripgrep-15.1.0-x86_64-apple-darwin.tar.gz", .browser_download_url = "" },
         .{ .name = "ripgrep-15.1.0-x86_64-pc-windows-gnu.zip", .browser_download_url = "" },
         .{ .name = "ripgrep-15.1.0-x86_64-pc-windows-msvc.zip", .browser_download_url = "" },
     };
-    const best = try findBestAsset(&assets);
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{ "windows", "win" },
+        .arch = &.{ "x86_64", "x64", "amd64" },
+    });
     try std.testing.expect(std.mem.indexOf(u8, best.name, "windows") != null);
 }
 
 test "isInstallableAsset" {
+    // Archives
     try std.testing.expect(isInstallableAsset("foo.zip"));
     try std.testing.expect(isInstallableAsset("foo.tar.gz"));
     try std.testing.expect(isInstallableAsset("foo.tgz"));
     try std.testing.expect(isInstallableAsset("foo.tar.xz"));
+    // Windows executables
+    try std.testing.expect(isInstallableAsset("cosign-windows-amd64.exe"));
+    try std.testing.expect(isInstallableAsset("tool.exe"));
+    // Bare binaries (no extension)
+    try std.testing.expect(isInstallableAsset("cosign-linux-amd64"));
+    try std.testing.expect(isInstallableAsset("cosign-darwin-arm64"));
+    // Non-installable
     try std.testing.expect(!isInstallableAsset("checksums.txt"));
     try std.testing.expect(!isInstallableAsset("foo.sha256"));
+    try std.testing.expect(!isInstallableAsset("cosign-linux-amd64.sigstore.json"));
+    try std.testing.expect(!isInstallableAsset("cosign-3.0.6-1.x86_64.rpm"));
+    try std.testing.expect(!isInstallableAsset("cosign_3.0.6_amd64.deb"));
+    try std.testing.expect(!isInstallableAsset("cosign_3.0.6_aarch64.apk"));
+    try std.testing.expect(!isInstallableAsset("release-cosign.pub"));
+}
+
+test "findBestAsset selects cosign exe for Windows" {
+    const assets = [_]Asset{
+        .{ .name = "cosign-darwin-amd64", .browser_download_url = "" },
+        .{ .name = "cosign-darwin-amd64.sigstore.json", .browser_download_url = "" },
+        .{ .name = "cosign-linux-amd64", .browser_download_url = "" },
+        .{ .name = "cosign-linux-amd64.sigstore.json", .browser_download_url = "" },
+        .{ .name = "cosign-windows-amd64.exe", .browser_download_url = "" },
+        .{ .name = "cosign-windows-amd64.exe.sigstore.json", .browser_download_url = "" },
+        .{ .name = "cosign_checksums.txt", .browser_download_url = "" },
+        .{ .name = "release-cosign.pub", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{ "windows", "win" },
+        .arch = &.{ "x86_64", "x64", "amd64" },
+    });
+    try std.testing.expectEqualStrings("cosign-windows-amd64.exe", best.name);
+}
+
+test "findBestAsset selects cosign bare binary for Linux" {
+    const assets = [_]Asset{
+        .{ .name = "cosign-darwin-amd64", .browser_download_url = "" },
+        .{ .name = "cosign-linux-amd64", .browser_download_url = "" },
+        .{ .name = "cosign-linux-amd64.sigstore.json", .browser_download_url = "" },
+        .{ .name = "cosign-windows-amd64.exe", .browser_download_url = "" },
+        .{ .name = "cosign_checksums.txt", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "x86_64", "x64", "amd64" },
+    });
+    try std.testing.expectEqualStrings("cosign-linux-amd64", best.name);
+}
+
+test "stageBareExecutable copies file with executable permissions" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create a fake "cache" subdir with a downloaded bare executable
+    tmp.dir.createDirPath(tio, "cache") catch {};
+    var cache_dir = try tmp.dir.openDir(tio, "cache", .{});
+    defer cache_dir.close(tio);
+    var src = try cache_dir.createFile(tio, "tool-windows-amd64.exe", .{});
+    try src.writeStreamingAll(tio, "FAKE_EXE_CONTENT");
+    src.close(tio);
+
+    // Create a staging dir
+    tmp.dir.createDirPath(tio, "staging") catch {};
+    var staging = try tmp.dir.openDir(tio, "staging", .{});
+    defer staging.close(tio);
+
+    // Stage the bare executable
+    const cache_path = try tmp.dir.realpath(tio, "cache", &(std.testing.TmpDir.real_path_buffer));
+    try stageBareExecutable(
+        std.testing.allocator,
+        tio,
+        cache_path,
+        "tool-windows-amd64.exe",
+        staging,
+        "tool.exe",
+    );
+
+    // Verify the staged file exists and has the right content
+    const content = try staging.readFileAlloc(tio, "tool.exe", std.testing.allocator, Io.Limit.limited(4096));
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("FAKE_EXE_CONTENT", content);
+
+    // Verify findExecutables discovers it
+    var exes = try findExecutables(std.testing.allocator, tio, staging);
+    defer {
+        for (exes.items) |e| std.testing.allocator.free(e);
+        exes.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("tool.exe", exes.items[0]);
 }
 
 /// Create a tar.gz test fixture using the system tar command.
