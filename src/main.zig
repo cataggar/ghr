@@ -140,11 +140,13 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
+        if (std.mem.endsWith(u8, entry.name, ".old")) continue; // skip tombstones
         var owner_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer owner_dir.close(io);
         var repo_iter = owner_dir.iterate();
         while (try repo_iter.next(io)) |repo_entry| {
             if (repo_entry.kind != .directory) continue;
+            if (std.mem.endsWith(u8, repo_entry.name, ".old")) continue; // skip tombstones
             const tag = readToolTag(allocator, io, owner_dir, repo_entry.name);
             defer if (tag) |t| allocator.free(t);
             if (tag) |t| {

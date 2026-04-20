@@ -792,10 +792,21 @@ fn linkToBin(
             var name_buf: [Dir.max_path_bytes]u8 = undefined;
             break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return error.PathTooLong;
         };
-        bin_dir.deleteFile(io, shim_exe_name) catch {};
-        var exe_file = bin_dir.createFile(io, shim_exe_name, .{}) catch return error.CreateFailed;
-        defer exe_file.close(io);
-        exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
+        bin_dir.deleteFile(io, shim_exe_name) catch {
+            // On Windows a running shim exe cannot be deleted; rename it out of the way.
+            var old_name_buf: [Dir.max_path_bytes]u8 = undefined;
+            const old_name = std.fmt.bufPrint(&old_name_buf, "{s}.old", .{shim_exe_name}) catch return error.PathTooLong;
+            bin_dir.deleteFile(io, old_name) catch {};
+            bin_dir.rename(shim_exe_name, bin_dir, old_name, io) catch {};
+        };
+        if (bin_dir.createFile(io, shim_exe_name, .{})) |*exe_file| {
+            defer exe_file.close(io);
+            exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
+        } else |_| {
+            // The shim exe is locked (self-update). The .shim file has already
+            // been updated with the new target path, so the existing shim exe
+            // will work correctly on the next invocation. Skip replacing it.
+        }
 
         // Clean up any legacy .cmd wrapper from previous installs
         var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
@@ -1172,6 +1183,41 @@ fn shimPointsToToolDir(io: Io, bin_dir: Dir, shim_name: []const u8, tool_path: [
         (content.len == tool_path.len or content[tool_path.len] == '\\' or content[tool_path.len] == '/');
 }
 
+/// Remove bin entries from a previous install that are NOT present in the new install.
+/// Called after new bins are already linked so the active install is never broken.
+fn cleanupStaleBinEntries(
+    io: Io,
+    bin_dir: Dir,
+    old_bins: []const []const u8,
+    new_bins: []const []const u8,
+    old_tool_path: []const u8,
+) void {
+    for (old_bins) |old_exe_rel| {
+        const old_name = std.fs.path.basename(old_exe_rel);
+        // Skip if this bin is also in the new install (already overwritten by linkToBin)
+        var dominated = false;
+        for (new_bins) |new_exe_rel| {
+            if (std.mem.eql(u8, std.fs.path.basename(new_exe_rel), old_name)) {
+                dominated = true;
+                break;
+            }
+        }
+        if (dominated) continue;
+        if (builtin.os.tag == .windows) {
+            cleanupWindowsBinEntry(io, bin_dir, old_name, old_tool_path);
+        } else {
+            var link_buf: [Dir.max_path_bytes]u8 = undefined;
+            const len = bin_dir.readLink(io, old_name, &link_buf) catch continue;
+            const link_target = link_buf[0..len];
+            if (std.mem.startsWith(u8, link_target, old_tool_path) and
+                (link_target.len == old_tool_path.len or link_target[old_tool_path.len] == '/'))
+            {
+                bin_dir.deleteFile(io, old_name) catch {};
+            }
+        }
+    }
+}
+
 pub fn cmdUninstall(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1455,9 +1501,40 @@ pub fn cmdInstall(
     });
     defer allocator.free(tool_path);
 
-    // Clean up old install's symlinks before deleting
-    cleanupOldInstall(allocator, io, environ, tool_path, d.bin, w);
-    deleteTreeAbsolute(io, tool_path) catch {};
+    // Clean up tombstone from a previous self-update (Windows)
+    if (comptime builtin.os.tag == .windows) {
+        var tb: [Dir.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&tb, "{s}.old", .{tool_path})) |t| {
+            deleteTreeAbsolute(io, t) catch {};
+        } else |_| {}
+    }
+
+    // Save old metadata before touching anything (for stale bin cleanup after install)
+    const old_meta = readMetadata(allocator, io, tool_path);
+    defer if (old_meta) |m| {
+        m.parsed.deinit();
+        allocator.free(m.body);
+    };
+
+    // Remove old tool directory. On Windows, running executables can be renamed
+    // but not deleted, so fall back to renaming the old dir as a tombstone.
+    deleteTreeAbsolute(io, tool_path) catch {
+        if (comptime builtin.os.tag == .windows) {
+            var tombstone_buf: [Dir.max_path_bytes]u8 = undefined;
+            const tombstone = std.fmt.bufPrint(&tombstone_buf, "{s}.old", .{tool_path}) catch {
+                try err_w.print("error: tool path too long\n", .{});
+                try err_w.flush();
+                std.process.exit(1);
+            };
+            deleteTreeAbsolute(io, tombstone) catch {};
+            Dir.renameAbsolute(tool_path, tombstone, io) catch {
+                try err_w.print("error: cannot replace tool directory (files may be locked by a running process)\n", .{});
+                try err_w.flush();
+                std.process.exit(1);
+            };
+        }
+    };
+
     // Ensure tools and owner dirs exist (create full path)
     const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
         d.tools, std.fs.path.sep, spec.owner,
@@ -1481,8 +1558,6 @@ pub fn cmdInstall(
 
     // Rename staging to final
     Dir.renameAbsolute(staging_path, tool_path, io) catch {
-        // Cross-device: fall back to copy
-        // For now, error out
         try err_w.print("error: failed to move staging directory to tool directory\n", .{});
         try err_w.flush();
         std.process.exit(1);
@@ -1509,6 +1584,11 @@ pub fn cmdInstall(
         linkToBin(allocator, io, tool_path, bin_dir, exe_name, w) catch |err| {
             try err_w.print("warning: failed to link {s}: {}\n", .{ exe_name, err });
         };
+    }
+
+    // Clean up stale bin entries from old install that aren't in the new one
+    if (old_meta) |m| {
+        cleanupStaleBinEntries(io, bin_dir, m.parsed.value.bins, exes.items, tool_path);
     }
 
     // On macOS, copy .app bundles into ~/Applications for Spotlight discovery
