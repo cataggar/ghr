@@ -35,8 +35,8 @@ pub fn main(init: std.process.Init) !void {
         try printUsage(&stdout.interface);
         return;
     }
-    if (eql(cmd_str, "--version") or eql(cmd_str, "-V")) {
-        try stdout.interface.print("ghr {s}\n", .{version});
+    if (eql(cmd_str, "version")) {
+        try stdout.interface.print("{s}\n", .{version});
         return;
     }
 
@@ -193,10 +193,10 @@ fn printUsage(w: *Writer) !void {
         \\    upgrade [name]               Upgrade installed tools
         \\    ensurepath [--dry-run]       Add ghr's bin dir to your user PATH
         \\    dir [--bin] [--cache]        Show ghr directories
+        \\    version                      Print version
         \\
         \\OPTIONS:
         \\    -h, --help      Print help
-        \\    -V, --version   Print version
         \\    --debug         Show diagnostic output for debugging
         \\    --no-auth       Skip GitHub authentication
         \\
