@@ -799,9 +799,14 @@ fn linkToBin(
             bin_dir.deleteFile(io, old_name) catch {};
             bin_dir.rename(shim_exe_name, bin_dir, old_name, io) catch {};
         };
-        var exe_file = bin_dir.createFile(io, shim_exe_name, .{}) catch return error.CreateFailed;
-        defer exe_file.close(io);
-        exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
+        if (bin_dir.createFile(io, shim_exe_name, .{})) |*exe_file| {
+            defer exe_file.close(io);
+            exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
+        } else |_| {
+            // The shim exe is locked (self-update). The .shim file has already
+            // been updated with the new target path, so the existing shim exe
+            // will work correctly on the next invocation. Skip replacing it.
+        }
 
         // Clean up any legacy .cmd wrapper from previous installs
         var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
@@ -1495,6 +1500,14 @@ pub fn cmdInstall(
         d.tools, std.fs.path.sep, spec.owner, std.fs.path.sep, spec.repo,
     });
     defer allocator.free(tool_path);
+
+    // Clean up tombstone from a previous self-update (Windows)
+    if (comptime builtin.os.tag == .windows) {
+        var tb: [Dir.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&tb, "{s}.old", .{tool_path})) |t| {
+            deleteTreeAbsolute(io, t) catch {};
+        } else |_| {}
+    }
 
     // Save old metadata before touching anything (for stale bin cleanup after install)
     const old_meta = readMetadata(allocator, io, tool_path);
