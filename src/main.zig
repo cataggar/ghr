@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const Dirs = @import("dirs.zig").Dirs;
 const install = @import("install.zig");
 const ensurepath = @import("ensurepath.zig");
+const upload = @import("upload.zig");
 
 pub const version = build_options.version;
 
@@ -86,6 +87,15 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         try ensurepath.cmdEnsurePath(allocator, io, environ, dry_run, &stdout.interface, &stderr.interface);
+    } else if (eql(cmd_str, "upload")) {
+        try upload.cmdUpload(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
+    } else if (upload.isLegacyUploadFlag(cmd_str)) {
+        try stderr.interface.print(
+            "warning: bare `ghr {s} ...` invocation looks like tcnksm/ghr usage; dispatching to `ghr upload`. Please migrate to `ghr upload ...` — this compatibility shim may be removed in a future release.\n",
+            .{cmd_str},
+        );
+        try stderr.interface.flush();
+        try upload.cmdUploadWithFirst(allocator, io, environ, cmd_str, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "help")) {
         try printUsage(&stdout.interface);
     } else {
@@ -194,6 +204,7 @@ fn printUsage(w: *Writer) !void {
         \\    list                         List installed tools
         \\    upgrade [name]               Upgrade installed tools
         \\    ensurepath [--dry-run]       Add ghr's bin dir to your user PATH
+        \\    upload <TAG> [PATH] [opts]   Create a GitHub Release and upload artifacts
         \\    dir [--bin] [--cache]        Show ghr directories
         \\    version                      Print version
         \\

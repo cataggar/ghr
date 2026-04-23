@@ -10,6 +10,7 @@ ghr uninstall <name>             Remove an installed tool
 ghr list                         List installed tools
 ghr upgrade [name]               Upgrade installed tools
 ghr ensurepath [--dry-run]       Add ghr's bin dir to your user PATH
+ghr upload <TAG> [PATH] [opts]   Create a GitHub Release and upload artifacts
 ghr dir [--bin] [--cache]        Show ghr directories
 ```
 
@@ -62,6 +63,22 @@ The bin directory is frequently not on `PATH` by default, especially on Windows.
 - **macOS / Linux**: appends a guarded block to your shell rc files (bash: `.bash_profile` / `.bashrc` / `.profile`; zsh: `.zprofile`; nushell: `~/.config/nushell/env.nu`). The block is idempotent and is replaced in place on re-runs.
 
 `ghr ensurepath --dry-run` prints the changes it would make without writing.
+
+## Uploading release artifacts (experimental)
+
+`ghr upload` creates a GitHub Release and uploads artifacts to it, mirroring the interface of [`tcnksm/ghr`](https://github.com/tcnksm/ghr) (the Go tool available via `brew install ghr`). This gives existing users a migration path: change `ghr ...` to `ghr upload ...` — the flags are the same.
+
+```sh
+# Create v1.0.0 and upload every file in ./dist
+ghr upload v1.0.0 dist/
+
+# Override owner/repo, draft release, replace existing assets
+ghr upload -u myorg -r myrepo -draft -replace v1.0.0 dist/
+```
+
+Flags: `-t TOKEN -u USER -r REPO -c COMMITTISH -n TITLE -b BODY -p NUM -delete -replace -draft -soft -prerelease -generatenotes`. Auth is resolved in order: `-t`, `$GITHUB_TOKEN`, `$GH_TOKEN`, `gh auth token`. Set `$GITHUB_API` for GitHub Enterprise.
+
+See [issue #46](https://github.com/cataggar/ghr/issues/46) for context on the name collision with `tcnksm/ghr`.
 
 ## Uninstall
 
