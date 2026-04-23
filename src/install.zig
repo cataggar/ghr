@@ -265,51 +265,234 @@ const PlatformKeywords = struct {
     arch: []const []const u8,
 };
 
-fn findBestAssetForKeywords(assets: []const Asset, plat: PlatformKeywords) !Asset {
-    var best: ?Asset = null;
-    var best_score: u32 = 0;
+/// Markers in asset names that indicate non-primary variants (libraries,
+/// source tarballs, minimal/debug builds, plugins, distro-specific static
+/// bundles) which should be deprioritized when a plain binary archive is
+/// also available.
+fn nonPrimaryPenalty(name: []const u8) u32 {
+    // Strong penalty: non-runtime variants (C API headers, SDKs, sources,
+    // checksums, debug symbols). These almost never contain an executable
+    // the user would want to run.
+    const strong = [_][]const u8{
+        "c-api",    "capi",      "headers",   "sdk",
+        "dev",      "lib-only",  "src",       "source",
+        "sources",  "sbom",      "checksum",  "checksums",
+        "debug",    "dbg",       "symbols",
+    };
+    // Medium penalty: plugins/addons that ship separately from the main
+    // runtime archive.
+    const medium = [_][]const u8{
+        "plugin",   "plugins",   "wasi_nn",   "wasi-nn",
+        "ffmpeg",   "tensorflow", "image",    "opencvmini",
+    };
+    // Soft penalty: minimal/static/distro-coupled variants. Still allowed
+    // if nothing better exists.
+    const soft = [_][]const u8{
+        "static",   "min",       "minimal",
+    };
+    var penalty: u32 = 0;
+    for (strong) |m| if (containsIgnoreCaseBounded(name, m)) { penalty += 5; };
+    for (medium) |m| if (containsIgnoreCaseBounded(name, m)) { penalty += 3; };
+    for (soft) |m| if (containsIgnoreCaseBounded(name, m)) { penalty += 1; };
+    return penalty;
+}
 
+/// Returns true if the asset name targets a platform that is clearly not
+/// the host. Used to filter out obviously-wrong candidates (e.g.
+/// `linux-android`, `wasm32-wasi`, or `darwin` on a Linux host) before
+/// ranking. If filtering removes everything, the caller falls back to the
+/// unfiltered set.
+fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
+    // Tokens that are never the host for a normal desktop/server install.
+    const always_wrong = [_][]const u8{
+        "linux-android", "android",
+        "ios", "tvos", "watchos",
+        "wasi",  "wasm32", "wasm64", "emscripten",
+    };
+    for (always_wrong) |t| {
+        if (containsIgnoreCaseBounded(name, t)) return true;
+    }
+    // If the asset contains any host OS keyword, accept it.
+    for (plat_os) |k| {
+        if (containsIgnoreCaseBounded(name, k)) return false;
+    }
+    // Otherwise, if it contains a known foreign OS token, it's wrong.
+    const foreign = [_][]const u8{
+        "windows", "win32", "win64", "mingw",
+        "linux",
+        "darwin",  "macos", "osx",
+        "freebsd", "netbsd", "openbsd", "solaris", "illumos",
+    };
+    for (foreign) |t| {
+        // Skip tokens that are in plat_os (case-insensitive match).
+        var is_host = false;
+        for (plat_os) |k| {
+            if (std.ascii.eqlIgnoreCase(k, t)) { is_host = true; break; }
+        }
+        if (is_host) continue;
+        if (containsIgnoreCaseBounded(name, t)) return true;
+    }
+    return false;
+}
+
+/// On Linux hosts, prefer portable glibc/musl triples over distro-tagged
+/// variants. Returns a signed bonus to fold into the score.
+fn linuxPortabilityBonus(name: []const u8, plat_os: []const []const u8) i32 {
+    var is_linux_host = false;
+    for (plat_os) |k| {
+        if (std.ascii.eqlIgnoreCase(k, "linux")) { is_linux_host = true; break; }
+    }
+    if (!is_linux_host) return 0;
+    var s: i32 = 0;
+    const generic = [_][]const u8{
+        "manylinux",
+        "unknown-linux-gnu", "unknown-linux-musl",
+        "linux-gnu", "linux-musl",
+    };
+    for (generic) |t| {
+        if (containsIgnoreCaseBounded(name, t)) { s += 2; break; }
+    }
+    const distros = [_][]const u8{
+        "ubuntu", "debian", "alpine", "fedora", "centos", "rhel", "suse",
+    };
+    for (distros) |t| {
+        if (containsIgnoreCaseBounded(name, t)) { s -= 1; break; }
+    }
+    return s;
+}
+
+/// Bonus for archive formats (portable, pre-packaged) over bare binaries.
+fn archiveFormatBonus(name: []const u8) i32 {
+    if (std.mem.endsWith(u8, name, ".tar.gz") or
+        std.mem.endsWith(u8, name, ".tgz") or
+        std.mem.endsWith(u8, name, ".tar.xz") or
+        std.mem.endsWith(u8, name, ".zip")) return 1;
+    return 0;
+}
+
+/// Tie-break: prefer shorter, then lexicographically smaller. Returns true
+/// if `a` should beat `b`.
+fn tieBreakPrefers(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return a.len < b.len;
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn scoreAsset(name: []const u8, plat: PlatformKeywords) i32 {
+    var score: i32 = 0;
+    for (plat.os) |kw| {
+        if (containsIgnoreCaseBounded(name, kw)) { score += 10; break; }
+    }
+    for (plat.arch) |kw| {
+        if (containsIgnoreCaseBounded(name, kw)) { score += 5; break; }
+    }
+    score -= @as(i32, @intCast(nonPrimaryPenalty(name)));
+    score += linuxPortabilityBonus(name, plat.os);
+    score += archiveFormatBonus(name);
+    return score;
+}
+
+fn selectBestByScore(
+    assets: []const Asset,
+    plat: PlatformKeywords,
+    skip_wrong_platform: bool,
+) ?Asset {
+    var best: ?Asset = null;
+    var best_score: i32 = std.math.minInt(i32);
     for (assets) |asset| {
         if (!isInstallableAsset(asset.name)) continue;
-
-        var score: u32 = 0;
-        for (plat.os) |kw| {
-            if (containsIgnoreCaseBounded(asset.name, kw)) {
-                score += 10;
-                break;
-            }
-        }
-        for (plat.arch) |kw| {
-            if (containsIgnoreCaseBounded(asset.name, kw)) {
-                score += 5;
-                break;
-            }
-        }
-        if (score > best_score) {
+        if (skip_wrong_platform and isWrongPlatform(asset.name, plat.os)) continue;
+        const score = scoreAsset(asset.name, plat);
+        if (best == null or score > best_score or
+            (score == best_score and tieBreakPrefers(asset.name, best.?.name)))
+        {
             best_score = score;
             best = asset;
         }
     }
+    return best;
+}
 
-    // If no platform match, check if there's exactly one installable asset
-    if (best == null) {
-        var count: u32 = 0;
-        var single: ?Asset = null;
-        for (assets) |asset| {
-            if (isInstallableAsset(asset.name)) {
-                count += 1;
-                single = asset;
-            }
-        }
-        if (count == 1) best = single;
+fn findBestAssetForKeywords(assets: []const Asset, plat: PlatformKeywords) !Asset {
+    // First pass: filter out obviously-wrong platforms and require a
+    // positive platform score.
+    if (selectBestByScore(assets, plat, true)) |b| {
+        // Require at least some platform signal (os or arch match) to
+        // accept; otherwise fall through.
+        if (scoreAsset(b.name, plat) > 0) return b;
     }
 
-    return best orelse error.NoMatchingAsset;
+    // Second pass: drop the wrong-platform filter in case filtering was
+    // too aggressive.
+    if (selectBestByScore(assets, plat, false)) |b| {
+        if (scoreAsset(b.name, plat) > 0) return b;
+    }
+
+    // Last resort: exactly one installable asset means it's unambiguous.
+    var count: u32 = 0;
+    var single: ?Asset = null;
+    for (assets) |asset| {
+        if (isInstallableAsset(asset.name)) {
+            count += 1;
+            single = asset;
+        }
+    }
+    if (count == 1) return single.?;
+    return error.NoMatchingAsset;
 }
 
 fn findBestAsset(assets: []const Asset) !Asset {
     const plat = currentPlatformKeywords();
     return findBestAssetForKeywords(assets, .{ .os = plat.os, .arch = plat.arch });
+}
+
+/// For bare-binary assets whose name follows the `<name>-<arch>-<triple>...`
+/// convention (e.g. `wash-aarch64-unknown-linux-musl`), extract `<name>` so
+/// the resulting link in `~/.ghr/bin/` is the natural command the user
+/// expects to run. Falls back to `repo` if the pattern doesn't match (e.g.
+/// `cosign-linux-amd64`, where the arch is not directly after the stem).
+fn deriveBareBinaryName(
+    allocator: std.mem.Allocator,
+    asset_name: []const u8,
+    repo: []const u8,
+    is_windows: bool,
+) ![]u8 {
+    var name = asset_name;
+    if (std.mem.endsWith(u8, name, ".exe")) name = name[0 .. name.len - 4];
+
+    // Find the first '-' or '_' separator.
+    var sep_idx: ?usize = null;
+    for (name, 0..) |c, i| {
+        if (c == '-' or c == '_') { sep_idx = i; break; }
+    }
+
+    if (sep_idx) |si| {
+        if (si > 0 and si + 1 < name.len) {
+            const stem = name[0..si];
+            const after = name[si + 1 ..];
+            const archs = [_][]const u8{
+                "x86_64", "x64",    "amd64",
+                "aarch64", "arm64",
+                "armv7l", "armv7",  "armv6",
+                "x86",    "i686",   "i386",
+                "ppc64le", "ppc64", "s390x", "riscv64",
+            };
+            for (archs) |a| {
+                if (after.len < a.len) continue;
+                if (!std.ascii.eqlIgnoreCase(after[0..a.len], a)) continue;
+                if (after.len > a.len) {
+                    const nc = after[a.len];
+                    if (nc != '-' and nc != '_' and nc != '.') continue;
+                }
+                if (is_windows) {
+                    return std.fmt.allocPrint(allocator, "{s}.exe", .{stem});
+                }
+                return allocator.dupe(u8, stem);
+            }
+        }
+    }
+
+    if (is_windows) return std.fmt.allocPrint(allocator, "{s}.exe", .{repo});
+    return allocator.dupe(u8, repo);
 }
 
 fn downloadAsset(
@@ -1462,11 +1645,16 @@ pub fn cmdInstall(
         };
     } else {
         // Bare executable (e.g., cosign-windows-amd64.exe or cosign-linux-amd64).
-        // Name it after the repo so the linked command is clean (e.g., "cosign").
-        const exe_name = if (builtin.os.tag == .windows)
-            try std.fmt.allocPrint(allocator, "{s}.exe", .{spec.repo})
-        else
-            try allocator.dupe(u8, spec.repo);
+        // Derive the command name from the asset (e.g. `wash` from
+        // `wash-aarch64-unknown-linux-musl`) so the linked command is the
+        // natural tool name. Falls back to repo when the pattern doesn't
+        // fit (e.g. `cosign-linux-amd64` -> `cosign`).
+        const exe_name = try deriveBareBinaryName(
+            allocator,
+            asset.name,
+            spec.repo,
+            builtin.os.tag == .windows,
+        );
         defer allocator.free(exe_name);
 
         try stageBareExecutable(allocator, io, d.cache, asset.name, staging_dir, exe_name);
@@ -1481,6 +1669,18 @@ pub fn cmdInstall(
 
     if (exes.items.len == 0) {
         try err_w.print("error: no executables found in archive\n", .{});
+        try err_w.print("  selected asset: {s}\n", .{asset.name});
+        try err_w.print("  other installable assets in this release:\n", .{});
+        var listed: u32 = 0;
+        for (release.parsed.value.assets) |a| {
+            if (std.mem.eql(u8, a.name, asset.name)) continue;
+            if (!isInstallableAsset(a.name)) continue;
+            try err_w.print("    {s}\n", .{a.name});
+            listed += 1;
+        }
+        if (listed == 0) {
+            try err_w.print("    (none)\n", .{});
+        }
         try err_w.flush();
         std.process.exit(1);
     }
@@ -1697,6 +1897,114 @@ test "findBestAsset selects cosign exe for Windows" {
         .arch = &.{ "x86_64", "x64", "amd64" },
     });
     try std.testing.expectEqualStrings("cosign-windows-amd64.exe", best.name);
+}
+
+test "findBestAsset prefers plain archive over c-api variant" {
+    const assets = [_]Asset{
+        .{ .name = "wasmtime-v44.0.0-aarch64-linux-c-api.tar.xz", .browser_download_url = "" },
+        .{ .name = "wasmtime-v44.0.0-aarch64-linux-min.tar.xz", .browser_download_url = "" },
+        .{ .name = "wasmtime-v44.0.0-aarch64-linux.tar.xz", .browser_download_url = "" },
+        .{ .name = "wasmtime-v44.0.0-x86_64-linux.tar.xz", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "aarch64", "arm64" },
+    });
+    try std.testing.expectEqualStrings("wasmtime-v44.0.0-aarch64-linux.tar.xz", best.name);
+}
+
+test "findBestAsset picks manylinux over distro-tagged and static WasmEdge variants" {
+    const assets = [_]Asset{
+        .{ .name = "WasmEdge-0.16.2-manylinux_2_28_aarch64.tar.gz", .browser_download_url = "" },
+        .{ .name = "WasmEdge-0.16.2-alpine3.23_aarch64_static.tar.gz", .browser_download_url = "" },
+        .{ .name = "WasmEdge-0.16.2-debian11_aarch64_static.tar.gz", .browser_download_url = "" },
+        .{ .name = "WasmEdge-0.16.2-ubuntu20.04_aarch64.tar.gz", .browser_download_url = "" },
+        .{ .name = "WasmEdge-plugin-wasi_nn-ggml-0.16.2-manylinux_2_28_aarch64.tar.gz", .browser_download_url = "" },
+        .{ .name = "WasmEdge-0.16.2-aarch64.rpm", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "aarch64", "arm64" },
+    });
+    try std.testing.expectEqualStrings("WasmEdge-0.16.2-manylinux_2_28_aarch64.tar.gz", best.name);
+}
+
+test "findBestAsset rejects linux-android on Linux host" {
+    const assets = [_]Asset{
+        .{ .name = "wash-aarch64-linux-android", .browser_download_url = "" },
+        .{ .name = "wash-aarch64-unknown-linux-musl", .browser_download_url = "" },
+        .{ .name = "wash-x86_64-unknown-linux-musl", .browser_download_url = "" },
+        .{ .name = "wash-aarch64-apple-darwin", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "aarch64", "arm64" },
+    });
+    try std.testing.expectEqualStrings("wash-aarch64-unknown-linux-musl", best.name);
+}
+
+test "findBestAsset tie-break prefers shorter name" {
+    const assets = [_]Asset{
+        .{ .name = "tool-x86_64-linux-extra.tar.gz", .browser_download_url = "" },
+        .{ .name = "tool-x86_64-linux.tar.gz", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "x86_64", "x64", "amd64" },
+    });
+    try std.testing.expectEqualStrings("tool-x86_64-linux.tar.gz", best.name);
+}
+
+test "isWrongPlatform basics" {
+    const linux_os: []const []const u8 = &.{"linux"};
+    try std.testing.expect(isWrongPlatform("wash-aarch64-linux-android", linux_os));
+    try std.testing.expect(isWrongPlatform("tool-wasm32-wasi.tar.gz", linux_os));
+    try std.testing.expect(isWrongPlatform("tool-x86_64-apple-darwin.tar.gz", linux_os));
+    try std.testing.expect(!isWrongPlatform("tool-x86_64-unknown-linux-gnu.tar.gz", linux_os));
+    try std.testing.expect(!isWrongPlatform("tool-aarch64-linux.tar.xz", linux_os));
+
+    const win_os: []const []const u8 = &.{ "windows", "win" };
+    try std.testing.expect(isWrongPlatform("tool-x86_64-apple-darwin.tar.gz", win_os));
+    try std.testing.expect(isWrongPlatform("tool-x86_64-unknown-linux-gnu.tar.gz", win_os));
+    try std.testing.expect(!isWrongPlatform("tool-x86_64-pc-windows-msvc.zip", win_os));
+}
+
+test "deriveBareBinaryName strips arch-triple from stem" {
+    const a = std.testing.allocator;
+
+    {
+        const n = try deriveBareBinaryName(a, "wash-aarch64-unknown-linux-musl", "wasmCloud", false);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("wash", n);
+    }
+    {
+        const n = try deriveBareBinaryName(a, "wash-x86_64-pc-windows-msvc.exe", "wasmCloud", true);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("wash.exe", n);
+    }
+    {
+        // arch is not directly after stem -> fall back to repo.
+        const n = try deriveBareBinaryName(a, "cosign-linux-amd64", "cosign", false);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("cosign", n);
+    }
+    {
+        const n = try deriveBareBinaryName(a, "cosign-windows-amd64.exe", "cosign", true);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("cosign.exe", n);
+    }
+    {
+        // Underscore separator.
+        const n = try deriveBareBinaryName(a, "foo_aarch64-unknown-linux-gnu", "repo", false);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("foo", n);
+    }
+    {
+        // No separator at all -> fall back.
+        const n = try deriveBareBinaryName(a, "singleword", "repo", false);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("repo", n);
+    }
 }
 
 test "findBestAsset selects cosign bare binary for Linux" {
