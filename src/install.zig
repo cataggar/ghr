@@ -265,14 +265,32 @@ const PlatformKeywords = struct {
     arch: []const []const u8,
 };
 
+/// Markers in asset names that indicate non-primary variants (libraries,
+/// source tarballs, minimal/debug builds) which should be deprioritized when
+/// a plain binary archive is also available.
+fn nonPrimaryPenalty(name: []const u8) u32 {
+    const markers = [_][]const u8{
+        "c-api", "capi",
+        "-src", "-source", "-sources",
+        "-min", "-minimal",
+        "-debug", "-dbg", "-symbols",
+        "-wasi",
+    };
+    var penalty: u32 = 0;
+    for (markers) |m| {
+        if (containsIgnoreCaseBounded(name, m)) penalty += 3;
+    }
+    return penalty;
+}
+
 fn findBestAssetForKeywords(assets: []const Asset, plat: PlatformKeywords) !Asset {
     var best: ?Asset = null;
-    var best_score: u32 = 0;
+    var best_score: i32 = 0;
 
     for (assets) |asset| {
         if (!isInstallableAsset(asset.name)) continue;
 
-        var score: u32 = 0;
+        var score: i32 = 0;
         for (plat.os) |kw| {
             if (containsIgnoreCaseBounded(asset.name, kw)) {
                 score += 10;
@@ -285,6 +303,7 @@ fn findBestAssetForKeywords(assets: []const Asset, plat: PlatformKeywords) !Asse
                 break;
             }
         }
+        score -= @as(i32, @intCast(nonPrimaryPenalty(asset.name)));
         if (score > best_score) {
             best_score = score;
             best = asset;
@@ -1697,6 +1716,20 @@ test "findBestAsset selects cosign exe for Windows" {
         .arch = &.{ "x86_64", "x64", "amd64" },
     });
     try std.testing.expectEqualStrings("cosign-windows-amd64.exe", best.name);
+}
+
+test "findBestAsset prefers plain archive over c-api variant" {
+    const assets = [_]Asset{
+        .{ .name = "wasmtime-v44.0.0-aarch64-linux-c-api.tar.xz", .browser_download_url = "" },
+        .{ .name = "wasmtime-v44.0.0-aarch64-linux-min.tar.xz", .browser_download_url = "" },
+        .{ .name = "wasmtime-v44.0.0-aarch64-linux.tar.xz", .browser_download_url = "" },
+        .{ .name = "wasmtime-v44.0.0-x86_64-linux.tar.xz", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "aarch64", "arm64" },
+    });
+    try std.testing.expectEqualStrings("wasmtime-v44.0.0-aarch64-linux.tar.xz", best.name);
 }
 
 test "findBestAsset selects cosign bare binary for Linux" {
