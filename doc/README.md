@@ -157,12 +157,13 @@ publishes:
   global signature are verified against the same key. The trusted comment
   (often a `timestamp:... file:... hashed` blob) is printed on success.
   If `--minisign` is set but no `<asset>.minisig` is published, ghr
-  aborts the download — minisign verification is fail-closed when opted in.
+  aborts before downloading — minisign verification is fail-closed when
+  opted in.
   If a `<asset>.minisig` IS published but neither `--minisign` nor
-  `--skip-verify` was passed, ghr also aborts: ignoring a published
-  signature would silently skip a real verification opportunity, so the
-  caller must opt in (pass `--minisign <pubkey>`) or opt out
-  (`--skip-verify`).
+  `--skip-verify` was passed, ghr also aborts before downloading:
+  ignoring a published signature would silently skip a real verification
+  opportunity, so the caller must opt in (pass `--minisign <pubkey>`) or
+  opt out (`--skip-verify`).
 
 On any verification failure the operation is aborted and the cached
 download is deleted. If no checksum, minisign sidecar, or bundle is

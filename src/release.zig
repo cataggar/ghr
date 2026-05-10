@@ -1168,6 +1168,81 @@ pub fn findAssetByName(
 ///   - If neither material is published, prints a `note:` saying the
 ///     download is unverified and returns `.no_verification`.
 ///
+/// Lightweight pre-flight that inspects only the release's asset list
+/// (no network, no disk) to decide whether the download is allowed to
+/// proceed:
+///
+///   - `--skip-verify` always short-circuits to ok.
+///   - If a `<asset_name>.minisig` sidecar is present but the caller did
+///     not pass `--minisign`, fail-closed with a hint pointing to both
+///     `--minisign` and `--skip-verify`. This aborts BEFORE the (often
+///     large) download begins.
+///   - If `--minisign` was supplied but no sidecar is published, fail
+///     immediately for the same reason.
+///   - Otherwise (no sidecar, no key, or sidecar+key both present) the
+///     check passes and the caller proceeds. Full cryptographic
+///     verification happens later in `verifyAssetOnDisk`.
+///
+/// Emits the same error messages as the post-download path so users see
+/// consistent diagnostics regardless of when the check fires.
+pub fn preflightVerification(
+    assets: []const Asset,
+    asset_name: []const u8,
+    skip_verify: bool,
+    minisign_pubkey_b64: ?[]const u8,
+    err_w: *Writer,
+) !void {
+    if (skip_verify) return;
+
+    var views_buf: [256]minisign.AssetView = undefined;
+    if (assets.len > views_buf.len) {
+        // Releases with more than 256 assets are vanishingly rare; if we
+        // ever hit one the caller can still rely on the post-download
+        // check.
+        return;
+    }
+    for (assets, 0..) |a, i| {
+        views_buf[i] = .{ .name = a.name, .browser_download_url = a.browser_download_url };
+    }
+    const views = views_buf[0..assets.len];
+
+    const sidecar_opt = minisign.findMinisigAsset(views, asset_name);
+
+    if (minisign_pubkey_b64) |key_b64| {
+        _ = minisign.parsePublicKey(key_b64) catch |err| {
+            try err_w.print(
+                "error: --minisign value is not a valid minisign public key ({s})\n",
+                .{@errorName(err)},
+            );
+            try err_w.flush();
+            return error.MinisignPubKeyParseError;
+        };
+
+        if (sidecar_opt == null) {
+            try err_w.print(
+                "error: --minisign was supplied but no '{s}.minisig' sidecar is published in this release\n",
+                .{asset_name},
+            );
+            try err_w.flush();
+            return error.MinisignSidecarMissing;
+        }
+        return;
+    }
+
+    if (sidecar_opt) |sidecar| {
+        try err_w.print(
+            "error: '{s}' is published with a minisign signature ('{s}') but --minisign was not provided\n",
+            .{ asset_name, sidecar.name },
+        );
+        try err_w.print(
+            "  hint: pass --minisign <base64-pubkey> to verify, or --skip-verify to bypass\n",
+            .{},
+        );
+        try err_w.flush();
+        return error.MinisignSidecarPresentButNoKey;
+    }
+}
+
 /// Errors propagate to the caller, which is responsible for deleting the
 /// cached file and aborting (`install` exits, `download` reports and
 /// removes the partial file).

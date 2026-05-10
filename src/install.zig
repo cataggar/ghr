@@ -915,6 +915,18 @@ pub fn cmdInstall(
         std.process.exit(1);
     };
 
+    // Pre-flight verification check: if a `.minisig` sidecar exists but
+    // the caller did not pass `--minisign` (and is not using
+    // `--skip-verify`), abort BEFORE downloading. Mirrors the same check
+    // in cmdDownload.
+    release_mod.preflightVerification(
+        release.parsed.value.assets,
+        asset.name,
+        skip_verify,
+        minisign_pubkey_b64,
+        err_w,
+    ) catch std.process.exit(1);
+
     try w.print("downloading {s} ...\n", .{asset.name});
     try w.flush();
 
