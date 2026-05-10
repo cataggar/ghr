@@ -671,7 +671,6 @@ fn computeFileSha256(io: Io, path: []const u8) ![32]u8 {
 fn verifyDownloadedAssetSha256(
     allocator: std.mem.Allocator,
     io: Io,
-    client: *std.http.Client,
     cache_dir: []const u8,
     assets: []const Asset,
     asset_name: []const u8,
@@ -694,7 +693,10 @@ fn verifyDownloadedAssetSha256(
     defer allocator.free(checksum_path);
     defer Dir.deleteFileAbsolute(io, checksum_path) catch {};
 
-    downloadAsset(allocator, io, client, checksum_asset.browser_download_url, checksum_path, debug_w, auth_header) catch |err| {
+    http.downloadToFile(allocator, io, checksum_asset.browser_download_url, checksum_path, .{
+        .auth_header = auth_header,
+        .debug_w = debug_w,
+    }) catch |err| {
         try err_w.print("error: failed to download checksum file '{s}': {}\n", .{ checksum_asset.name, err });
         try err_w.flush();
         return error.ChecksumDownloadFailed;
@@ -744,7 +746,6 @@ fn verifyDownloadedAssetSha256(
 fn verifyDownloadedAssetSigstore(
     allocator: std.mem.Allocator,
     io: Io,
-    client: *std.http.Client,
     cache_dir: []const u8,
     assets: []const Asset,
     asset_name: []const u8,
@@ -774,7 +775,10 @@ fn verifyDownloadedAssetSigstore(
     defer allocator.free(bundle_path);
     defer Dir.deleteFileAbsolute(io, bundle_path) catch {};
 
-    downloadAsset(allocator, io, client, bundle_asset.browser_download_url, bundle_path, debug_w, auth_header) catch |err| {
+    http.downloadToFile(allocator, io, bundle_asset.browser_download_url, bundle_path, .{
+        .auth_header = auth_header,
+        .debug_w = debug_w,
+    }) catch |err| {
         try err_w.print("error: failed to download sigstore bundle '{s}': {}\n", .{ bundle_asset.name, err });
         try err_w.flush();
         return error.SigstoreDownloadFailed;
@@ -821,6 +825,12 @@ fn verifyDownloadedAssetSigstore(
     }
     if (identity.identity.oidc_issuer) |issuer| {
         try w.print("  issuer:   {s}\n", .{issuer});
+    }
+    if (identity.inclusion_verified) {
+        const cp_note: []const u8 = if (identity.checkpoint_verified) " + checkpoint" else "";
+        if (bundle.inclusion) |inc| {
+            try w.print("  inclusion: tree size {d}{s}\n", .{ inc.tree_size, cp_note });
+        }
     }
     try w.flush();
     return .sigstore_verified;
@@ -1682,7 +1692,6 @@ pub fn cmdInstall(
         const sha_outcome = verifyDownloadedAssetSha256(
             allocator,
             io,
-            &client,
             d.cache,
             release.parsed.value.assets,
             asset.name,
@@ -1713,7 +1722,6 @@ pub fn cmdInstall(
         const sig_outcome = verifyDownloadedAssetSigstore(
             allocator,
             io,
-            &client,
             d.cache,
             release.parsed.value.assets,
             asset.name,
@@ -2644,9 +2652,8 @@ test "computeFileSha256 streams a synthetic file" {
     f.close(std.testing.io);
 
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(std.testing.io, ".", &path_buf);
-    const full_path = try std.fmt.allocPrint(std.testing.allocator, "{s}{c}{s}", .{ tmp_path, std.fs.path.sep, "blob" });
-    defer std.testing.allocator.free(full_path);
+    const n = try tmp.dir.realPathFile(std.testing.io, "blob", &path_buf);
+    const full_path = path_buf[0..n];
 
     const digest = try computeFileSha256(std.testing.io, full_path);
     var expected: [32]u8 = undefined;

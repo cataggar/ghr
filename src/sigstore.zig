@@ -13,12 +13,14 @@
 //!     disk so we don't need to hold the asset in memory.
 //!   * Rekor SET (signed entry timestamp) verification against the embedded
 //!     Rekor public key. This is what makes `integratedTime` trustworthy.
+//!   * Merkle inclusion-proof verification (RFC 6962) plus signed checkpoint
+//!     verification, anchoring the entry to a published log root.
 //!   * X.509 chain walk against the embedded trust roots, using the parser
 //!     from `std.crypto.Certificate`. The verification clock is the Rekor
 //!     `integratedTime`, since cosign's leaf certs only live ~10 minutes.
 //!
-//! Future work: identity reporting (SAN URI/email + OIDC issuer OIDs) and
-//! Merkle inclusion-proof verification against a signed Rekor checkpoint.
+//! Future work: enforce a specific identity (`--cert-identity` /
+//! `--cert-oidc-issuer`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -147,6 +149,7 @@ pub const Bundle = struct {
     rekor_log_key_id: []const u8, // raw bytes (binary keyId), owned via arena
     rekor_canonical_body: []const u8, // base64-decoded canonical Rekor entry body
     rekor_set: ?[]const u8, // base64-decoded SET bytes, when inclusionPromise is present
+    inclusion: ?Inclusion, // present when the bundle carries an inclusionProof
     arena: *std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Bundle) void {
@@ -155,6 +158,28 @@ pub const Bundle = struct {
         self.arena.deinit();
         child.destroy(self.arena);
     }
+};
+
+/// Parsed Merkle inclusion proof from the bundle. All slices are owned by
+/// the bundle's arena.
+pub const Inclusion = struct {
+    /// 0-indexed position of the entry within the tree at the time the
+    /// proof was fetched (`inclusionProof.logIndex`). NOT the same as
+    /// `Bundle.rekor_log_index`, which is the global Rekor log index.
+    leaf_index: u64,
+    /// Total number of leaves in the tree the proof anchors to
+    /// (`inclusionProof.treeSize`).
+    tree_size: u64,
+    /// Expected root hash for `tree_size` leaves
+    /// (`inclusionProof.rootHash`).
+    root_hash: [32]u8,
+    /// Audit path: 32-byte sibling hashes from leaf level upwards.
+    proof_hashes: []const [32]u8,
+    /// Optional signed checkpoint envelope (`inclusionProof.checkpoint`).
+    /// When present, the checkpoint's body is verified against the
+    /// embedded Rekor key and its `<size>` / `<root_hash>` lines must
+    /// match `tree_size` / `root_hash`.
+    checkpoint_envelope: ?[]const u8,
 };
 
 /// Parse a Sigstore Bundle JSON blob and decode the base64-encoded fields we
@@ -214,6 +239,40 @@ pub fn parseBundle(allocator: std.mem.Allocator, json_bytes: []const u8) !Bundle
     else
         null;
 
+    const inclusion: ?Inclusion = if (tlog.inclusionProof) |ip| blk: {
+        const leaf_index = std.fmt.parseInt(u64, ip.logIndex, 10) catch
+            return error.InvalidInclusionProof;
+        const tree_size = std.fmt.parseInt(u64, ip.treeSize, 10) catch
+            return error.InvalidInclusionProof;
+        if (tree_size == 0 or leaf_index >= tree_size)
+            return error.InvalidInclusionProof;
+
+        const root_bytes = try base64Decode(aalloc, ip.rootHash);
+        if (root_bytes.len != 32) return error.InvalidInclusionProof;
+        var root_arr: [32]u8 = undefined;
+        @memcpy(&root_arr, root_bytes);
+
+        const hashes = try aalloc.alloc([32]u8, ip.hashes.len);
+        for (ip.hashes, 0..) |h_b64, i| {
+            const h_bytes = try base64Decode(aalloc, h_b64);
+            if (h_bytes.len != 32) return error.InvalidInclusionProof;
+            @memcpy(&hashes[i], h_bytes);
+        }
+
+        const envelope: ?[]const u8 = if (ip.checkpoint) |c|
+            if (c.envelope.len > 0) c.envelope else null
+        else
+            null;
+
+        break :blk .{
+            .leaf_index = leaf_index,
+            .tree_size = tree_size,
+            .root_hash = root_arr,
+            .proof_hashes = hashes,
+            .checkpoint_envelope = envelope,
+        };
+    } else null;
+
     const integrated_time = std.fmt.parseInt(i64, tlog.integratedTime, 10) catch
         return error.BundleHasNoTlogEntry;
     const log_index = std.fmt.parseInt(u64, tlog.logIndex, 10) catch
@@ -229,6 +288,7 @@ pub fn parseBundle(allocator: std.mem.Allocator, json_bytes: []const u8) !Bundle
         .rekor_log_key_id = log_key_id,
         .rekor_canonical_body = canonical_body,
         .rekor_set = set_bytes,
+        .inclusion = inclusion,
         .arena = arena,
     };
 }
@@ -625,6 +685,170 @@ pub fn verifyArtifactSignature(
 }
 
 // ---------------------------------------------------------------------------
+// Merkle inclusion proof + signed checkpoint verification.
+//
+// RFC 6962 specifies that:
+//   leaf_hash(d)        = SHA-256(0x00 || d)
+//   inner_hash(l, r)    = SHA-256(0x01 || l || r)
+//
+// The Rekor entry is anchored to a specific tree size by walking the audit
+// path from the leaf up to a root, then comparing that root against the
+// signed checkpoint root. The checkpoint envelope is a Go `sumdb/note`:
+//
+//   <origin>\n<size>\n<base64 root>\n
+//   \n
+//   — <key_name> <base64(key_hint || signature)>\n
+//
+// `key_hint` is the first 4 bytes of SHA-256(SPKI), matching the Rekor
+// `logId.keyId` we already verify. The signature itself is ECDSA-P256
+// over the body (everything before "\n— ", *including* the trailing \n
+// of the third line, but *not* the empty separator line).
+//
+// Verifying the checkpoint pins the SET-witnessed entry to a publicly
+// observable log root, defending against split-view attacks where an
+// attacker could otherwise issue a different SET to different verifiers.
+// ---------------------------------------------------------------------------
+
+/// Recompute the Merkle root for `leaf_data` at position `leaf_index` in
+/// a tree of `tree_size` leaves, using the audit `proof` as sibling
+/// hashes from leaf level upwards. Returns the computed root.
+pub fn computeMerkleRoot(
+    leaf_data: []const u8,
+    leaf_index: u64,
+    tree_size: u64,
+    proof: []const [32]u8,
+) ![32]u8 {
+    if (tree_size == 0 or leaf_index >= tree_size)
+        return error.InvalidInclusionProof;
+
+    var prefix_leaf = [_]u8{0x00};
+    var hasher = Sha256.init(.{});
+    hasher.update(&prefix_leaf);
+    hasher.update(leaf_data);
+    var current: [32]u8 = undefined;
+    hasher.final(&current);
+
+    var fn_idx: u64 = leaf_index;
+    var sn_idx: u64 = tree_size - 1;
+    var combined: [1 + 32 + 32]u8 = undefined;
+    combined[0] = 0x01;
+
+    for (proof) |sibling| {
+        if (sn_idx == 0) return error.InvalidInclusionProof;
+        if ((fn_idx & 1) == 1 or fn_idx == sn_idx) {
+            @memcpy(combined[1..33], &sibling);
+            @memcpy(combined[33..65], &current);
+            Sha256.hash(&combined, &current, .{});
+            while ((fn_idx & 1) == 0) {
+                fn_idx >>= 1;
+                sn_idx >>= 1;
+            }
+        } else {
+            @memcpy(combined[1..33], &current);
+            @memcpy(combined[33..65], &sibling);
+            Sha256.hash(&combined, &current, .{});
+        }
+        fn_idx >>= 1;
+        sn_idx >>= 1;
+    }
+
+    if (sn_idx != 0) return error.InvalidInclusionProof;
+    return current;
+}
+
+/// Parse a Rekor checkpoint envelope and verify its signature against the
+/// embedded Rekor key. Confirms the checkpoint's declared tree size and
+/// root hash match the proof's `tree_size` / `expected_root`.
+pub fn verifyCheckpoint(
+    envelope: []const u8,
+    expected_size: u64,
+    expected_root: [32]u8,
+    rekor: RekorKey,
+) !void {
+    // Body / signature split: signature lines begin with "\n— " (the dash
+    // here is U+2014 EM DASH, not a hyphen). The signed body is everything
+    // before the "\n— ", *including* the trailing newline of the last text
+    // line. The empty line that visually separates body and signature
+    // belongs to the signature side.
+    const sep = "\n\n\xe2\x80\x94 ";
+    const sep_pos = std.mem.indexOf(u8, envelope, sep) orelse
+        return error.InvalidCheckpoint;
+    const signed_body = envelope[0 .. sep_pos + 1]; // include the trailing \n
+    const sig_section = envelope[sep_pos + 2 ..]; // starts at "— "
+
+    // Body: <origin>\n<size>\n<base64 root>\n
+    var lines = std.mem.splitScalar(u8, signed_body, '\n');
+    _ = lines.next() orelse return error.InvalidCheckpoint; // origin
+    const size_line = lines.next() orelse return error.InvalidCheckpoint;
+    const root_line = lines.next() orelse return error.InvalidCheckpoint;
+
+    const declared_size = std.fmt.parseInt(u64, size_line, 10) catch
+        return error.InvalidCheckpoint;
+    if (declared_size != expected_size) return error.CheckpointSizeMismatch;
+
+    var declared_root: [32]u8 = undefined;
+    {
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(root_line) catch
+            return error.InvalidCheckpoint;
+        if (decoded_len != 32) return error.InvalidCheckpoint;
+        decoder.decode(&declared_root, root_line) catch
+            return error.InvalidCheckpoint;
+    }
+    if (!std.mem.eql(u8, &declared_root, &expected_root))
+        return error.CheckpointRootMismatch;
+
+    // Signature line: "— <name> <base64>". There may be additional
+    // signature lines after it; we only need a Rekor signature.
+    var sig_lines = std.mem.splitScalar(u8, sig_section, '\n');
+    while (sig_lines.next()) |raw_line| {
+        if (raw_line.len == 0) continue;
+        if (!std.mem.startsWith(u8, raw_line, "\xe2\x80\x94 ")) continue;
+        const after_dash = raw_line[4..];
+        const space = std.mem.indexOfScalar(u8, after_dash, ' ') orelse continue;
+        const sig_b64 = after_dash[space + 1 ..];
+
+        const decoder = std.base64.standard.Decoder;
+        const decoded_len = decoder.calcSizeForSlice(sig_b64) catch continue;
+        if (decoded_len < 4 + 8) continue; // 4-byte hint + min DER ECDSA
+        var sig_buf: [256]u8 = undefined;
+        if (decoded_len > sig_buf.len) continue;
+        decoder.decode(sig_buf[0..decoded_len], sig_b64) catch continue;
+
+        if (!std.mem.eql(u8, sig_buf[0..4], rekor.key_id[0..4])) continue;
+
+        const sig_der = sig_buf[4..decoded_len];
+        const signature = EcdsaP256Sha256.Signature.fromDer(sig_der) catch
+            return error.InvalidCheckpointSignature;
+        signature.verify(signed_body, rekor.public_key) catch
+            return error.InvalidCheckpointSignature;
+        return;
+    }
+
+    return error.InvalidCheckpointSignature;
+}
+
+/// Verify the bundle's inclusion proof. Recomputes the Merkle root from
+/// the canonicalized Rekor body + audit path and compares it to the
+/// proof's `rootHash`. When a checkpoint envelope is present, also
+/// verifies its signature and binds it back to the proof.
+pub fn verifyInclusionProof(bundle: Bundle, rekor: RekorKey) !void {
+    const inc = bundle.inclusion orelse return error.BundleHasNoInclusionProof;
+
+    const computed = try computeMerkleRoot(
+        bundle.rekor_canonical_body,
+        inc.leaf_index,
+        inc.tree_size,
+        inc.proof_hashes,
+    );
+    if (!std.mem.eql(u8, &computed, &inc.root_hash))
+        return error.InclusionProofRootMismatch;
+
+    if (inc.checkpoint_envelope) |env|
+        try verifyCheckpoint(env, inc.tree_size, inc.root_hash, rekor);
+}
+
+// ---------------------------------------------------------------------------
 // Top-level verification orchestrator.
 // ---------------------------------------------------------------------------
 
@@ -634,6 +858,13 @@ pub const VerifiedIdentity = struct {
     /// Rekor `integratedTime`, useful for the install metadata and CLI
     /// output.
     integrated_time: i64,
+    /// True if a Merkle inclusion proof was verified (and, when present,
+    /// its signed checkpoint). False on legacy bundles that only carry an
+    /// inclusionPromise (Rekor SET).
+    inclusion_verified: bool,
+    /// True if a signed checkpoint envelope was verified alongside the
+    /// inclusion proof.
+    checkpoint_verified: bool,
 };
 
 /// Signer identity extracted from a Sigstore leaf cert. All fields are
@@ -742,13 +973,16 @@ pub fn extractIdentity(leaf_der: []const u8) !Identity {
 /// cached artifact:
 ///
 ///   1. Verify the Rekor SET (ties `integratedTime` to the embedded Rekor
-///      key).
-///   2. Decode the canonicalized Rekor body and confirm it agrees with the
+///      key) when the bundle carries an `inclusionPromise`.
+///   2. Verify the Merkle inclusion proof + signed checkpoint when the
+///      bundle carries an `inclusionProof`. At least one of (1) or (2)
+///      must be present and pass.
+///   3. Decode the canonicalized Rekor body and confirm it agrees with the
 ///      bundle's claimed leaf cert, signature, and digest.
-///   3. Stream the artifact through an ECDSA-P256/SHA-256 verifier with
+///   4. Stream the artifact through an ECDSA-P256/SHA-256 verifier with
 ///      the leaf cert's pubkey and confirm both the signature and the
 ///      digest match what Rekor witnessed.
-///   4. Walk the X.509 chain from the leaf to the embedded Fulcio root,
+///   5. Walk the X.509 chain from the leaf to the embedded Fulcio root,
 ///      using `integratedTime` as the validity clock.
 pub fn verifyBundle(
     allocator: std.mem.Allocator,
@@ -757,7 +991,22 @@ pub fn verifyBundle(
     rekor: RekorKey,
     file: Io.File,
 ) !VerifiedIdentity {
-    try verifyRekorSet(allocator, bundle, rekor);
+    var set_verified = false;
+    if (bundle.rekor_set != null) {
+        try verifyRekorSet(allocator, bundle, rekor);
+        set_verified = true;
+    }
+
+    var inclusion_verified = false;
+    var checkpoint_verified = false;
+    if (bundle.inclusion) |inc| {
+        try verifyInclusionProof(bundle, rekor);
+        inclusion_verified = true;
+        checkpoint_verified = inc.checkpoint_envelope != null;
+    }
+
+    if (!set_verified and !inclusion_verified)
+        return error.BundleHasNoLogProof;
 
     var body = try decodeRekorBody(allocator, bundle.rekor_canonical_body);
     defer body.deinit();
@@ -785,6 +1034,8 @@ pub fn verifyBundle(
     return .{
         .identity = try extractIdentity(bundle.leaf_der),
         .integrated_time = bundle.rekor_integrated_time,
+        .inclusion_verified = inclusion_verified,
+        .checkpoint_verified = checkpoint_verified,
     };
 }
 
@@ -852,8 +1103,11 @@ test "verifyCertChain walks cosign fixture to embedded Fulcio root" {
     var trust = try buildTrustBundle(allocator, bundle.rekor_integrated_time);
     defer trust.deinit(allocator);
 
-    const leaf_parsed = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
-    try std.testing.expect(leaf_parsed.subject_alt_name_slice.end > leaf_parsed.subject_alt_name_slice.start);
+    // Walking from the leaf to the embedded Fulcio root must succeed.
+    // (The returned `Parsed` is std.crypto.Certificate.Parsed; we don't
+    // rely on its SAN slice here — our own `extractIdentity` is the
+    // ground truth for that.)
+    _ = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
 }
 
 test "embeddedRekorKey matches well-known production key id" {
@@ -937,9 +1191,9 @@ test "verifyArtifactSignature streams a signed blob end-to-end" {
     }
 
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(io, ".", &path_buf);
-    const full_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tmp_path, std.fs.path.sep, "payload" });
-    defer allocator.free(full_path);
+    const n = try tmp.dir.realPathFile(io, "payload", &path_buf);
+    const full_path = path_buf[0..n];
+    _ = allocator;
 
     var f = try Io.Dir.openFileAbsolute(io, full_path, .{});
     defer f.close(io);
@@ -976,9 +1230,9 @@ test "verifyArtifactSignature rejects a tampered file" {
     }
 
     var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const tmp_path = try tmp.dir.realpath(io, ".", &path_buf);
-    const full_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tmp_path, std.fs.path.sep, "tampered" });
-    defer allocator.free(full_path);
+    const n = try tmp.dir.realPathFile(io, "tampered", &path_buf);
+    const full_path = path_buf[0..n];
+    _ = allocator;
 
     var f = try Io.Dir.openFileAbsolute(io, full_path, .{});
     defer f.close(io);
@@ -1017,4 +1271,103 @@ test "verifyBundle returns identity on the cosign fixture" {
     // 127 MiB cosign artifact in test fixtures.
     const id = try extractIdentity(bundle.leaf_der);
     try std.testing.expect(id.primarySubject() != null);
+}
+
+test "parseBundle extracts the inclusion proof" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    const inc = bundle.inclusion orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(@as(u64, 1122916277), inc.leaf_index);
+    try std.testing.expectEqual(@as(u64, 1122916324), inc.tree_size);
+    try std.testing.expectEqual(@as(usize, 21), inc.proof_hashes.len);
+    try std.testing.expect(inc.checkpoint_envelope != null);
+}
+
+test "verifyInclusionProof recomputes root and verifies checkpoint" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    const rekor = try embeddedRekorKey(allocator);
+    try verifyInclusionProof(bundle, rekor);
+}
+
+test "verifyInclusionProof rejects tampered proof" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    const rekor = try embeddedRekorKey(allocator);
+
+    // Flip a bit in the first sibling hash of the audit path.
+    const inc = bundle.inclusion orelse return error.TestUnexpectedNull;
+    const tampered = try allocator.alloc([32]u8, inc.proof_hashes.len);
+    defer allocator.free(tampered);
+    @memcpy(tampered, inc.proof_hashes);
+    tampered[0][0] ^= 0x01;
+
+    bundle.inclusion = .{
+        .leaf_index = inc.leaf_index,
+        .tree_size = inc.tree_size,
+        .root_hash = inc.root_hash,
+        .proof_hashes = tampered,
+        .checkpoint_envelope = inc.checkpoint_envelope,
+    };
+
+    try std.testing.expectError(
+        error.InclusionProofRootMismatch,
+        verifyInclusionProof(bundle, rekor),
+    );
+}
+
+test "verifyCheckpoint rejects mismatched root or size" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    const inc = bundle.inclusion orelse return error.TestUnexpectedNull;
+    const env = inc.checkpoint_envelope orelse return error.TestUnexpectedNull;
+    const rekor = try embeddedRekorKey(allocator);
+
+    var bad_root = inc.root_hash;
+    bad_root[0] ^= 0x01;
+    try std.testing.expectError(
+        error.CheckpointRootMismatch,
+        verifyCheckpoint(env, inc.tree_size, bad_root, rekor),
+    );
+
+    try std.testing.expectError(
+        error.CheckpointSizeMismatch,
+        verifyCheckpoint(env, inc.tree_size + 1, inc.root_hash, rekor),
+    );
+}
+
+test "verifyCheckpoint rejects tampered signature body" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    const inc = bundle.inclusion orelse return error.TestUnexpectedNull;
+    const env = inc.checkpoint_envelope orelse return error.TestUnexpectedNull;
+    const rekor = try embeddedRekorKey(allocator);
+
+    // Replace a digit in the size line so the body no longer matches the
+    // signature. The size on disk parses to a different number, so we
+    // also need to ask verifyCheckpoint about that new size to bypass
+    // the size check and reach the signature check.
+    const tampered = try allocator.dupe(u8, env);
+    defer allocator.free(tampered);
+    const size_idx = std.mem.indexOfScalar(u8, tampered, '\n').? + 1;
+    tampered[size_idx] = if (tampered[size_idx] == '9') '8' else '9';
+
+    // Compute what the tampered size now parses to.
+    const newline_after = std.mem.indexOfScalarPos(u8, tampered, size_idx, '\n').?;
+    const new_size = try std.fmt.parseInt(u64, tampered[size_idx..newline_after], 10);
+
+    try std.testing.expectError(
+        error.InvalidCheckpointSignature,
+        verifyCheckpoint(tampered, new_size, inc.root_hash, rekor),
+    );
 }

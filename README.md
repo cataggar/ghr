@@ -146,10 +146,13 @@ against any verification material the release publishes:
   ECDSA-P256/SHA-256 signature is checked against the leaf, and Rekor's
   signed entry timestamp is verified against the embedded Rekor public
   key. The Rekor `integratedTime` is used as the verification clock since
-  cosign leaf certs only live for ~10 minutes. The signer's SAN
-  (URI/email) and OIDC issuer are extracted from the leaf cert and
-  printed to stdout for visual review; ghr does not yet enforce a
-  specific identity.
+  cosign leaf certs only live for ~10 minutes. When the bundle carries
+  an inclusion proof, the Merkle audit path is replayed (RFC 6962) to
+  recompute the log root, and the signed checkpoint envelope is verified
+  against the embedded Rekor key — anchoring the entry to a publicly
+  observable log root. The signer's SAN (URI/email) and OIDC issuer are
+  extracted from the leaf cert and printed to stdout for visual review;
+  ghr does not yet enforce a specific identity.
 
 On any verification failure the install is aborted and the cached
 download is deleted. If no checksum or bundle is published the download
