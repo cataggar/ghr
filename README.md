@@ -5,7 +5,7 @@ A toolkit for GitHub releases.
 Install tools from GitHub releases with one cross-platform command. A single
 static binary that picks the right asset for your OS and architecture.
 Supports verifying with [minisign](https://jedisct1.github.io/minisign/),
-[sigstore](https://www.sigstore.dev/), and checksums. Install it on a
+[sigstore](https://sigstore.dev/), and checksums. Install it on a
 GitHub-hosted runner with `pipx install ghr-bin`.
 
 ## Usage
