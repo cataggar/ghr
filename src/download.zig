@@ -220,6 +220,7 @@ pub fn cmdDownload(
                 error.ChecksumDownloadFailed,
                 error.ChecksumEntryMissing,
                 error.MinisignSidecarMissing,
+                error.MinisignSidecarPresentButNoKey,
                 error.MinisignKeyIdMismatch,
                 error.MinisignSignatureMismatch,
                 error.MinisignGlobalSigMismatch,
