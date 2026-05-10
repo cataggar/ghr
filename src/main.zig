@@ -49,6 +49,7 @@ pub fn main(init: std.process.Init) !void {
         var debug = false;
         var no_auth = false;
         var skip_verify = false;
+        var minisign_pubkey: ?[]const u8 = null;
         var spec: ?[]const u8 = null;
         while (args.next()) |arg| {
             if (eql(arg, "--debug")) {
@@ -57,6 +58,13 @@ pub fn main(init: std.process.Init) !void {
                 no_auth = true;
             } else if (eql(arg, "--skip-verify")) {
                 skip_verify = true;
+            } else if (eql(arg, "--minisign")) {
+                const v = args.next() orelse {
+                    try stderr.interface.print("error: '--minisign' requires a base64 minisign public key value\n", .{});
+                    try stderr.interface.flush();
+                    std.process.exit(1);
+                };
+                minisign_pubkey = v;
             } else if (spec == null) {
                 spec = arg;
             }
@@ -66,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try install.cmdInstall(allocator, io, environ, spec_val, &stdout.interface, &stderr.interface, debug, no_auth, skip_verify);
+        try install.cmdInstall(allocator, io, environ, spec_val, &stdout.interface, &stderr.interface, debug, no_auth, skip_verify, minisign_pubkey);
     } else if (eql(cmd_str, "uninstall")) {
         const spec = args.next() orelse {
             try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
@@ -258,9 +266,11 @@ fn printUsage(w: *Writer) !void {
         \\    help                                 Print this help and exit
         \\
         \\OPTIONS:
-        \\    --debug         Show diagnostic output for debugging
-        \\    --no-auth       Skip GitHub authentication
-        \\    --skip-verify   Skip sigstore + SHA256 checksum verification
+        \\    --debug                 Show diagnostic output for debugging
+        \\    --no-auth               Skip GitHub authentication
+        \\    --skip-verify           Skip sigstore + SHA256 + minisign verification
+        \\    --minisign <pubkey>     Require minisign signature (install/download only);
+        \\                            <pubkey> is a base64 minisign public key string
         \\
     , .{});
 }

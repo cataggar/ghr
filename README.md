@@ -4,9 +4,9 @@ A toolkit for GitHub releases.
 
 Install tools from GitHub releases with one cross-platform command. A single
 static binary that picks the right asset for your OS and architecture,
-verifies it with any published sigstore bundle or SHA256 checksum, and drops
-the executable onto your `PATH`. Install it on a GitHub-hosted runner with
-`pipx install ghr-bin`.
+verifies it with any published sigstore bundle, minisign sidecar, or SHA256
+checksum, and drops the executable onto your `PATH`. Install it on a
+GitHub-hosted runner with `pipx install ghr-bin`.
 
 ## Usage
 
