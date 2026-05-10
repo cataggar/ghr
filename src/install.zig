@@ -1,6 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Dirs = @import("dirs.zig").Dirs;
+const http = @import("http.zig");
+const archive = @import("archive.zig");
+const auth = @import("auth.zig");
 const version = @import("build_options").version;
 
 const Io = std.Io;
@@ -9,6 +12,10 @@ const File = Io.File;
 const Writer = Io.Writer;
 const Environ = std.process.Environ;
 const EnvironMap = Environ.Map;
+
+const http_write_buffer_size = http.http_write_buffer_size;
+const debugLog = http.debugLog;
+const isTransientStatus = http.isTransientStatus;
 
 /// Delete an absolute path's directory tree. Zig 0.16 removed Dir.deleteTreeAbsolute,
 /// so we open the parent dir and call deleteTree on the basename.
@@ -19,13 +26,6 @@ fn deleteTreeAbsolute(io: Io, abs_path: []const u8) !void {
     defer dir.close(io);
     try dir.deleteTree(io, basename);
 }
-
-/// HTTP write buffer size for download clients. GitHub release downloads redirect
-/// to CDN URLs with long signed query strings (~900 bytes). The default
-/// write_buffer_size of 1024 is too small, causing the request to be truncated
-/// and the CDN to return HTTP 400. We use 4096 to accommodate these URLs plus
-/// the request line and headers.
-const http_write_buffer_size = 4096;
 const Spec = struct {
     owner: []const u8,
     repo: []const u8,
@@ -495,310 +495,6 @@ fn deriveBareBinaryName(
     return allocator.dupe(u8, repo);
 }
 
-fn downloadAsset(
-    allocator: std.mem.Allocator,
-    io: Io,
-    _: *std.http.Client,
-    url: []const u8,
-    dest_path: []const u8,
-    debug_w: ?*Writer,
-    auth_header: ?[]const u8,
-) !void {
-    const max_retries: u8 = 5;
-    var attempts: u8 = 0;
-    while (attempts < max_retries) : (attempts += 1) {
-        if (attempts > 0) {
-            const delay_s: i64 = @as(i64, 1) << @intCast(attempts - 1);
-            debugLog(debug_w, "  retrying in {d}s ...\n", .{delay_s});
-            io.sleep(Io.Duration.fromSeconds(delay_s), .real) catch {};
-            Dir.deleteFileAbsolute(io, dest_path) catch {};
-        }
-
-        var client: std.http.Client = .{
-            .allocator = allocator,
-            .io = io,
-            .write_buffer_size = http_write_buffer_size,
-        };
-        defer client.deinit();
-
-        const auth_only = [_]std.http.Header{
-            .{ .name = "Authorization", .value = auth_header orelse "" },
-        };
-
-        const uri = std.Uri.parse(url) catch {
-            debugLog(debug_w, "  invalid URL: {s}\n", .{url});
-            return error.DownloadFailed;
-        };
-
-        // Use unhandled redirects so we can strip Authorization on
-        // cross-domain redirect (github.com -> CDN). Zig 0.16's
-        // privileged_headers field is not written by sendHead.
-        // Use .headers.user_agent override to replace (not duplicate)
-        // Zig's default user-agent header.
-        var req = client.request(.GET, uri, .{
-            .redirect_behavior = .unhandled,
-            .headers = .{ .user_agent = .{ .override = "ghr/" ++ version } },
-            .extra_headers = if (auth_header != null) &auth_only else &.{},
-        }) catch |err| {
-            debugLog(debug_w, "  attempt {d}/{d} request error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
-        };
-        req.sendBodiless() catch |err| {
-            req.deinit();
-            debugLog(debug_w, "  attempt {d}/{d} send error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
-        };
-
-        const head_buf = allocator.alloc(u8, 8 * 1024) catch return error.DownloadFailed;
-        defer allocator.free(head_buf);
-
-        var response = req.receiveHead(head_buf) catch |err| {
-            req.deinit();
-            debugLog(debug_w, "  attempt {d}/{d} receiveHead error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
-        };
-
-        if (response.head.status.class() != .redirect) {
-            defer req.deinit();
-            const result = handleDownloadResponse(allocator, io, &response, dest_path, debug_w, attempts, max_retries) catch |err| {
-                if (err == error.DownloadFailed) return err;
-                return err;
-            };
-            if (result) return; // success
-            continue; // retry
-        }
-
-        // Follow redirect without Authorization header
-        const location = response.head.location orelse {
-            req.deinit();
-            debugLog(debug_w, "  redirect without Location header\n", .{});
-            return error.DownloadFailed;
-        };
-        const redirect_url = try allocator.dupe(u8, location);
-        defer allocator.free(redirect_url);
-
-        // Discard redirect body and release connection
-        var redir_buf: [64]u8 = undefined;
-        const redir_reader = response.reader(&redir_buf);
-        _ = redir_reader.discardRemaining() catch {};
-        req.deinit();
-
-        debugLog(debug_w, "  debug: redirect: {s}\n", .{redirect_url});
-
-        var cdn_client: std.http.Client = .{
-            .allocator = allocator,
-            .io = io,
-            .write_buffer_size = http_write_buffer_size,
-        };
-        defer cdn_client.deinit();
-
-        const cdn_uri = std.Uri.parse(redirect_url) catch {
-            debugLog(debug_w, "  invalid redirect URL\n", .{});
-            return error.DownloadFailed;
-        };
-
-        var cdn_req = cdn_client.request(.GET, cdn_uri, .{
-            .redirect_behavior = @enumFromInt(3),
-            .headers = .{ .user_agent = .{ .override = "ghr/" ++ version } },
-        }) catch |err| {
-            debugLog(debug_w, "  attempt {d}/{d} CDN request error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
-        };
-        defer cdn_req.deinit();
-
-        cdn_req.sendBodiless() catch |err| {
-            debugLog(debug_w, "  attempt {d}/{d} CDN send error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
-        };
-
-        const cdn_head_buf = allocator.alloc(u8, 8 * 1024) catch return error.DownloadFailed;
-        defer allocator.free(cdn_head_buf);
-
-        var cdn_response = cdn_req.receiveHead(cdn_head_buf) catch |err| {
-            debugLog(debug_w, "  attempt {d}/{d} CDN receiveHead error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
-        };
-
-        const result = handleDownloadResponse(allocator, io, &cdn_response, dest_path, debug_w, attempts, max_retries) catch |err| {
-            if (err == error.DownloadFailed) return err;
-            return err;
-        };
-        if (result) return;
-        continue;
-    }
-}
-
-/// Handle the download response: check status, write body to file.
-/// Returns true on success, false to retry.
-fn handleDownloadResponse(
-    allocator: std.mem.Allocator,
-    io: Io,
-    response: *std.http.Client.Response,
-    dest_path: []const u8,
-    debug_w: ?*Writer,
-    attempt: u8,
-    max_retries: u8,
-) !bool {
-    if (response.head.status != .ok) {
-        var err_buf: [64]u8 = undefined;
-        const body_reader = response.reader(&err_buf);
-        var body_w = Writer.Allocating.init(allocator);
-        defer body_w.deinit();
-        _ = body_reader.streamRemaining(&body_w.writer) catch {};
-        const err_body = body_w.toOwnedSlice() catch null;
-        defer if (err_body) |b| allocator.free(b);
-
-        if (response.head.status == .bad_request) {
-            std.log.err("download failed with HTTP 400 (bad_request)", .{});
-            if (err_body) |b| {
-                if (b.len > 0) std.log.err("{s}", .{b});
-            }
-            return error.DownloadFailed;
-        }
-
-        if (isTransientStatus(response.head.status)) {
-            debugLog(debug_w, "  attempt {d}/{d} HTTP {d} ({s})\n", .{
-                attempt + 1, max_retries,
-                @intFromEnum(response.head.status), @tagName(response.head.status),
-            });
-            if (debug_w) |dw| {
-                if (err_body) |b| {
-                    if (b.len > 0)
-                        dw.print("  debug: response body ({d} bytes):\n{s}\n", .{ b.len, b }) catch {};
-                }
-                dw.flush() catch {};
-            }
-            if (attempt + 1 < max_retries) return false;
-        }
-        std.log.err("download failed with HTTP {d} ({s})", .{
-            @intFromEnum(response.head.status), @tagName(response.head.status),
-        });
-        return error.DownloadFailed;
-    }
-
-    var file = Dir.createFileAbsolute(io, dest_path, .{}) catch return error.DownloadFailed;
-    defer file.close(io);
-    var file_buf: [8192]u8 = undefined;
-    var file_writer = file.writer(io, &file_buf);
-
-    var transfer_buffer: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
-
-    _ = reader.streamRemaining(&file_writer.interface) catch return error.DownloadFailed;
-    file_writer.end() catch return error.DownloadFailed;
-
-    return true;
-}
-
-/// Log response details on failure for debugging.
-fn debugLogResponse(w: ?*Writer, response: *const std.http.Client.Response) void {
-    if (w == null) return;
-    const writer = w.?;
-    writer.print("  debug: response headers:\n{s}\n", .{response.head.bytes}) catch {};
-    writer.flush() catch {};
-}
-
-fn debugLog(w: ?*Writer, comptime fmt: []const u8, args: anytype) void {
-    if (w) |writer| {
-        writer.print(fmt, args) catch {};
-        writer.flush() catch {};
-    }
-}
-
-fn isTransientStatus(status: std.http.Status) bool {
-    return switch (status) {
-        .request_timeout,
-        .too_many_requests,
-        .internal_server_error,
-        .bad_gateway,
-        .service_unavailable,
-        .gateway_timeout,
-        => true,
-        else => false,
-    };
-}
-
-/// Run `gh auth token` to get a GitHub token from the gh CLI.
-/// Returns null if gh is not installed or the command fails.
-fn ghAuthToken(allocator: std.mem.Allocator, io: Io) ?[]const u8 {
-    const result = std.process.run(allocator, io, .{
-        .argv = &.{ "gh", "auth", "token" },
-        .stdout_limit = Io.Limit.limited(256),
-        .stderr_limit = Io.Limit.limited(0),
-    }) catch return null;
-    defer allocator.free(result.stderr);
-
-    if (result.term != .exited or result.term.exited != 0) {
-        allocator.free(result.stdout);
-        return null;
-    }
-
-    // Trim trailing newline/whitespace and return owned copy
-    const trimmed = std.mem.trimEnd(u8, result.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
-    if (trimmed.len == 0) {
-        allocator.free(result.stdout);
-        return null;
-    }
-
-    const token = allocator.dupe(u8, trimmed) catch {
-        allocator.free(result.stdout);
-        return null;
-    };
-    allocator.free(result.stdout);
-    return token;
-}
-
-/// Validate that a zip entry path is safe (no path traversal).
-fn isSafePath(name: []const u8) bool {
-    if (name.len == 0) return false;
-    // Reject absolute paths
-    if (name[0] == '/' or name[0] == '\\') return false;
-    if (name.len >= 2 and name[1] == ':') return false; // Windows drive letter
-    // Reject path traversal
-    var it = std.mem.splitScalar(u8, name, '/');
-    while (it.next()) |component| {
-        if (std.mem.eql(u8, component, "..")) return false;
-    }
-    return true;
-}
-
-fn extractZip(io: Io, dest_dir: Dir, file: *File) !void {
-    var buf: [8192]u8 = undefined;
-    var reader = file.reader(io, &buf);
-    try std.zip.extract(dest_dir, &reader, .{
-        .allow_backslashes = true,
-    });
-}
-
-fn extractTarGz(io: Io, dest_dir: Dir, file: *File) !void {
-    var file_buf: [8192]u8 = undefined;
-    var file_reader = file.reader(io, &file_buf);
-    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
-    var decompress: std.compress.flate.Decompress = .init(
-        &file_reader.interface,
-        .gzip,
-        &decompress_buf,
-    );
-    try std.tar.extract(io, dest_dir, &decompress.reader, .{});
-}
-
-fn extractTarXz(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *File) !void {
-    var file_buf: [8192]u8 = undefined;
-    var file_reader = file.reader(io, &file_buf);
-    // xz.Decompress takes ownership of the buffer and may resize it via the allocator,
-    // so it must be heap-allocated (not stack).
-    const xz_buf = try allocator.alloc(u8, 8192);
-    var xz_decompress = try std.compress.xz.Decompress.init(&file_reader.interface, allocator, xz_buf);
-    defer xz_decompress.deinit();
-    try std.tar.extract(io, dest_dir, &xz_decompress.reader, .{});
-}
 
 /// Copy a bare executable from the cache into the staging directory,
 /// renaming it to `dest_name` and setting executable permissions.
@@ -1498,20 +1194,9 @@ pub fn cmdInstall(
     defer d.deinit();
 
     // Resolve auth token: env vars first, then `gh auth token` as fallback
-    const token = if (no_auth)
-        @as(?[]const u8, null)
-    else
-        environ.get("GH_TOKEN") orelse environ.get("GITHUB_TOKEN") orelse ghAuthToken(allocator, io);
-    defer if (token) |t| {
-        // Only free if we allocated it (from ghAuthToken), not if it's from environ
-        if (environ.get("GH_TOKEN") == null and environ.get("GITHUB_TOKEN") == null) {
-            allocator.free(t);
-        }
-    };
-    const auth_header: ?[]const u8 = if (token) |t|
-        try std.fmt.allocPrint(allocator, "Bearer {s}", .{t})
-    else
-        null;
+    const auth_resolved = auth.resolveGithubToken(allocator, io, environ, no_auth);
+    defer auth_resolved.deinit(allocator);
+    const auth_header = try auth.bearerHeader(allocator, auth_resolved);
     defer if (auth_header) |h| allocator.free(h);
 
     try w.print("resolving {s}/{s}", .{ spec.owner, spec.repo });
@@ -1574,12 +1259,14 @@ pub fn cmdInstall(
     const debug_w: ?*Writer = if (debug) err_w else null;
 
     debugLog(debug_w, "debug: ghr {s}\n", .{version});
-    const auth_source: []const u8 = if (no_auth) "disabled" else if (environ.get("GH_TOKEN") != null) "GH_TOKEN" else if (environ.get("GITHUB_TOKEN") != null) "GITHUB_TOKEN" else if (token != null) "gh" else "none";
-    debugLog(debug_w, "debug: auth: {s}\n", .{auth_source});
+    debugLog(debug_w, "debug: auth: {s}\n", .{auth_resolved.source});
     debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
     debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
 
-    downloadAsset(allocator, io, &client, asset.browser_download_url, download_path, debug_w, auth_header) catch |err| {
+    http.downloadToFile(allocator, io, asset.browser_download_url, download_path, .{
+        .auth_header = auth_header,
+        .debug_w = debug_w,
+    }) catch |err| {
         try err_w.print("error: download failed: {}\n", .{err});
         try err_w.print("  url: {s}\n", .{asset.browser_download_url});
         try err_w.flush();
@@ -1616,48 +1303,30 @@ pub fn cmdInstall(
     try w.print("extracting ...\n", .{});
     try w.flush();
 
-    if (std.mem.endsWith(u8, asset.name, ".zip")) {
-        var zip_file = try Dir.openFileAbsolute(io, download_path, .{});
-        defer zip_file.close(io);
+    switch (archive.detectFormat(asset.name)) {
+        .zip, .tar_gz, .tar_xz => {
+            archive.extractAuto(allocator, io, staging_dir, download_path, 0) catch |err| {
+                try err_w.print("error: extraction failed: {}\n", .{err});
+                try err_w.flush();
+                std.process.exit(1);
+            };
+        },
+        .unknown => {
+            // Bare executable (e.g., cosign-windows-amd64.exe or cosign-linux-amd64).
+            // Derive the command name from the asset (e.g. `wash` from
+            // `wash-aarch64-unknown-linux-musl`) so the linked command is the
+            // natural tool name. Falls back to repo when the pattern doesn't
+            // fit (e.g. `cosign-linux-amd64` -> `cosign`).
+            const exe_name = try deriveBareBinaryName(
+                allocator,
+                asset.name,
+                spec.repo,
+                builtin.os.tag == .windows,
+            );
+            defer allocator.free(exe_name);
 
-        extractZip(io, staging_dir, &zip_file) catch |err| {
-            try err_w.print("error: extraction failed: {}\n", .{err});
-            try err_w.flush();
-            std.process.exit(1);
-        };
-    } else if (std.mem.endsWith(u8, asset.name, ".tar.gz") or std.mem.endsWith(u8, asset.name, ".tgz")) {
-        var tar_file = try Dir.openFileAbsolute(io, download_path, .{});
-        defer tar_file.close(io);
-
-        extractTarGz(io, staging_dir, &tar_file) catch |err| {
-            try err_w.print("error: extraction failed: {}\n", .{err});
-            try err_w.flush();
-            std.process.exit(1);
-        };
-    } else if (std.mem.endsWith(u8, asset.name, ".tar.xz")) {
-        var xz_file = try Dir.openFileAbsolute(io, download_path, .{});
-        defer xz_file.close(io);
-
-        extractTarXz(allocator, io, staging_dir, &xz_file) catch |err| {
-            try err_w.print("error: extraction failed: {}\n", .{err});
-            try err_w.flush();
-            std.process.exit(1);
-        };
-    } else {
-        // Bare executable (e.g., cosign-windows-amd64.exe or cosign-linux-amd64).
-        // Derive the command name from the asset (e.g. `wash` from
-        // `wash-aarch64-unknown-linux-musl`) so the linked command is the
-        // natural tool name. Falls back to repo when the pattern doesn't
-        // fit (e.g. `cosign-linux-amd64` -> `cosign`).
-        const exe_name = try deriveBareBinaryName(
-            allocator,
-            asset.name,
-            spec.repo,
-            builtin.os.tag == .windows,
-        );
-        defer allocator.free(exe_name);
-
-        try stageBareExecutable(allocator, io, d.cache, asset.name, staging_dir, exe_name);
+            try stageBareExecutable(allocator, io, d.cache, asset.name, staging_dir, exe_name);
+        },
     }
 
     // Find executables
@@ -1819,15 +1488,6 @@ test "parseSpec invalid" {
     try std.testing.expectError(error.InvalidSpec, parseSpec("noslash"));
     try std.testing.expectError(error.InvalidSpec, parseSpec("/repo"));
     try std.testing.expectError(error.InvalidSpec, parseSpec("owner/"));
-}
-
-test "isSafePath" {
-    try std.testing.expect(isSafePath("foo/bar.txt"));
-    try std.testing.expect(isSafePath("foo.exe"));
-    try std.testing.expect(!isSafePath("../etc/passwd"));
-    try std.testing.expect(!isSafePath("/absolute/path"));
-    try std.testing.expect(!isSafePath("C:\\windows\\path"));
-    try std.testing.expect(!isSafePath(""));
 }
 
 test "containsIgnoreCase" {
@@ -2037,11 +1697,13 @@ test "stageBareExecutable copies file with executable permissions" {
 
     // Create a staging dir
     tmp.dir.createDirPath(tio, "staging") catch {};
-    var staging = try tmp.dir.openDir(tio, "staging", .{});
+    var staging = try tmp.dir.openDir(tio, "staging", .{ .iterate = true });
     defer staging.close(tio);
 
     // Stage the bare executable
-    const cache_path = try tmp.dir.realpath(tio, "cache", &(std.testing.TmpDir.real_path_buffer));
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cache_path_len = try tmp.dir.realPathFile(tio, "cache", &path_buf);
+    const cache_path = path_buf[0..cache_path_len];
     try stageBareExecutable(
         std.testing.allocator,
         tio,
@@ -2066,123 +1728,9 @@ test "stageBareExecutable copies file with executable permissions" {
     try std.testing.expectEqualStrings("tool.exe", exes.items[0]);
 }
 
-/// Create a tar.gz test fixture using the system tar command.
-fn createTestTarGz(tmp: *std.testing.TmpDir, names: []const []const u8, contents: []const []const u8) !File {
-    const tio = std.testing.io;
-    for (names, contents) |name, content| {
-        if (std.fs.path.dirname(name)) |parent| {
-            tmp.dir.createDirPath(tio, parent) catch {};
-        }
-        var f = try tmp.dir.createFile(tio, name, .{ .permissions = .executable_file });
-        try f.writeStreamingAll(tio, content);
-        f.close(tio);
-    }
-
-    // Build argv: tar czf archive.tar.gz <names...>
-    var argv = std.ArrayListUnmanaged([]const u8).empty;
-    defer argv.deinit(std.testing.allocator);
-    try argv.appendSlice(std.testing.allocator, &.{ "tar", "czf", "archive.tar.gz" });
-    try argv.appendSlice(std.testing.allocator, names);
-
-    var child = try std.process.spawn(tio, .{
-        .argv = argv.items,
-        .cwd = .{ .dir = tmp.dir },
-    });
-    _ = try child.wait(tio);
-
-    // Remove source files so extraction starts clean
-    for (names) |name| {
-        tmp.dir.deleteFile(tio, name) catch {};
-        if (std.fs.path.dirname(name)) |parent| {
-            tmp.dir.deleteDir(tio, parent) catch {};
-        }
-    }
-
-    return try tmp.dir.openFile(tio, "archive.tar.gz", .{});
-}
-
-test "extractTarGz extracts files with correct contents" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var file = try createTestTarGz(&tmp, &.{ "myapp/README.md", "myapp/myapp" }, &.{ "readme\n", "#!/bin/sh\necho hello\n" });
-    defer file.close(std.testing.io);
-
-    extractTarGz(std.testing.io, tmp.dir, &file) catch |err| return err;
-
-    // Verify files exist
-    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "myapp/README.md", .{})).kind == .file);
-    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "myapp/myapp", .{})).kind == .file);
-
-    // Verify contents
-    const content = try tmp.dir.readFileAlloc(std.testing.io, "myapp/README.md", std.testing.allocator, Io.Limit.limited(256));
-    defer std.testing.allocator.free(content);
-    try std.testing.expectEqualStrings("readme\n", content);
-}
-
-test "extractTarGz handles single file archive" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var file = try createTestTarGz(&tmp, &.{"tool"}, &.{"binary"});
-    defer file.close(std.testing.io);
-
-    extractTarGz(std.testing.io, tmp.dir, &file) catch |err| return err;
-
-    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "tool", .{})).kind == .file);
-}
-
-fn createTestTarXz(tmp: *std.testing.TmpDir, names: []const []const u8, contents: []const []const u8) !File {
-    const tio = std.testing.io;
-    for (names, contents) |name, content| {
-        if (std.fs.path.dirname(name)) |parent| {
-            tmp.dir.createDirPath(tio, parent) catch {};
-        }
-        var f = try tmp.dir.createFile(tio, name, .{ .permissions = .executable_file });
-        try f.writeStreamingAll(tio, content);
-        f.close(tio);
-    }
-
-    var argv = std.ArrayListUnmanaged([]const u8).empty;
-    defer argv.deinit(std.testing.allocator);
-    try argv.appendSlice(std.testing.allocator, &.{ "tar", "cJf", "archive.tar.xz" });
-    try argv.appendSlice(std.testing.allocator, names);
-
-    var child = try std.process.spawn(tio, .{
-        .argv = argv.items,
-        .cwd = .{ .dir = tmp.dir },
-    });
-    _ = try child.wait(tio);
-
-    for (names) |name| {
-        tmp.dir.deleteFile(tio, name) catch {};
-        if (std.fs.path.dirname(name)) |parent| {
-            tmp.dir.deleteDir(tio, parent) catch {};
-        }
-    }
-
-    return try tmp.dir.openFile(tio, "archive.tar.xz", .{});
-}
-
-test "extractTarXz extracts files with correct contents" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var file = try createTestTarXz(&tmp, &.{ "myapp/README.md", "myapp/myapp" }, &.{ "readme\n", "#!/bin/sh\necho hello\n" });
-    defer file.close(std.testing.io);
-
-    extractTarXz(std.testing.io, tmp.dir, &file) catch |err| return err;
-
-    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "myapp/README.md", .{})).kind == .file);
-    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "myapp/myapp", .{})).kind == .file);
-
-    const content = try tmp.dir.readFileAlloc(std.testing.io, "myapp/README.md", std.testing.allocator, Io.Limit.limited(256));
-    defer std.testing.allocator.free(content);
-    try std.testing.expectEqualStrings("readme\n", content);
-}
 
 test "findExecutables discovers executable files" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     // Create an executable file
@@ -2206,7 +1754,7 @@ test "findExecutables discovers executable files" {
 }
 
 test "findExecutables discovers nested executables" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     // Create nested structure
@@ -2226,7 +1774,7 @@ test "findExecutables discovers nested executables" {
 }
 
 test "findExecutables returns empty for no executables" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     const txt_file = try tmp.dir.createFile(std.testing.io, "readme.txt", .{});
@@ -2281,7 +1829,7 @@ test "isMacAppBundle detects valid .app bundles" {
 }
 
 test "findExecutables only scans Contents/MacOS in .app bundles" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     const allocator = std.testing.allocator;
@@ -2315,7 +1863,7 @@ test "findExecutables only scans Contents/MacOS in .app bundles" {
 }
 
 test "findExecutables handles .app bundle alongside regular executables" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     const allocator = std.testing.allocator;
@@ -2370,7 +1918,7 @@ test "isLibraryDir identifies library directories" {
 }
 
 test "findExecutables skips shared libraries" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     const allocator = std.testing.allocator;
@@ -2420,84 +1968,6 @@ test "urlEncode handles special characters" {
     try std.testing.expectEqualStrings("100%25done", percent);
 }
 
-test "isTransientStatus" {
-    try std.testing.expect(!isTransientStatus(.bad_request));
-    try std.testing.expect(isTransientStatus(.request_timeout));
-    try std.testing.expect(isTransientStatus(.too_many_requests));
-    try std.testing.expect(isTransientStatus(.internal_server_error));
-    try std.testing.expect(isTransientStatus(.bad_gateway));
-    try std.testing.expect(isTransientStatus(.service_unavailable));
-    try std.testing.expect(isTransientStatus(.gateway_timeout));
-    try std.testing.expect(!isTransientStatus(.ok));
-    try std.testing.expect(!isTransientStatus(.not_found));
-    try std.testing.expect(!isTransientStatus(.forbidden));
-}
-
-test "no User-Agent in extra_headers (override prevents duplicate)" {
-    // Zig's HTTP client always emits a default "user-agent: zig/..." header.
-    // If User-Agent also appears in extra_headers, the CDN receives duplicate
-    // user-agent headers and returns HTTP 400 "Bad Request - Invalid Header".
-    // We must use .headers.user_agent = .{ .override = "ghr/..." } instead.
-    //
-    // Verify that the extra_headers arrays used in downloadAsset do NOT
-    // contain a User-Agent entry. Auth-only is fine; User-Agent must come
-    // from the .headers.user_agent override.
-    const auth_only = [_]std.http.Header{
-        .{ .name = "Authorization", .value = "Bearer test-token" },
-    };
-    const empty: []const std.http.Header = &.{};
-
-    for (auth_only) |h| {
-        try std.testing.expect(!std.ascii.eqlIgnoreCase(h.name, "User-Agent"));
-    }
-    try std.testing.expectEqual(@as(usize, 0), empty.len);
-
-    // Verify that using .override suppresses the default user-agent.
-    // emitOverridableHeader returns true only for .default (meaning "emit default").
-    // .override writes its own value and returns false, preventing the default.
-    const ua_override: std.http.Client.Request.Headers.Value = .{ .override = "ghr/" ++ version };
-    try std.testing.expect(ua_override == .override);
-    try std.testing.expectEqualStrings("ghr/" ++ version, ua_override.override);
-}
-
-test "http_write_buffer_size accommodates GitHub CDN redirect URLs" {
-    // GitHub release downloads redirect to CDN URLs with long signed query strings.
-    // The HTTP write buffer must hold the full request line + headers for the redirect.
-    // A typical redirect URL path+query is ~900 bytes. With request line overhead
-    // ("GET " + " HTTP/1.1\r\n") and headers (Host, User-Agent, Accept-Encoding,
-    // Connection), the total request can reach ~1100 bytes.
-    const typical_cdn_path = "/github-production-release-asset/1234567890/" ++
-        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" ++
-        "?sp=r&sv=2018-11-09&sr=b&spr=https" ++
-        "&se=2026-04-15T07%3A04%3A01Z" ++
-        "&rscd=attachment%3B+filename%3Dzig-aarch64-macos-0.16.0.tar.xz" ++
-        "&rsct=application%2Foctet-stream" ++
-        "&skoid=96c2d410-5711-43a1-aedd-ab1947aa7ab0" ++
-        "&sktid=398a6654-997b-47e9-b12b-9515b896b4de" ++
-        "&skt=2026-04-15T06%3A03%3A53Z" ++
-        "&ske=2026-04-15T07%3A04%3A01Z" ++
-        "&sks=b&skv=2018-11-09" ++
-        "&sig=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop%2Bqrstuv%3D" ++
-        "&jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9" ++
-        ".eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmVsZWFzZS1hc3NldHMu" ++
-        "Z2l0aHVidXNlcmNvbnRlbnQuY29tIiwia2V5Ijoia2V5MSIsImV4cCI6MT" ++
-        "c3NjIzNTg1MiwibmJmIjoxNzc2MjM0MDUyLCJwYXRoIjoicmVsZWFzZW" ++
-        "Fzc2V0cHJvZHVjdGlvbi5ibG9iLmNvcmUud2luZG93cy5uZXQifQ" ++
-        ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0" ++
-        "&response-content-disposition=attachment%3B%20filename%3Dzig-aarch64-macos-0.16.0.tar.xz" ++
-        "&response-content-type=application%2Foctet-stream";
-
-    // Simulate the HTTP request line + minimal headers
-    const request_line_overhead = "GET ".len + " HTTP/1.1\r\n".len;
-    const host_header = "Host: release-assets.githubusercontent.com\r\n";
-    const user_agent_header = "user-agent: ghr/" ++ version ++ "\r\n";
-    const min_request_size = request_line_overhead + typical_cdn_path.len +
-        host_header.len + user_agent_header.len + "\r\n".len;
-
-    try std.testing.expect(http_write_buffer_size >= min_request_size);
-    // Verify the default of 1024 would NOT be sufficient (this is the bug we fixed)
-    try std.testing.expect(1024 < min_request_size);
-}
 
 test "writeJsonEscaped escapes backslashes and quotes" {
     const allocator = std.testing.allocator;
@@ -2557,7 +2027,8 @@ test "readMetadata returns null for missing file" {
 
     // Get absolute path for the tmp dir
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const tmp_path = tmp.dir.realpath(std.testing.io, ".", &path_buf) catch return;
+    const tmp_path_len = tmp.dir.realPath(std.testing.io, &path_buf) catch return;
+    const tmp_path = path_buf[0..tmp_path_len];
     const result = readMetadata(allocator, std.testing.io, tmp_path);
     try std.testing.expect(result == null);
 }
@@ -2607,13 +2078,3 @@ test "shimPointsToToolDir validates path boundaries" {
     ));
 }
 
-test "ghAuthToken returns token when gh is available" {
-    const allocator = std.testing.allocator;
-    const token = ghAuthToken(allocator, std.testing.io);
-    // gh may or may not be installed in the test environment;
-    // just verify no crash and that if returned, it's non-empty
-    if (token) |t| {
-        defer allocator.free(t);
-        try std.testing.expect(t.len > 0);
-    }
-}
