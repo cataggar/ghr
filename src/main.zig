@@ -32,12 +32,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    if (eql(cmd_str, "--help") or eql(cmd_str, "-h")) {
-        try printUsage(&stdout.interface);
-        return;
-    }
     if (eql(cmd_str, "version")) {
         try stdout.interface.print("{s}\n", .{version});
+        return;
+    }
+    if (eql(cmd_str, "help")) {
+        try printUsage(&stdout.interface);
         return;
     }
 
@@ -80,8 +80,6 @@ pub fn main(init: std.process.Init) !void {
         try stderr.interface.print("error: upgrade not yet implemented\n", .{});
         try stderr.interface.flush();
         std.process.exit(1);
-    } else if (eql(cmd_str, "help")) {
-        try printUsage(&stdout.interface);
     } else {
         try stderr.interface.print("error: unknown command '{s}'\n\n", .{cmd_str});
         try printUsage(&stderr.interface);
@@ -256,10 +254,10 @@ fn printUsage(w: *Writer) !void {
         \\    download <owner/repo/file[@tag]>     Download a specific asset by name
         \\    path ensure [--dry-run]              Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
-        \\    version                              Print version
+        \\    version                              Print version and exit
+        \\    help                                 Print this help and exit
         \\
         \\OPTIONS:
-        \\    -h, --help      Print help
         \\    --debug         Show diagnostic output for debugging
         \\    --no-auth       Skip GitHub authentication
         \\    --skip-verify   Skip sigstore + SHA256 checksum verification
