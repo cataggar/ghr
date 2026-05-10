@@ -14,6 +14,8 @@ ghr download <owner/repo[@tag]>          Download the asset 'install' would pick
 ghr download <owner/repo/file[@tag]>     Download a specific asset by name
 ghr path ensure [--dry-run]              Add ghr's bin dir to your user PATH
 ghr path [bin|tools|cache]               Show ghr directories
+ghr version                              Print version and exit
+ghr help                                 Print this help and exit
 ```
 
 ### Examples
