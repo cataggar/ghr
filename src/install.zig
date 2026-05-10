@@ -798,6 +798,7 @@ pub fn cmdInstall(
     debug: bool,
     no_auth: bool,
     skip_verify: bool,
+    minisign_pubkey_b64: ?[]const u8,
 ) !void {
     const classified = release_mod.classifyArg(spec_str) catch {
         try err_w.print("error: invalid argument '{s}'\n", .{spec_str});
@@ -959,10 +960,11 @@ pub fn cmdInstall(
         }
     }
 
-    // Verification (issue #50). Runs after the asset is on disk, before we
-    // extract or move anything. SHA256 (Phase 1) and sigstore bundle
-    // (Phase 2) are independent — both run when material is published.
-    // Sigstore is the stronger signal and overrides the metadata label.
+    // Verification (issue #50 + issue #65). Runs after the asset is on
+    // disk, before we extract or move anything. SHA256 (Phase 1), minisign
+    // (issue #65, requires `--minisign`), and sigstore bundle (Phase 2)
+    // are independent — all run when material is published. Outcome
+    // precedence for the metadata label: sigstore > minisign > sha256.
     var verified_label: []const u8 = "none";
     if (skip_verify) {
         verified_label = "skipped";
@@ -998,6 +1000,25 @@ pub fn cmdInstall(
         };
         if (sha_outcome == .sha256_verified) verified_label = "sha256";
 
+        const mini_outcome = release_mod.verifyDownloadedAssetMinisign(
+            allocator,
+            io,
+            d.cache,
+            release.parsed.value.assets,
+            asset.name,
+            download_path,
+            debug_w,
+            auth_header,
+            minisign_pubkey_b64,
+            w,
+            err_w,
+        ) catch {
+            // Diagnostic was already printed by the verifier.
+            Dir.deleteFileAbsolute(io, download_path) catch {};
+            std.process.exit(1);
+        };
+        if (mini_outcome == .minisign_verified) verified_label = "minisign";
+
         const sig_outcome = verifyDownloadedAssetSigstore(
             allocator,
             io,
@@ -1017,8 +1038,11 @@ pub fn cmdInstall(
         };
         if (sig_outcome == .sigstore_verified) verified_label = "sigstore";
 
-        if (sha_outcome == .no_verification and sig_outcome == .no_verification) {
-            try w.print("note: download is unverified (no SHA256 checksum or sigstore bundle published)\n", .{});
+        if (sha_outcome == .no_verification and
+            mini_outcome == .no_verification and
+            sig_outcome == .no_verification)
+        {
+            try w.print("note: download is unverified (no SHA256 checksum, minisign sidecar, or sigstore bundle published)\n", .{});
         }
         try w.flush();
     }
@@ -1536,6 +1560,23 @@ test "writeMetadata and readMetadata round-trip" {
     try std.testing.expectEqual(@as(usize, 2), parsed.value.bins.len);
     try std.testing.expectEqualStrings("sub\\dir\\tool.exe", parsed.value.bins[0]);
     try std.testing.expectEqualStrings("other.exe", parsed.value.bins[1]);
+}
+
+test "writeMetadata round-trips the minisign verified label" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bins = [_][]const u8{"tool"};
+    const apps = [_][]const u8{};
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.2.3", "tool-linux.tar.xz", &bins, &apps, "minisign");
+
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("minisign", parsed.value.verified);
 }
 
 test "readMetadata returns null for missing file" {

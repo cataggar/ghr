@@ -13,6 +13,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("http.zig");
 const sigstore = @import("sigstore.zig");
+const minisign = @import("minisign.zig");
 const version = @import("build_options").version;
 
 const Io = std.Io;
@@ -606,6 +607,10 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const VerifyOutcome = enum {
     /// A SHA256 checksum file was found and its hash matched the download.
     sha256_verified,
+    /// A `<asset>.minisig` sidecar was found and the caller-supplied
+    /// minisign public key verified both the artifact and trusted-comment
+    /// signatures.
+    minisign_verified,
     /// A sigstore bundle was found and verification (chain, signature, Rekor
     /// SET) succeeded. This implies SHA256 verification too — the bundle's
     /// `messageDigest` is checked against the cached file.
@@ -963,6 +968,128 @@ pub fn verifyDownloadedAssetSigstore(
 // Asset matching by name and unified verification wrapper.
 // ---------------------------------------------------------------------------
 
+/// Run minisign verification on `download_path` using a caller-supplied
+/// public key. Pure plumbing — the protocol lives in `src/minisign.zig`.
+///
+///   - `pubkey_b64 == null` → return `.no_verification` silently. The
+///     caller didn't opt in.
+///   - `pubkey_b64 != null` but no `<asset>.minisig` sidecar is published
+///     → fail-closed with `error.MinisignSidecarMissing`. The user
+///     explicitly required minisign verification.
+///   - Otherwise: download the sidecar to `cache_dir`, parse the user's
+///     pubkey, parse the sidecar, check key-id, verify the artifact
+///     signature (streams the file for the `ED` Blake2b-prehash variant),
+///     verify the trusted-comment global signature, and print a one-line
+///     summary on success.
+pub fn verifyDownloadedAssetMinisign(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_dir: []const u8,
+    assets: []const Asset,
+    asset_name: []const u8,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    auth_header: ?[]const u8,
+    pubkey_b64: ?[]const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    const key_b64 = pubkey_b64 orelse return .no_verification;
+
+    // Parse the pubkey first — if it's malformed there's no point in
+    // touching the network.
+    const pk = minisign.parsePublicKey(key_b64) catch |err| {
+        try err_w.print("error: --minisign value is not a valid minisign public key ({s})\n", .{@errorName(err)});
+        try err_w.flush();
+        return error.MinisignPubKeyParseError;
+    };
+
+    const views = try allocator.alloc(minisign.AssetView, assets.len);
+    defer allocator.free(views);
+    for (assets, 0..) |a, i| {
+        views[i] = .{ .name = a.name, .browser_download_url = a.browser_download_url };
+    }
+
+    const sidecar = minisign.findMinisigAsset(views, asset_name) orelse {
+        try err_w.print(
+            "error: --minisign was supplied but no '{s}.minisig' sidecar is published in this release\n",
+            .{asset_name},
+        );
+        try err_w.flush();
+        return error.MinisignSidecarMissing;
+    };
+
+    debugLog(debug_w, "debug: minisign sidecar: {s}\n", .{sidecar.name});
+
+    const sidecar_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        cache_dir, std.fs.path.sep, sidecar.name,
+    });
+    defer allocator.free(sidecar_path);
+    defer Dir.deleteFileAbsolute(io, sidecar_path) catch {};
+
+    http.downloadToFile(allocator, io, sidecar.browser_download_url, sidecar_path, .{
+        .auth_header = auth_header,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: failed to download minisign sidecar '{s}': {}\n", .{ sidecar.name, err });
+        try err_w.flush();
+        return error.MinisignDownloadFailed;
+    };
+
+    const sidecar_bytes = blk: {
+        var dir = try Dir.openDirAbsolute(io, cache_dir, .{});
+        defer dir.close(io);
+        // A `.minisig` is ~280 bytes; 64 KiB is generous and bounded.
+        break :blk try dir.readFileAlloc(io, sidecar.name, allocator, Io.Limit.limited(64 * 1024));
+    };
+    defer allocator.free(sidecar_bytes);
+
+    const sig = minisign.parseSignature(sidecar_bytes) catch |err| {
+        try err_w.print("error: failed to parse minisign sidecar '{s}': {s}\n", .{ sidecar.name, @errorName(err) });
+        try err_w.flush();
+        return error.MinisignParseError;
+    };
+
+    minisign.verifyKeyId(pk, sig) catch {
+        var sig_id_hex: [16]u8 = undefined;
+        var pk_id_hex: [16]u8 = undefined;
+        minisign.keyIdToHex(sig.key_id, &sig_id_hex);
+        minisign.keyIdToHex(pk.key_id, &pk_id_hex);
+        try err_w.print(
+            "error: minisign key id mismatch for '{s}'\n  sidecar key: {s}\n  --minisign:  {s}\n",
+            .{ asset_name, &sig_id_hex, &pk_id_hex },
+        );
+        try err_w.flush();
+        return error.MinisignKeyIdMismatch;
+    };
+
+    var file = try Dir.openFileAbsolute(io, download_path, .{});
+    defer file.close(io);
+    minisign.verifyArtifact(io, file, pk, sig) catch |err| {
+        try err_w.print(
+            "error: minisign artifact signature does not verify for '{s}': {s}\n",
+            .{ asset_name, @errorName(err) },
+        );
+        try err_w.flush();
+        return error.MinisignSignatureMismatch;
+    };
+
+    minisign.verifyGlobal(pk, sig) catch |err| {
+        try err_w.print(
+            "error: minisign trusted-comment signature does not verify for '{s}': {s}\n",
+            .{ asset_name, @errorName(err) },
+        );
+        try err_w.flush();
+        return error.MinisignGlobalSigMismatch;
+    };
+
+    var key_hex: [16]u8 = undefined;
+    minisign.keyIdToHex(pk.key_id, &key_hex);
+    try w.print("verified minisign: key {s} ({s})\n", .{ &key_hex, sig.trusted_comment });
+    try w.flush();
+    return .minisign_verified;
+}
+
 /// Result of `findAssetByName`. The `ambiguous` slice references entries in
 /// the input `assets` array (so they live as long as the assets do), but the
 /// slice itself is allocator-owned and the caller must free it.
@@ -1005,13 +1132,16 @@ pub fn findAssetByName(
     return .{ .ambiguous = try matches.toOwnedSlice(allocator) };
 }
 
-/// Run SHA256 + sigstore verification on `download_path` and return the
-/// strongest outcome. Mirrors the existing `cmdInstall` flow:
+/// Run SHA256 + minisign + sigstore verification on `download_path` and
+/// return the strongest outcome. Mirrors the existing `cmdInstall` flow:
 ///
 ///   - `skip_verify=true` → prints a `note:` line and returns `.skipped`
 ///     without touching the file.
-///   - Otherwise runs SHA256 first, then sigstore. Sigstore success
-///     upgrades the outcome (`.sigstore_verified` implies SHA256).
+///   - Otherwise runs SHA256, then minisign (only when `minisign_pubkey_b64`
+///     is non-null), then sigstore. Each verifier is independent; the
+///     strongest success drives the returned outcome.
+///   - Outcome precedence: `.sigstore_verified` > `.minisign_verified` >
+///     `.sha256_verified` > `.no_verification`.
 ///   - If neither material is published, prints a `note:` saying the
 ///     download is unverified and returns `.no_verification`.
 ///
@@ -1028,6 +1158,7 @@ pub fn verifyAssetOnDisk(
     debug_w: ?*Writer,
     auth_header: ?[]const u8,
     skip_verify: bool,
+    minisign_pubkey_b64: ?[]const u8,
     w: *Writer,
     err_w: *Writer,
 ) !VerifyOutcome {
@@ -1050,6 +1181,20 @@ pub fn verifyAssetOnDisk(
         err_w,
     );
 
+    const mini_outcome = try verifyDownloadedAssetMinisign(
+        allocator,
+        io,
+        cache_dir,
+        assets,
+        asset_name,
+        download_path,
+        debug_w,
+        auth_header,
+        minisign_pubkey_b64,
+        w,
+        err_w,
+    );
+
     const sig_outcome = try verifyDownloadedAssetSigstore(
         allocator,
         io,
@@ -1064,9 +1209,10 @@ pub fn verifyAssetOnDisk(
     );
 
     if (sig_outcome == .sigstore_verified) return .sigstore_verified;
+    if (mini_outcome == .minisign_verified) return .minisign_verified;
     if (sha_outcome == .sha256_verified) return .sha256_verified;
 
-    try w.print("note: download is unverified (no SHA256 checksum or sigstore bundle published)\n", .{});
+    try w.print("note: download is unverified (no SHA256 checksum, minisign sidecar, or sigstore bundle published)\n", .{});
     try w.flush();
     return .no_verification;
 }
@@ -1077,6 +1223,7 @@ pub fn verifyAssetOnDisk(
 
 test {
     _ = @import("sigstore.zig");
+    _ = @import("minisign.zig");
 }
 
 test "parseRepoSpec with tag" {
@@ -1641,4 +1788,66 @@ test "findAssetByName none when nothing matches" {
         .{ .name = "tool-linux-amd64.tar.gz", .browser_download_url = "" },
     };
     try std.testing.expectEqual(AssetMatch.none, try findAssetByName(a, &assets, "macos"));
+}
+
+test "verifyDownloadedAssetMinisign fails closed when no sidecar is published" {
+    const a = std.testing.allocator;
+    // No --minisign value → silent .no_verification, no network or disk touched.
+    var out_buf: [256]u8 = undefined;
+    var out_writer = std.Io.Writer.Discarding.init(&out_buf);
+    var err_buf: [256]u8 = undefined;
+    var err_writer = std.Io.Writer.Discarding.init(&err_buf);
+
+    const assets = [_]Asset{
+        .{ .name = "tool.tar.xz", .browser_download_url = "https://example.invalid/a" },
+        .{ .name = "tool.tar.xz.sha256", .browser_download_url = "https://example.invalid/b" },
+    };
+
+    const none_outcome = try verifyDownloadedAssetMinisign(
+        a,
+        std.testing.io,
+        "/tmp/should/not/be/used",
+        &assets,
+        "tool.tar.xz",
+        "/tmp/should/not/exist",
+        null,
+        null,
+        null,
+        &out_writer.writer,
+        &err_writer.writer,
+    );
+    try std.testing.expectEqual(VerifyOutcome.no_verification, none_outcome);
+
+    // --minisign set but no sidecar in the asset list → fail-closed.
+    // Use a valid pubkey so we get past parsePublicKey.
+    const valid_pubkey = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+    try std.testing.expectError(error.MinisignSidecarMissing, verifyDownloadedAssetMinisign(
+        a,
+        std.testing.io,
+        "/tmp/should/not/be/used",
+        &assets,
+        "tool.tar.xz",
+        "/tmp/should/not/exist",
+        null,
+        null,
+        valid_pubkey,
+        &out_writer.writer,
+        &err_writer.writer,
+    ));
+
+    // --minisign set with a garbage value → parse error fast-path, also
+    // no network or disk touched.
+    try std.testing.expectError(error.MinisignPubKeyParseError, verifyDownloadedAssetMinisign(
+        a,
+        std.testing.io,
+        "/tmp/should/not/be/used",
+        &assets,
+        "tool.tar.xz",
+        "/tmp/should/not/exist",
+        null,
+        null,
+        "not a real minisign pubkey",
+        &out_writer.writer,
+        &err_writer.writer,
+    ));
 }

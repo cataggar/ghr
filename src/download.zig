@@ -35,6 +35,10 @@ pub const Options = struct {
     quiet: bool = false,
     no_auth: bool = false,
     skip_verify: bool = false,
+    /// Raw base64 minisign public key (single token). When set, ghr fetches
+    /// `<asset>.minisig` from the release and verifies it; missing sidecar
+    /// is treated as a verification failure (fail-closed).
+    minisign_pubkey: ?[]const u8 = null,
     debug: bool = false,
 
     /// No-op today (parseArgs holds slices into argv). Kept so callers can
@@ -206,6 +210,7 @@ pub fn cmdDownload(
             debug_w,
             auth_header,
             opts.skip_verify,
+            opts.minisign_pubkey,
             w,
             err_w,
         ) catch |verr| {
@@ -214,7 +219,13 @@ pub fn cmdDownload(
                 error.ChecksumMismatch,
                 error.ChecksumDownloadFailed,
                 error.ChecksumEntryMissing,
+                error.MinisignSidecarMissing,
+                error.MinisignKeyIdMismatch,
+                error.MinisignSignatureMismatch,
+                error.MinisignGlobalSigMismatch,
                 => std.process.exit(exit_sha256_mismatch),
+                error.MinisignDownloadFailed,
+                => std.process.exit(exit_http_error),
                 else => {
                     try err_w.print("error: verification failed: {}\n", .{verr});
                     try err_w.flush();
@@ -604,6 +615,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
             opts.no_auth = true;
         } else if (eql(arg, "--skip-verify")) {
             opts.skip_verify = true;
+        } else if (eql(arg, "--minisign")) {
+            opts.minisign_pubkey = try takeValue(args, "--minisign", err_w);
         } else if (eql(arg, "--debug")) {
             opts.debug = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
@@ -660,14 +673,17 @@ fn printDownloadUsage(w: *Writer) !void {
         \\Picks the asset that 'ghr install' would install (first form), or the
         \\named asset (second form, exact match preferred, otherwise unique
         \\substring). The download is auto-verified against any sigstore bundle
-        \\or sha256 checksum file published with the release.
+        \\or sha256 checksum file published with the release. Pass
+        \\`--minisign <base64-pubkey>` to also require minisign signature
+        \\verification against a `<asset>.minisig` sidecar.
         \\
         \\OPTIONS:
         \\    -o, --output <path>        Output file path (default: asset name in cwd)
         \\        --extract <dir>        Extract archive into <dir> after download
         \\        --strip-components <N> Strip N leading path components when extracting
         \\        --sha256 <hex>         Verify download against SHA-256 digest (64 hex chars)
-        \\        --skip-verify          Skip sigstore + sha256 release verification
+        \\        --minisign <pubkey>    Require minisign signature; <pubkey> is a base64 minisign public key
+        \\        --skip-verify          Skip sigstore + sha256 + minisign release verification
         \\        --keep-archive         Keep archive on disk after extraction
         \\        --quiet                Suppress progress output
         \\        --no-auth              Do not send GitHub auth even for github.com URLs
