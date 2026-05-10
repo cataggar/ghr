@@ -130,7 +130,7 @@ def build_wheel(
         f"Metadata-Version: 2.4\n"
         f"Name: ghr-bin\n"
         f"Version: {version}\n"
-        f"Summary: Install tools from GitHub releases\n"
+        f"Summary: A toolkit for GitHub releases\n"
         f"Home-page: https://github.com/cataggar/ghr\n"
         f"License: MIT\n"
         f"Requires-Python: >=3.9\n"

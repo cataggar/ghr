@@ -41,8 +41,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (eql(cmd_str, "dir")) {
-        try cmdDir(allocator, environ, &args, &stdout.interface, &stderr.interface);
+    if (eql(cmd_str, "path")) {
+        try cmdPath(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
         try cmdList(allocator, environ, io, &stdout.interface);
     } else if (eql(cmd_str, "install")) {
@@ -80,18 +80,6 @@ pub fn main(init: std.process.Init) !void {
         try stderr.interface.print("error: upgrade not yet implemented\n", .{});
         try stderr.interface.flush();
         std.process.exit(1);
-    } else if (eql(cmd_str, "ensurepath")) {
-        var dry_run = false;
-        while (args.next()) |arg| {
-            if (eql(arg, "--dry-run")) {
-                dry_run = true;
-            } else {
-                try stderr.interface.print("error: unknown flag '{s}' for 'ghr ensurepath'\n", .{arg});
-                try stderr.interface.flush();
-                std.process.exit(1);
-            }
-        }
-        try ensurepath.cmdEnsurePath(allocator, io, environ, dry_run, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "help")) {
         try printUsage(&stdout.interface);
     } else {
@@ -106,30 +94,78 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn cmdDir(
+fn cmdPath(
     allocator: std.mem.Allocator,
+    io: Io,
     environ: *const std.process.Environ.Map,
     args: *std.process.Args.Iterator,
     w: *Writer,
     err_w: *Writer,
 ) !void {
-    const d = try Dirs.detect(allocator, environ);
-    defer d.deinit();
-
-    const flag = args.next();
-    if (flag == null) {
-        try w.print("{s}\n", .{d.tools});
-        return;
-    }
-    if (eql(flag.?, "--bin")) {
-        try w.print("{s}\n", .{d.bin});
-    } else if (eql(flag.?, "--cache")) {
-        try w.print("{s}\n", .{d.cache});
-    } else {
-        try err_w.print("error: unknown flag '{s}' for 'ghr dir'\n", .{flag.?});
+    const sub = args.next() orelse {
+        try printPathUsage(err_w);
         try err_w.flush();
         std.process.exit(1);
+    };
+
+    if (eql(sub, "ensure")) {
+        var dry_run = false;
+        while (args.next()) |arg| {
+            if (eql(arg, "--dry-run")) {
+                dry_run = true;
+            } else {
+                try err_w.print("error: unknown flag '{s}' for 'ghr path ensure'\n", .{arg});
+                try err_w.flush();
+                std.process.exit(1);
+            }
+        }
+        try ensurepath.cmdEnsurePath(allocator, io, environ, dry_run, w, err_w);
+        return;
     }
+
+    if (eql(sub, "bin") or eql(sub, "tools") or eql(sub, "cache")) {
+        if (args.next()) |arg| {
+            try err_w.print("error: unexpected argument '{s}' for 'ghr path {s}'\n", .{ arg, sub });
+            try err_w.flush();
+            std.process.exit(1);
+        }
+        const d = try Dirs.detect(allocator, environ);
+        defer d.deinit();
+        if (eql(sub, "bin")) {
+            try w.print("{s}\n", .{d.bin});
+        } else if (eql(sub, "tools")) {
+            try w.print("{s}\n", .{d.tools});
+        } else {
+            try w.print("{s}\n", .{d.cache});
+        }
+        return;
+    }
+
+    if (eql(sub, "-h") or eql(sub, "--help") or eql(sub, "help")) {
+        try printPathUsage(w);
+        return;
+    }
+
+    try err_w.print("error: unknown subcommand '{s}' for 'ghr path'\n\n", .{sub});
+    try printPathUsage(err_w);
+    try err_w.flush();
+    std.process.exit(1);
+}
+
+fn printPathUsage(w: *Writer) !void {
+    try w.print(
+        \\ghr path - Show ghr directories and manage PATH
+        \\
+        \\USAGE:
+        \\    ghr path <SUBCOMMAND> [OPTIONS]
+        \\
+        \\SUBCOMMANDS:
+        \\    ensure [--dry-run]   Add ghr's bin dir to your user PATH
+        \\    bin                  Print the bin directory
+        \\    tools                Print the tool storage directory
+        \\    cache                Print the cache directory
+        \\
+    , .{});
 }
 
 fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, io: Io, w: *Writer) !void {
@@ -142,7 +178,12 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
     };
     defer dir.close(io);
 
-    var found = false;
+    var lines: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
@@ -155,17 +196,28 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
             if (std.mem.endsWith(u8, repo_entry.name, ".old")) continue; // skip tombstones
             const tag = readToolTag(allocator, io, owner_dir, repo_entry.name);
             defer if (tag) |t| allocator.free(t);
-            if (tag) |t| {
-                try w.print("{s}/{s}@{s}\n", .{ entry.name, repo_entry.name, t });
-            } else {
-                try w.print("{s}/{s}\n", .{ entry.name, repo_entry.name });
-            }
-            found = true;
+            const line = if (tag) |t|
+                try std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ entry.name, repo_entry.name, t })
+            else
+                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.name, repo_entry.name });
+            errdefer allocator.free(line);
+            try lines.append(allocator, line);
         }
     }
 
-    if (!found) {
+    if (lines.items.len == 0) {
         try w.print("No tools installed.\n", .{});
+        return;
+    }
+
+    std.mem.sort([]u8, lines.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    for (lines.items) |line| {
+        try w.print("{s}\n", .{line});
     }
 }
 
@@ -189,21 +241,21 @@ fn readToolTag(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_nam
 
 fn printUsage(w: *Writer) !void {
     try w.print(
-        \\ghr - Install tools from GitHub releases
+        \\ghr - A toolkit for GitHub releases
         \\
         \\USAGE:
         \\    ghr <COMMAND> [OPTIONS]
         \\
         \\COMMANDS:
+        \\    list                                 List installed tools
         \\    install <owner/repo[@tag]>           Install a tool from a GitHub release
         \\    install <owner/repo/file[@tag]>      Install a specific asset by name
         \\    uninstall <owner/repo>               Remove an installed tool
         \\    download <owner/repo[@tag]>          Download the asset 'install' would pick
         \\    download <owner/repo/file[@tag]>     Download a specific asset by name
-        \\    list                                 List installed tools
         \\    upgrade [name]                       Upgrade installed tools
-        \\    ensurepath [--dry-run]               Add ghr's bin dir to your user PATH
-        \\    dir [--bin] [--cache]                Show ghr directories
+        \\    path ensure [--dry-run]              Add ghr's bin dir to your user PATH
+        \\    path [bin|tools|cache]               Show ghr directories
         \\    version                              Print version
         \\
         \\OPTIONS:

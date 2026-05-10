@@ -156,7 +156,7 @@ jobs:
           body: |
             ## ghr ${{ steps.version.outputs.version }}
 
-            Install tools from GitHub releases.
+            A toolkit for GitHub releases.
 
             **Install:**
             ```

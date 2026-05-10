@@ -1,4 +1,4 @@
-"""ghr-bin — Install tools from GitHub releases."""
+"""ghr-bin — A toolkit for GitHub releases."""
 
 from __future__ import annotations
 
