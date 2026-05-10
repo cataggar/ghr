@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         const spec_val = spec orelse {
-            try stderr.interface.print("error: 'ghr install' requires <owner/repo[@tag]>\n", .{});
+            try stderr.interface.print("error: 'ghr install' requires <owner/repo[@tag]> or <owner/repo/file[@tag]>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
         };
@@ -195,20 +195,22 @@ fn printUsage(w: *Writer) !void {
         \\    ghr <COMMAND> [OPTIONS]
         \\
         \\COMMANDS:
-        \\    install <owner/repo[@tag]>   Install a tool from a GitHub release
-        \\    uninstall <owner/repo>       Remove an installed tool
-        \\    download <url> [--extract D] Download a file (replaces wget/curl)
-        \\    list                         List installed tools
-        \\    upgrade [name]               Upgrade installed tools
-        \\    ensurepath [--dry-run]       Add ghr's bin dir to your user PATH
-        \\    dir [--bin] [--cache]        Show ghr directories
-        \\    version                      Print version
+        \\    install <owner/repo[@tag]>           Install a tool from a GitHub release
+        \\    install <owner/repo/file[@tag]>      Install a specific asset by name
+        \\    uninstall <owner/repo>               Remove an installed tool
+        \\    download <owner/repo[@tag]>          Download the asset 'install' would pick
+        \\    download <owner/repo/file[@tag]>     Download a specific asset by name
+        \\    list                                 List installed tools
+        \\    upgrade [name]                       Upgrade installed tools
+        \\    ensurepath [--dry-run]               Add ghr's bin dir to your user PATH
+        \\    dir [--bin] [--cache]                Show ghr directories
+        \\    version                              Print version
         \\
         \\OPTIONS:
         \\    -h, --help      Print help
         \\    --debug         Show diagnostic output for debugging
         \\    --no-auth       Skip GitHub authentication
-        \\    --skip-verify   Skip SHA256 checksum verification on install
+        \\    --skip-verify   Skip sigstore + SHA256 checksum verification
         \\
     , .{});
 }
@@ -217,6 +219,7 @@ test {
     // Ensure tests in imported modules are discovered by `zig build test`.
     // Zig 0.16 does not auto-include tests from indirectly referenced files.
     _ = @import("install.zig");
+    _ = @import("release.zig");
     _ = @import("ensurepath.zig");
     _ = @import("dirs.zig");
     _ = @import("http.zig");

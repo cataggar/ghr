@@ -5,42 +5,54 @@ An installer for GitHub releases.
 ## Usage
 
 ```
-ghr install <owner/repo[@tag]>   Install a tool from a GitHub release
-ghr uninstall <name>             Remove an installed tool
-ghr download <url> [options]     Download a file (cross-platform wget/curl)
-ghr list                         List installed tools
-ghr upgrade [name]               Upgrade installed tools
-ghr ensurepath [--dry-run]       Add ghr's bin dir to your user PATH
-ghr dir [--bin] [--cache]        Show ghr directories
+ghr install <owner/repo[@tag]>           Install a tool from a GitHub release
+ghr install <owner/repo/file[@tag]>      Install a specific asset by name
+ghr uninstall <name>                     Remove an installed tool
+ghr download <owner/repo[@tag]>          Download the asset 'install' would pick
+ghr download <owner/repo/file[@tag]>     Download a specific asset by name
+ghr list                                 List installed tools
+ghr upgrade [name]                       Upgrade installed tools
+ghr ensurepath [--dry-run]               Add ghr's bin dir to your user PATH
+ghr dir [--bin] [--cache]                Show ghr directories
 ```
 
 ## Download
 
-`ghr download` is a cross-platform replacement for the common
-`wget -O ... && tar -xf ...` pattern in CI. Same syntax on Ubuntu, macOS,
-and Windows; no `choco install wget` step needed.
+`ghr download` fetches a release asset using the same discovery logic as
+`ghr install`, then drops the file in the current directory (or the path
+given by `-o`). Use it as a cross-platform replacement for the common
+`wget -O ... && tar -xf ...` pattern in CI — same syntax on Ubuntu,
+macOS, and Windows; no `choco install wget` step needed.
 
 ```
-ghr download <url> [options]
+ghr download <owner/repo[@tag]> [options]
+ghr download <owner/repo/file[@tag]> [options]
 
 OPTIONS:
-    -o, --output <path>        Output file path (default: URL basename in cwd)
+    -o, --output <path>        Output file path (default: asset name in cwd)
         --extract <dir>        Extract archive into <dir> after download
         --strip-components <N> Strip N leading path components when extracting
         --sha256 <hex>         Verify download against SHA-256 digest (64 hex)
+        --skip-verify          Skip sigstore + sha256 release verification
         --keep-archive         Keep archive on disk after extraction
         --quiet                Suppress progress output
         --no-auth              Do not send GitHub auth even for github.com URLs
         --debug                Verbose diagnostic output
 ```
 
-Recognised archive formats: `.zip`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`.
-Format is detected from the URL/filename. When `--extract` is used the
-archive is deleted after extraction unless `--keep-archive` (or `-o`) is
-set. GitHub auth is attached automatically for `github.com`-owned hosts
-(using `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`); pass `--no-auth`
-to skip it. Exit codes: `0` success, `1` argument/IO error, `2` HTTP
-error after retries, `3` SHA-256 mismatch.
+The first form picks the asset that `ghr install` would install for the
+current OS / architecture. The second form names a specific asset:
+exact-name match wins, otherwise a unique case-insensitive substring
+wins (multiple matches print the candidates). Recognised archive
+formats: `.zip`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`. Format is
+detected from the filename. When `--extract` is used the archive is
+deleted after extraction unless `--keep-archive` (or `-o`) is set.
+GitHub auth is attached automatically (using `GH_TOKEN`,
+`GITHUB_TOKEN`, or `gh auth token`); pass `--no-auth` to skip it.
+Downloads are auto-verified against any sigstore bundle or sha256
+checksum file published with the release; pass `--skip-verify` to
+bypass. Exit codes: `0` success, `1` argument/IO error, `2` HTTP error
+after retries, `3` SHA-256 mismatch.
 
 ### Replacing wget + tar in workflows
 
@@ -65,7 +77,7 @@ After — one step on every OS:
 ```yaml
 - run: |
     ghr download \
-      https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz \
+      WebAssembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25 \
       --extract /opt
 ```
 
@@ -92,6 +104,9 @@ ghr install burntsushi/ripgrep
 
 # Install a specific tag
 ghr install burntsushi/ripgrep@15.1.0
+
+# Install a specific asset by name (exact match or unique substring)
+ghr install WebAssembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
 
 # Show where tools are stored
 ghr dir
@@ -134,8 +149,9 @@ winget uninstall ghr
 
 ## Verification
 
-When you install a tool, ghr automatically verifies the downloaded asset
-against any verification material the release publishes:
+When you install or download a release asset, ghr automatically verifies
+the downloaded bytes against any verification material the release
+publishes:
 
 - **SHA256 checksum files** — sidecar `<asset>.sha256` files and aggregate
   `*checksums*` / `SHA256SUMS` files are both supported, in GNU and BSD
@@ -154,12 +170,12 @@ against any verification material the release publishes:
   extracted from the leaf cert and printed to stdout for visual review;
   ghr does not yet enforce a specific identity.
 
-On any verification failure the install is aborted and the cached
+On any verification failure the operation is aborted and the cached
 download is deleted. If no checksum or bundle is published the download
 proceeds with a `note:` line so you know it was unverified.
 
-Pass `--skip-verify` to bypass both checks. The strongest result is
-recorded in each tool's `ghr.json` metadata as `"verified"`:
+Pass `--skip-verify` to bypass both checks. For `install`, the strongest
+result is recorded in each tool's `ghr.json` metadata as `"verified"`:
 
 - `"sigstore"` — sigstore bundle verified (also implies the bundle's
   declared SHA256 matches the file).
