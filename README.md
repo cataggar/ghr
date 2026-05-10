@@ -132,6 +132,21 @@ python -m pip uninstall ghr-bin -y
 winget uninstall ghr
 ```
 
+## Verification
+
+When you install a tool, ghr automatically verifies the downloaded asset
+against the release's published SHA256 checksum file when one is available
+(sidecar `<asset>.sha256` files and aggregate `*checksums*` /
+`SHA256SUMS` files are both supported, in GNU and BSD formats). On
+mismatch the install is aborted; if no checksum file is published the
+download proceeds with a `note:` line so you know it was unverified.
+
+Pass `--skip-verify` to bypass the check. The verification status is
+recorded in each tool's `ghr.json` metadata as `"verified": "sha256"`,
+`"none"`, or `"skipped"`.
+
+Native sigstore bundle verification (`.sigstore.json`) is planned next.
+
 ## License
 
 MIT
