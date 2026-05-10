@@ -141,7 +141,31 @@ pub fn cmdDownload(
         try err_w.flush();
     }
 
-    // 4) Download to a `.part` file beside the destination so a partial file
+    // 4) Pre-flight verification check: if a `.minisig` sidecar is
+    //    published, refuse to download without explicit user intent
+    //    (either `--minisign <key>` or `--skip-verify`). Similarly, fail
+    //    early if `--minisign` was supplied but no sidecar exists. Both
+    //    checks are also re-applied after the download by
+    //    `verifyAssetOnDisk`; running them here avoids fetching a large
+    //    asset only to throw it away.
+    if (target.release != null and target.asset_name != null) {
+        release_mod.preflightVerification(
+            target.release.?.parsed.value.assets,
+            target.asset_name.?,
+            opts.skip_verify,
+            opts.minisign_pubkey,
+            err_w,
+        ) catch |perr| switch (perr) {
+            error.MinisignSidecarPresentButNoKey,
+            error.MinisignSidecarMissing,
+            => std.process.exit(exit_sha256_mismatch),
+            error.MinisignPubKeyParseError,
+            => std.process.exit(exit_arg_error),
+            else => return perr,
+        };
+    }
+
+    // 5) Download to a `.part` file beside the destination so a partial file
     //    never appears at the user-visible path.
     const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{paths.archive_path});
     defer allocator.free(part_path);
@@ -220,6 +244,7 @@ pub fn cmdDownload(
                 error.ChecksumDownloadFailed,
                 error.ChecksumEntryMissing,
                 error.MinisignSidecarMissing,
+                error.MinisignSidecarPresentButNoKey,
                 error.MinisignKeyIdMismatch,
                 error.MinisignSignatureMismatch,
                 error.MinisignGlobalSigMismatch,
