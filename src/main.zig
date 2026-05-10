@@ -2,6 +2,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const Dirs = @import("dirs.zig").Dirs;
 const install = @import("install.zig");
+const download = @import("download.zig");
 const ensurepath = @import("ensurepath.zig");
 
 pub const version = build_options.version;
@@ -70,6 +71,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         try install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface);
+    } else if (eql(cmd_str, "download")) {
+        try download.cmdDownload(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "upgrade")) {
         try stderr.interface.print("error: upgrade not yet implemented\n", .{});
         try stderr.interface.flush();
@@ -191,6 +194,7 @@ fn printUsage(w: *Writer) !void {
         \\COMMANDS:
         \\    install <owner/repo[@tag]>   Install a tool from a GitHub release
         \\    uninstall <owner/repo>       Remove an installed tool
+        \\    download <url> [--extract D] Download a file (replaces wget/curl)
         \\    list                         List installed tools
         \\    upgrade [name]               Upgrade installed tools
         \\    ensurepath [--dry-run]       Add ghr's bin dir to your user PATH
@@ -203,4 +207,16 @@ fn printUsage(w: *Writer) !void {
         \\    --no-auth       Skip GitHub authentication
         \\
     , .{});
+}
+
+test {
+    // Ensure tests in imported modules are discovered by `zig build test`.
+    // Zig 0.16 does not auto-include tests from indirectly referenced files.
+    _ = @import("install.zig");
+    _ = @import("ensurepath.zig");
+    _ = @import("dirs.zig");
+    _ = @import("http.zig");
+    _ = @import("archive.zig");
+    _ = @import("auth.zig");
+    _ = @import("download.zig");
 }
