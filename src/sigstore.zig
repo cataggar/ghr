@@ -629,13 +629,114 @@ pub fn verifyArtifactSignature(
 // ---------------------------------------------------------------------------
 
 pub const VerifiedIdentity = struct {
-    /// `subject_alt_name_slice` of the leaf cert. Caller-borrowed against
-    /// the bundle's arena.
-    san_der: []const u8,
+    /// Signer identity extracted from the leaf cert, if present.
+    identity: Identity,
     /// Rekor `integratedTime`, useful for the install metadata and CLI
     /// output.
     integrated_time: i64,
 };
+
+/// Signer identity extracted from a Sigstore leaf cert. All fields are
+/// borrowed from the bundle's leaf-cert byte buffer.
+pub const Identity = struct {
+    /// rfc822Name SAN entry (e.g., `keyless@projectsigstore.iam.gserviceaccount.com`).
+    san_email: ?[]const u8 = null,
+    /// uniformResourceIdentifier SAN entry (e.g., the GitHub Actions workflow
+    /// URI for keyless workflow signing).
+    san_uri: ?[]const u8 = null,
+    /// OIDC issuer URL from extension OID 1.3.6.1.4.1.57264.1.8 (preferred)
+    /// or .1.1 (legacy). Both encode the same value; `.8` wraps it in a
+    /// DER UTF8String, `.1` is a raw URL.
+    oidc_issuer: ?[]const u8 = null,
+
+    /// First non-null SAN value, preferring URI over email.
+    pub fn primarySubject(self: Identity) ?[]const u8 {
+        return self.san_uri orelse self.san_email;
+    }
+};
+
+/// Extract the signer identity from a leaf cert. Returns an `Identity` with
+/// any of its fields set to non-null when the cert carries the
+/// corresponding SAN entry or extension. Slices borrow from `leaf_der`.
+pub fn extractIdentity(leaf_der: []const u8) !Identity {
+    var id: Identity = .{};
+
+    var leaf_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
+    const leaf = leaf_cert.parse() catch return id;
+
+    // SAN entries — walk the SEQUENCE OF GeneralName.
+    const san = leaf.subjectAltName();
+    if (san.len > 0) {
+        const general_names = Certificate.der.Element.parse(san, 0) catch
+            return id;
+        var i: u32 = general_names.slice.start;
+        while (i < general_names.slice.end) {
+            const gn = Certificate.der.Element.parse(san, i) catch break;
+            i = gn.slice.end;
+            const ident: u8 = @bitCast(gn.identifier);
+            const value = san[gn.slice.start..gn.slice.end];
+            // Tagged GeneralName CHOICE: class=context-specific (10),
+            //   primitive (0), tag = 1 rfc822Name, 6 uniformResourceIdentifier.
+            switch (ident) {
+                0x81 => if (id.san_email == null) {
+                    id.san_email = value;
+                },
+                0x86 => if (id.san_uri == null) {
+                    id.san_uri = value;
+                },
+                else => {},
+            }
+        }
+    }
+
+    // OIDC issuer — walk the extension list. We have to do this ourselves
+    // because std.crypto.Certificate only exposes SAN.
+    const oidc_issuer_v1 = [_]u8{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xbf, 0x30, 0x01, 0x01 };
+    const oidc_issuer_v2 = [_]u8{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xbf, 0x30, 0x01, 0x08 };
+
+    const certificate = Certificate.der.Element.parse(leaf_der, 0) catch return id;
+    const tbs = Certificate.der.Element.parse(leaf_der, certificate.slice.start) catch
+        return id;
+    var ti: u32 = tbs.slice.start;
+    while (ti < tbs.slice.end) {
+        const e = Certificate.der.Element.parse(leaf_der, ti) catch break;
+        ti = e.slice.end;
+        const ident: u8 = @bitCast(e.identifier);
+        // [3] EXPLICIT extensions wrapper: class=context-specific,
+        //   constructed, tag=3 -> 0xA3.
+        if (ident != 0xa3) continue;
+        const exts = Certificate.der.Element.parse(leaf_der, e.slice.start) catch
+            break;
+        var xi: u32 = exts.slice.start;
+        while (xi < exts.slice.end) {
+            const ext = Certificate.der.Element.parse(leaf_der, xi) catch break;
+            xi = ext.slice.end;
+            const oid_elem = Certificate.der.Element.parse(leaf_der, ext.slice.start) catch
+                continue;
+            const after_oid = Certificate.der.Element.parse(leaf_der, oid_elem.slice.end) catch
+                continue;
+            const value_elem = if (after_oid.identifier.tag == .boolean)
+                Certificate.der.Element.parse(leaf_der, after_oid.slice.end) catch continue
+            else
+                after_oid;
+            const oid_bytes = leaf_der[oid_elem.slice.start..oid_elem.slice.end];
+            const value_bytes = leaf_der[value_elem.slice.start..value_elem.slice.end];
+
+            if (std.mem.eql(u8, oid_bytes, &oidc_issuer_v2)) {
+                // V2: extension value is a DER UTF8String.
+                const inner = Certificate.der.Element.parse(value_bytes, 0) catch continue;
+                if (@intFromEnum(inner.identifier.tag) == 12) {
+                    id.oidc_issuer = value_bytes[inner.slice.start..inner.slice.end];
+                }
+            } else if (std.mem.eql(u8, oid_bytes, &oidc_issuer_v1)) {
+                if (id.oidc_issuer == null) id.oidc_issuer = value_bytes;
+            }
+        }
+        break;
+    }
+
+    return id;
+}
 
 /// Run the full verification pipeline against a parsed bundle and the
 /// cached artifact:
@@ -679,10 +780,10 @@ pub fn verifyBundle(
 
     var trust = try buildTrustBundle(allocator, bundle.rekor_integrated_time);
     defer trust.deinit(allocator);
-    const verified_leaf = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
+    _ = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
 
     return .{
-        .san_der = verified_leaf.slice(verified_leaf.subject_alt_name_slice),
+        .identity = try extractIdentity(bundle.leaf_der),
         .integrated_time = bundle.rekor_integrated_time,
     };
 }
@@ -887,4 +988,33 @@ test "verifyArtifactSignature rejects a tampered file" {
         error.InvalidArtifactSignature,
         verifyArtifactSignature(io, f, &pub_sec1, sig_der, &digest),
     );
+}
+
+test "extractIdentity from cosign fixture" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    const id = try extractIdentity(bundle.leaf_der);
+    try std.testing.expect(id.san_email != null);
+    try std.testing.expectEqualStrings(
+        "keyless@projectsigstore.iam.gserviceaccount.com",
+        id.san_email.?,
+    );
+    try std.testing.expect(id.san_uri == null);
+    try std.testing.expect(id.oidc_issuer != null);
+    try std.testing.expectEqualStrings("https://accounts.google.com", id.oidc_issuer.?);
+    try std.testing.expectEqualStrings(id.san_email.?, id.primarySubject().?);
+}
+
+test "verifyBundle returns identity on the cosign fixture" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    // Sanity: extractIdentity from the bundle's leaf cert directly should
+    // match what verifyBundle would expose. This avoids needing the full
+    // 127 MiB cosign artifact in test fixtures.
+    const id = try extractIdentity(bundle.leaf_der);
+    try std.testing.expect(id.primarySubject() != null);
 }

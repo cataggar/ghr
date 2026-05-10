@@ -816,6 +816,12 @@ fn verifyDownloadedAssetSigstore(
         "verified sigstore: sha256 {s}… (rekor t={d}, log {d})\n",
         .{ digest_hex[0..12], identity.integrated_time, bundle.rekor_log_index },
     );
+    if (identity.identity.primarySubject()) |subject| {
+        try w.print("  identity: {s}\n", .{subject});
+    }
+    if (identity.identity.oidc_issuer) |issuer| {
+        try w.print("  issuer:   {s}\n", .{issuer});
+    }
     try w.flush();
     return .sigstore_verified;
 }
