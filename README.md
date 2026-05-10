@@ -33,6 +33,11 @@ ghr install burntsushi/ripgrep
 # Install a specific version
 # https://github.com/bytecodealliance/wasmtime/releases/tag/v44.0.1
 ghr install bytecodealliance/wasmtime@v44.0.1
+
+# Install minisign itself, verifying the release with the upstream
+# minisign public key from https://jedisct1.github.io/minisign/
+ghr install jedisct1/minisign@0.12 \
+    --minisign RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
 ```
 
 ## Install
