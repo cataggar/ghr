@@ -498,6 +498,10 @@ fn sha256ToHex(digest: [32]u8, out: *[64]u8) void {
     }
 }
 
+test {
+    _ = @import("sigstore.zig");
+}
+
 const Sha256Entry = struct {
     hex: []const u8,
     name: []const u8,
