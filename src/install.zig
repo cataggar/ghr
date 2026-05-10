@@ -4,6 +4,7 @@ const Dirs = @import("dirs.zig").Dirs;
 const http = @import("http.zig");
 const archive = @import("archive.zig");
 const auth = @import("auth.zig");
+const sigstore = @import("sigstore.zig");
 const version = @import("build_options").version;
 
 const Io = std.Io;
@@ -443,6 +444,396 @@ fn findBestAssetForKeywords(assets: []const Asset, plat: PlatformKeywords) !Asse
 fn findBestAsset(assets: []const Asset) !Asset {
     const plat = currentPlatformKeywords();
     return findBestAssetForKeywords(assets, .{ .os = plat.os, .arch = plat.arch });
+}
+
+// ---------------------------------------------------------------------------
+// SHA256 download verification (Phase 1 of issue #50).
+// ---------------------------------------------------------------------------
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// Outcome of running the verification step for a downloaded asset.
+const VerifyOutcome = enum {
+    /// A SHA256 checksum file was found and its hash matched the download.
+    sha256_verified,
+    /// A sigstore bundle was found and verification (chain, signature, Rekor
+    /// SET) succeeded. This implies SHA256 verification too — the bundle's
+    /// `messageDigest` is checked against the cached file.
+    sigstore_verified,
+    /// No verification material was published for this release.
+    no_verification,
+    /// User passed --skip-verify.
+    skipped,
+};
+
+/// Decode a single ASCII hex character into 0..15. Returns null on invalid input.
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Returns true if `s` is exactly 64 ASCII hex characters.
+fn isHex64(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |c| {
+        if (hexNibble(c) == null) return false;
+    }
+    return true;
+}
+
+/// Lowercase ASCII-hex equality. Both sides must already be 64 chars.
+fn hexEqIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+/// Format a 32-byte digest as 64 lowercase hex characters into `out`.
+fn sha256ToHex(digest: [32]u8, out: *[64]u8) void {
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 0x0f];
+    }
+}
+
+test {
+    _ = @import("sigstore.zig");
+}
+
+const Sha256Entry = struct {
+    hex: []const u8,
+    name: []const u8,
+};
+
+/// Parse a single line from a SHA256 checksum file. Supports:
+///   GNU coreutils: `<hex>  <name>` or `<hex> *<name>` (binary-mode marker)
+///   BSD shasum:    `SHA256 (<name>) = <hex>`
+/// Strips a leading `./` from the filename. Returns null for blank lines,
+/// `#` comment lines, or anything we can't recognize.
+fn parseSha256Line(raw: []const u8) ?Sha256Entry {
+    // Trim trailing CR/LF and surrounding spaces/tabs.
+    var line = raw;
+    while (line.len > 0 and (line[line.len - 1] == '\r' or line[line.len - 1] == '\n' or
+        line[line.len - 1] == ' ' or line[line.len - 1] == '\t'))
+    {
+        line = line[0 .. line.len - 1];
+    }
+    while (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) line = line[1..];
+    if (line.len == 0) return null;
+    if (line[0] == '#') return null;
+
+    // BSD form: "SHA256 (<name>) = <hex>"
+    const bsd_prefix = "SHA256 (";
+    if (line.len > bsd_prefix.len and std.mem.startsWith(u8, line, bsd_prefix)) {
+        const rest = line[bsd_prefix.len..];
+        const close = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
+        const name = rest[0..close];
+        const after = rest[close + 1 ..];
+        const eq_marker = ") = ";
+        // We've already consumed the ')'; expect " = <hex>"
+        if (after.len < 4) return null;
+        if (!std.mem.startsWith(u8, after, " = ")) return null;
+        _ = eq_marker;
+        const hex = after[3..];
+        if (!isHex64(hex)) return null;
+        return .{ .hex = hex, .name = stripDotSlash(name) };
+    }
+
+    // GNU form: "<hex>  <name>" or "<hex> *<name>"
+    if (line.len < 64 + 1 + 1) return null;
+    const hex = line[0..64];
+    if (!isHex64(hex)) return null;
+    if (line[64] != ' ' and line[64] != '\t') return null;
+    var name_start: usize = 65;
+    // Skip extra whitespace, optional `*` binary-mode marker.
+    while (name_start < line.len and (line[name_start] == ' ' or line[name_start] == '\t')) {
+        name_start += 1;
+    }
+    if (name_start < line.len and line[name_start] == '*') name_start += 1;
+    if (name_start >= line.len) return null;
+    return .{ .hex = hex, .name = stripDotSlash(line[name_start..]) };
+}
+
+fn stripDotSlash(name: []const u8) []const u8 {
+    if (name.len >= 2 and name[0] == '.' and name[1] == '/') return name[2..];
+    return name;
+}
+
+/// Filename equality used when matching a checksum-file entry to a target
+/// asset basename. Case-insensitive (Windows + Unix asset names mix), and
+/// matches by basename so `./foo` and `foo` both work after `stripDotSlash`.
+fn checksumNameMatches(entry_name: []const u8, target: []const u8) bool {
+    const last_slash = std.mem.lastIndexOfAny(u8, entry_name, "/\\");
+    const basename = if (last_slash) |i| entry_name[i + 1 ..] else entry_name;
+    return std.ascii.eqlIgnoreCase(basename, target);
+}
+
+/// Search a SHA256 checksum-file body for the entry matching `target_name`
+/// and return its 64-char hex hash. Returns null if no entry matches.
+fn lookupSha256(content: []const u8, target_name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        const entry = parseSha256Line(line) orelse continue;
+        if (checksumNameMatches(entry.name, target_name)) return entry.hex;
+    }
+    return null;
+}
+
+/// Returns true if `name` looks like a SHA256 checksum file rather than a
+/// signature, key, or unrelated checksum (sha512/md5).
+fn isSha256ChecksumFile(name: []const u8) bool {
+    // Reject signature/key/non-sha256 sidecars first.
+    const reject_suffixes = [_][]const u8{
+        ".sig", ".asc", ".pem", ".pub", ".gpg", ".minisig",
+        ".sha512", ".sha512sum", ".sha512sums",
+        ".md5", ".md5sum", ".md5sums",
+        ".sha1", ".sha1sum",
+    };
+    for (reject_suffixes) |s| {
+        if (std.ascii.endsWithIgnoreCase(name, s)) return false;
+    }
+    // Sidecar SHA256 files.
+    if (std.ascii.endsWithIgnoreCase(name, ".sha256")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha256sum")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha256sums")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha256sum.txt")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha256sums.txt")) return true;
+    // Aggregate checksum files. Use a bounded substring match to avoid
+    // false positives like `notchecksums.zip` (which would still contain
+    // "checksum"); aggregate names are conventionally `*checksums*` or
+    // `SHA256SUMS*`, so we accept either pattern.
+    if (containsIgnoreCase(name, "checksum")) return true;
+    if (containsIgnoreCase(name, "sha256sums")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "SHA256SUMS")) return true;
+    return false;
+}
+
+/// Locate the best SHA256 checksum asset for `asset_name` in the release's
+/// asset list. Prefers a sidecar (`<asset>.sha256`) when present, otherwise
+/// falls back to an aggregate checksum file. Returns null when none is
+/// available.
+fn findChecksumAsset(assets: []const Asset, asset_name: []const u8) ?Asset {
+    // Pass 1: exact sidecar match.
+    for (assets) |a| {
+        if (std.mem.eql(u8, a.name, asset_name)) continue;
+        if (std.ascii.endsWithIgnoreCase(a.name, ".sha256") or
+            std.ascii.endsWithIgnoreCase(a.name, ".sha256sum"))
+        {
+            // The sidecar's stem (everything before the trailing `.sha256[sum]`)
+            // must equal the asset name.
+            const dot = std.mem.lastIndexOfScalar(u8, a.name, '.').?;
+            const stem = a.name[0..dot];
+            // Handle the `.sha256sum` two-extension case.
+            const final_stem = if (std.ascii.endsWithIgnoreCase(stem, ".sha256"))
+                stem[0 .. stem.len - ".sha256".len]
+            else
+                stem;
+            if (std.ascii.eqlIgnoreCase(final_stem, asset_name)) return a;
+        }
+    }
+    // Pass 2: aggregate checksum file.
+    for (assets) |a| {
+        if (std.mem.eql(u8, a.name, asset_name)) continue;
+        if (isSha256ChecksumFile(a.name)) return a;
+    }
+    return null;
+}
+
+/// Stream the file at `path` through SHA-256 and return the 32-byte digest.
+fn computeFileSha256(io: Io, path: []const u8) ![32]u8 {
+    var file = try Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var read_buf: [64 * 1024]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    var hasher = Sha256.init(.{});
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try file_reader.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        hasher.update(chunk[0..n]);
+        if (n < chunk.len) break;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+/// Run Phase 1 verification on `download_path`. On `mismatch` this function
+/// prints the diagnostic and returns `error.ChecksumMismatch`; the caller is
+/// responsible for deleting the cached file and exiting.
+fn verifyDownloadedAssetSha256(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_dir: []const u8,
+    assets: []const Asset,
+    asset_name: []const u8,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    auth_header: ?[]const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    const checksum_asset = findChecksumAsset(assets, asset_name) orelse {
+        return .no_verification;
+    };
+
+    debugLog(debug_w, "debug: checksum asset: {s}\n", .{checksum_asset.name});
+
+    // Download the checksum file into the cache, alongside the asset.
+    const checksum_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        cache_dir, std.fs.path.sep, checksum_asset.name,
+    });
+    defer allocator.free(checksum_path);
+    defer Dir.deleteFileAbsolute(io, checksum_path) catch {};
+
+    http.downloadToFile(allocator, io, checksum_asset.browser_download_url, checksum_path, .{
+        .auth_header = auth_header,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: failed to download checksum file '{s}': {}\n", .{ checksum_asset.name, err });
+        try err_w.flush();
+        return error.ChecksumDownloadFailed;
+    };
+
+    const checksum_bytes = blk: {
+        var dir = try Dir.openDirAbsolute(io, cache_dir, .{});
+        defer dir.close(io);
+        // Cap the checksum file at 16 MiB; real-world files are << 1 MiB.
+        break :blk try dir.readFileAlloc(io, checksum_asset.name, allocator, Io.Limit.limited(16 * 1024 * 1024));
+    };
+    defer allocator.free(checksum_bytes);
+
+    const expected_hex = lookupSha256(checksum_bytes, asset_name) orelse {
+        try err_w.print("error: checksum file '{s}' has no entry for '{s}'\n", .{ checksum_asset.name, asset_name });
+        try err_w.flush();
+        return error.ChecksumEntryMissing;
+    };
+
+    const digest = computeFileSha256(io, download_path) catch |err| {
+        try err_w.print("error: failed to hash '{s}': {}\n", .{ download_path, err });
+        try err_w.flush();
+        return err;
+    };
+    var actual_hex: [64]u8 = undefined;
+    sha256ToHex(digest, &actual_hex);
+
+    if (!hexEqIgnoreCase(expected_hex, &actual_hex)) {
+        try err_w.print(
+            "error: SHA256 mismatch for {s}\n  expected: {s}\n  actual:   {s}\n  source:   {s}\n",
+            .{ asset_name, expected_hex, &actual_hex, checksum_asset.name },
+        );
+        try err_w.flush();
+        return error.ChecksumMismatch;
+    }
+
+    try w.print("verified sha256 {s}… ({s})\n", .{ actual_hex[0..12], checksum_asset.name });
+    try w.flush();
+    return .sha256_verified;
+}
+
+/// Run Phase 2 verification (sigstore bundle) on `download_path`. Verifies
+/// the X.509 chain to the embedded Fulcio root, the artifact ECDSA
+/// signature, and the Rekor SET. Returns `.no_verification` when no bundle
+/// asset is published. On any verification failure, prints a diagnostic and
+/// returns an error; the caller deletes the cached file and exits.
+fn verifyDownloadedAssetSigstore(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_dir: []const u8,
+    assets: []const Asset,
+    asset_name: []const u8,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    auth_header: ?[]const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    // Build a view of the asset list using the sigstore module's public
+    // adapter shape (avoids exposing the install-internal `Asset` type).
+    const views = try allocator.alloc(sigstore.AssetView, assets.len);
+    defer allocator.free(views);
+    for (assets, 0..) |a, i| {
+        views[i] = .{ .name = a.name, .browser_download_url = a.browser_download_url };
+    }
+
+    const bundle_asset = sigstore.findBundleAsset(views, asset_name) orelse {
+        return .no_verification;
+    };
+
+    debugLog(debug_w, "debug: sigstore bundle asset: {s}\n", .{bundle_asset.name});
+
+    const bundle_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        cache_dir, std.fs.path.sep, bundle_asset.name,
+    });
+    defer allocator.free(bundle_path);
+    defer Dir.deleteFileAbsolute(io, bundle_path) catch {};
+
+    http.downloadToFile(allocator, io, bundle_asset.browser_download_url, bundle_path, .{
+        .auth_header = auth_header,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: failed to download sigstore bundle '{s}': {}\n", .{ bundle_asset.name, err });
+        try err_w.flush();
+        return error.SigstoreDownloadFailed;
+    };
+
+    const bundle_bytes = blk: {
+        var dir = try Dir.openDirAbsolute(io, cache_dir, .{});
+        defer dir.close(io);
+        // Cap at 8 MiB; cosign bundles are < 16 KiB but allow generous slack.
+        break :blk try dir.readFileAlloc(io, bundle_asset.name, allocator, Io.Limit.limited(8 * 1024 * 1024));
+    };
+    defer allocator.free(bundle_bytes);
+
+    var bundle = sigstore.parseBundle(allocator, bundle_bytes) catch |err| {
+        try err_w.print("error: failed to parse sigstore bundle '{s}': {s}\n", .{ bundle_asset.name, @errorName(err) });
+        try err_w.flush();
+        return error.SigstoreParseFailed;
+    };
+    defer bundle.deinit();
+
+    const rekor = sigstore.embeddedRekorKey(allocator) catch |err| {
+        try err_w.print("error: failed to load embedded Rekor key: {s}\n", .{@errorName(err)});
+        try err_w.flush();
+        return err;
+    };
+
+    var file = try Dir.openFileAbsolute(io, download_path, .{});
+    defer file.close(io);
+
+    const identity = sigstore.verifyBundle(allocator, io, bundle, rekor, file) catch |err| {
+        try err_w.print("error: sigstore verification failed for '{s}': {s}\n", .{ asset_name, @errorName(err) });
+        try err_w.flush();
+        return error.SigstoreVerificationFailed;
+    };
+
+    var digest_hex: [64]u8 = undefined;
+    sha256ToHex(bundle.artifact_digest, &digest_hex);
+    try w.print(
+        "verified sigstore: sha256 {s}… (rekor t={d}, log {d})\n",
+        .{ digest_hex[0..12], identity.integrated_time, bundle.rekor_log_index },
+    );
+    if (identity.identity.primarySubject()) |subject| {
+        try w.print("  identity: {s}\n", .{subject});
+    }
+    if (identity.identity.oidc_issuer) |issuer| {
+        try w.print("  issuer:   {s}\n", .{issuer});
+    }
+    if (identity.inclusion_verified) {
+        const cp_note: []const u8 = if (identity.checkpoint_verified) " + checkpoint" else "";
+        if (bundle.inclusion) |inc| {
+            try w.print("  inclusion: tree size {d}{s}\n", .{ inc.tree_size, cp_note });
+        }
+    }
+    try w.flush();
+    return .sigstore_verified;
 }
 
 /// For bare-binary assets whose name follows the `<name>-<arch>-<triple>...`
@@ -928,6 +1319,7 @@ fn writeMetadata(
     asset_name: []const u8,
     bins: []const []const u8,
     apps: []const []const u8,
+    verified: []const u8,
 ) !void {
     _ = allocator;
     var file = try tool_dir.createFile(io, "ghr.json", .{});
@@ -935,7 +1327,7 @@ fn writeMetadata(
     var buf: [4096]u8 = undefined;
     var fw = file.writer(io, &buf);
     const w = &fw.interface;
-    try w.print("{{\"tag\":\"{s}\",\"asset\":\"{s}\",\"bins\":[", .{ tag, asset_name });
+    try w.print("{{\"tag\":\"{s}\",\"asset\":\"{s}\",\"verified\":\"{s}\",\"bins\":[", .{ tag, asset_name, verified });
     for (bins, 0..) |bin, i| {
         if (i > 0) try w.print(",", .{});
         try w.print("\"", .{});
@@ -968,6 +1360,7 @@ fn writeJsonEscaped(w: *Writer, s: []const u8) !void {
 const Metadata = struct {
     tag: []const u8,
     asset: []const u8,
+    verified: []const u8 = "none",
     bins: []const []const u8 = &.{},
     apps: []const []const u8 = &.{},
 };
@@ -1183,6 +1576,7 @@ pub fn cmdInstall(
     err_w: *Writer,
     debug: bool,
     no_auth: bool,
+    skip_verify: bool,
 ) !void {
     const spec = parseSpec(spec_str) catch {
         try err_w.print("error: invalid spec '{s}', expected owner/repo[@tag]\n", .{spec_str});
@@ -1284,6 +1678,70 @@ pub fn cmdInstall(
                 try w.print("downloaded {d:.1} MB\n", .{@as(f64, @floatFromInt(size)) / 1024.0 / 1024.0});
             }
         }
+    }
+
+    // Verification (issue #50). Runs after the asset is on disk, before we
+    // extract or move anything. SHA256 (Phase 1) and sigstore bundle
+    // (Phase 2) are independent — both run when material is published.
+    // Sigstore is the stronger signal and overrides the metadata label.
+    var verified_label: []const u8 = "none";
+    if (skip_verify) {
+        verified_label = "skipped";
+        try w.print("note: verification skipped (--skip-verify)\n", .{});
+    } else {
+        const sha_outcome = verifyDownloadedAssetSha256(
+            allocator,
+            io,
+            d.cache,
+            release.parsed.value.assets,
+            asset.name,
+            download_path,
+            debug_w,
+            auth_header,
+            w,
+            err_w,
+        ) catch |verr| {
+            switch (verr) {
+                error.ChecksumMismatch,
+                error.ChecksumDownloadFailed,
+                error.ChecksumEntryMissing,
+                => {
+                    Dir.deleteFileAbsolute(io, download_path) catch {};
+                    std.process.exit(1);
+                },
+                else => {
+                    try err_w.print("error: SHA256 verification failed: {}\n", .{verr});
+                    try err_w.flush();
+                    Dir.deleteFileAbsolute(io, download_path) catch {};
+                    std.process.exit(1);
+                },
+            }
+        };
+        if (sha_outcome == .sha256_verified) verified_label = "sha256";
+
+        const sig_outcome = verifyDownloadedAssetSigstore(
+            allocator,
+            io,
+            d.cache,
+            release.parsed.value.assets,
+            asset.name,
+            download_path,
+            debug_w,
+            auth_header,
+            w,
+            err_w,
+        ) catch |verr| {
+            try err_w.print("error: sigstore verification failed: {s}\n", .{@errorName(verr)});
+            try err_w.flush();
+            Dir.deleteFileAbsolute(io, download_path) catch {};
+            std.process.exit(1);
+        };
+        if (sig_outcome == .sigstore_verified) verified_label = "sigstore";
+
+        if (sha_outcome == .no_verification and sig_outcome == .no_verification) {
+            try w.print("note: download is unverified (no SHA256 checksum or sigstore bundle published)\n", .{});
+        }
+        try w.flush();
     }
 
     // Stage extraction
@@ -1439,7 +1897,7 @@ pub fn cmdInstall(
     // Write metadata
     const bins_slice = exes.items;
     const apps_slice = apps.items;
-    writeMetadata(allocator, io, tool_dir, tag_name, asset.name, bins_slice, apps_slice) catch |err| {
+    writeMetadata(allocator, io, tool_dir, tag_name, asset.name, bins_slice, apps_slice, verified_label) catch |err| {
         try err_w.print("warning: failed to write metadata: {}\n", .{err});
     };
 
@@ -2001,7 +2459,7 @@ test "writeMetadata and readMetadata round-trip" {
 
     const bins = [_][]const u8{ "sub\\dir\\tool.exe", "other.exe" };
     const apps = [_][]const u8{};
-    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.0.0", "tool-windows.zip", &bins, &apps);
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.0.0", "tool-windows.zip", &bins, &apps, "sha256");
 
     // Verify it's valid JSON by reading it back
     const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
@@ -2015,6 +2473,7 @@ test "writeMetadata and readMetadata round-trip" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("v1.0.0", parsed.value.tag);
     try std.testing.expectEqualStrings("tool-windows.zip", parsed.value.asset);
+    try std.testing.expectEqualStrings("sha256", parsed.value.verified);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.bins.len);
     try std.testing.expectEqualStrings("sub\\dir\\tool.exe", parsed.value.bins[0]);
     try std.testing.expectEqualStrings("other.exe", parsed.value.bins[1]);
@@ -2078,3 +2537,137 @@ test "shimPointsToToolDir validates path boundaries" {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// SHA256 verification tests (Phase 1 of issue #50).
+// ---------------------------------------------------------------------------
+
+test "isHex64 accepts and rejects" {
+    try std.testing.expect(isHex64("0123456789abcdefABCDEF000000000000000000000000000000000000000000"));
+    try std.testing.expect(!isHex64("0123")); // too short
+    try std.testing.expect(!isHex64("zzzz" ++ ("0" ** 60))); // bad chars
+    try std.testing.expect(!isHex64("g" ++ ("0" ** 63)));
+}
+
+test "parseSha256Line GNU two-space form" {
+    const line = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  app.tar.gz";
+    const e = parseSha256Line(line) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", e.hex);
+    try std.testing.expectEqualStrings("app.tar.gz", e.name);
+}
+
+test "parseSha256Line GNU binary-mode asterisk" {
+    const line = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff *bin.exe";
+    const e = parseSha256Line(line) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("bin.exe", e.name);
+}
+
+test "parseSha256Line strips leading ./" {
+    const line = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff  ./foo";
+    const e = parseSha256Line(line) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("foo", e.name);
+}
+
+test "parseSha256Line BSD form" {
+    const line = "SHA256 (app.tar.gz) = abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const e = parseSha256Line(line) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("app.tar.gz", e.name);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", e.hex);
+}
+
+test "parseSha256Line skips comments and blanks" {
+    try std.testing.expect(parseSha256Line("") == null);
+    try std.testing.expect(parseSha256Line("   \r\n") == null);
+    try std.testing.expect(parseSha256Line("# header line") == null);
+    try std.testing.expect(parseSha256Line("not a real line") == null);
+    // Bad hex length
+    try std.testing.expect(parseSha256Line("dead  short") == null);
+}
+
+test "lookupSha256 finds entry across formats" {
+    const body =
+        "# generated by something\n" ++
+        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  other.bin\n" ++
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  app.tar.gz\n" ++
+        "SHA256 (alt.zip) = 1111111111111111111111111111111111111111111111111111111111111111\n";
+    const got = lookupSha256(body, "app.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", got);
+    const got2 = lookupSha256(body, "alt.zip") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("1111111111111111111111111111111111111111111111111111111111111111", got2);
+    try std.testing.expect(lookupSha256(body, "missing") == null);
+}
+
+test "checksumNameMatches strips path and ignores case" {
+    try std.testing.expect(checksumNameMatches("./Foo.TGZ", "foo.tgz"));
+    try std.testing.expect(checksumNameMatches("dist/foo.tgz", "foo.tgz"));
+    try std.testing.expect(!checksumNameMatches("bar.tgz", "foo.tgz"));
+}
+
+test "isSha256ChecksumFile accepts sha256 forms, rejects sigs and sha512" {
+    try std.testing.expect(isSha256ChecksumFile("app.tar.gz.sha256"));
+    try std.testing.expect(isSha256ChecksumFile("checksums.txt"));
+    try std.testing.expect(isSha256ChecksumFile("SHA256SUMS"));
+    try std.testing.expect(isSha256ChecksumFile("project_checksums_v1.0.txt"));
+    try std.testing.expect(!isSha256ChecksumFile("app.tar.gz"));
+    try std.testing.expect(!isSha256ChecksumFile("app.tar.gz.sig"));
+    try std.testing.expect(!isSha256ChecksumFile("app.tar.gz.sha512"));
+    try std.testing.expect(!isSha256ChecksumFile("checksums.txt.sig"));
+    try std.testing.expect(!isSha256ChecksumFile("release.pub"));
+}
+
+test "findChecksumAsset prefers sidecar over aggregate" {
+    const assets = [_]Asset{
+        .{ .name = "app-linux.tar.gz", .browser_download_url = "" },
+        .{ .name = "checksums.txt", .browser_download_url = "" },
+        .{ .name = "app-linux.tar.gz.sha256", .browser_download_url = "" },
+    };
+    const got = findChecksumAsset(&assets, "app-linux.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("app-linux.tar.gz.sha256", got.name);
+}
+
+test "findChecksumAsset falls back to aggregate" {
+    const assets = [_]Asset{
+        .{ .name = "app-linux.tar.gz", .browser_download_url = "" },
+        .{ .name = "SHA256SUMS", .browser_download_url = "" },
+    };
+    const got = findChecksumAsset(&assets, "app-linux.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("SHA256SUMS", got.name);
+}
+
+test "findChecksumAsset returns null when only sha512 is present" {
+    const assets = [_]Asset{
+        .{ .name = "app-linux.tar.gz", .browser_download_url = "" },
+        .{ .name = "app-linux.tar.gz.sha512", .browser_download_url = "" },
+        .{ .name = "release.sig", .browser_download_url = "" },
+    };
+    try std.testing.expect(findChecksumAsset(&assets, "app-linux.tar.gz") == null);
+}
+
+test "computeFileSha256 streams a synthetic file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "the quick brown fox jumps over the lazy dog\n";
+    var f = try tmp.dir.createFile(std.testing.io, "blob", .{});
+    try f.writeStreamingAll(std.testing.io, payload);
+    f.close(std.testing.io);
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(std.testing.io, "blob", &path_buf);
+    const full_path = path_buf[0..n];
+
+    const digest = try computeFileSha256(std.testing.io, full_path);
+    var expected: [32]u8 = undefined;
+    Sha256.hash(payload, &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &digest);
+}
+
+test "hexEqIgnoreCase mixed case" {
+    try std.testing.expect(hexEqIgnoreCase(
+        "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789",
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+    ));
+    try std.testing.expect(!hexEqIgnoreCase(
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456788",
+    ));
+}

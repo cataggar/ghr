@@ -132,6 +132,45 @@ python -m pip uninstall ghr-bin -y
 winget uninstall ghr
 ```
 
+## Verification
+
+When you install a tool, ghr automatically verifies the downloaded asset
+against any verification material the release publishes:
+
+- **SHA256 checksum files** — sidecar `<asset>.sha256` files and aggregate
+  `*checksums*` / `SHA256SUMS` files are both supported, in GNU and BSD
+  formats.
+- **Sigstore bundles** — `<asset>.sigstore.json` (cosign bundle v0.3) is
+  verified entirely natively in Zig. The X.509 chain is walked from the
+  bundle's leaf cert to embedded production Fulcio roots, the artifact's
+  ECDSA-P256/SHA-256 signature is checked against the leaf, and Rekor's
+  signed entry timestamp is verified against the embedded Rekor public
+  key. The Rekor `integratedTime` is used as the verification clock since
+  cosign leaf certs only live for ~10 minutes. When the bundle carries
+  an inclusion proof, the Merkle audit path is replayed (RFC 6962) to
+  recompute the log root, and the signed checkpoint envelope is verified
+  against the embedded Rekor key — anchoring the entry to a publicly
+  observable log root. The signer's SAN (URI/email) and OIDC issuer are
+  extracted from the leaf cert and printed to stdout for visual review;
+  ghr does not yet enforce a specific identity.
+
+On any verification failure the install is aborted and the cached
+download is deleted. If no checksum or bundle is published the download
+proceeds with a `note:` line so you know it was unverified.
+
+Pass `--skip-verify` to bypass both checks. The strongest result is
+recorded in each tool's `ghr.json` metadata as `"verified"`:
+
+- `"sigstore"` — sigstore bundle verified (also implies the bundle's
+  declared SHA256 matches the file).
+- `"sha256"` — SHA256 checksum verified.
+- `"none"` — no verification material was published.
+- `"skipped"` — `--skip-verify` was passed.
+
+The trust roots embedded in ghr come from
+[`sigstore/root-signing`](https://github.com/sigstore/root-signing).
+Rotating them requires a new ghr release.
+
 ## License
 
 MIT
