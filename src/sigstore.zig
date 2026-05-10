@@ -1,23 +1,30 @@
 //! Native Sigstore Bundle (v0.3) verification, Phase 2 of issue #50.
 //!
-//! Today this module covers the foundation pieces:
+//! Coverage:
 //!   * Embedded production Fulcio root + intermediate (Sigstore public good
 //!     instance) and the Rekor public key, pulled from
 //!     https://github.com/sigstore/root-signing.
 //!   * Asset-list helper to find the `<asset>.sigstore.json` sidecar.
 //!   * JSON parser for the fields of the bundle we actually consume.
-//!   * X.509 chain walk against the embedded trust roots, using
-//!     `std.crypto.Certificate` and the `Bundle.verify` pattern from
-//!     `std/crypto/tls/Client.zig`. The verification clock is the Rekor
-//!     `integratedTime` from the bundle, since cosign's leaf certs only
-//!     live for ~10 minutes.
+//!   * Decode of the canonicalized Rekor `hashedrekord` body so we can bind
+//!     the bundle's claims (digest, signature, leaf cert) to what Rekor
+//!     witnessed.
+//!   * Artifact ECDSA-P256/SHA-256 signature verification, streamed from
+//!     disk so we don't need to hold the asset in memory.
+//!   * Rekor SET (signed entry timestamp) verification against the embedded
+//!     Rekor public key. This is what makes `integratedTime` trustworthy.
+//!   * X.509 chain walk against the embedded trust roots, using the parser
+//!     from `std.crypto.Certificate`. The verification clock is the Rekor
+//!     `integratedTime`, since cosign's leaf certs only live ~10 minutes.
 //!
-//! Subsequent commits will add: artifact signature verification, Rekor SET
-//! verification (anchors `integratedTime`), and identity reporting.
+//! Future work: identity reporting (SAN URI/email + OIDC issuer OIDs) and
+//! Merkle inclusion-proof verification against a signed Rekor checkpoint.
 
 const std = @import("std");
 const Io = std.Io;
 const Certificate = std.crypto.Certificate;
+const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Embedded Sigstore production trust roots. Updating these requires a new
 /// ghr release; see `docs/sigstore.md` (TODO) for rotation notes.
@@ -130,18 +137,6 @@ pub const RawBundle = struct {
     };
 };
 
-pub const BundleParseError = std.json.ParseFromValueError ||
-    std.json.Scanner.NextError ||
-    std.mem.Allocator.Error ||
-    error{
-        UnsupportedBundleMediaType,
-        BundleHasNoCertificate,
-        BundleHasNoTlogEntry,
-        UnsupportedDigestAlgorithm,
-        UnsupportedRekorEntryKind,
-    };
-
-/// Parsed bundle, owned by the caller. Call `deinit` to release.
 pub const Bundle = struct {
     parsed: std.json.Parsed(RawBundle),
     leaf_der: []const u8, // DER-decoded leaf cert (sub-slice of `arena_bytes`)
@@ -164,7 +159,7 @@ pub const Bundle = struct {
 
 /// Parse a Sigstore Bundle JSON blob and decode the base64-encoded fields we
 /// need. The returned `Bundle` owns its decoded buffers via an arena.
-pub fn parseBundle(allocator: std.mem.Allocator, json_bytes: []const u8) BundleParseError!Bundle {
+pub fn parseBundle(allocator: std.mem.Allocator, json_bytes: []const u8) !Bundle {
     var parsed = try std.json.parseFromSlice(RawBundle, allocator, json_bytes, .{
         .ignore_unknown_fields = true,
     });
@@ -251,12 +246,6 @@ fn base64Decode(allocator: std.mem.Allocator, b64: []const u8) ![]u8 {
 // X.509 chain verification against the embedded Fulcio trust bundle.
 // ---------------------------------------------------------------------------
 
-pub const ChainError = error{
-    LeafCertParseFailed,
-    TrustBundleBuildFailed,
-    IssuerNotInTrustBundle,
-} || Certificate.Parsed.VerifyError || Certificate.ParseError || std.mem.Allocator.Error;
-
 /// Build a `Certificate.Bundle` containing the embedded Fulcio root +
 /// intermediate. Caller owns the returned bundle and must call
 /// `bundle.deinit(allocator)`.
@@ -265,7 +254,7 @@ pub const ChainError = error{
 /// embedded roots are valid until 2031, so passing the current wall-clock
 /// time is fine. Certificate-validity-window enforcement during chain
 /// verification uses a separate `verify_at` parameter.
-pub fn buildTrustBundle(allocator: std.mem.Allocator, now_sec: i64) ChainError!Certificate.Bundle {
+pub fn buildTrustBundle(allocator: std.mem.Allocator, now_sec: i64) !Certificate.Bundle {
     var bundle: Certificate.Bundle = .empty;
     errdefer bundle.deinit(allocator);
     try addPemCertsToBundle(&bundle, allocator, fulcio_root_pem, now_sec);
@@ -281,7 +270,7 @@ fn addPemCertsToBundle(
     gpa: std.mem.Allocator,
     pem_bytes: []const u8,
     now_sec: i64,
-) ChainError!void {
+) !void {
     const begin_marker = "-----BEGIN CERTIFICATE-----";
     const end_marker = "-----END CERTIFICATE-----";
 
@@ -323,7 +312,9 @@ fn stripWhitespace(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
         out[n] = c;
         n += 1;
     }
-    return out[0..n];
+    // Shrink so the caller's `free(slice)` matches the allocation size that
+    // the allocator tracks. We always succeed because n <= s.len.
+    return gpa.realloc(out, n) catch unreachable;
 }
 
 /// Verify that `leaf_der` chains to the embedded Fulcio root via the
@@ -339,7 +330,7 @@ pub fn verifyCertChain(
     bundle: Certificate.Bundle,
     leaf_der: []const u8,
     verify_at: i64,
-) ChainError!Certificate.Parsed {
+) !Certificate.Parsed {
     var subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
     var subject = subject_cert.parse() catch return error.LeafCertParseFailed;
 
@@ -365,8 +356,336 @@ pub fn verifyCertChain(
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Embedded Rekor public key (SPKI PEM) — extract the SEC1-encoded EC point
+// and compute its log key id (SHA256 of the SPKI DER).
 // ---------------------------------------------------------------------------
+
+pub const RekorKey = struct {
+    public_key: EcdsaP256Sha256.PublicKey,
+    /// SHA256 of the SPKI DER. This is the canonical Rekor log identifier
+    /// embedded in tlog entries (`logId.keyId`, in raw bytes).
+    key_id: [32]u8,
+};
+
+/// Decode the embedded Rekor PEM into a `RekorKey`. Allocates a temporary
+/// SPKI DER buffer that's freed before returning; the returned struct is
+/// fully owned by the caller and copy-by-value safe.
+pub fn embeddedRekorKey(allocator: std.mem.Allocator) !RekorKey {
+    const spki_der = try decodeSinglePem(allocator, rekor_pubkey_pem, "PUBLIC KEY");
+    defer allocator.free(spki_der);
+
+    // SubjectPublicKeyInfo := SEQUENCE { algo AlgorithmIdentifier, pk BIT STRING }
+    const root = try Certificate.der.Element.parse(spki_der, 0);
+    if (root.identifier.tag != .sequence) return error.InvalidRekorPem;
+    const algo = try Certificate.der.Element.parse(spki_der, root.slice.start);
+    if (algo.identifier.tag != .sequence) return error.InvalidRekorPem;
+    const bit_string = try Certificate.der.Element.parse(spki_der, algo.slice.end);
+    if (bit_string.identifier.tag != .bitstring) return error.InvalidRekorPem;
+
+    const bit_bytes = spki_der[bit_string.slice.start..bit_string.slice.end];
+    if (bit_bytes.len < 2 or bit_bytes[0] != 0x00) return error.InvalidRekorPem;
+    const sec1 = bit_bytes[1..]; // skip "unused bits" prefix
+    if (sec1.len != 65 or sec1[0] != 0x04) return error.UnsupportedRekorKeyAlgorithm;
+
+    var key_id: [32]u8 = undefined;
+    Sha256.hash(spki_der, &key_id, .{});
+
+    return .{
+        .public_key = try EcdsaP256Sha256.PublicKey.fromSec1(sec1),
+        .key_id = key_id,
+    };
+}
+
+/// Decode the first PEM block of `expected_label` from `pem_bytes`.
+fn decodeSinglePem(
+    allocator: std.mem.Allocator,
+    pem_bytes: []const u8,
+    expected_label: []const u8,
+) ![]u8 {
+    const begin_prefix = "-----BEGIN ";
+    const end_prefix = "-----END ";
+    const begin_off = std.mem.indexOf(u8, pem_bytes, begin_prefix) orelse return error.InvalidRekorPem;
+    const after_begin = begin_off + begin_prefix.len;
+    const begin_eol = std.mem.indexOfScalarPos(u8, pem_bytes, after_begin, '\n') orelse
+        return error.InvalidRekorPem;
+    const begin_label_end = std.mem.lastIndexOfScalar(u8, pem_bytes[after_begin..begin_eol], '-') orelse
+        return error.InvalidRekorPem;
+    const begin_label = std.mem.trim(u8, pem_bytes[after_begin .. after_begin + begin_label_end], " \t\r-");
+    if (!std.mem.eql(u8, begin_label, expected_label)) return error.InvalidRekorPem;
+
+    const end_off = std.mem.indexOfPos(u8, pem_bytes, begin_eol, end_prefix) orelse
+        return error.InvalidRekorPem;
+    const b64 = std.mem.trim(u8, pem_bytes[begin_eol + 1 .. end_off], " \t\r\n");
+    const stripped = try stripWhitespace(allocator, b64);
+    defer allocator.free(stripped);
+
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = try decoder.calcSizeForSlice(stripped);
+    const out = try allocator.alloc(u8, decoded_len);
+    errdefer allocator.free(out);
+    try decoder.decode(out, stripped);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Decoded Rekor `hashedrekord` body. The bundle's `canonicalizedBody` is the
+// base64-encoded JSON Rekor signed; we need to peek inside to bind it back
+// to the bundle's other fields.
+// ---------------------------------------------------------------------------
+
+pub const RawRekorBody = struct {
+    apiVersion: []const u8 = "",
+    kind: []const u8 = "",
+    spec: Spec,
+
+    pub const Spec = struct {
+        data: Data,
+        signature: BodySignature,
+    };
+
+    pub const Data = struct {
+        hash: Hash,
+    };
+
+    pub const Hash = struct {
+        algorithm: []const u8,
+        value: []const u8,
+    };
+
+    pub const BodySignature = struct {
+        content: []const u8,
+        publicKey: PublicKey,
+    };
+
+    pub const PublicKey = struct {
+        content: []const u8,
+    };
+};
+
+pub const RekorBody = struct {
+    parsed: std.json.Parsed(RawRekorBody),
+    /// Decoded leaf cert (DER), arena-owned.
+    leaf_der: []const u8,
+    /// Hex-decoded artifact digest. `digest_len` indicates the populated prefix.
+    digest: [32]u8,
+    digest_len: u8,
+    /// Base64-decoded raw signature (DER ECDSA), arena-owned.
+    signature: []const u8,
+    arena: *std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *RekorBody) void {
+        const child = self.arena.child_allocator;
+        self.parsed.deinit();
+        self.arena.deinit();
+        child.destroy(self.arena);
+    }
+};
+
+/// Decode the canonicalized Rekor `hashedrekord` body (the raw JSON bytes
+/// that Rekor signs) into a `RekorBody`. The returned body owns its decoded
+/// fields via an arena.
+pub fn decodeRekorBody(allocator: std.mem.Allocator, body_json: []const u8) !RekorBody {
+    var parsed = try std.json.parseFromSlice(RawRekorBody, allocator, body_json, .{
+        .ignore_unknown_fields = true,
+    });
+    errdefer parsed.deinit();
+
+    const raw = parsed.value;
+    if (!std.mem.eql(u8, raw.kind, "hashedrekord")) return error.UnsupportedRekorEntryKind;
+    if (!std.ascii.eqlIgnoreCase(raw.spec.data.hash.algorithm, "sha256"))
+        return error.UnsupportedDigestAlgorithm;
+    if (raw.spec.data.hash.value.len != 64) return error.InvalidRekorBodyDigest;
+
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena.deinit();
+        allocator.destroy(arena);
+    }
+    const aalloc = arena.allocator();
+
+    var digest: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&digest, raw.spec.data.hash.value) catch
+        return error.InvalidRekorBodyDigest;
+
+    const sig = try base64Decode(aalloc, raw.spec.signature.content);
+
+    // The Rekor body's publicKey.content is base64 of the leaf cert PEM.
+    const cert_pem = try base64Decode(aalloc, raw.spec.signature.publicKey.content);
+    const leaf_der = try decodeSinglePem(aalloc, cert_pem, "CERTIFICATE");
+
+    return .{
+        .parsed = parsed,
+        .leaf_der = leaf_der,
+        .digest = digest,
+        .digest_len = 32,
+        .signature = sig,
+        .arena = arena,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Rekor SET verification.
+//
+// The SET (signedEntryTimestamp) is an ECDSA-P256/SHA-256 signature, made by
+// the Rekor production key, over the canonical JSON
+//
+//   {"body":"<base64 of canonicalizedBody>","integratedTime":<int>,
+//    "logID":"<hex of keyId>","logIndex":<int>}
+//
+// (no whitespace, keys alphabetically sorted, integers as numbers). This
+// matches Go's `json.Marshal` of Rekor's `signableData` struct, since the
+// struct field order happens to be alphabetical.
+//
+// Without verifying the SET, `integratedTime` is unsigned data — an attacker
+// could backdate it to a window where the leaf cert was valid. Therefore
+// SET verification is a hard requirement before trusting `integratedTime`
+// as a clock for cert validity.
+// ---------------------------------------------------------------------------
+
+pub fn verifyRekorSet(
+    allocator: std.mem.Allocator,
+    bundle: Bundle,
+    rekor: RekorKey,
+) !void {
+    const set_bytes = bundle.rekor_set orelse return error.BundleHasNoRekorSet;
+
+    if (bundle.rekor_log_key_id.len != rekor.key_id.len or
+        !std.mem.eql(u8, bundle.rekor_log_key_id, &rekor.key_id))
+        return error.RekorKeyIdMismatch;
+
+    // Re-extract the original base64 form of canonicalizedBody. The bundle's
+    // raw JSON (unparsed) preserves it verbatim, but we have only the parsed
+    // struct here, so re-encode the decoded bytes — the result is identical
+    // because base64 is deterministic.
+    const body_b64_buf = try allocator.alloc(
+        u8,
+        std.base64.standard.Encoder.calcSize(bundle.rekor_canonical_body.len),
+    );
+    defer allocator.free(body_b64_buf);
+    const body_b64 = std.base64.standard.Encoder.encode(body_b64_buf, bundle.rekor_canonical_body);
+
+    var key_id_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&key_id_hex, "{x}", .{bundle.rekor_log_key_id}) catch unreachable;
+
+    // Build canonical JSON with no whitespace.
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try buf.writer.print(
+        "{{\"body\":\"{s}\",\"integratedTime\":{d},\"logID\":\"{s}\",\"logIndex\":{d}}}",
+        .{ body_b64, bundle.rekor_integrated_time, key_id_hex[0..key_id_hex.len], bundle.rekor_log_index },
+    );
+    const canonical = buf.written();
+
+    const signature = EcdsaP256Sha256.Signature.fromDer(set_bytes) catch
+        return error.InvalidRekorSetSignature;
+    signature.verify(canonical, rekor.public_key) catch
+        return error.InvalidRekorSetSignature;
+}
+
+// ---------------------------------------------------------------------------
+// Artifact signature verification.
+//
+// cosign signs blobs with `EcdsaP256Sha256.sign(artifact_bytes)`, hashing
+// internally. Verification mirrors that — stream the file through an ECDSA
+// verifier so we don't need to load the artifact into memory.
+// ---------------------------------------------------------------------------
+
+/// Stream the artifact at `file` through an ECDSA-P256/SHA-256 verifier
+/// using the leaf cert's SEC1 public key and the bundle's DER signature.
+/// Also recomputes the SHA256 along the way and writes it to `digest_out`,
+/// so the caller can bind the bundle's claimed digest back to the file.
+pub fn verifyArtifactSignature(
+    io: Io,
+    file: Io.File,
+    leaf_pubkey_sec1: []const u8,
+    signature_der: []const u8,
+    digest_out: *[32]u8,
+) !void {
+    const pub_key = EcdsaP256Sha256.PublicKey.fromSec1(leaf_pubkey_sec1) catch
+        return error.InvalidArtifactSignature;
+    const sig = EcdsaP256Sha256.Signature.fromDer(signature_der) catch
+        return error.InvalidArtifactSignature;
+
+    var verifier = sig.verifier(pub_key) catch return error.InvalidArtifactSignature;
+    var hasher = Sha256.init(.{});
+
+    var read_buf: [64 * 1024]u8 = undefined;
+    var fr = file.reader(io, &read_buf);
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try fr.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        verifier.update(chunk[0..n]);
+        hasher.update(chunk[0..n]);
+        if (n < chunk.len) break;
+    }
+    hasher.final(digest_out);
+    verifier.verify() catch return error.InvalidArtifactSignature;
+}
+
+// ---------------------------------------------------------------------------
+// Top-level verification orchestrator.
+// ---------------------------------------------------------------------------
+
+pub const VerifiedIdentity = struct {
+    /// `subject_alt_name_slice` of the leaf cert. Caller-borrowed against
+    /// the bundle's arena.
+    san_der: []const u8,
+    /// Rekor `integratedTime`, useful for the install metadata and CLI
+    /// output.
+    integrated_time: i64,
+};
+
+/// Run the full verification pipeline against a parsed bundle and the
+/// cached artifact:
+///
+///   1. Verify the Rekor SET (ties `integratedTime` to the embedded Rekor
+///      key).
+///   2. Decode the canonicalized Rekor body and confirm it agrees with the
+///      bundle's claimed leaf cert, signature, and digest.
+///   3. Stream the artifact through an ECDSA-P256/SHA-256 verifier with
+///      the leaf cert's pubkey and confirm both the signature and the
+///      digest match what Rekor witnessed.
+///   4. Walk the X.509 chain from the leaf to the embedded Fulcio root,
+///      using `integratedTime` as the validity clock.
+pub fn verifyBundle(
+    allocator: std.mem.Allocator,
+    io: Io,
+    bundle: Bundle,
+    rekor: RekorKey,
+    file: Io.File,
+) !VerifiedIdentity {
+    try verifyRekorSet(allocator, bundle, rekor);
+
+    var body = try decodeRekorBody(allocator, bundle.rekor_canonical_body);
+    defer body.deinit();
+
+    if (!std.mem.eql(u8, &body.digest, &bundle.artifact_digest))
+        return error.BundleSignatureMismatch;
+    if (!std.mem.eql(u8, body.signature, bundle.artifact_signature))
+        return error.BundleSignatureMismatch;
+    if (!std.mem.eql(u8, body.leaf_der, bundle.leaf_der))
+        return error.BundleCertMismatch;
+
+    var leaf_cert: Certificate = .{ .buffer = bundle.leaf_der, .index = 0 };
+    const leaf = leaf_cert.parse() catch return error.LeafCertParseFailed;
+    const leaf_pubkey_sec1 = leaf.pubKey();
+
+    var actual_digest: [32]u8 = undefined;
+    try verifyArtifactSignature(io, file, leaf_pubkey_sec1, bundle.artifact_signature, &actual_digest);
+    if (!std.mem.eql(u8, &actual_digest, &bundle.artifact_digest))
+        return error.ArtifactDigestMismatch;
+
+    var trust = try buildTrustBundle(allocator, bundle.rekor_integrated_time);
+    defer trust.deinit(allocator);
+    const verified_leaf = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
+
+    return .{
+        .san_der = verified_leaf.slice(verified_leaf.subject_alt_name_slice),
+        .integrated_time = bundle.rekor_integrated_time,
+    };
+}
 
 const test_bundle_json = @embedFile("sigstore/testdata/cosign-linux-arm64.sigstore.json");
 
@@ -434,4 +753,138 @@ test "verifyCertChain walks cosign fixture to embedded Fulcio root" {
 
     const leaf_parsed = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
     try std.testing.expect(leaf_parsed.subject_alt_name_slice.end > leaf_parsed.subject_alt_name_slice.start);
+}
+
+test "embeddedRekorKey matches well-known production key id" {
+    const allocator = std.testing.allocator;
+    const key = try embeddedRekorKey(allocator);
+    // sha256 of the production Rekor SPKI DER, as published.
+    const expected = [_]u8{
+        0xc0, 0xd2, 0x3d, 0x6a, 0xd4, 0x06, 0x97, 0x3f,
+        0x95, 0x59, 0xf3, 0xba, 0x2d, 0x1c, 0xa0, 0x1f,
+        0x84, 0x14, 0x7d, 0x8f, 0xfc, 0x5b, 0x84, 0x45,
+        0xc2, 0x24, 0xf9, 0x8b, 0x95, 0x91, 0x80, 0x1d,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, &key.key_id);
+}
+
+test "verifyRekorSet on captured cosign fixture" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+    const rekor = try embeddedRekorKey(allocator);
+    try verifyRekorSet(allocator, bundle, rekor);
+}
+
+test "verifyRekorSet rejects mismatched key id" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+    var rekor = try embeddedRekorKey(allocator);
+    // Flip a byte to simulate a swapped Rekor key.
+    rekor.key_id[0] ^= 0xFF;
+    try std.testing.expectError(error.RekorKeyIdMismatch, verifyRekorSet(allocator, bundle, rekor));
+}
+
+test "verifyRekorSet rejects tampered SET signature" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+    const rekor = try embeddedRekorKey(allocator);
+    // Tamper with the integrated time so the canonical payload no longer
+    // matches what Rekor signed.
+    bundle.rekor_integrated_time += 1;
+    const result = verifyRekorSet(allocator, bundle, rekor);
+    try std.testing.expect(result == error.InvalidRekorSetSignature or
+        result == error.SignatureVerificationFailed);
+}
+
+test "decodeRekorBody binds digest, signature, and cert to bundle" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+    var body = try decodeRekorBody(allocator, bundle.rekor_canonical_body);
+    defer body.deinit();
+    try std.testing.expectEqualSlices(u8, &bundle.artifact_digest, &body.digest);
+    try std.testing.expectEqualSlices(u8, bundle.artifact_signature, body.signature);
+    try std.testing.expectEqualSlices(u8, bundle.leaf_der, body.leaf_der);
+}
+
+test "verifyArtifactSignature streams a signed blob end-to-end" {
+    const allocator = std.testing.allocator;
+
+    // Generate an ephemeral P-256 keypair and sign a payload, then verify
+    // through the same streaming code path used in production.
+    const seed = [_]u8{0x42} ** EcdsaP256Sha256.KeyPair.seed_length;
+    const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed);
+    const payload = "the quick brown fox jumps over the lazy dog";
+    var signer = try kp.signer(null);
+    signer.update(payload);
+    const sig = try signer.finalize();
+    var sig_der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = sig.toDer(&sig_der_buf);
+    const pub_sec1 = kp.public_key.toUncompressedSec1();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    {
+        var f = try tmp.dir.createFile(io, "payload", .{});
+        try f.writeStreamingAll(io, payload);
+        f.close(io);
+    }
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(io, ".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tmp_path, std.fs.path.sep, "payload" });
+    defer allocator.free(full_path);
+
+    var f = try Io.Dir.openFileAbsolute(io, full_path, .{});
+    defer f.close(io);
+
+    var digest: [32]u8 = undefined;
+    try verifyArtifactSignature(io, f, &pub_sec1, sig_der, &digest);
+
+    var expected_digest: [32]u8 = undefined;
+    Sha256.hash(payload, &expected_digest, .{});
+    try std.testing.expectEqualSlices(u8, &expected_digest, &digest);
+}
+
+test "verifyArtifactSignature rejects a tampered file" {
+    const allocator = std.testing.allocator;
+
+    const seed = [_]u8{0x55} ** EcdsaP256Sha256.KeyPair.seed_length;
+    const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed);
+    const payload = "hello sigstore";
+    var signer = try kp.signer(null);
+    signer.update(payload);
+    const sig = try signer.finalize();
+    var sig_der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig_der = sig.toDer(&sig_der_buf);
+    const pub_sec1 = kp.public_key.toUncompressedSec1();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+
+    {
+        var f = try tmp.dir.createFile(io, "tampered", .{});
+        try f.writeStreamingAll(io, "hello sigsbore"); // single-byte tamper
+        f.close(io);
+    }
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(io, ".", &path_buf);
+    const full_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tmp_path, std.fs.path.sep, "tampered" });
+    defer allocator.free(full_path);
+
+    var f = try Io.Dir.openFileAbsolute(io, full_path, .{});
+    defer f.close(io);
+
+    var digest: [32]u8 = undefined;
+    try std.testing.expectError(
+        error.InvalidArtifactSignature,
+        verifyArtifactSignature(io, f, &pub_sec1, sig_der, &digest),
+    );
 }

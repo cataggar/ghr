@@ -135,17 +135,35 @@ winget uninstall ghr
 ## Verification
 
 When you install a tool, ghr automatically verifies the downloaded asset
-against the release's published SHA256 checksum file when one is available
-(sidecar `<asset>.sha256` files and aggregate `*checksums*` /
-`SHA256SUMS` files are both supported, in GNU and BSD formats). On
-mismatch the install is aborted; if no checksum file is published the
-download proceeds with a `note:` line so you know it was unverified.
+against any verification material the release publishes:
 
-Pass `--skip-verify` to bypass the check. The verification status is
-recorded in each tool's `ghr.json` metadata as `"verified": "sha256"`,
-`"none"`, or `"skipped"`.
+- **SHA256 checksum files** — sidecar `<asset>.sha256` files and aggregate
+  `*checksums*` / `SHA256SUMS` files are both supported, in GNU and BSD
+  formats.
+- **Sigstore bundles** — `<asset>.sigstore.json` (cosign bundle v0.3) is
+  verified entirely natively in Zig. The X.509 chain is walked from the
+  bundle's leaf cert to embedded production Fulcio roots, the artifact's
+  ECDSA-P256/SHA-256 signature is checked against the leaf, and Rekor's
+  signed entry timestamp is verified against the embedded Rekor public
+  key. The Rekor `integratedTime` is used as the verification clock since
+  cosign leaf certs only live for ~10 minutes.
 
-Native sigstore bundle verification (`.sigstore.json`) is planned next.
+On any verification failure the install is aborted and the cached
+download is deleted. If no checksum or bundle is published the download
+proceeds with a `note:` line so you know it was unverified.
+
+Pass `--skip-verify` to bypass both checks. The strongest result is
+recorded in each tool's `ghr.json` metadata as `"verified"`:
+
+- `"sigstore"` — sigstore bundle verified (also implies the bundle's
+  declared SHA256 matches the file).
+- `"sha256"` — SHA256 checksum verified.
+- `"none"` — no verification material was published.
+- `"skipped"` — `--skip-verify` was passed.
+
+The trust roots embedded in ghr come from
+[`sigstore/root-signing`](https://github.com/sigstore/root-signing).
+Rotating them requires a new ghr release.
 
 ## License
 

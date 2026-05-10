@@ -4,6 +4,7 @@ const Dirs = @import("dirs.zig").Dirs;
 const http = @import("http.zig");
 const archive = @import("archive.zig");
 const auth = @import("auth.zig");
+const sigstore = @import("sigstore.zig");
 const version = @import("build_options").version;
 
 const Io = std.Io;
@@ -455,8 +456,12 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const VerifyOutcome = enum {
     /// A SHA256 checksum file was found and its hash matched the download.
     sha256_verified,
-    /// No checksum file was published for this release. Continue with a warning.
-    no_checksum,
+    /// A sigstore bundle was found and verification (chain, signature, Rekor
+    /// SET) succeeded. This implies SHA256 verification too — the bundle's
+    /// `messageDigest` is checked against the cached file.
+    sigstore_verified,
+    /// No verification material was published for this release.
+    no_verification,
     /// User passed --skip-verify.
     skipped,
 };
@@ -677,7 +682,7 @@ fn verifyDownloadedAssetSha256(
     err_w: *Writer,
 ) !VerifyOutcome {
     const checksum_asset = findChecksumAsset(assets, asset_name) orelse {
-        return .no_checksum;
+        return .no_verification;
     };
 
     debugLog(debug_w, "debug: checksum asset: {s}\n", .{checksum_asset.name});
@@ -729,6 +734,90 @@ fn verifyDownloadedAssetSha256(
     try w.print("verified sha256 {s}… ({s})\n", .{ actual_hex[0..12], checksum_asset.name });
     try w.flush();
     return .sha256_verified;
+}
+
+/// Run Phase 2 verification (sigstore bundle) on `download_path`. Verifies
+/// the X.509 chain to the embedded Fulcio root, the artifact ECDSA
+/// signature, and the Rekor SET. Returns `.no_verification` when no bundle
+/// asset is published. On any verification failure, prints a diagnostic and
+/// returns an error; the caller deletes the cached file and exits.
+fn verifyDownloadedAssetSigstore(
+    allocator: std.mem.Allocator,
+    io: Io,
+    client: *std.http.Client,
+    cache_dir: []const u8,
+    assets: []const Asset,
+    asset_name: []const u8,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    auth_header: ?[]const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    // Build a view of the asset list using the sigstore module's public
+    // adapter shape (avoids exposing the install-internal `Asset` type).
+    const views = try allocator.alloc(sigstore.AssetView, assets.len);
+    defer allocator.free(views);
+    for (assets, 0..) |a, i| {
+        views[i] = .{ .name = a.name, .browser_download_url = a.browser_download_url };
+    }
+
+    const bundle_asset = sigstore.findBundleAsset(views, asset_name) orelse {
+        return .no_verification;
+    };
+
+    debugLog(debug_w, "debug: sigstore bundle asset: {s}\n", .{bundle_asset.name});
+
+    const bundle_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        cache_dir, std.fs.path.sep, bundle_asset.name,
+    });
+    defer allocator.free(bundle_path);
+    defer Dir.deleteFileAbsolute(io, bundle_path) catch {};
+
+    downloadAsset(allocator, io, client, bundle_asset.browser_download_url, bundle_path, debug_w, auth_header) catch |err| {
+        try err_w.print("error: failed to download sigstore bundle '{s}': {}\n", .{ bundle_asset.name, err });
+        try err_w.flush();
+        return error.SigstoreDownloadFailed;
+    };
+
+    const bundle_bytes = blk: {
+        var dir = try Dir.openDirAbsolute(io, cache_dir, .{});
+        defer dir.close(io);
+        // Cap at 8 MiB; cosign bundles are < 16 KiB but allow generous slack.
+        break :blk try dir.readFileAlloc(io, bundle_asset.name, allocator, Io.Limit.limited(8 * 1024 * 1024));
+    };
+    defer allocator.free(bundle_bytes);
+
+    var bundle = sigstore.parseBundle(allocator, bundle_bytes) catch |err| {
+        try err_w.print("error: failed to parse sigstore bundle '{s}': {s}\n", .{ bundle_asset.name, @errorName(err) });
+        try err_w.flush();
+        return error.SigstoreParseFailed;
+    };
+    defer bundle.deinit();
+
+    const rekor = sigstore.embeddedRekorKey(allocator) catch |err| {
+        try err_w.print("error: failed to load embedded Rekor key: {s}\n", .{@errorName(err)});
+        try err_w.flush();
+        return err;
+    };
+
+    var file = try Dir.openFileAbsolute(io, download_path, .{});
+    defer file.close(io);
+
+    const identity = sigstore.verifyBundle(allocator, io, bundle, rekor, file) catch |err| {
+        try err_w.print("error: sigstore verification failed for '{s}': {s}\n", .{ asset_name, @errorName(err) });
+        try err_w.flush();
+        return error.SigstoreVerificationFailed;
+    };
+
+    var digest_hex: [64]u8 = undefined;
+    sha256ToHex(bundle.artifact_digest, &digest_hex);
+    try w.print(
+        "verified sigstore: sha256 {s}… (rekor t={d}, log {d})\n",
+        .{ digest_hex[0..12], identity.integrated_time, bundle.rekor_log_index },
+    );
+    try w.flush();
+    return .sigstore_verified;
 }
 
 /// For bare-binary assets whose name follows the `<name>-<arch>-<triple>...`
@@ -1575,15 +1664,16 @@ pub fn cmdInstall(
         }
     }
 
-    // Phase 1: SHA256 verification (issue #50). Runs after the asset is on
-    // disk, before we extract or move anything. On a hard mismatch we abort
-    // here; on a missing checksum file we just print a note.
+    // Verification (issue #50). Runs after the asset is on disk, before we
+    // extract or move anything. SHA256 (Phase 1) and sigstore bundle
+    // (Phase 2) are independent — both run when material is published.
+    // Sigstore is the stronger signal and overrides the metadata label.
     var verified_label: []const u8 = "none";
     if (skip_verify) {
         verified_label = "skipped";
         try w.print("note: verification skipped (--skip-verify)\n", .{});
     } else {
-        const outcome = verifyDownloadedAssetSha256(
+        const sha_outcome = verifyDownloadedAssetSha256(
             allocator,
             io,
             &client,
@@ -1600,20 +1690,42 @@ pub fn cmdInstall(
                 error.ChecksumMismatch,
                 error.ChecksumDownloadFailed,
                 error.ChecksumEntryMissing,
-                => std.process.exit(1),
+                => {
+                    Dir.deleteFileAbsolute(io, download_path) catch {};
+                    std.process.exit(1);
+                },
                 else => {
-                    try err_w.print("error: verification failed: {}\n", .{verr});
+                    try err_w.print("error: SHA256 verification failed: {}\n", .{verr});
                     try err_w.flush();
+                    Dir.deleteFileAbsolute(io, download_path) catch {};
                     std.process.exit(1);
                 },
             }
         };
-        switch (outcome) {
-            .sha256_verified => verified_label = "sha256",
-            .skipped => verified_label = "skipped",
-            .no_checksum => {
-                try w.print("note: no SHA256 checksum file published; download is unverified\n", .{});
-            },
+        if (sha_outcome == .sha256_verified) verified_label = "sha256";
+
+        const sig_outcome = verifyDownloadedAssetSigstore(
+            allocator,
+            io,
+            &client,
+            d.cache,
+            release.parsed.value.assets,
+            asset.name,
+            download_path,
+            debug_w,
+            auth_header,
+            w,
+            err_w,
+        ) catch |verr| {
+            try err_w.print("error: sigstore verification failed: {s}\n", .{@errorName(verr)});
+            try err_w.flush();
+            Dir.deleteFileAbsolute(io, download_path) catch {};
+            std.process.exit(1);
+        };
+        if (sig_outcome == .sigstore_verified) verified_label = "sigstore";
+
+        if (sha_outcome == .no_verification and sig_outcome == .no_verification) {
+            try w.print("note: download is unverified (no SHA256 checksum or sigstore bundle published)\n", .{});
         }
         try w.flush();
     }
