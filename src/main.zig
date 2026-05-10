@@ -250,10 +250,10 @@ fn printUsage(w: *Writer) !void {
         \\    list                                 List installed tools
         \\    install <owner/repo[@tag]>           Install a tool from a GitHub release
         \\    install <owner/repo/file[@tag]>      Install a specific asset by name
+        \\    upgrade [name]                       Upgrade installed tools
         \\    uninstall <owner/repo>               Remove an installed tool
         \\    download <owner/repo[@tag]>          Download the asset 'install' would pick
         \\    download <owner/repo/file[@tag]>     Download a specific asset by name
-        \\    upgrade [name]                       Upgrade installed tools
         \\    path ensure [--dry-run]              Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
         \\    version                              Print version
