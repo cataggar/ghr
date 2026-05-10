@@ -336,6 +336,42 @@ fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
     return false;
 }
 
+/// Returns true if the asset name targets a CPU architecture that is
+/// clearly not the host. Used to reject `linux-amd64` on aarch64 hosts
+/// (and vice versa) so that a foreign-arch asset doesn't win on the
+/// strength of an OS keyword match alone.
+///
+/// The check is deliberately conservative: it only rejects when the
+/// name contains a foreign-arch token AND no host-arch token. That
+/// preserves names that mention both arches (e.g. cross-arch bundles)
+/// and is a no-op on hosts whose arch isn't in the supported set
+/// (`plat_arch` empty).
+fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
+    if (plat_arch.len == 0) return false;
+    // Universe of arch tokens recognized across supported hosts. Any of
+    // these that aren't host-arch keywords are "foreign".
+    const all_arch = [_][]const u8{
+        "x86_64", "x64",   "amd64",
+        "aarch64", "arm64",
+        "armv7l", "armv7", "armv6",
+        "i386",   "i686",  "x86",
+    };
+    // If the name contains any host-arch keyword, accept it.
+    for (plat_arch) |k| {
+        if (containsIgnoreCaseBounded(name, k)) return false;
+    }
+    // Otherwise, if it contains a known foreign-arch token, it's wrong.
+    for (all_arch) |t| {
+        var is_host = false;
+        for (plat_arch) |k| {
+            if (std.ascii.eqlIgnoreCase(k, t)) { is_host = true; break; }
+        }
+        if (is_host) continue;
+        if (containsIgnoreCaseBounded(name, t)) return true;
+    }
+    return false;
+}
+
 /// On Linux hosts, prefer portable glibc/musl triples over distro-tagged
 /// variants. Returns a signed bonus to fold into the score.
 fn linuxPortabilityBonus(name: []const u8, plat_os: []const []const u8) i32 {
@@ -392,16 +428,13 @@ fn scoreAsset(name: []const u8, plat: PlatformKeywords) i32 {
     return score;
 }
 
-fn selectBestByScore(
-    assets: []const Asset,
-    plat: PlatformKeywords,
-    skip_wrong_platform: bool,
-) ?Asset {
+fn selectBestByScore(assets: []const Asset, plat: PlatformKeywords) ?Asset {
     var best: ?Asset = null;
     var best_score: i32 = std.math.minInt(i32);
     for (assets) |asset| {
         if (!isInstallableAsset(asset.name)) continue;
-        if (skip_wrong_platform and isWrongPlatform(asset.name, plat.os)) continue;
+        if (isWrongPlatform(asset.name, plat.os)) continue;
+        if (isForeignArch(asset.name, plat.arch)) continue;
         const score = scoreAsset(asset.name, plat);
         if (best == null or score > best_score or
             (score == best_score and tieBreakPrefers(asset.name, best.?.name)))
@@ -414,28 +447,25 @@ fn selectBestByScore(
 }
 
 fn findBestAssetForKeywords(assets: []const Asset, plat: PlatformKeywords) !Asset {
-    // First pass: filter out obviously-wrong platforms and require a
-    // positive platform score.
-    if (selectBestByScore(assets, plat, true)) |b| {
-        // Require at least some platform signal (os or arch match) to
-        // accept; otherwise fall through.
-        if (scoreAsset(b.name, plat) > 0) return b;
-    }
-
-    // Second pass: drop the wrong-platform filter in case filtering was
-    // too aggressive.
-    if (selectBestByScore(assets, plat, false)) |b| {
+    // Filter out wrong-OS and wrong-arch assets, and require a positive
+    // platform score. A wrong-platform asset must never win, even when
+    // it is the only candidate the upstream ships, so we deliberately
+    // do not relax this filter as a fallback.
+    if (selectBestByScore(assets, plat)) |b| {
         if (scoreAsset(b.name, plat) > 0) return b;
     }
 
     // Last resort: exactly one installable asset means it's unambiguous.
+    // Still gate on platform correctness so a single foreign-arch /
+    // foreign-OS asset doesn't slip through.
     var count: u32 = 0;
     var single: ?Asset = null;
     for (assets) |asset| {
-        if (isInstallableAsset(asset.name)) {
-            count += 1;
-            single = asset;
-        }
+        if (!isInstallableAsset(asset.name)) continue;
+        if (isWrongPlatform(asset.name, plat.os)) continue;
+        if (isForeignArch(asset.name, plat.arch)) continue;
+        count += 1;
+        single = asset;
     }
     if (count == 1) return single.?;
     return error.NoMatchingAsset;
@@ -2085,6 +2115,102 @@ test "isWrongPlatform basics" {
     try std.testing.expect(isWrongPlatform("tool-x86_64-apple-darwin.tar.gz", win_os));
     try std.testing.expect(isWrongPlatform("tool-x86_64-unknown-linux-gnu.tar.gz", win_os));
     try std.testing.expect(!isWrongPlatform("tool-x86_64-pc-windows-msvc.zip", win_os));
+}
+
+test "isForeignArch basics" {
+    // aarch64 host: amd64/x86_64/x64/i386/i686/x86 are foreign.
+    const aarch64_arch: []const []const u8 = &.{ "aarch64", "arm64" };
+    try std.testing.expect(isForeignArch("lunatic-linux-amd64.tar.gz", aarch64_arch));
+    try std.testing.expect(isForeignArch("wavm-nightly-linux-x64.tar.gz", aarch64_arch));
+    try std.testing.expect(isForeignArch("tool-x86_64-unknown-linux-gnu.tar.gz", aarch64_arch));
+    try std.testing.expect(isForeignArch("tool-i686-linux.tar.gz", aarch64_arch));
+    try std.testing.expect(!isForeignArch("tool-aarch64-linux.tar.xz", aarch64_arch));
+    try std.testing.expect(!isForeignArch("wash-aarch64-unknown-linux-musl", aarch64_arch));
+    // Names with no arch tokens are not rejected.
+    try std.testing.expect(!isForeignArch("lunatic-macos-universal.tar.gz", aarch64_arch));
+    try std.testing.expect(!isForeignArch("tool.tar.gz", aarch64_arch));
+    // Mixed names that include a host-arch token are not rejected even
+    // if a foreign-arch token is also present (e.g. cross-arch bundles).
+    try std.testing.expect(!isForeignArch("tool-x86_64-and-aarch64.tar.gz", aarch64_arch));
+
+    // x86_64 host: aarch64/arm64/armv7*/armv6 are foreign.
+    const x86_64_arch: []const []const u8 = &.{ "x86_64", "x64", "amd64" };
+    try std.testing.expect(isForeignArch("tool-aarch64-linux.tar.xz", x86_64_arch));
+    try std.testing.expect(isForeignArch("tool-arm64-linux.tar.gz", x86_64_arch));
+    try std.testing.expect(isForeignArch("tool-armv7l.tar.gz", x86_64_arch));
+    try std.testing.expect(!isForeignArch("tool-x86_64-linux.tar.gz", x86_64_arch));
+    try std.testing.expect(!isForeignArch("lunatic-linux-amd64.tar.gz", x86_64_arch));
+
+    // Word boundary: x64 must not match inside linux64 etc.
+    try std.testing.expect(!isForeignArch("tool-linux64.tar.gz", aarch64_arch));
+
+    // Unknown host (empty arch list) -> never reject.
+    const empty: []const []const u8 = &.{};
+    try std.testing.expect(!isForeignArch("tool-x86_64-linux.tar.gz", empty));
+}
+
+test "findBestAsset errors on aarch64 when only amd64 Linux assets exist (issue #55 lunatic)" {
+    // Repro 1 from issue #55: lunatic-solutions/lunatic@v0.13.2 ships only
+    // x86_64 binaries; on aarch64 Linux ghr must error rather than install
+    // the wrong-arch x86_64 ELF.
+    const assets = [_]Asset{
+        .{ .name = "lunatic-linux-amd64.tar.gz", .browser_download_url = "" },
+        .{ .name = "lunatic-macos-universal.tar.gz", .browser_download_url = "" },
+        .{ .name = "lunatic-windows-amd64.zip", .browser_download_url = "" },
+    };
+    const result = findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "aarch64", "arm64" },
+    });
+    try std.testing.expectError(error.NoMatchingAsset, result);
+}
+
+test "findBestAsset errors on aarch64 when only x64 Linux assets exist (issue #55 WAVM)" {
+    // Repro 2 from issue #55: WAVM nightly ships only linux-x64 for Linux.
+    // The release also has macos-arm64, which would falsely match the host
+    // arch if foreign-OS rejection were ever bypassed; this test guards
+    // that the OS filter is never relaxed.
+    const assets = [_]Asset{
+        .{ .name = "wavm-nightly-2026-04-05-linux-x64.tar.gz", .browser_download_url = "" },
+        .{ .name = "wavm-nightly-2026-04-05-macos-arm64.tar.gz", .browser_download_url = "" },
+        .{ .name = "wavm-nightly-2026-04-05-macos-x64.tar.gz", .browser_download_url = "" },
+        .{ .name = "wavm-nightly-2026-04-05-windows-arm64.zip", .browser_download_url = "" },
+        .{ .name = "wavm-nightly-2026-04-05-windows-x64.zip", .browser_download_url = "" },
+    };
+    const result = findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "aarch64", "arm64" },
+    });
+    try std.testing.expectError(error.NoMatchingAsset, result);
+}
+
+test "findBestAsset errors on x86_64 when only aarch64 Linux assets exist" {
+    // Symmetric of issue #55: an upstream that ships only aarch64 Linux
+    // binaries must error on an x86_64 Linux host.
+    const assets = [_]Asset{
+        .{ .name = "tool-aarch64-linux.tar.gz", .browser_download_url = "" },
+        .{ .name = "tool-aarch64-apple-darwin.tar.gz", .browser_download_url = "" },
+        .{ .name = "tool-aarch64-windows.zip", .browser_download_url = "" },
+    };
+    const result = findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "x86_64", "x64", "amd64" },
+    });
+    try std.testing.expectError(error.NoMatchingAsset, result);
+}
+
+test "findBestAsset selects host-arch Linux asset when both arches present" {
+    // On aarch64 Linux, when both aarch64 and x86_64 Linux assets exist,
+    // the aarch64 one must win.
+    const assets = [_]Asset{
+        .{ .name = "tool-x86_64-linux.tar.gz", .browser_download_url = "" },
+        .{ .name = "tool-aarch64-linux.tar.gz", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "aarch64", "arm64" },
+    });
+    try std.testing.expectEqualStrings("tool-aarch64-linux.tar.gz", best.name);
 }
 
 test "deriveBareBinaryName strips arch-triple from stem" {
