@@ -3,6 +3,8 @@ const builtin = @import("builtin");
 const http = @import("http.zig");
 const archive = @import("archive.zig");
 const auth = @import("auth.zig");
+const release_mod = @import("release.zig");
+const Dirs = @import("dirs.zig").Dirs;
 
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -22,7 +24,9 @@ pub const exit_sha256_mismatch: u8 = 3;
 
 /// Parsed `download` command-line options.
 pub const Options = struct {
-    url: []const u8,
+    /// Positional argument: a URL, `owner/repo[@tag]`, or
+    /// `owner/repo/file[@tag]`.
+    target: []const u8,
     output: ?[]const u8 = null,
     extract: ?[]const u8 = null,
     sha256: ?[]const u8 = null,
@@ -30,6 +34,7 @@ pub const Options = struct {
     keep_archive: bool = false,
     quiet: bool = false,
     no_auth: bool = false,
+    skip_verify: bool = false,
     debug: bool = false,
 
     /// No-op today (parseArgs holds slices into argv). Kept so callers can
@@ -38,6 +43,27 @@ pub const Options = struct {
     pub fn deinit(self: Options, allocator: std.mem.Allocator) void {
         _ = self;
         _ = allocator;
+    }
+};
+
+/// Internal: target resolved from `Options.target` plus any release context
+/// needed for verification.
+const ResolvedTarget = struct {
+    /// Final URL to download from. Borrows from argv (URL form) or from
+    /// `release.parsed.value.assets[*].browser_download_url` (spec form).
+    download_url: []const u8,
+    /// Default output filename. When null, the caller derives one from the URL.
+    default_filename: ?[]const u8,
+    /// Release context for verification, when known.
+    release: ?release_mod.ParsedRelease,
+    /// Asset name within `release.parsed.value.assets`, when release is set.
+    asset_name: ?[]const u8,
+    /// Allocated buffer for parseGitHubReleaseUrl results (URL form only).
+    url_decoded: ?release_mod.ParsedReleaseUrl,
+
+    fn deinit(self: *ResolvedTarget, allocator: std.mem.Allocator) void {
+        if (self.release) |*r| r.deinit();
+        if (self.url_decoded) |*u| u.deinit(allocator);
     }
 };
 
@@ -54,15 +80,24 @@ pub fn cmdDownload(
             try printDownloadUsage(w);
             return;
         },
-        error.MissingValue, error.InvalidArgument, error.MissingUrl => std.process.exit(exit_arg_error),
+        error.MissingValue, error.InvalidArgument, error.MissingTarget => std.process.exit(exit_arg_error),
         else => return err,
     };
     defer opts.deinit(allocator);
 
     const debug_w: ?*Writer = if (opts.debug) err_w else null;
 
+    // 0) Classify positional + resolve release context (for spec forms, or
+    //    for URL form when it's a github release URL).
+    var target = resolveTarget(allocator, io, environ, opts, w, err_w) catch |err| switch (err) {
+        error.InvalidArgument => std.process.exit(exit_arg_error),
+        error.ReleaseLookupFailed, error.AssetMatchFailed => std.process.exit(exit_http_error),
+        else => return err,
+    };
+    defer target.deinit(allocator);
+
     // 1) Determine output and archive-on-disk paths.
-    const paths = resolvePaths(allocator, io, opts, err_w) catch |err| switch (err) {
+    const paths = resolvePaths(allocator, io, opts, target.download_url, target.default_filename, err_w) catch |err| switch (err) {
         error.InvalidUrl, error.NoFilename, error.UnsupportedScheme => std.process.exit(exit_arg_error),
         else => return err,
     };
@@ -78,7 +113,7 @@ pub fn cmdDownload(
     }
 
     // 3) Resolve auth header (only for github-owned hosts, unless --no-auth).
-    const uri = std.Uri.parse(opts.url) catch unreachable; // already validated
+    const uri = std.Uri.parse(target.download_url) catch unreachable; // already validated
     var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     const host = (uri.getHost(&host_buf) catch null) orelse blk: {
         // No host (shouldn't happen for http/https URLs we accept) — treat as non-github.
@@ -94,7 +129,7 @@ pub fn cmdDownload(
     defer if (auth_header) |h| allocator.free(h);
 
     if (opts.debug) {
-        try err_w.print("debug: url: {s}\n", .{opts.url});
+        try err_w.print("debug: url: {s}\n", .{target.download_url});
         try err_w.print("debug: host: {s}\n", .{host.bytes});
         try err_w.print("debug: auth: {s}\n", .{resolved.source});
         try err_w.print("debug: archive_path: {s}\n", .{paths.archive_path});
@@ -112,23 +147,23 @@ pub fn cmdDownload(
     var hasher: ?Sha256 = if (opts.sha256 != null) Sha256.init(.{}) else null;
 
     if (!opts.quiet) {
-        try w.print("downloading {s} ...\n", .{opts.url});
+        try w.print("downloading {s} ...\n", .{target.download_url});
         try w.flush();
     }
 
-    http.downloadToFile(allocator, io, opts.url, part_path, .{
+    http.downloadToFile(allocator, io, target.download_url, part_path, .{
         .auth_header = auth_header,
         .debug_w = debug_w,
         .hasher = if (hasher != null) &hasher.? else null,
     }) catch |err| {
         Dir.deleteFileAbsolute(io, part_path) catch {};
         try err_w.print("error: download failed: {}\n", .{err});
-        try err_w.print("  url: {s}\n", .{opts.url});
+        try err_w.print("  url: {s}\n", .{target.download_url});
         try err_w.flush();
         std.process.exit(exit_http_error);
     };
 
-    // 5) Verify SHA-256 if provided.
+    // 5) Verify SHA-256 if --sha256 was passed.
     if (opts.sha256) |expected_hex| {
         var digest: [Sha256.digest_length]u8 = undefined;
         hasher.?.final(&digest);
@@ -146,6 +181,48 @@ pub fn cmdDownload(
             try w.print("sha256 ok\n", .{});
             try w.flush();
         }
+    }
+
+    // 5b) Auto-verify against release manifest (sha256 / sigstore) when we
+    //     have a release context. `--skip-verify` bypasses this. An explicit
+    //     `--sha256` already validated the bytes, so we still attempt
+    //     sigstore verification but allow `.no_verification` outcomes to be
+    //     silent.
+    if (target.release != null and target.asset_name != null) {
+        const r = &target.release.?;
+        const d = try Dirs.detect(allocator, environ);
+        defer d.deinit();
+        if (std.fs.path.dirname(d.cache)) |parent| {
+            Dir.createDirAbsolute(io, parent, .default_dir) catch {};
+        }
+        Dir.createDirAbsolute(io, d.cache, .default_dir) catch {};
+        const outcome = release_mod.verifyAssetOnDisk(
+            allocator,
+            io,
+            d.cache,
+            r.parsed.value.assets,
+            target.asset_name.?,
+            part_path,
+            debug_w,
+            auth_header,
+            opts.skip_verify,
+            w,
+            err_w,
+        ) catch |verr| {
+            Dir.deleteFileAbsolute(io, part_path) catch {};
+            switch (verr) {
+                error.ChecksumMismatch,
+                error.ChecksumDownloadFailed,
+                error.ChecksumEntryMissing,
+                => std.process.exit(exit_sha256_mismatch),
+                else => {
+                    try err_w.print("error: verification failed: {}\n", .{verr});
+                    try err_w.flush();
+                    std.process.exit(exit_http_error);
+                },
+            }
+        };
+        _ = outcome;
     }
 
     // 6) Atomic rename into place.
@@ -210,6 +287,171 @@ pub fn cmdDownload(
     }
 }
 
+/// Resolve the positional argument into an actual download URL, optional
+/// default output filename, and optional release context for verification.
+fn resolveTarget(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    opts: Options,
+    w: *Writer,
+    err_w: *Writer,
+) !ResolvedTarget {
+    const classified = release_mod.classifyArg(opts.target) catch {
+        try err_w.print("error: invalid argument '{s}'\n", .{opts.target});
+        try err_w.print("  expected: owner/repo[@tag] or owner/repo/file[@tag]\n", .{});
+        try err_w.flush();
+        return error.InvalidArgument;
+    };
+
+    switch (classified) {
+        .url => |u| {
+            // Try to extract a github release context for opportunistic
+            // verification. Failure is silent — non-github URLs and odd
+            // shapes simply skip verification.
+            const gh_opt = release_mod.parseGitHubReleaseUrl(allocator, u) catch null;
+            if (gh_opt == null) {
+                return .{
+                    .download_url = u,
+                    .default_filename = null,
+                    .release = null,
+                    .asset_name = null,
+                    .url_decoded = null,
+                };
+            }
+            const gh = gh_opt.?;
+
+            const rel_opt = fetchRelease(allocator, io, environ, opts, gh.owner, gh.repo, gh.tag, w, err_w) catch null;
+            if (rel_opt) |rel| {
+                return .{
+                    .download_url = u,
+                    .default_filename = null,
+                    .release = rel,
+                    .asset_name = gh.file,
+                    .url_decoded = gh,
+                };
+            }
+            // Couldn't fetch release context; download anyway, no verify.
+            var gh_mut = gh;
+            gh_mut.deinit(allocator);
+            return .{
+                .download_url = u,
+                .default_filename = null,
+                .release = null,
+                .asset_name = null,
+                .url_decoded = null,
+            };
+        },
+        .repo_spec => |rs| {
+            var rel = try fetchRelease(allocator, io, environ, opts, rs.owner, rs.repo, rs.tag, w, err_w);
+            errdefer rel.deinit();
+
+            const asset = release_mod.findBestAsset(rel.parsed.value.assets) catch {
+                try err_w.print("error: no matching asset for this platform\n", .{});
+                try err_w.print("available assets:\n", .{});
+                for (rel.parsed.value.assets) |a| try err_w.print("  {s}\n", .{a.name});
+                try err_w.flush();
+                return error.AssetMatchFailed;
+            };
+            return .{
+                .download_url = asset.browser_download_url,
+                .default_filename = asset.name,
+                .release = rel,
+                .asset_name = asset.name,
+                .url_decoded = null,
+            };
+        },
+        .file_spec => |fs| {
+            var rel = try fetchRelease(allocator, io, environ, opts, fs.owner, fs.repo, fs.tag, w, err_w);
+            errdefer rel.deinit();
+
+            const m = release_mod.findAssetByName(allocator, rel.parsed.value.assets, fs.file) catch |err| {
+                try err_w.print("error: failed to match asset by name: {}\n", .{err});
+                try err_w.flush();
+                return error.AssetMatchFailed;
+            };
+            switch (m) {
+                .one => |asset| return .{
+                    .download_url = asset.browser_download_url,
+                    .default_filename = asset.name,
+                    .release = rel,
+                    .asset_name = asset.name,
+                    .url_decoded = null,
+                },
+                .none => {
+                    try err_w.print("error: no asset matching '{s}' in {s}/{s}@{s}\n", .{
+                        fs.file, fs.owner, fs.repo, rel.parsed.value.tag_name,
+                    });
+                    try err_w.print("available assets:\n", .{});
+                    for (rel.parsed.value.assets) |a| try err_w.print("  {s}\n", .{a.name});
+                    try err_w.flush();
+                    return error.AssetMatchFailed;
+                },
+                .ambiguous => |list| {
+                    defer allocator.free(list);
+                    try err_w.print("error: '{s}' matches multiple assets in {s}/{s}@{s}:\n", .{
+                        fs.file, fs.owner, fs.repo, rel.parsed.value.tag_name,
+                    });
+                    for (list) |a| try err_w.print("  {s}\n", .{a.name});
+                    try err_w.flush();
+                    return error.AssetMatchFailed;
+                },
+            }
+        },
+    }
+}
+
+/// Fetch a release via the GitHub API. Logs progress lines mimicking
+/// `cmdInstall`'s output.
+fn fetchRelease(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    opts: Options,
+    owner: []const u8,
+    repo: []const u8,
+    tag: ?[]const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !release_mod.ParsedRelease {
+    const auth_resolved = auth.resolveGithubToken(allocator, io, environ, opts.no_auth);
+    defer auth_resolved.deinit(allocator);
+    const auth_header = try auth.bearerHeader(allocator, auth_resolved);
+    defer if (auth_header) |h| allocator.free(h);
+
+    if (!opts.quiet) {
+        try w.print("resolving {s}/{s}", .{ owner, repo });
+        if (tag) |t| try w.print("@{s}", .{t});
+        try w.print(" ...\n", .{});
+        try w.flush();
+    }
+
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+        .write_buffer_size = http.http_write_buffer_size,
+    };
+    defer client.deinit();
+
+    const rel = release_mod.getRelease(allocator, &client, owner, repo, tag, auth_header) catch |err| {
+        switch (err) {
+            error.GitHubApiError => {
+                try err_w.print("error: release not found for {s}/{s}", .{ owner, repo });
+                if (tag) |t| try err_w.print("@{s}", .{t});
+                try err_w.print("\n", .{});
+            },
+            else => try err_w.print("error: failed to fetch release: {}\n", .{err}),
+        }
+        try err_w.flush();
+        return error.ReleaseLookupFailed;
+    };
+    if (!opts.quiet) {
+        try w.print("found release {s}\n", .{rel.parsed.value.tag_name});
+        try w.flush();
+    }
+    return rel;
+}
+
 const ResolvedPaths = struct {
     /// Absolute path to the downloaded archive on disk.
     archive_path: []const u8,
@@ -231,10 +473,12 @@ fn resolvePaths(
     allocator: std.mem.Allocator,
     io: Io,
     opts: Options,
+    download_url: []const u8,
+    default_filename: ?[]const u8,
     err_w: *Writer,
 ) !ResolvedPaths {
-    const uri = std.Uri.parse(opts.url) catch {
-        try err_w.print("error: invalid URL: {s}\n", .{opts.url});
+    const uri = std.Uri.parse(download_url) catch {
+        try err_w.print("error: invalid URL: {s}\n", .{download_url});
         try err_w.flush();
         return error.InvalidUrl;
     };
@@ -246,6 +490,8 @@ fn resolvePaths(
 
     const archive_path = if (opts.output) |out|
         try toAbsolute(allocator, io, out)
+    else if (default_filename) |name|
+        try toAbsolute(allocator, io, name)
     else blk: {
         const default_name = derivedFilename(uri) catch {
             try err_w.print("error: cannot derive output filename from URL; pass -o <path>\n", .{});
@@ -325,8 +571,8 @@ fn bytesToHexLower(bytes: []const u8, out: []u8) []const u8 {
 
 fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer) !Options {
     _ = allocator; // reserved for future flags that allocate
-    var opts: Options = .{ .url = "" };
-    var url: ?[]const u8 = null;
+    var opts: Options = .{ .target = "" };
+    var positional: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (eql(arg, "-h") or eql(arg, "--help")) {
@@ -356,25 +602,27 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
             opts.quiet = true;
         } else if (eql(arg, "--no-auth")) {
             opts.no_auth = true;
+        } else if (eql(arg, "--skip-verify")) {
+            opts.skip_verify = true;
         } else if (eql(arg, "--debug")) {
             opts.debug = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             try err_w.print("error: unknown flag '{s}' for 'ghr download'\n", .{arg});
             try err_w.flush();
             return error.InvalidArgument;
-        } else if (url == null) {
-            url = arg;
+        } else if (positional == null) {
+            positional = arg;
         } else {
-            try err_w.print("error: unexpected argument '{s}'; only one URL is supported\n", .{arg});
+            try err_w.print("error: unexpected argument '{s}'; only one positional is supported\n", .{arg});
             try err_w.flush();
             return error.InvalidArgument;
         }
     }
 
-    opts.url = url orelse {
-        try err_w.print("error: 'ghr download' requires a URL\n", .{});
+    opts.target = positional orelse {
+        try err_w.print("error: 'ghr download' requires owner/repo[@tag] or owner/repo/file[@tag]\n", .{});
         try err_w.flush();
-        return error.MissingUrl;
+        return error.MissingTarget;
     };
 
     return opts;
@@ -403,16 +651,23 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 fn printDownloadUsage(w: *Writer) !void {
     try w.print(
-        \\ghr download - download a file over HTTPS, optionally extracting it
+        \\ghr download - download a release asset, optionally extracting it
         \\
         \\USAGE:
-        \\    ghr download <url> [options]
+        \\    ghr download <owner/repo[@tag]> [options]
+        \\    ghr download <owner/repo/file[@tag]> [options]
+        \\
+        \\Picks the asset that 'ghr install' would install (first form), or the
+        \\named asset (second form, exact match preferred, otherwise unique
+        \\substring). The download is auto-verified against any sigstore bundle
+        \\or sha256 checksum file published with the release.
         \\
         \\OPTIONS:
-        \\    -o, --output <path>        Output file path (default: URL basename in cwd)
+        \\    -o, --output <path>        Output file path (default: asset name in cwd)
         \\        --extract <dir>        Extract archive into <dir> after download
         \\        --strip-components <N> Strip N leading path components when extracting
         \\        --sha256 <hex>         Verify download against SHA-256 digest (64 hex chars)
+        \\        --skip-verify          Skip sigstore + sha256 release verification
         \\        --keep-archive         Keep archive on disk after extraction
         \\        --quiet                Suppress progress output
         \\        --no-auth              Do not send GitHub auth even for github.com URLs
