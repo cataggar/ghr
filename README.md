@@ -8,17 +8,31 @@ A toolkit for GitHub releases.
 ghr list                                 List installed tools
 ghr install <owner/repo[@tag]>           Install a tool from a GitHub release
 ghr install <owner/repo/file[@tag]>      Install a specific asset by name
+ghr upgrade [name]                       Upgrade installed tools
 ghr uninstall <name>                     Remove an installed tool
 ghr download <owner/repo[@tag]>          Download the asset 'install' would pick
 ghr download <owner/repo/file[@tag]>     Download a specific asset by name
-ghr upgrade [name]                       Upgrade installed tools
 ghr path ensure [--dry-run]              Add ghr's bin dir to your user PATH
 ghr path [bin|tools|cache]               Show ghr directories
 ```
 
+### Examples
+
 ```sh
 # Install the latest release of a tool
 ghr install burntsushi/ripgrep
+
+# Install a specific version
+# https://github.com/bytecodealliance/wasmtime/releases/tag/v44.0.1
+ghr install bytecodealliance/wasmtime@v44.0.1
+```
+
+## Install
+
+```sh
+pipx install ghr-bin
+uv tool install ghr-bin
+winget install ghr
 ```
 
 See [doc/README.md](doc/README.md) for download, install, directories,

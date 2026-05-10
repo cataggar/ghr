@@ -85,33 +85,6 @@ checksum file published with the release; pass `--skip-verify` to
 bypass. Exit codes: `0` success, `1` argument/IO error, `2` HTTP error
 after retries, `3` SHA-256 mismatch.
 
-### Replacing wget + tar in workflows
-
-Before — three OS-specific steps to fetch and extract a release archive:
-
-```yaml
-# Ubuntu / macOS
-- run: |
-    sudo wget -O wasi-sdk.tar.gz --progress=dot:giga \
-      https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-    sudo tar -xf wasi-sdk.tar.gz -C /opt
-# Windows
-- run: |
-    choco install -y wget
-    wget -O wasi-sdk.tar.gz `
-      https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-25/wasi-sdk-25.0-x86_64-linux.tar.gz
-    tar -xf wasi-sdk.tar.gz -C /opt
-```
-
-After — one step on every OS:
-
-```yaml
-- run: |
-    ghr download \
-      WebAssembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25 \
-      --extract /opt
-```
-
 ## Directories
 
 Follows [uv tool](https://docs.astral.sh/uv/) conventions.
