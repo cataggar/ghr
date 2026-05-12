@@ -161,7 +161,6 @@ jobs:
             pipx install ghr-bin==${{ steps.version.outputs.pep440 }}
             uv tool install ghr-bin==${{ steps.version.outputs.pep440 }}
             winget install ghr --version ${{ steps.version.outputs.version }}
-            brew install cataggar/ghr/ghr
             ```
           files: |
             ghr-*.tar.gz
