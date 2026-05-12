@@ -84,10 +84,6 @@ pub fn main(init: std.process.Init) !void {
         try install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "download")) {
         try download.cmdDownload(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
-    } else if (eql(cmd_str, "upgrade")) {
-        try stderr.interface.print("error: upgrade not yet implemented\n", .{});
-        try stderr.interface.flush();
-        std.process.exit(1);
     } else {
         try stderr.interface.print("error: unknown command '{s}'\n\n", .{cmd_str});
         try printUsage(&stderr.interface);
@@ -256,7 +252,6 @@ fn printUsage(w: *Writer) !void {
         \\    list                                 List installed tools
         \\    install <owner/repo[@tag]>           Install a tool from a GitHub release
         \\    install <owner/repo/file[@tag]>      Install a specific asset by name
-        \\    upgrade [name]                       Upgrade installed tools
         \\    uninstall <owner/repo>               Remove an installed tool
         \\    download <owner/repo[@tag]>          Download the asset 'install' would pick
         \\    download <owner/repo/file[@tag]>     Download a specific asset by name

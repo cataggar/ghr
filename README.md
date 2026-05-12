@@ -14,7 +14,6 @@ GitHub-hosted runner with `pipx install ghr-bin`.
 ghr list                                 List installed tools
 ghr install <owner/repo[@tag]>           Install a tool from a GitHub release
 ghr install <owner/repo/file[@tag]>      Install a specific asset by name
-ghr upgrade [name]                       Upgrade installed tools
 ghr uninstall <name>                     Remove an installed tool
 ghr download <owner/repo[@tag]>          Download the asset 'install' would pick
 ghr download <owner/repo/file[@tag]>     Download a specific asset by name
