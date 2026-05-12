@@ -154,8 +154,6 @@ jobs:
         with:
           name: ghr ${{ steps.version.outputs.version }}
           body: |
-            ## ghr ${{ steps.version.outputs.version }}
-
             A toolkit for GitHub releases.
 
             **Install:**
