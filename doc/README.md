@@ -5,8 +5,8 @@ details. For a quick overview and usage, see the [top-level README](../README.md
 
 ## Install
 
-It can be installed with pipx (great for CI), uv, pip, winget, or downloaded
-straight from a GitHub release.
+It can be installed with pipx (great for CI), uv, pip, winget, Homebrew, or
+downloaded straight from a GitHub release.
 
 ```sh
 # pipx (recommended for one-shot use in GitHub Actions and other CI)
@@ -20,7 +20,15 @@ python3 -m pip install ghr-bin
 
 # winget
 winget install ghr
+
+# Homebrew (tap)
+brew install cataggar/ghr/ghr
 ```
+
+The Homebrew formula lives at [cataggar/homebrew-ghr](https://github.com/cataggar/homebrew-ghr).
+It is installed through a custom tap (`cataggar/ghr/ghr`) because the short
+name `ghr` collides with another formula in the default Homebrew tap — see
+[issue #46](https://github.com/cataggar/ghr/issues/46) for context.
 
 `pipx install ghr-bin` works the same on Ubuntu, macOS and Windows runners in
 GitHub Actions, so it is a one-line way to put `ghr` on `PATH` in a workflow
@@ -123,6 +131,9 @@ python -m pip uninstall ghr-bin -y
 
 # winget
 winget uninstall ghr
+
+# Homebrew
+brew uninstall ghr
 ```
 
 ## Verification
