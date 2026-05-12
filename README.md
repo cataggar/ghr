@@ -47,6 +47,7 @@ ghr install jedisct1/minisign@0.12 \
 pipx install ghr-bin
 uv tool install ghr-bin
 winget install ghr
+brew install cataggar/ghr/ghr
 ```
 
 See [doc/README.md](doc/README.md) for download, install, directories,
