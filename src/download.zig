@@ -611,9 +611,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
     var positional: ?[]const u8 = null;
 
     while (args.next()) |arg| {
-        if (eql(arg, "-h") or eql(arg, "--help")) {
-            return error.HelpRequested;
-        } else if (eql(arg, "-o") or eql(arg, "--output")) {
+        if (eql(arg, "-o") or eql(arg, "--output")) {
             opts.output = try takeValue(args, "-o", err_w);
         } else if (eql(arg, "--extract")) {
             opts.extract = try takeValue(args, "--extract", err_w);
@@ -649,6 +647,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
             try err_w.flush();
             return error.InvalidArgument;
         } else if (positional == null) {
+            if (eql(arg, "help")) return error.HelpRequested;
             positional = arg;
         } else {
             try err_w.print("error: unexpected argument '{s}'; only one positional is supported\n", .{arg});
@@ -713,7 +712,8 @@ fn printDownloadUsage(w: *Writer) !void {
         \\        --quiet                Suppress progress output
         \\        --no-auth              Do not send GitHub auth even for github.com URLs
         \\        --debug                Verbose diagnostic output
-        \\    -h, --help                 Show this help
+        \\
+        \\Run 'ghr download help' to show this help.
         \\
         \\EXIT CODES:
         \\    0 success

@@ -44,6 +44,15 @@ pub fn main(init: std.process.Init) !void {
     if (eql(cmd_str, "path")) {
         try cmdPath(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
+        if (args.next()) |arg| {
+            if (eql(arg, "help")) {
+                try printListUsage(&stdout.interface);
+                return;
+            }
+            try stderr.interface.print("error: unexpected argument '{s}' for 'ghr list'\n", .{arg});
+            try stderr.interface.flush();
+            std.process.exit(1);
+        }
         try cmdList(allocator, environ, io, &stdout.interface);
     } else if (eql(cmd_str, "install")) {
         var debug = false;
@@ -66,6 +75,10 @@ pub fn main(init: std.process.Init) !void {
                 };
                 minisign_pubkey = v;
             } else if (spec == null) {
+                if (eql(arg, "help")) {
+                    try printInstallUsage(&stdout.interface);
+                    return;
+                }
                 spec = arg;
             }
         }
@@ -81,6 +94,10 @@ pub fn main(init: std.process.Init) !void {
             try stderr.interface.flush();
             std.process.exit(1);
         };
+        if (eql(spec, "help")) {
+            try printUninstallUsage(&stdout.interface);
+            return;
+        }
         try install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "download")) {
         try download.cmdDownload(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
@@ -143,7 +160,7 @@ fn cmdPath(
         return;
     }
 
-    if (eql(sub, "-h") or eql(sub, "--help") or eql(sub, "help")) {
+    if (eql(sub, "help")) {
         try printPathUsage(w);
         return;
     }
@@ -166,6 +183,60 @@ fn printPathUsage(w: *Writer) !void {
         \\    bin                  Print the bin directory
         \\    tools                Print the tool storage directory
         \\    cache                Print the cache directory
+        \\    help                 Show this help
+        \\
+    , .{});
+}
+
+fn printListUsage(w: *Writer) !void {
+    try w.print(
+        \\ghr list - List installed tools
+        \\
+        \\USAGE:
+        \\    ghr list
+        \\
+        \\Prints each installed tool as 'owner/repo[@tag]', one per line.
+        \\
+        \\Run 'ghr list help' to show this help.
+        \\
+    , .{});
+}
+
+fn printInstallUsage(w: *Writer) !void {
+    try w.print(
+        \\ghr install - install a tool from a GitHub release
+        \\
+        \\USAGE:
+        \\    ghr install <owner/repo[@tag]> [options]
+        \\    ghr install <owner/repo/file[@tag]> [options]
+        \\
+        \\Downloads the best-matching release asset (first form) or a specific
+        \\named asset (second form), extracts it if needed, and installs the
+        \\resulting binary into ghr's bin directory.
+        \\
+        \\OPTIONS:
+        \\    --debug                 Show diagnostic output for debugging
+        \\    --no-auth               Skip GitHub authentication
+        \\    --skip-verify           Skip sigstore + SHA256 + minisign verification
+        \\    --minisign <pubkey>     Require minisign signature; <pubkey> is a
+        \\                            base64 minisign public key string
+        \\
+        \\Run 'ghr install help' to show this help.
+        \\
+    , .{});
+}
+
+fn printUninstallUsage(w: *Writer) !void {
+    try w.print(
+        \\ghr uninstall - remove an installed tool
+        \\
+        \\USAGE:
+        \\    ghr uninstall <owner/repo>
+        \\
+        \\Removes the installed tool's binaries from ghr's bin directory and
+        \\its tool storage directory.
+        \\
+        \\Run 'ghr uninstall help' to show this help.
         \\
     , .{});
 }
@@ -259,6 +330,8 @@ fn printUsage(w: *Writer) !void {
         \\    path [bin|tools|cache]               Show ghr directories
         \\    version                              Print version and exit
         \\    help                                 Print this help and exit
+        \\
+        \\Run 'ghr <COMMAND> help' to show help for a specific command.
         \\
         \\OPTIONS:
         \\    --debug                 Show diagnostic output for debugging

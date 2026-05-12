@@ -23,6 +23,8 @@ ghr version                              Print version and exit
 ghr help                                 Print this help and exit
 ```
 
+Run `ghr <COMMAND> help` to show help for a specific command, e.g. `ghr download help`.
+
 ### Examples
 
 ```sh
