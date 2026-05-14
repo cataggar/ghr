@@ -1470,6 +1470,106 @@ fn lastIndexOf4(haystack: []const u8, needle: [4]u8) ?usize {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Embedded Authenticode + RFC 3161 trust roots.
+//
+// Vendored under `src/authenticode/trust/`. See the README in that
+// directory for provenance and rotation notes. The same bundle is
+// used for both signer-cert and TSA-cert chain verification: every
+// public TSA used by mainstream Authenticode signers chains to one
+// of these same roots (Microsoft TSAs chain to MS Root 2011,
+// DigiCert TSAs chain to DigiCert G4, GlobalSign TSAs chain to
+// GlobalSign Root, etc.).
+// ---------------------------------------------------------------------------
+
+const embedded_roots = [_][]const u8{
+    @embedFile("authenticode/trust/microsoft_identity_verification_root_2020.crt.pem"),
+    @embedFile("authenticode/trust/microsoft_root_ca_2011.crt.pem"),
+    @embedFile("authenticode/trust/digicert_trusted_root_g4.crt.pem"),
+    @embedFile("authenticode/trust/digicert_global_root_g3.crt.pem"),
+    @embedFile("authenticode/trust/digicert_global_root_ca.crt.pem"),
+    @embedFile("authenticode/trust/digicert_high_assurance_ev_root_ca.crt.pem"),
+    @embedFile("authenticode/trust/digicert_assured_id_root_g3.crt.pem"),
+    @embedFile("authenticode/trust/globalsign_root_ca_r3.crt.pem"),
+    @embedFile("authenticode/trust/globalsign_root_ca_r6.crt.pem"),
+    @embedFile("authenticode/trust/globalsign_code_signing_root_r45.crt.pem"),
+    @embedFile("authenticode/trust/usertrust_rsa_ca.crt.pem"),
+    @embedFile("authenticode/trust/usertrust_ecc_ca.crt.pem"),
+    @embedFile("authenticode/trust/entrust_root_ca_g2.crt.pem"),
+    @embedFile("authenticode/trust/entrust_root_ca_ec1.crt.pem"),
+};
+
+/// Build a `Certificate.Bundle` populated with the embedded
+/// Authenticode trust roots. Caller owns the returned bundle and
+/// must call `bundle.deinit(allocator)`.
+///
+/// `now_sec` is used by `parseCert` to skip already-expired roots;
+/// passing the current wall-clock time is fine since all 14 embedded
+/// roots are valid through 2029 or later.
+pub fn buildTrustBundle(allocator: std.mem.Allocator, now_sec: i64) !Certificate.Bundle {
+    var bundle: Certificate.Bundle = .empty;
+    errdefer bundle.deinit(allocator);
+    for (embedded_roots) |pem| try addPemCertsToBundle(&bundle, allocator, pem, now_sec);
+    return bundle;
+}
+
+/// Add every PEM-encoded `CERTIFICATE` block in `pem_bytes` to `cb`.
+/// Mirrors `sigstore.zig`'s helper; kept local to avoid the
+/// cross-module dependency.
+fn addPemCertsToBundle(
+    cb: *Certificate.Bundle,
+    gpa: std.mem.Allocator,
+    pem_bytes: []const u8,
+    now_sec: i64,
+) !void {
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+
+    try cb.bytes.ensureUnusedCapacity(gpa, @intCast(pem_bytes.len));
+
+    var start_index: usize = 0;
+    while (std.mem.indexOfPos(u8, pem_bytes, start_index, begin_marker)) |begin_off| {
+        const cert_start = begin_off + begin_marker.len;
+        const cert_end = std.mem.indexOfPos(u8, pem_bytes, cert_start, end_marker) orelse
+            return error.TrustBundleBuildFailed;
+        start_index = cert_end + end_marker.len;
+        const encoded_cert = std.mem.trim(u8, pem_bytes[cert_start..cert_end], " \t\r\n");
+        const decoded_start: u32 = @intCast(cb.bytes.items.len);
+        const decoder = std.base64.standard.Decoder;
+        const stripped = try stripPemWhitespace(gpa, encoded_cert);
+        defer gpa.free(stripped);
+        const decoded_len = decoder.calcSizeForSlice(stripped) catch
+            return error.TrustBundleBuildFailed;
+        try cb.bytes.ensureUnusedCapacity(gpa, decoded_len);
+        decoder.decode(cb.bytes.allocatedSlice()[decoded_start..], stripped) catch
+            return error.TrustBundleBuildFailed;
+        cb.bytes.items.len += decoded_len;
+        try cb.parseCert(gpa, decoded_start, now_sec);
+    }
+}
+
+fn stripPemWhitespace(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out = try gpa.alloc(u8, s.len);
+    errdefer gpa.free(out);
+    var n: usize = 0;
+    for (s) |c| {
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+        out[n] = c;
+        n += 1;
+    }
+    return gpa.realloc(out, n) catch unreachable;
+}
+
+test "buildTrustBundle parses all embedded Authenticode roots" {
+    const allocator = std.testing.allocator;
+    const now: i64 = 1746878400; // 2025-05-10, inside every root's validity window
+    var bundle = try buildTrustBundle(allocator, now);
+    defer bundle.deinit(allocator);
+    try std.testing.expect(bundle.bytes.items.len > 0);
+    // 14 embedded roots; map_size grows by 1 per parsed cert.
+    try std.testing.expectEqual(@as(usize, embedded_roots.len), bundle.map.count());
+}
+
 fn decompressDeflateToBuf(compressed: []const u8, out: []u8) !void {
     // Wrap `compressed` in a memory Reader, drive a raw-deflate
     // Decompress over it, and read exactly `out.len` bytes into the
