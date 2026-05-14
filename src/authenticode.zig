@@ -814,20 +814,260 @@ fn sigAlgFromOid(oid_bytes: []const u8) Pkcs7Error!SignatureAlgorithm {
 /// bytes of `elem`. Used to recover the "whole TLV" span when we need
 /// to copy/re-encode an element.
 fn elementHeaderLen(buf: []const u8, elem: der.Element) u32 {
-    // The element starts at `elem.slice.start - header_len`. We must
-    // back-calculate from `(elem.slice.end - elem.slice.start)` (the
-    // content length) and the length-encoding rules in
-    // `der.Element.parse`. content_len < 0x80 ⇒ 1 length byte.
-    // Otherwise the low-7-bits of the first length byte give the
-    // number of length octets that follow.
     _ = buf;
     const content_len = elem.slice.end - elem.slice.start;
     if (content_len < 0x80) return 2; // tag + 1 length byte
-    // Long-form length: count bytes needed for the integer.
     var n: u32 = 0;
     var v: u32 = content_len;
     while (v != 0) : (v >>= 8) n += 1;
     return 2 + n; // tag + (0x80|len_len) + len_len bytes
+}
+
+// ---------------------------------------------------------------------------
+// Signer signature verification and certificate chain walk.
+// ---------------------------------------------------------------------------
+
+const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const EcdsaP384Sha384 = std.crypto.sign.ecdsa.Ecdsa(
+    std.crypto.ecc.P384,
+    std.crypto.hash.sha2.Sha384,
+);
+
+pub const VerifyError = error{
+    InvalidSignature,
+    SignerCertNotFound,
+    BundleSignerMismatch,
+    UnsupportedSignerKeyType,
+    InvalidCertificateSet,
+    OutOfMemory,
+} || Pkcs7Error || der.Element.ParseError || Certificate.ParseError;
+
+/// Verify `signer.signature` against the message-to-be-signed
+/// (signedAttrs re-tagged as SET OF) using the signer cert's public
+/// key. The cert is located in `signed_data.certificates_raw` by
+/// matching `signer.sid_raw` (IssuerAndSerialNumber).
+pub fn verifySignerSignature(
+    allocator: std.mem.Allocator,
+    signed_data: SignedData,
+) VerifyError!void {
+    // Re-encode signedAttrs as SET OF for the signature input.
+    const msg = signedAttrsForSigning(allocator, signed_data.signer) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSignerInfo,
+    };
+    defer allocator.free(msg);
+
+    const signer_cert_der = (try findSignerCertDer(signed_data)) orelse
+        return error.SignerCertNotFound;
+
+    // Parse the leaf cert, extract its SubjectPublicKeyInfo, dispatch on
+    // public-key + signature algorithm pair.
+    var cert: Certificate = .{ .buffer = signer_cert_der, .index = 0 };
+    const parsed = try cert.parse();
+
+    switch (signed_data.signer.signature_alg) {
+        .rsa_pkcs1_v15_sha256, .rsa_pkcs1_v15_implicit_hash => {
+            // For .rsa_pkcs1_v15_implicit_hash the hash comes from the
+            // SignerInfo's digestAlgorithm. We require that to also be
+            // SHA-256 for now; SHA-384/-512 follow the same pattern.
+            switch (signed_data.signer.digest_alg) {
+                .sha256 => try verifyRsaPkcs1v15(
+                    msg,
+                    signed_data.signer.signature,
+                    parsed.pubKey(),
+                    std.crypto.hash.sha2.Sha256,
+                ),
+                .sha384 => try verifyRsaPkcs1v15(
+                    msg,
+                    signed_data.signer.signature,
+                    parsed.pubKey(),
+                    std.crypto.hash.sha2.Sha384,
+                ),
+                .sha512 => try verifyRsaPkcs1v15(
+                    msg,
+                    signed_data.signer.signature,
+                    parsed.pubKey(),
+                    std.crypto.hash.sha2.Sha512,
+                ),
+            }
+        },
+        .rsa_pkcs1_v15_sha384 => try verifyRsaPkcs1v15(
+            msg,
+            signed_data.signer.signature,
+            parsed.pubKey(),
+            std.crypto.hash.sha2.Sha384,
+        ),
+        .rsa_pkcs1_v15_sha512 => try verifyRsaPkcs1v15(
+            msg,
+            signed_data.signer.signature,
+            parsed.pubKey(),
+            std.crypto.hash.sha2.Sha512,
+        ),
+        .ecdsa_sha256 => try verifyEcdsa(EcdsaP256Sha256, msg, signed_data.signer.signature, parsed.pubKey()),
+        .ecdsa_sha384 => try verifyEcdsa(EcdsaP384Sha384, msg, signed_data.signer.signature, parsed.pubKey()),
+    }
+}
+
+fn verifyRsaPkcs1v15(
+    msg: []const u8,
+    signature: []const u8,
+    pub_key_der: []const u8,
+    comptime Hash: type,
+) VerifyError!void {
+    const pk_components = Certificate.rsa.PublicKey.parseDer(pub_key_der) catch
+        return error.InvalidSignature;
+    const exponent = pk_components.exponent;
+    const modulus = pk_components.modulus;
+    if (exponent.len > modulus.len) return error.InvalidSignature;
+    if (signature.len != modulus.len) return error.InvalidSignature;
+
+    switch (modulus.len) {
+        inline 128, 256, 384, 512 => |modulus_len| {
+            const pub_key = Certificate.rsa.PublicKey.fromBytes(exponent, modulus) catch
+                return error.InvalidSignature;
+            Certificate.rsa.PKCS1v1_5Signature.verify(
+                modulus_len,
+                signature[0..modulus_len].*,
+                msg,
+                pub_key,
+                Hash,
+            ) catch return error.InvalidSignature;
+        },
+        else => return error.UnsupportedSignerKeyType,
+    }
+}
+
+fn verifyEcdsa(
+    comptime Ec: type,
+    msg: []const u8,
+    signature_der: []const u8,
+    pub_key_sec1: []const u8,
+) VerifyError!void {
+    const sig = Ec.Signature.fromDer(signature_der) catch return error.InvalidSignature;
+    const pub_key = Ec.PublicKey.fromSec1(pub_key_sec1) catch return error.InvalidSignature;
+    sig.verify(msg, pub_key) catch return error.InvalidSignature;
+}
+
+/// Locate the signer's leaf certificate in `signed_data.certificates_raw`
+/// by matching against `signer.sid_raw` (the IssuerAndSerialNumber
+/// SignerIdentifier). Returns the raw DER bytes of the cert, or null
+/// when no matching cert was found.
+pub fn findSignerCertDer(signed_data: SignedData) VerifyError!?[]const u8 {
+    if (signed_data.certificates_raw.len == 0) return null;
+    // certificates_raw is the body of the [0] IMPLICIT wrapper — i.e.
+    // a concatenation of certificate SEQUENCEs.
+
+    // Parse the SignerIdentifier (IssuerAndSerialNumber) once.
+    const sid = signed_data.signer.sid_raw;
+    if (sid.len == 0) return null;
+    const sid_seq = try der.Element.parse(sid, 0);
+    if (sid_seq.identifier.tag != .sequence) return error.InvalidSignerInfo;
+    const sid_issuer = try der.Element.parse(sid, sid_seq.slice.start);
+    if (sid_issuer.identifier.tag != .sequence) return error.InvalidSignerInfo;
+    const sid_serial = try der.Element.parse(sid, sid_issuer.slice.end);
+    if (sid_serial.identifier.tag != .integer) return error.InvalidSignerInfo;
+
+    var i: u32 = 0;
+    while (i < signed_data.certificates_raw.len) {
+        const cert_elem = try der.Element.parse(signed_data.certificates_raw, i);
+        if (cert_elem.identifier.tag != .sequence) return error.InvalidCertificateSet;
+
+        // A cert's tbsCertificate's issuer + serial are accessible via
+        // Certificate.Parsed; let's walk via std.crypto.Certificate for
+        // robustness. The "cert" start in our buffer includes the
+        // outer SEQUENCE header; pass the start of that SEQUENCE as
+        // the .index hint and use Certificate.buffer = the raw slice
+        // beginning at that offset.
+        const cert_start = i;
+        const cert_end = cert_elem.slice.end;
+        const cert_der = signed_data.certificates_raw[cert_start..cert_end];
+
+        // Move iterator forward unconditionally.
+        i = cert_end;
+
+        // Parse cert into Certificate.Parsed to grab issuer + serial.
+        var cert: Certificate = .{ .buffer = cert_der, .index = 0 };
+        const parsed = cert.parse() catch continue;
+
+        // Compare issuer DN bytes.
+        const cert_issuer = cert_der[parsed.issuer_slice.start..parsed.issuer_slice.end];
+        const sid_issuer_bytes = sid[sid_issuer.slice.start..sid_issuer.slice.end];
+        if (!std.mem.eql(u8, cert_issuer, sid_issuer_bytes)) continue;
+
+        // Compare serial number bytes.
+        const cert_serial = cert_der[parsed.serial_number_slice.start..parsed.serial_number_slice.end];
+        const sid_serial_bytes = sid[sid_serial.slice.start..sid_serial.slice.end];
+        if (!std.mem.eql(u8, cert_serial, sid_serial_bytes)) continue;
+
+        return cert_der;
+    }
+    return null;
+}
+
+/// Walk the X.509 chain from `leaf_der` through the intermediates in
+/// `intermediates_raw` (the concatenated cert SEQUENCEs from a
+/// PKCS#7 certificates SET) up to one of the embedded trust roots in
+/// `trust`. Uses `verify_at` (typically the RFC 3161 timestamp's
+/// genTime) as the validity-window clock.
+///
+/// Re-uses the std.crypto.Certificate.verify primitive, which
+/// performs the per-step signature verification.
+pub fn verifyChain(
+    allocator: std.mem.Allocator,
+    leaf_der: []const u8,
+    intermediates_raw: []const u8,
+    trust: Certificate.Bundle,
+    verify_at: i64,
+) VerifyError!Certificate.Parsed {
+    // Build a working pool of {intermediate} certs we can lookup by
+    // subject name.
+    var pool = std.array_list.Managed(Certificate).init(allocator);
+    defer pool.deinit();
+
+    var ii: u32 = 0;
+    while (ii < intermediates_raw.len) {
+        const e = try der.Element.parse(intermediates_raw, ii);
+        if (e.identifier.tag != .sequence) return error.InvalidCertificateSet;
+        try pool.append(.{ .buffer = intermediates_raw[ii..e.slice.end], .index = 0 });
+        ii = e.slice.end;
+    }
+
+    var subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
+    var subject = subject_cert.parse() catch return error.InvalidSignature;
+
+    var depth: u8 = 0;
+    while (depth < 8) : (depth += 1) {
+        const issuer_name = subject.issuer();
+
+        // 1. Try to find issuer in the embedded trust bundle.
+        if (trust.find(issuer_name)) |issuer_idx| {
+            const issuer_cert: Certificate = .{ .buffer = trust.bytes.items, .index = issuer_idx };
+            const issuer = issuer_cert.parse() catch return error.InvalidSignature;
+            try subject.verify(issuer, verify_at);
+            // Confirm root is valid at the same clock.
+            if (verify_at < issuer.validity.not_before) return error.InvalidSignature;
+            if (verify_at > issuer.validity.not_after) return error.InvalidSignature;
+            return subject_cert.parse() catch error.InvalidSignature;
+        }
+
+        // 2. Try to find issuer among the in-bundle intermediates.
+        var matched: ?Certificate.Parsed = null;
+        var matched_cert: ?Certificate = null;
+        for (pool.items) |c| {
+            var cc = c;
+            const p = cc.parse() catch continue;
+            if (std.mem.eql(u8, p.subject(), issuer_name)) {
+                matched = p;
+                matched_cert = cc;
+                break;
+            }
+        }
+        const issuer = matched orelse return error.InvalidSignature;
+        try subject.verify(issuer, verify_at);
+        subject = issuer;
+        subject_cert = matched_cert.?;
+    }
+    return error.InvalidSignature;
 }
 
 // ---------------------------------------------------------------------------
