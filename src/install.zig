@@ -1054,7 +1054,7 @@ pub fn cmdInstall(
             mini_outcome == .no_verification and
             sig_outcome == .no_verification)
         {
-            try w.print("note: download is unverified (no SHA256 checksum, minisign sidecar, or sigstore bundle published)\n", .{});
+            try w.print("note: download is unverified (no checksum, minisign, or sigstore)\n", .{});
         }
         try w.flush();
     }
