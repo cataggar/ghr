@@ -1031,6 +1031,21 @@ pub fn cmdInstall(
         };
         if (mini_outcome == .minisign_verified) verified_label = "minisign";
 
+        const ac_outcome = release_mod.verifyDownloadedAssetAuthenticode(
+            allocator,
+            io,
+            download_path,
+            debug_w,
+            w,
+            err_w,
+        ) catch |verr| {
+            try err_w.print("error: authenticode verification failed: {s}\n", .{@errorName(verr)});
+            try err_w.flush();
+            Dir.deleteFileAbsolute(io, download_path) catch {};
+            std.process.exit(1);
+        };
+        if (ac_outcome == .authenticode_verified) verified_label = "authenticode";
+
         const sig_outcome = verifyDownloadedAssetSigstore(
             allocator,
             io,
@@ -1052,9 +1067,10 @@ pub fn cmdInstall(
 
         if (sha_outcome == .no_verification and
             mini_outcome == .no_verification and
+            ac_outcome == .no_verification and
             sig_outcome == .no_verification)
         {
-            try w.print("note: download is unverified (no checksum, minisign, or sigstore)\n", .{});
+            try w.print("note: download is unverified (no checksum, minisign, sigstore, or authenticode)\n", .{});
         }
         try w.flush();
     }
