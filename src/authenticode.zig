@@ -422,6 +422,9 @@ pub const oid = struct {
     pub const sha512_with_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D };
     pub const ecdsa_with_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
     pub const ecdsa_with_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03 };
+
+    /// RFC 3161 id-ct-TSTInfo — encapContentType for TimeStampToken.
+    pub const tst_info = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x01, 0x04 };
 };
 
 /// Hash algorithm referenced by an Authenticode SignedData. Authenticode
@@ -516,6 +519,27 @@ pub const SignedData = struct {
 /// Parse a PKCS#7 ContentInfo blob carrying SignedData. The returned
 /// `SignedData` borrows from `pkcs7_bytes`.
 pub fn parseSignedData(pkcs7_bytes: []const u8) Pkcs7Error!SignedData {
+    return parseSignedDataInternal(pkcs7_bytes, &oid.spc_indirect_data);
+}
+
+/// Parse a PKCS#7 ContentInfo blob carrying SignedData whose
+/// encapContentType is `id-ct-TSTInfo` — i.e. an RFC 3161 TimeStamp
+/// Token (which is itself a PKCS#7 SignedData over a TSTInfo
+/// structure).
+///
+/// The returned `SignedData.spc_indirect_data` field carries the
+/// **raw TSTInfo bytes** in this case, not an SpcIndirectDataContent.
+/// `file_digest` / `file_digest_alg` are unused for TSTInfo (set to
+/// SHA-256 zero placeholders); callers parse the TSTInfo directly via
+/// `parseTstInfo`.
+pub fn parseTimestampToken(pkcs7_bytes: []const u8) Pkcs7Error!SignedData {
+    return parseSignedDataInternal(pkcs7_bytes, &oid.tst_info);
+}
+
+fn parseSignedDataInternal(
+    pkcs7_bytes: []const u8,
+    expected_encap_content_type: []const u8,
+) Pkcs7Error!SignedData {
     // ContentInfo := SEQUENCE { contentType OID, content [0] EXPLICIT SignedData }
     const ci = try der.Element.parse(pkcs7_bytes, 0);
     if (ci.identifier.tag != .sequence) return error.InvalidContentInfo;
@@ -561,19 +585,29 @@ pub fn parseSignedData(pkcs7_bytes: []const u8) Pkcs7Error!SignedData {
     const enc_ct = try der.Element.parse(pkcs7_bytes, enc.slice.start);
     if (enc_ct.identifier.tag != .object_identifier) return error.InvalidSignedData;
     const encap_content_type = pkcs7_bytes[enc_ct.slice.start..enc_ct.slice.end];
-    // Authenticode only: must be spcIndirectData. For RFC 3161
-    // TimeStampToken we parse via a different entry point.
-    if (!std.mem.eql(u8, encap_content_type, &oid.spc_indirect_data))
+    if (!std.mem.eql(u8, encap_content_type, expected_encap_content_type))
         return error.UnsupportedEncapContentType;
 
     const enc_content_wrap = try der.Element.parse(pkcs7_bytes, enc_ct.slice.end);
     if (!isContextSpecificTag(enc_content_wrap.identifier, 0))
         return error.InvalidSpcIndirectData;
     const enc_content = try der.Element.parse(pkcs7_bytes, enc_content_wrap.slice.start);
-    if (enc_content.identifier.tag != .octetstring) return error.InvalidSpcIndirectData;
+    if (enc_content.identifier.tag != .octetstring and enc_content.identifier.tag != .sequence)
+        return error.InvalidSpcIndirectData;
 
-    const spc_indirect_data = pkcs7_bytes[enc_content.slice.start..enc_content.slice.end];
-    const file_digest = try parseSpcIndirectDataMessageDigest(spc_indirect_data);
+    // For SpcIndirectDataContent the enclosure is an OCTET STRING whose
+    // value is the SpcIndirectDataContent SEQUENCE; for TSTInfo it's
+    // an OCTET STRING wrapping the TSTInfo SEQUENCE bytes (per
+    // RFC 3161 the OCTET STRING contains the DER-encoded TSTInfo).
+    const inner_bytes = pkcs7_bytes[enc_content.slice.start..enc_content.slice.end];
+
+    var file_digest_alg: HashAlgorithm = .sha256;
+    var file_digest: []const u8 = &.{};
+    if (std.mem.eql(u8, expected_encap_content_type, &oid.spc_indirect_data)) {
+        const fd = try parseSpcIndirectDataMessageDigest(inner_bytes);
+        file_digest_alg = fd.alg;
+        file_digest = fd.digest;
+    }
 
     // certificates [0] IMPLICIT CertificateSet OPTIONAL — required for our path.
     var certificates_raw: []const u8 = &.{};
@@ -603,9 +637,9 @@ pub fn parseSignedData(pkcs7_bytes: []const u8) Pkcs7Error!SignedData {
     return .{
         .raw = pkcs7_bytes[ci.slice.start - 0 .. ci.slice.end], // span of ContentInfo content body
         .encap_content_type = encap_content_type,
-        .spc_indirect_data = spc_indirect_data,
-        .file_digest_alg = file_digest.alg,
-        .file_digest = file_digest.digest,
+        .spc_indirect_data = inner_bytes,
+        .file_digest_alg = file_digest_alg,
+        .file_digest = file_digest,
         .certificates_raw = certificates_raw,
         .signer = signer,
     };
@@ -1004,11 +1038,295 @@ pub fn findSignerCertDer(signed_data: SignedData) VerifyError!?[]const u8 {
     return null;
 }
 
-/// Walk the X.509 chain from `leaf_der` through the intermediates in
-/// `intermediates_raw` (the concatenated cert SEQUENCEs from a
-/// PKCS#7 certificates SET) up to one of the embedded trust roots in
-/// `trust`. Uses `verify_at` (typically the RFC 3161 timestamp's
-/// genTime) as the validity-window clock.
+// ---------------------------------------------------------------------------
+// RFC 3161 TimeStampToken parsing and verification.
+//
+// The RFC 3161 timestamp countersignature is a separate PKCS#7
+// SignedData (over a TSTInfo) that the upstream TSA produced when the
+// signer asked for a trustworthy clock. It is what lets us verify
+// signatures past the leaf cert's notAfter.
+// ---------------------------------------------------------------------------
+
+pub const TstError = error{
+    InvalidTstInfo,
+    UnsupportedTstInfoVersion,
+    TstInfoMessageImprintMismatch,
+    InvalidGeneralizedTime,
+} || Pkcs7Error;
+
+/// Parsed TSTInfo carrying just enough info to bind the timestamp
+/// back to the signer's signature and expose `gen_time` as the
+/// validity clock.
+pub const TstInfo = struct {
+    /// SHA-256 (or other) hash of the data the TSA witnessed. For an
+    /// Authenticode timestamp countersignature this equals
+    /// sha256(outer SignerInfo.signature).
+    imprint_alg: HashAlgorithm,
+    imprint: []const u8,
+    /// GeneralizedTime seconds-since-epoch (UTC).
+    gen_time: i64,
+};
+
+/// Parse the raw DER bytes of a TSTInfo SEQUENCE.
+pub fn parseTstInfo(bytes: []const u8) TstError!TstInfo {
+    const root = try der.Element.parse(bytes, 0);
+    if (root.identifier.tag != .sequence) return error.InvalidTstInfo;
+    var i: u32 = root.slice.start;
+
+    // version INTEGER { v1(1) }
+    const ver = try der.Element.parse(bytes, i);
+    if (ver.identifier.tag != .integer) return error.InvalidTstInfo;
+    if (ver.slice.end - ver.slice.start != 1) return error.UnsupportedTstInfoVersion;
+    if (bytes[ver.slice.start] != 1) return error.UnsupportedTstInfoVersion;
+    i = ver.slice.end;
+
+    // policy TSAPolicyId (OBJECT IDENTIFIER)
+    const policy = try der.Element.parse(bytes, i);
+    if (policy.identifier.tag != .object_identifier) return error.InvalidTstInfo;
+    i = policy.slice.end;
+
+    // messageImprint SEQUENCE { hashAlgorithm AlgorithmIdentifier, hashedMessage OCTET STRING }
+    const mi = try der.Element.parse(bytes, i);
+    if (mi.identifier.tag != .sequence) return error.InvalidTstInfo;
+    const halg = try der.Element.parse(bytes, mi.slice.start);
+    if (halg.identifier.tag != .sequence) return error.InvalidTstInfo;
+    const halg_oid = try der.Element.parse(bytes, halg.slice.start);
+    if (halg_oid.identifier.tag != .object_identifier) return error.InvalidTstInfo;
+    const imprint_alg = hashAlgFromOid(bytes[halg_oid.slice.start..halg_oid.slice.end]) catch
+        return error.InvalidTstInfo;
+    const himg = try der.Element.parse(bytes, halg.slice.end);
+    if (himg.identifier.tag != .octetstring) return error.InvalidTstInfo;
+    const imprint = bytes[himg.slice.start..himg.slice.end];
+    i = mi.slice.end;
+
+    // serialNumber INTEGER
+    const sn = try der.Element.parse(bytes, i);
+    if (sn.identifier.tag != .integer) return error.InvalidTstInfo;
+    i = sn.slice.end;
+
+    // genTime GeneralizedTime
+    const gt = try der.Element.parse(bytes, i);
+    if (gt.identifier.tag != .generalized_time) return error.InvalidTstInfo;
+    const gen_time = parseGeneralizedTime(bytes[gt.slice.start..gt.slice.end]) catch
+        return error.InvalidGeneralizedTime;
+
+    return .{
+        .imprint_alg = imprint_alg,
+        .imprint = imprint,
+        .gen_time = gen_time,
+    };
+}
+
+/// Verify the embedded RFC 3161 timestamp countersignature on a
+/// SignerInfo. Returns the TSA's `gen_time` (UTC seconds) on success.
+///
+///   1. Locate the `id-aa-signatureTimeStampToken` attribute in
+///      `signer.unsigned_attrs_raw`.
+///   2. Parse the TimeStampToken as a PKCS#7 SignedData over a
+///      TSTInfo (`parseTimestampToken`).
+///   3. Verify the TSA SignerInfo's signature over its own
+///      signedAttrs using the TSA's leaf cert.
+///   4. Walk the TSA cert chain to a trusted TSA root in
+///      `tsa_trust`, using the wall-clock `now` as the clock.
+///   5. Verify TSTInfo.messageImprint.hashedMessage equals the hash
+///      (per `imprint_alg`) of `signer.signature`.
+pub fn verifyTimestamp(
+    allocator: std.mem.Allocator,
+    signer: SignerInfo,
+    tsa_trust: Certificate.Bundle,
+    now: i64,
+) (TstError || VerifyError)!i64 {
+    const token_bytes = (try findUnsignedAttr(signer, &oid.timestamp_token)) orelse
+        return error.MissingSignedAttrs; // re-purposed: caller treats as fail-closed
+    const token = try parseTimestampToken(token_bytes);
+
+    // Step 3: verify the TSA's own signer signature over its
+    // signedAttrs (re-emitted as SET OF), using the TSA leaf cert
+    // bundled inside this TimeStampToken.
+    try verifySignerSignature(allocator, token);
+
+    // Step 4: walk the TSA cert chain to one of the embedded TSA
+    // roots. Use wall-clock `now` here since the TSA cert itself
+    // does have a validity window we want to enforce against the
+    // moment of verification.
+    const tsa_leaf = (try findSignerCertDer(token)) orelse
+        return error.SignerCertNotFound;
+    _ = try verifyChain(allocator, tsa_leaf, token.certificates_raw, tsa_trust, now);
+
+    // Step 5: bind the TSTInfo's messageImprint to sha256(signer.signature).
+    const tst = try parseTstInfo(token.spc_indirect_data);
+    var imprint_calc: [64]u8 = undefined; // big enough for sha-512
+    const imprint_calc_slice = switch (tst.imprint_alg) {
+        .sha256 => blk: {
+            std.crypto.hash.sha2.Sha256.hash(signer.signature, imprint_calc[0..32], .{});
+            break :blk imprint_calc[0..32];
+        },
+        .sha384 => blk: {
+            std.crypto.hash.sha2.Sha384.hash(signer.signature, imprint_calc[0..48], .{});
+            break :blk imprint_calc[0..48];
+        },
+        .sha512 => blk: {
+            std.crypto.hash.sha2.Sha512.hash(signer.signature, imprint_calc[0..64], .{});
+            break :blk imprint_calc[0..64];
+        },
+    };
+    if (!std.mem.eql(u8, tst.imprint, imprint_calc_slice))
+        return error.TstInfoMessageImprintMismatch;
+
+    return tst.gen_time;
+}
+
+/// Parse an ASN.1 GeneralizedTime ("YYYYMMDDHHMMSSZ" — RFC 5280 form)
+/// into seconds-since-Unix-epoch. Only the trailing-Z form is
+/// supported (Authenticode TSAs always emit it).
+fn parseGeneralizedTime(s: []const u8) !i64 {
+    if (s.len < 15) return error.InvalidGeneralizedTime;
+    if (s[s.len - 1] != 'Z') return error.InvalidGeneralizedTime;
+    const y = try std.fmt.parseInt(u16, s[0..4], 10);
+    const mo = try std.fmt.parseInt(u8, s[4..6], 10);
+    const d = try std.fmt.parseInt(u8, s[6..8], 10);
+    const h = try std.fmt.parseInt(u8, s[8..10], 10);
+    const mi = try std.fmt.parseInt(u8, s[10..12], 10);
+    const sc = try std.fmt.parseInt(u8, s[12..14], 10);
+    return daysFromCivil(y, mo, d) * 86400 + @as(i64, h) * 3600 + @as(i64, mi) * 60 + @as(i64, sc);
+}
+
+/// Howard Hinnant's "days from civil" — algorithm 3 in
+/// http://howardhinnant.github.io/date_algorithms.html — used to
+/// convert a Gregorian (year, month, day) to Unix days without
+/// timezone considerations.
+fn daysFromCivil(y_in: u16, m: u8, d: u8) i64 {
+    var y: i64 = y_in;
+    if (m <= 2) y -= 1;
+    const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe: i64 = y - era * 400;
+    const m_i: i64 = m;
+    const doy: i64 = @divFloor(153 * (m_i + (if (m > 2) @as(i64, -3) else @as(i64, 9))) + 2, 5) + d - 1;
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+test "parseGeneralizedTime round-trips a known instant" {
+    // 2026-04-21T10:24:31Z → 1776767071 epoch seconds.
+    const t = try parseGeneralizedTime("20260421102431Z");
+    try std.testing.expectEqual(@as(i64, 1776767071), t);
+}
+
+// ---------------------------------------------------------------------------
+// Top-level orchestrator: end-to-end verification of a single PE.
+// ---------------------------------------------------------------------------
+
+pub const Outcome = struct {
+    /// SHA-256 Authenticode digest of the verified PE.
+    digest: [32]u8,
+    /// Subject CN of the signer cert, or empty when none was found.
+    subject_cn: []const u8,
+    /// Organization name (O=) of the signer cert, or empty.
+    organization: []const u8,
+    /// RFC 3161 timestamp's `genTime` — Unix seconds.
+    gen_time: i64,
+};
+
+pub const VerifyPeError = error{
+    NoAuthenticodeSignature,
+    AuthenticodeDigestMismatch,
+    SignerMessageDigestMismatch,
+} || VerifyError || TstError || ParseError || WinCertError || DigestError;
+
+/// Top-level: verify the Authenticode signature on a PE/COFF image.
+///
+/// `signer_trust` and `tsa_trust` are bundles of trusted Authenticode
+/// and TSA roots respectively (typically populated via
+/// `buildEmbeddedTrustBundle` plus any caller-supplied additions).
+/// `now` is the wall-clock used to enforce the TSA cert's own
+/// validity window; the TSA's `genTime` is then used as the clock
+/// for the signer chain so the signature remains valid past the
+/// signer cert's notAfter.
+pub fn verifyPe(
+    allocator: std.mem.Allocator,
+    pe_bytes: []const u8,
+    signer_trust: Certificate.Bundle,
+    tsa_trust: Certificate.Bundle,
+    now: i64,
+) VerifyPeError!Outcome {
+    const image = try parsePe(pe_bytes);
+    const cert_entry = (try findFirstPkcs7Entry(image)) orelse
+        return error.NoAuthenticodeSignature;
+    const signed = try parseSignedData(cert_entry.data);
+
+    // (1) Authenticode digest of file == SpcIndirectDataContent.digest.
+    var auth_digest: [32]u8 = undefined;
+    try computeAuthenticodeDigestSha256(image, &auth_digest);
+    if (signed.file_digest_alg != .sha256)
+        return error.UnsupportedDigestAlgorithm;
+    if (!std.mem.eql(u8, signed.file_digest, &auth_digest))
+        return error.AuthenticodeDigestMismatch;
+
+    // (2) SignerInfo.signedAttrs.messageDigest == sha256(SpcIndirectDataContent).
+    var spc_digest: [32]u8 = undefined;
+    Sha256.hash(signed.spc_indirect_data, &spc_digest, .{});
+    if (signed.signer.digest_alg != .sha256)
+        return error.UnsupportedDigestAlgorithm;
+    if (!std.mem.eql(u8, signed.signer.message_digest, &spc_digest))
+        return error.SignerMessageDigestMismatch;
+
+    // (3) SignerInfo signature verifies over signedAttrs (SET OF form).
+    try verifySignerSignature(allocator, signed);
+
+    // (4) RFC 3161 timestamp verifies and gives us a trustworthy clock.
+    const gen_time = try verifyTimestamp(allocator, signed.signer, tsa_trust, now);
+
+    // (5) Signer chain walks to a trusted root, using genTime.
+    const leaf_der = (try findSignerCertDer(signed)) orelse
+        return error.SignerCertNotFound;
+    const leaf = try verifyChain(allocator, leaf_der, signed.certificates_raw, signer_trust, gen_time);
+
+    return .{
+        .digest = auth_digest,
+        .subject_cn = extractSubjectCn(leaf) catch "",
+        .organization = extractOrganization(leaf) catch "",
+        .gen_time = gen_time,
+    };
+}
+
+/// Extract the Common Name (CN) attribute from the leaf cert's
+/// subject DN. Returns the raw bytes; the caller can copy as needed.
+/// Returns an empty slice when no CN is present.
+fn extractSubjectCn(leaf: Certificate.Parsed) ![]const u8 {
+    return findRdnAttribute(leaf.certificate.buffer[leaf.subject_slice.start..leaf.subject_slice.end], &.{ 0x55, 0x04, 0x03 });
+}
+
+/// Extract the Organization (O) attribute from the leaf cert's
+/// subject DN.
+fn extractOrganization(leaf: Certificate.Parsed) ![]const u8 {
+    return findRdnAttribute(leaf.certificate.buffer[leaf.subject_slice.start..leaf.subject_slice.end], &.{ 0x55, 0x04, 0x0A });
+}
+
+fn findRdnAttribute(name_der: []const u8, target_oid: []const u8) ![]const u8 {
+    // Name ::= SEQUENCE OF RDN ; we receive the inner bytes (no
+    // outer SEQUENCE wrapper, since Parsed.subject_slice is the
+    // body of the subject SEQUENCE).
+    var i: u32 = 0;
+    while (i < name_der.len) {
+        const rdn = try der.Element.parse(name_der, i);
+        i = rdn.slice.end;
+        if (@intFromEnum(rdn.identifier.tag) != 17) continue; // SET OF
+        var j: u32 = rdn.slice.start;
+        while (j < rdn.slice.end) {
+            const attr = try der.Element.parse(name_der, j);
+            j = attr.slice.end;
+            if (attr.identifier.tag != .sequence) continue;
+            const t = try der.Element.parse(name_der, attr.slice.start);
+            if (t.identifier.tag != .object_identifier) continue;
+            const oid_bytes = name_der[t.slice.start..t.slice.end];
+            if (!std.mem.eql(u8, oid_bytes, target_oid)) continue;
+            const v = try der.Element.parse(name_der, t.slice.end);
+            // value is usually PrintableString / UTF8String / etc.
+            return name_der[v.slice.start..v.slice.end];
+        }
+    }
+    return &.{};
+}
 ///
 /// Re-uses the std.crypto.Certificate.verify primitive, which
 /// performs the per-step signature verification.
