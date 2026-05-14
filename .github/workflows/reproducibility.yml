@@ -1,0 +1,207 @@
+name: Reproducibility
+
+# Validates that the published tar.gz archives for a release tag can be
+# byte-reproduced from source. Windows zips contain a code-signed .exe and
+# are intentionally not covered.
+#
+# Triggers:
+#   * workflow_run on "Release" success — automatically validates each new tag.
+#   * workflow_dispatch — manual revalidation; supply the tag (e.g. v0.2.1).
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to validate (e.g. v0.2.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-tag:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    # Skip auto-runs that come from a failed Release workflow.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          if [[ -z "$TAG" || "$TAG" != v* ]]; then
+            echo "::error::Could not resolve a release tag (got '$TAG')"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  reproduce:
+    name: Reproduce ${{ matrix.name }}
+    needs: resolve-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      # Mirror the non-Windows entries of release.yml so each rebuild
+      # uses the same os/target pairing as the original release.
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-linux
+            name: linux-x64
+          - os: ubuntu-22.04-arm
+            target: aarch64-linux
+            name: linux-arm64
+          - os: macos-14
+            target: aarch64-macos
+            name: macos-arm64
+          - os: ubuntu-22.04
+            target: x86_64-macos
+            name: macos-x64
+          - os: ubuntu-22.04
+            target: x86_64-linux-musl
+            name: linux-musl-x64
+          - os: ubuntu-22.04
+            target: aarch64-linux-musl
+            name: linux-musl-arm64
+
+    steps:
+      - name: Checkout source at ${{ needs.resolve-tag.outputs.tag }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
+          # Need full history so `git log -1 --pretty=%ct` on the tagged
+          # commit works for SOURCE_DATE_EPOCH.
+          fetch-depth: 0
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Compute SOURCE_DATE_EPOCH
+        shell: bash
+        run: |
+          SDE=$(git log -1 --pretty=%ct HEAD)
+          echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
+          echo "Using SOURCE_DATE_EPOCH=$SDE"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
+
+      - name: Repackage deterministically
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKGNAME="ghr-${{ needs.resolve-tag.outputs.version }}-${{ matrix.name }}"
+          mkdir -p "rebuilt/$PKGNAME/bin"
+          cp "zig-out/bin/ghr" "rebuilt/$PKGNAME/bin/"
+          cp LICENSE README.md "rebuilt/$PKGNAME/" 2>/dev/null || true
+          ( cd rebuilt && python3 ../scripts/pack.py "$PKGNAME" "$PKGNAME.tar.gz" )
+          echo "PKGNAME=$PKGNAME" >> "$GITHUB_ENV"
+
+      - name: Download published archive + sha256
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p published
+          cd published
+          gh release download "${{ needs.resolve-tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${PKGNAME}.tar.gz" \
+            --pattern "${PKGNAME}.tar.gz.sha256"
+          ls -la
+
+      - name: Verify published sha256 matches its archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd published
+          # The sidecar holds the published hash; this just confirms the
+          # downloaded archive matches what GitHub served alongside it.
+          if command -v sha256sum >/dev/null; then
+            sha256sum -c "${PKGNAME}.tar.gz.sha256"
+          else
+            shasum -a 256 -c "${PKGNAME}.tar.gz.sha256"
+          fi
+
+      - name: Compare published vs rebuilt sha256
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          PUB=$(awk '{print $1}' "published/${PKGNAME}.tar.gz.sha256")
+          NEW=$(awk '{print $1}' "rebuilt/${PKGNAME}.tar.gz.sha256")
+          echo "published=$PUB" >> "$GITHUB_OUTPUT"
+          echo "rebuilt=$NEW"   >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${{ matrix.name }}"
+            echo ""
+            echo "| | sha256 |"
+            echo "|---|---|"
+            echo "| published | \`$PUB\` |"
+            echo "| rebuilt   | \`$NEW\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$PUB" == "$NEW" ]]; then
+            echo "result=match" >> "$GITHUB_OUTPUT"
+            echo "✅ REPRODUCIBLE: ${{ matrix.name }}"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ Reproducible." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "result=mismatch" >> "$GITHUB_OUTPUT"
+            echo "::error::Reproducibility mismatch for ${{ matrix.name }}: published=$PUB rebuilt=$NEW"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ Mismatch — see diagnostics step for details." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Diagnose mismatch
+        if: steps.compare.outputs.result == 'mismatch'
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p diag/published diag/rebuilt
+          tar -xzf "published/${PKGNAME}.tar.gz" -C diag/published
+          tar -xzf "rebuilt/${PKGNAME}.tar.gz"   -C diag/rebuilt
+          echo "=== Archive metadata (tar tvf) — published ==="
+          tar tvf "published/${PKGNAME}.tar.gz" | sort > diag/published.tar.list
+          cat diag/published.tar.list
+          echo "=== Archive metadata (tar tvf) — rebuilt ==="
+          tar tvf "rebuilt/${PKGNAME}.tar.gz" | sort > diag/rebuilt.tar.list
+          cat diag/rebuilt.tar.list
+          echo "=== Metadata diff ==="
+          diff -u diag/published.tar.list diag/rebuilt.tar.list || true
+          echo "=== Binary diff (first 100 byte differences) ==="
+          cmp -l "diag/published/${PKGNAME}/bin/ghr" "diag/rebuilt/${PKGNAME}/bin/ghr" | head -100 || true
+          echo "=== sha256 of extracted binary ==="
+          if command -v sha256sum >/dev/null; then
+            sha256sum "diag/published/${PKGNAME}/bin/ghr" "diag/rebuilt/${PKGNAME}/bin/ghr"
+          else
+            shasum -a 256 "diag/published/${PKGNAME}/bin/ghr" "diag/rebuilt/${PKGNAME}/bin/ghr"
+          fi
+          # Fail the job so the matrix entry is red.
+          exit 1
+
+      - name: Upload diagnostic artifacts
+        if: always() && steps.compare.outputs.result == 'mismatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: repro-diag-${{ matrix.name }}
+          path: |
+            published/
+            rebuilt/
+            diag/

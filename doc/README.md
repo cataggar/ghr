@@ -200,3 +200,34 @@ own diagnostic line, so the full set is visible at install time.
 The trust roots embedded in ghr come from
 [`sigstore/root-signing`](https://github.com/sigstore/root-signing).
 Rotating them requires a new ghr release.
+
+## Reproducible builds
+
+Linux and macOS release archives (`.tar.gz`) are produced deterministically:
+the gzip header carries `mtime=0` and no filename, and every tar entry has
+sorted order, fixed uid/gid 0, empty owner/group names, and `mtime` set to
+`SOURCE_DATE_EPOCH` derived from the tagged commit. Packaging is performed
+by [`scripts/pack.py`](../scripts/pack.py), and the same script is used
+both at release time and during validation, so the published `.sha256`
+sidecar can be reproduced bit-for-bit from source.
+
+The [`Reproducibility` workflow](../.github/workflows/reproducibility.yml)
+runs automatically after each successful `Release` workflow and can also be
+triggered manually with `workflow_dispatch` (provide the tag, e.g. `v0.3.0`).
+For every non-Windows release target it:
+
+1. checks out the source at the tag,
+2. installs the pinned Zig version,
+3. rebuilds with the same flags as `release.yml`,
+4. repackages with `scripts/pack.py`,
+5. downloads the published `.tar.gz` + `.sha256` from the release, and
+6. fails the job if the two hashes differ — with `tar tvf` and `cmp` diffs
+   uploaded as a diagnostic artifact.
+
+Windows zips are intentionally **not** part of the reproducibility check:
+the `.exe` is code-signed with Azure Trusted Signing, so byte-identical
+reproduction is impossible without the signing key. Validate Windows
+releases via sigstore or minisign instead.
+
+Releases tagged at or before `v0.2.1` predate deterministic packaging and
+will not reproduce at the archive level.

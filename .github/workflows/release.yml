@@ -57,6 +57,15 @@ jobs:
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Compute SOURCE_DATE_EPOCH
+        id: sde
+        shell: bash
+        run: |
+          # Derive from the tagged commit so packaging is reproducible.
+          SDE=$(git log -1 --pretty=%ct "$GITHUB_SHA")
+          echo "value=$SDE" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
+
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ steps.version.outputs.version }}"
 
@@ -94,6 +103,10 @@ jobs:
           cp LICENSE README.md "$PKGNAME/" 2>/dev/null || true
           case "${{ matrix.target }}" in
             *-windows)
+              # Windows zips contain a code-signed .exe (Azure Trusted Signing),
+              # so they are intentionally not byte-reproducible without the
+              # signing key. Pack with the platform's default zip tool and
+              # produce a plain sha256 sidecar.
               if command -v zip &>/dev/null; then
                 zip -r "$PKGNAME.zip" "$PKGNAME"
               else
@@ -106,12 +119,10 @@ jobs:
               fi
               ;;
             *)
-              tar czf "$PKGNAME.tar.gz" "$PKGNAME"
-              if command -v sha256sum &>/dev/null; then
-                sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-              else
-                shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-              fi
+              # Deterministic tar.gz: fixed mtimes, sorted entries, fixed
+              # owner/group, gzip header with mtime=0. See scripts/pack.py.
+              # SOURCE_DATE_EPOCH is set in the env from the tagged commit.
+              python3 scripts/pack.py "$PKGNAME" "$PKGNAME.tar.gz"
               ;;
           esac
 
