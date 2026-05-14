@@ -1,0 +1,166 @@
+name: 'ghr install'
+description: >-
+  Install one or more tools from GitHub releases using `ghr`. Caches the
+  installed tools (binaries + extracted artifacts) across workflow runs so a
+  cache-hit reduces the install step to a near-instant restore.
+author: 'cataggar/ghr contributors'
+branding:
+  icon: 'download-cloud'
+  color: 'gray-dark'
+
+inputs:
+  tools:
+    description: >-
+      Newline-separated list of release specs to install. Each entry is
+      `owner/repo[@tag]` (auto-pick asset) or `owner/repo/file[@tag]`
+      (specific asset). Lines that are empty or start with `#` are
+      ignored.
+    required: true
+  cache:
+    description: >-
+      Cache installed tools across runs. Default: true. The cache key is
+      `os + arch + sorted(tools) + ghr version`, so adding a tool or
+      bumping ghr invalidates the cache cleanly.
+    required: false
+    default: 'true'
+  minisign:
+    description: >-
+      Optional base64 minisign public key. When set, ghr also requires a
+      `.minisig` sidecar to be present for every spec and verifies it.
+    required: false
+    default: ''
+  skip-verify:
+    description: >-
+      Skip sigstore + sha256 + minisign verification. Default: false.
+    required: false
+    default: 'false'
+  keep-going:
+    description: >-
+      Continue past per-spec failures. The job step still exits non-zero
+      if any spec failed, but every spec is attempted first.
+    required: false
+    default: 'false'
+  ghr-version:
+    description: >-
+      Override the `ghr-bin` version installed via pipx. By default the
+      action installs the `ghr-bin` version matching its own git ref —
+      e.g. when pinned at `@v0.3.0` it installs `ghr-bin==0.3.0`. Pass
+      this input to override (e.g. `latest`, or a specific version).
+      When set to `latest`, the literal value `latest` is interpreted as
+      "no version pin" (pipx installs whatever PyPI considers latest).
+    required: false
+    default: ''
+
+outputs:
+  cache-hit:
+    description: >-
+      `true` when the tool cache was restored from a prior run, `false`
+      otherwise. Mirrors `actions/cache@v4`'s own `cache-hit` output.
+    value: ${{ steps.ghr-cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install ghr-bin via pipx
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.ghr-version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        # Resolution order:
+        #   1. explicit `ghr-version:` input (literal "latest" means "no pin")
+        #   2. derived from $GITHUB_ACTION_REF if it looks like a semver tag
+        #      (e.g. `v0.3.0` -> `0.3.0`)
+        #   3. fall back to latest on PyPI
+        resolved=""
+        if [[ -n "${INPUT_VERSION}" ]]; then
+          if [[ "${INPUT_VERSION}" != "latest" ]]; then
+            resolved="${INPUT_VERSION}"
+          fi
+        elif [[ "${ACTION_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+          resolved="${ACTION_REF#v}"
+        fi
+        if [[ -n "${resolved}" ]]; then
+          pipx install "ghr-bin==${resolved}"
+        else
+          pipx install ghr-bin
+        fi
+
+    - name: Point ghr at a cacheable directory
+      id: ghr-dirs
+      shell: bash
+      run: |
+        set -euo pipefail
+        tool_dir="${RUNNER_TEMP}/ghr-tools"
+        bin_dir="${RUNNER_TEMP}/ghr-bin"
+        cache_dir="${RUNNER_TEMP}/ghr-cache"
+        mkdir -p "$tool_dir" "$bin_dir" "$cache_dir"
+        echo "GHR_TOOL_DIR=$tool_dir"   >> "$GITHUB_ENV"
+        echo "GHR_BIN_DIR=$bin_dir"     >> "$GITHUB_ENV"
+        echo "GHR_CACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        echo "tool_dir=$tool_dir"   >> "$GITHUB_OUTPUT"
+        echo "bin_dir=$bin_dir"     >> "$GITHUB_OUTPUT"
+        echo "cache_dir=$cache_dir" >> "$GITHUB_OUTPUT"
+
+    - name: Resolve cache key
+      id: cache-key
+      shell: bash
+      env:
+        TOOLS_INPUT: ${{ inputs.tools }}
+      run: |
+        set -euo pipefail
+        ghr_version="$(ghr version)"
+        sorted_specs="$(printf '%s\n' "${TOOLS_INPUT}" \
+          | sed -e 's/[[:space:]]\{1,\}/\n/g' \
+          | grep -v '^$' \
+          | grep -v '^#' \
+          | LC_ALL=C sort -u)"
+        if [[ -z "$sorted_specs" ]]; then
+          echo "error: 'tools' input is empty" >&2
+          exit 1
+        fi
+        # Hash the sorted-specs list so the cache key is stable and short.
+        specs_hash="$(printf '%s' "$sorted_specs" | sha256sum | cut -c1-16)"
+        key="ghr-${RUNNER_OS}-${RUNNER_ARCH}-ghrv${ghr_version}-${specs_hash}"
+        {
+          echo "key=$key"
+          echo "ghr_version=$ghr_version"
+          echo 'sorted_specs<<__GHR_EOF__'
+          echo "$sorted_specs"
+          echo '__GHR_EOF__'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore ghr tool cache
+      id: ghr-cache
+      if: inputs.cache == 'true'
+      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: |
+          ${{ steps.ghr-dirs.outputs.tool_dir }}
+          ${{ steps.ghr-dirs.outputs.bin_dir }}
+          ${{ steps.ghr-dirs.outputs.cache_dir }}
+        key: ${{ steps.cache-key.outputs.key }}
+
+    - name: Install tools with ghr
+      if: steps.ghr-cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        SORTED_SPECS: ${{ steps.cache-key.outputs.sorted_specs }}
+        MINISIGN: ${{ inputs.minisign }}
+        SKIP_VERIFY: ${{ inputs.skip-verify }}
+        KEEP_GOING: ${{ inputs.keep-going }}
+      run: |
+        set -euo pipefail
+        flags=()
+        if [[ "${KEEP_GOING}" == "true" ]]; then flags+=(--keep-going); fi
+        if [[ "${SKIP_VERIFY}" == "true" ]]; then flags+=(--skip-verify); fi
+        if [[ -n "${MINISIGN}" ]]; then flags+=(--minisign "${MINISIGN}"); fi
+        # SORTED_SPECS is newline-separated; pass each as a positional spec.
+        readarray -t specs <<< "${SORTED_SPECS}"
+        ghr install "${flags[@]}" "${specs[@]}"
+
+    - name: Sanity check (ghr list)
+      shell: bash
+      run: ghr list

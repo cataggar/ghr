@@ -45,6 +45,9 @@ ghr install burntsushi/ripgrep
 # Install a specific tag
 ghr install burntsushi/ripgrep@15.1.0
 
+# Install several tools in one invocation (shared HTTP client + auth)
+ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
+
 # Install a specific asset by name (exact match or unique substring)
 ghr install WebAssembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
 
@@ -64,36 +67,190 @@ given by `-o`). Use it as a cross-platform replacement for the common
 macOS, and Windows; no `choco install wget` step needed.
 
 ```
-ghr download <owner/repo[@tag]> [options]
-ghr download <owner/repo/file[@tag]> [options]
+ghr download <spec> [<spec> ...] [options]
 
 OPTIONS:
-    -o, --output <path>        Output file path (default: asset name in cwd)
-        --extract <dir>        Extract archive into <dir> after download
+    -o, --output <path>        Output file path (single-spec only)
+        --extract <dir>        Extract archive(s) into <dir> after download
         --strip-components <N> Strip N leading path components when extracting
-        --sha256 <hex>         Verify download against SHA-256 digest (64 hex)
+        --sha256 <hex>         Verify download against SHA-256 digest (single-spec only)
         --minisign <pubkey>    Require minisign signature; <pubkey> is a base64 minisign public key
         --skip-verify          Skip sigstore + sha256 + minisign verification
         --keep-archive         Keep archive on disk after extraction
+        --keep-going           For multi-spec, continue past per-spec failures
         --quiet                Suppress progress output
         --no-auth              Do not send GitHub auth even for github.com URLs
         --debug                Verbose diagnostic output
 ```
 
-The first form picks the asset that `ghr install` would install for the
-current OS / architecture. The second form names a specific asset:
-exact-name match wins, otherwise a unique case-insensitive substring
-wins (multiple matches print the candidates). Recognised archive
-formats: `.zip`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`. Format is
-detected from the filename. When `--extract` is used the archive is
-deleted after extraction unless `--keep-archive` (or `-o`) is set.
+Each `<spec>` is `owner/repo[@tag]` (auto-pick asset for the current
+OS/arch) or `owner/repo/file[@tag]` (exact match wins, otherwise a
+unique case-insensitive substring wins; multiple matches print the
+candidates). Recognised archive formats: `.zip`, `.tar.gz`, `.tgz`,
+`.tar.xz`, `.txz`. Format is detected from the filename. When
+`--extract` is used the archive is deleted after extraction unless
+`--keep-archive` (or `-o`) is set.
+
+Multi-spec invocations share a single HTTP client + auth context, so
+adding more specs costs little beyond the per-asset bytes. `-o` and
+`--sha256` are inherently single-target and are rejected when more
+than one spec is supplied — use `--extract <dir>` for "land each
+archive in a shared directory", or invoke `ghr download` once per
+spec for distinct outputs. `--keep-going` continues past per-spec
+failures and exits non-zero with a summary if any spec failed.
+
 GitHub auth is attached automatically (using `GH_TOKEN`,
 `GITHUB_TOKEN`, or `gh auth token`); pass `--no-auth` to skip it.
 Downloads are auto-verified against any sigstore bundle or sha256
 checksum file published with the release; pass `--minisign <pubkey>` to
 also require a minisign signature, or `--skip-verify` to bypass all
 checks. Exit codes: `0` success, `1` argument/IO error, `2` HTTP error
-after retries, `3` SHA-256/minisign mismatch.
+after retries, `3` SHA-256/minisign mismatch. Multi-spec invocations
+exit with the most-severe code observed across the batch.
+
+## Caching in GitHub Actions
+
+Running `pipx install ghr-bin && ghr install <tool>` from scratch on every
+workflow run pays the download + extraction cost each time. Caching the
+tool directory across runs reduces a warm install to a near-instant
+restore.
+
+The pattern is the same one
+[pipx users settled on](https://github.com/pypa/pipx/discussions/1051) —
+override the on-disk locations to a user-writable path (so
+`actions/cache` can write back to it without `sudo`), then key the cache
+on the sorted list of tools + `ghr` version.
+
+### Recommended: composite actions
+
+This repository ships two composite actions that wrap the dance below
+end-to-end:
+
+- [`cataggar/ghr/actions/install`](../actions/install/README.md) —
+  install one or more tools with cross-run caching.
+- [`cataggar/ghr/actions/download`](../actions/download/README.md) —
+  download (and optionally extract) one or more release assets with
+  cross-run caching.
+
+```yaml
+- uses: cataggar/ghr/actions/install@v0.3.0  # pin to the matching ghr release
+  with:
+    tools: |
+      BurntSushi/ripgrep@14.1.1
+      sharkdp/fd@v10.2.0
+```
+
+The actions ship in this same repository, so their git tags are the
+same as `ghr`'s — pinning `@v0.3.0` pins both the action body and the
+`ghr-bin` binary the action installs. Pick the latest tag from
+[the releases page](https://github.com/cataggar/ghr/releases).
+
+### Hand-rolled recipe (`ghr install`)
+
+If you'd rather wire it up yourself — for instance to share a cache step
+with other tools in the same job:
+
+```yaml
+- run: pipx install ghr-bin
+  shell: bash
+
+- name: Point ghr at a cacheable directory
+  shell: bash
+  run: |
+    echo "GHR_TOOL_DIR=$RUNNER_TEMP/ghr-tools"  >> "$GITHUB_ENV"
+    echo "GHR_BIN_DIR=$RUNNER_TEMP/ghr-bin"     >> "$GITHUB_ENV"
+    echo "GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache" >> "$GITHUB_ENV"
+    echo "$RUNNER_TEMP/ghr-bin" >> "$GITHUB_PATH"
+
+- uses: actions/cache@v4
+  id: ghr-cache
+  with:
+    path: |
+      ${{ runner.temp }}/ghr-tools
+      ${{ runner.temp }}/ghr-bin
+      ${{ runner.temp }}/ghr-cache
+    key: ghr-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0
+
+- if: steps.ghr-cache.outputs.cache-hit != 'true'
+  run: |
+    ghr install \
+      BurntSushi/ripgrep@14.1.1 \
+      sharkdp/fd@v10.2.0
+
+- run: ghr list  # sanity check after a cache restore
+```
+
+`ghr install` is multi-spec: pass every tool as a positional argument
+in a single invocation so they share one HTTP client + auth context,
+and the cache step pairs naturally with one install step. Use
+`--keep-going` to attempt every spec even if one fails.
+
+### Cache key shape
+
+A cache-key like `ghr-<os>-<arch>-<sorted-specs>-<ghr-version>` invalidates
+cleanly when:
+
+- the runner OS or architecture changes,
+- a tool is added, removed, or its pinned tag changes,
+- `ghr` itself is upgraded (the install layout could shift between
+  versions).
+
+For tiny lists, an inline literal is fine. For larger lists, check the
+tool list into a file and key on `${{ hashFiles('.github/ghr-tools.txt') }}`.
+The composite actions above hash the sorted tool list internally, so you
+don't have to choose.
+
+### Caveats
+
+- Verification metadata (`ghr.json`, sigstore bundles, sha256 sidecars)
+  is stored under `GHR_TOOL_DIR` as regular files and survives a cache
+  round-trip — verification happens at install time, not on restore.
+- Windows shims are regular files (the runtime resolves them through
+  PATH) and survive the cache round-trip cleanly.
+- `pipx install ghr-bin` is cheap (single static binary). Caching it
+  separately isn't worth the complexity.
+
+### Caching `ghr download`
+
+`ghr download` lands files in the user-chosen directory rather than a
+managed cache, so the pattern is slightly simpler — cache the
+destination directory and the extracted contents (if `--extract` is
+used):
+
+```yaml
+- uses: cataggar/ghr/actions/download@v0.3.0  # pin to the matching ghr release
+  with:
+    tools: |
+      BurntSushi/ripgrep@14.1.1
+      sharkdp/fd@v10.2.0
+    extract: 'true'
+    strip-components: '1'
+    dest: ./bin
+```
+
+Hand-rolled equivalent:
+
+```yaml
+- uses: actions/cache@v4
+  id: ghr-dl-cache
+  with:
+    path: ./bin
+    key: ghr-dl-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0
+
+- if: steps.ghr-dl-cache.outputs.cache-hit != 'true'
+  run: |
+    pipx install ghr-bin
+    mkdir -p ./bin
+    ghr download \
+      BurntSushi/ripgrep@14.1.1 \
+      sharkdp/fd@v10.2.0 \
+      --extract ./bin --strip-components 1
+```
+
+The same multi-spec rules apply: `-o` and `--sha256` are rejected when
+more than one spec is supplied — `--extract <dir>` is the multi-spec
+equivalent of `-o`, and verification falls back to whatever sigstore /
+sha256 sidecars the release publishes.
 
 ## Directories
 

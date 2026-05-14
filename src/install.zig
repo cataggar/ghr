@@ -788,23 +788,54 @@ pub fn cmdUninstall(
     try w.print("uninstalled {s}/{s}\n", .{ spec.owner, spec.repo });
 }
 
-pub fn cmdInstall(
+/// Per-install error signalling a single spec's install path failed after
+/// printing a user-visible diagnostic. The outer multi-spec driver decides
+/// whether to abort (fail-fast) or continue (`--keep-going`).
+pub const InstallStepError = error{InstallStepFailed};
+
+/// Shared state for one or more sequential per-spec installs in a single
+/// `ghr install` invocation. Built once by `cmdInstallMany`; reused by
+/// `installOne` so a multi-spec invocation reuses one HTTP client, one
+/// auth resolution, and one `Dirs.detect` result.
+pub const InstallContext = struct {
     allocator: std.mem.Allocator,
     io: Io,
     environ: *const EnvironMap,
-    spec_str: []const u8,
+    dirs: Dirs,
+    client: *std.http.Client,
+    auth_resolved: auth.Resolved,
+    auth_header: ?[]const u8,
     w: *Writer,
     err_w: *Writer,
     debug: bool,
     no_auth: bool,
     skip_verify: bool,
     minisign_pubkey_b64: ?[]const u8,
-) !void {
+};
+
+/// Install a single spec using the shared `InstallContext`.
+///
+/// On any user-visible failure this prints a diagnostic via `ctx.err_w`
+/// and returns `error.InstallStepFailed`. Allocation / I/O errors that
+/// indicate environmental rather than per-spec problems propagate as
+/// their original error type.
+fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const environ = ctx.environ;
+    const d = ctx.dirs;
+    const auth_header = ctx.auth_header;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+    const debug = ctx.debug;
+    const skip_verify = ctx.skip_verify;
+    const minisign_pubkey_b64 = ctx.minisign_pubkey_b64;
+
     const classified = release_mod.classifyArg(spec_str) catch {
         try err_w.print("error: invalid argument '{s}'\n", .{spec_str});
         try err_w.print("  expected: owner/repo[@tag] or owner/repo/file[@tag]\n", .{});
         try err_w.flush();
-        std.process.exit(1);
+        return error.InstallStepFailed;
     };
 
     var url_buf: ?release_mod.ParsedReleaseUrl = null;
@@ -823,13 +854,13 @@ pub fn cmdInstall(
             const parsed_opt = release_mod.parseGitHubReleaseUrl(allocator, u) catch {
                 try err_w.print("error: failed to parse URL '{s}'\n", .{u});
                 try err_w.flush();
-                std.process.exit(1);
+                return error.InstallStepFailed;
             };
             const parsed = parsed_opt orelse {
                 try err_w.print("error: install only accepts github.com release-download URLs (got: {s})\n", .{u});
                 try err_w.print("  hint: use owner/repo[@tag] for auto-pick or owner/repo/file[@tag] for an explicit file\n", .{});
                 try err_w.flush();
-                std.process.exit(1);
+                return error.InstallStepFailed;
             };
             url_buf = parsed;
             spec = .{ .owner = parsed.owner, .repo = parsed.repo, .tag = parsed.tag };
@@ -837,30 +868,13 @@ pub fn cmdInstall(
         },
     }
 
-    const d = try Dirs.detect(allocator, environ);
-    defer d.deinit();
-
-    // Resolve auth token: env vars first, then `gh auth token` as fallback
-    const auth_resolved = auth.resolveGithubToken(allocator, io, environ, no_auth);
-    defer auth_resolved.deinit(allocator);
-    const auth_header = try auth.bearerHeader(allocator, auth_resolved);
-    defer if (auth_header) |h| allocator.free(h);
-
     try w.print("resolving {s}/{s}", .{ spec.owner, spec.repo });
     if (spec.tag) |t| try w.print("@{s}", .{t});
     try w.print(" ...\n", .{});
     try w.flush();
 
-    // Set up HTTP client
-    var client: std.http.Client = .{
-        .allocator = allocator,
-        .io = io,
-        .write_buffer_size = http_write_buffer_size,
-    };
-    defer client.deinit();
-
     // Get release info
-    var release = getRelease(allocator, &client, spec.owner, spec.repo, spec.tag, auth_header) catch |err| {
+    var release = getRelease(allocator, ctx.client, spec.owner, spec.repo, spec.tag, auth_header) catch |err| {
         switch (err) {
             error.GitHubApiError => {
                 try err_w.print("error: release not found for {s}/{s}", .{ spec.owner, spec.repo });
@@ -870,7 +884,7 @@ pub fn cmdInstall(
             else => try err_w.print("error: failed to fetch release: {}\n", .{err}),
         }
         try err_w.flush();
-        std.process.exit(1);
+        return error.InstallStepFailed;
     };
     defer release.deinit();
 
@@ -882,7 +896,7 @@ pub fn cmdInstall(
         const m = release_mod.findAssetByName(allocator, release.parsed.value.assets, fname) catch |err| {
             try err_w.print("error: failed to match asset by name: {}\n", .{err});
             try err_w.flush();
-            std.process.exit(1);
+            return error.InstallStepFailed;
         };
         switch (m) {
             .one => |a| break :blk a,
@@ -893,7 +907,7 @@ pub fn cmdInstall(
                     try err_w.print("  {s}\n", .{a.name});
                 }
                 try err_w.flush();
-                std.process.exit(1);
+                return error.InstallStepFailed;
             },
             .ambiguous => |list| {
                 defer allocator.free(list);
@@ -902,7 +916,7 @@ pub fn cmdInstall(
                     try err_w.print("  {s}\n", .{a.name});
                 }
                 try err_w.flush();
-                std.process.exit(1);
+                return error.InstallStepFailed;
             },
         }
     } else findBestAsset(release.parsed.value.assets) catch {
@@ -912,7 +926,7 @@ pub fn cmdInstall(
             try err_w.print("  {s}\n", .{a.name});
         }
         try err_w.flush();
-        std.process.exit(1);
+        return error.InstallStepFailed;
     };
 
     // Pre-flight verification check: if a `.minisig` sidecar exists but
@@ -925,7 +939,7 @@ pub fn cmdInstall(
         skip_verify,
         minisign_pubkey_b64,
         err_w,
-    ) catch std.process.exit(1);
+    ) catch return error.InstallStepFailed;
 
     try w.print("downloading {s} ...\n", .{asset.name});
     try w.flush();
@@ -945,7 +959,7 @@ pub fn cmdInstall(
     const debug_w: ?*Writer = if (debug) err_w else null;
 
     debugLog(debug_w, "debug: ghr {s}\n", .{version});
-    debugLog(debug_w, "debug: auth: {s}\n", .{auth_resolved.source});
+    debugLog(debug_w, "debug: auth: {s}\n", .{ctx.auth_resolved.source});
     debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
     debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
 
@@ -956,7 +970,7 @@ pub fn cmdInstall(
         try err_w.print("error: download failed: {}\n", .{err});
         try err_w.print("  url: {s}\n", .{asset.browser_download_url});
         try err_w.flush();
-        std.process.exit(1);
+        return error.InstallStepFailed;
     };
     defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
@@ -1000,13 +1014,13 @@ pub fn cmdInstall(
                 error.ChecksumEntryMissing,
                 => {
                     Dir.deleteFileAbsolute(io, download_path) catch {};
-                    std.process.exit(1);
+                    return error.InstallStepFailed;
                 },
                 else => {
                     try err_w.print("error: SHA256 verification failed: {}\n", .{verr});
                     try err_w.flush();
                     Dir.deleteFileAbsolute(io, download_path) catch {};
-                    std.process.exit(1);
+                    return error.InstallStepFailed;
                 },
             }
         };
@@ -1027,7 +1041,7 @@ pub fn cmdInstall(
         ) catch {
             // Diagnostic was already printed by the verifier.
             Dir.deleteFileAbsolute(io, download_path) catch {};
-            std.process.exit(1);
+            return error.InstallStepFailed;
         };
         if (mini_outcome == .minisign_verified) verified_label = "minisign";
 
@@ -1042,7 +1056,7 @@ pub fn cmdInstall(
             try err_w.print("error: authenticode verification failed: {s}\n", .{@errorName(verr)});
             try err_w.flush();
             Dir.deleteFileAbsolute(io, download_path) catch {};
-            std.process.exit(1);
+            return error.InstallStepFailed;
         };
         if (ac_outcome == .authenticode_verified) verified_label = "authenticode";
 
@@ -1061,7 +1075,7 @@ pub fn cmdInstall(
             try err_w.print("error: sigstore verification failed: {s}\n", .{@errorName(verr)});
             try err_w.flush();
             Dir.deleteFileAbsolute(io, download_path) catch {};
-            std.process.exit(1);
+            return error.InstallStepFailed;
         };
         if (sig_outcome == .sigstore_verified) verified_label = "sigstore";
 
@@ -1097,7 +1111,7 @@ pub fn cmdInstall(
             archive.extractAuto(allocator, io, staging_dir, download_path, 0) catch |err| {
                 try err_w.print("error: extraction failed: {}\n", .{err});
                 try err_w.flush();
-                std.process.exit(1);
+                return error.InstallStepFailed;
             };
         },
         .unknown => {
@@ -1140,7 +1154,7 @@ pub fn cmdInstall(
             try err_w.print("    (none)\n", .{});
         }
         try err_w.flush();
-        std.process.exit(1);
+        return error.InstallStepFailed;
     }
 
     // Find .app bundles (macOS)
@@ -1182,13 +1196,13 @@ pub fn cmdInstall(
             const tombstone = std.fmt.bufPrint(&tombstone_buf, "{s}.old", .{tool_path}) catch {
                 try err_w.print("error: tool path too long\n", .{});
                 try err_w.flush();
-                std.process.exit(1);
+                return error.InstallStepFailed;
             };
             deleteTreeAbsolute(io, tombstone) catch {};
             Dir.renameAbsolute(tool_path, tombstone, io) catch {
                 try err_w.print("error: cannot replace tool directory (files may be locked by a running process)\n", .{});
                 try err_w.flush();
-                std.process.exit(1);
+                return error.InstallStepFailed;
             };
         }
     };
@@ -1218,7 +1232,7 @@ pub fn cmdInstall(
     Dir.renameAbsolute(staging_path, tool_path, io) catch {
         try err_w.print("error: failed to move staging directory to tool directory\n", .{});
         try err_w.flush();
-        std.process.exit(1);
+        return error.InstallStepFailed;
     };
 
     // Re-open the tool dir for metadata and linking
@@ -1257,6 +1271,154 @@ pub fn cmdInstall(
     }
 
     try w.print("installed {s}/{s}@{s}\n", .{ spec.owner, spec.repo, tag_name });
+}
+
+/// Install one or more release specs in a single invocation. Builds the
+/// shared HTTP client + auth context + `Dirs.detect` result once and
+/// reuses them across every spec.
+///
+/// `keep_going` controls failure semantics:
+///   - `false` (default for `ghr install`): on the first per-spec
+///     failure, exit the process with status 1. The current spec's
+///     diagnostic has already been printed by `installOne`.
+///   - `true` (`--keep-going`): continue past per-spec failures,
+///     attempt every spec, and exit non-zero with a summary line if
+///     any spec failed.
+pub fn cmdInstallMany(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    specs: []const []const u8,
+    w: *Writer,
+    err_w: *Writer,
+    debug: bool,
+    no_auth: bool,
+    skip_verify: bool,
+    minisign_pubkey_b64: ?[]const u8,
+    keep_going: bool,
+) !void {
+    if (specs.len == 0) return;
+
+    const dirs = try Dirs.detect(allocator, environ);
+    defer dirs.deinit();
+
+    // Resolve auth token: env vars first, then `gh auth token` as fallback.
+    const auth_resolved = auth.resolveGithubToken(allocator, io, environ, no_auth);
+    defer auth_resolved.deinit(allocator);
+    const auth_header = try auth.bearerHeader(allocator, auth_resolved);
+    defer if (auth_header) |h| allocator.free(h);
+
+    // One HTTP client per invocation, reused across all specs.
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+        .write_buffer_size = http_write_buffer_size,
+    };
+    defer client.deinit();
+
+    const ctx = InstallContext{
+        .allocator = allocator,
+        .io = io,
+        .environ = environ,
+        .dirs = dirs,
+        .client = &client,
+        .auth_resolved = auth_resolved,
+        .auth_header = auth_header,
+        .w = w,
+        .err_w = err_w,
+        .debug = debug,
+        .no_auth = no_auth,
+        .skip_verify = skip_verify,
+        .minisign_pubkey_b64 = minisign_pubkey_b64,
+    };
+
+    var failed_specs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer failed_specs.deinit(allocator);
+
+    for (specs, 0..) |spec, i| {
+        if (specs.len > 1) {
+            try w.print("[{d}/{d}] {s}\n", .{ i + 1, specs.len, spec });
+            try w.flush();
+        }
+        installOne(&ctx, spec) catch |err| switch (err) {
+            error.InstallStepFailed => {
+                try failed_specs.append(allocator, spec);
+                if (!keep_going) std.process.exit(1);
+                try err_w.print("note: --keep-going, continuing past failure for {s}\n", .{spec});
+                try err_w.flush();
+            },
+            else => return err,
+        };
+    }
+
+    if (specs.len > 1) {
+        const ok = specs.len - failed_specs.items.len;
+        try w.print("installed {d}/{d}", .{ ok, specs.len });
+        if (failed_specs.items.len > 0) {
+            try w.print(", failed:", .{});
+            for (failed_specs.items) |s| try w.print(" {s}", .{s});
+        }
+        try w.print("\n", .{});
+        try w.flush();
+    }
+
+    if (failed_specs.items.len > 0) std.process.exit(1);
+}
+
+/// Single-spec install wrapper retained for backwards compatibility with
+/// older callers. Delegates to `cmdInstallMany`.
+pub fn cmdInstall(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    spec_str: []const u8,
+    w: *Writer,
+    err_w: *Writer,
+    debug: bool,
+    no_auth: bool,
+    skip_verify: bool,
+    minisign_pubkey_b64: ?[]const u8,
+) !void {
+    const specs: [1][]const u8 = .{spec_str};
+    return cmdInstallMany(
+        allocator,
+        io,
+        environ,
+        specs[0..],
+        w,
+        err_w,
+        debug,
+        no_auth,
+        skip_verify,
+        minisign_pubkey_b64,
+        false,
+    );
+}
+
+test "cmdInstallMany short-circuits on empty spec list" {
+    // No allocator/io is even consulted because len==0 returns immediately.
+    var out_buf: [64]u8 = undefined;
+    var out_w = std.Io.Writer.Discarding.init(&out_buf);
+    var err_buf: [64]u8 = undefined;
+    var err_w = std.Io.Writer.Discarding.init(&err_buf);
+
+    var environ_map = EnvironMap.init(std.testing.allocator);
+    defer environ_map.deinit();
+
+    const empty: []const []const u8 = &.{};
+    try cmdInstallMany(
+        std.testing.allocator,
+        std.testing.io,
+        &environ_map,
+        empty,
+        &out_w.writer,
+        &err_w.writer,
+        false,
+        false,
+        false,
+        null,
+        false,
+    );
 }
 
 test "deriveBareBinaryName strips arch-triple from stem" {
