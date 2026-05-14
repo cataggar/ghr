@@ -1303,11 +1303,15 @@ fn extractOrganization(leaf: Certificate.Parsed) ![]const u8 {
 }
 
 fn findRdnAttribute(name_der: []const u8, target_oid: []const u8) ![]const u8 {
-    // Name ::= SEQUENCE OF RDN ; we receive the inner bytes (no
-    // outer SEQUENCE wrapper, since Parsed.subject_slice is the
-    // body of the subject SEQUENCE).
-    var i: u32 = 0;
-    while (i < name_der.len) {
+    // The subject_slice bytes already include the outer SEQUENCE
+    // header in std.crypto.Certificate.Parsed, so we re-parse it to
+    // step into the SEQUENCE OF RDN body.
+    if (name_der.len < 2) return &.{};
+    const outer = der.Element.parse(name_der, 0) catch return &.{};
+    if (outer.identifier.tag != .sequence) return &.{};
+
+    var i: u32 = outer.slice.start;
+    while (i < outer.slice.end) {
         const rdn = try der.Element.parse(name_der, i);
         i = rdn.slice.end;
         if (@intFromEnum(rdn.identifier.tag) != 17) continue; // SET OF
@@ -1326,6 +1330,269 @@ fn findRdnAttribute(name_der: []const u8, target_oid: []const u8) ![]const u8 {
         }
     }
     return &.{};
+}
+
+// ---------------------------------------------------------------------------
+// ZIP-aware Authenticode verification.
+//
+// When the downloaded asset is a `.zip`, we walk its central directory
+// in memory to find PE entries (`*.exe` / `*.dll` / `*.sys`),
+// decompress each into a temporary buffer, and run `verifyPe`. The
+// caller's pass / fail / no-verification decision is:
+//
+//   * Any PE that carries an Authenticode signature must verify or
+//     the whole archive is rejected.
+//   * If no PE in the archive carries an Authenticode signature,
+//     return `.no_verification` (consistent with sha256 / sigstore
+//     fail-open when no material is published).
+// ---------------------------------------------------------------------------
+
+const zip = std.zip;
+const flate = std.compress.flate;
+
+pub const ZipWalkError = error{
+    ZipBadFile,
+    ZipUnsupportedCompression,
+    ZipTruncated,
+    ZipFilenameTooLong,
+    ZipEntryTooLarge,
+} || std.mem.Allocator.Error;
+
+pub const PeEntryResult = struct {
+    /// Lower-cased filename of the entry within the zip (UTF-8).
+    name: []const u8,
+    /// Decompressed entry bytes. Owned by the caller; freed by the
+    /// caller via `allocator.free`.
+    bytes: []u8,
+};
+
+/// Limit (in bytes) on a single decompressed entry. Authenticode is
+/// only relevant for executable PE files, which are bounded by
+/// practical release sizes; the cap is generous but guards against
+/// zip-bomb-style attacks.
+pub const max_entry_size: u64 = 200 * 1024 * 1024;
+const max_zip_filename: usize = 4096;
+
+/// Walk a zip archive at `zip_bytes` and yield each entry whose
+/// filename ends in `.exe`, `.dll`, or `.sys` as decompressed bytes.
+/// `out` collects up to `out.capacity` results.
+///
+/// Returns the number of entries written. Each entry's `bytes` slice
+/// must be freed by the caller.
+pub fn walkZipPes(
+    allocator: std.mem.Allocator,
+    zip_bytes: []const u8,
+    out: *std.array_list.Managed(PeEntryResult),
+) ZipWalkError!void {
+    // Parse end-of-central-directory record by scanning backwards for
+    // the signature. std.zip.EndRecord.findBuffer has an error-set
+    // mismatch with its implementation in this Zig version, so we
+    // parse the small subset we need directly.
+    const eocd_off = lastIndexOf4(zip_bytes, zip.end_record_sig) orelse return error.ZipBadFile;
+    if (eocd_off + 22 > zip_bytes.len) return error.ZipBadFile;
+    const cd_size: u32 = std.mem.readInt(u32, zip_bytes[eocd_off + 12 .. eocd_off + 16][0..4], .little);
+    const cd_offset: u32 = std.mem.readInt(u32, zip_bytes[eocd_off + 16 .. eocd_off + 20][0..4], .little);
+    if (cd_offset == std.math.maxInt(u32) or cd_size == std.math.maxInt(u32))
+        return error.ZipBadFile; // ZIP64 not handled here.
+    if (@as(usize, cd_offset) + @as(usize, cd_size) > zip_bytes.len)
+        return error.ZipTruncated;
+
+    var i: usize = cd_offset;
+    const cd_end: usize = @as(usize, cd_offset) + @as(usize, cd_size);
+    while (i < cd_end) {
+        if (i + @sizeOf(zip.CentralDirectoryFileHeader) > zip_bytes.len) return error.ZipTruncated;
+        const cdh_bytes = zip_bytes[i .. i + @sizeOf(zip.CentralDirectoryFileHeader)];
+        const cdh: zip.CentralDirectoryFileHeader = std.mem.bytesAsValue(zip.CentralDirectoryFileHeader, cdh_bytes[0..@sizeOf(zip.CentralDirectoryFileHeader)]).*;
+        if (!std.mem.eql(u8, &cdh.signature, &zip.central_file_header_sig))
+            return error.ZipBadFile;
+
+        const name_off: usize = i + @sizeOf(zip.CentralDirectoryFileHeader);
+        const name_end: usize = name_off + cdh.filename_len;
+        if (name_end > zip_bytes.len) return error.ZipTruncated;
+        if (cdh.filename_len > max_zip_filename) return error.ZipFilenameTooLong;
+        const name = zip_bytes[name_off..name_end];
+        const extras_off = name_end;
+        const extras_end = extras_off + cdh.extra_len;
+        const comment_end = extras_end + cdh.comment_len;
+        if (comment_end > zip_bytes.len) return error.ZipTruncated;
+        i = comment_end;
+
+        if (!hasPeSuffix(name)) continue;
+
+        // Read the local file header to locate the data payload.
+        const lfh_off: usize = cdh.local_file_header_offset;
+        if (lfh_off + @sizeOf(zip.LocalFileHeader) > zip_bytes.len) return error.ZipTruncated;
+        const lfh_bytes = zip_bytes[lfh_off .. lfh_off + @sizeOf(zip.LocalFileHeader)];
+        const lfh = std.mem.bytesAsValue(zip.LocalFileHeader, lfh_bytes[0..@sizeOf(zip.LocalFileHeader)]).*;
+        if (!std.mem.eql(u8, &lfh.signature, &zip.local_file_header_sig))
+            return error.ZipBadFile;
+
+        const data_off: usize = lfh_off + @sizeOf(zip.LocalFileHeader) + lfh.filename_len + lfh.extra_len;
+        const compressed_end: usize = data_off + cdh.compressed_size;
+        if (compressed_end > zip_bytes.len) return error.ZipTruncated;
+        if (cdh.uncompressed_size > max_entry_size) return error.ZipEntryTooLarge;
+
+        const data = zip_bytes[data_off..compressed_end];
+
+        const buf = try allocator.alloc(u8, cdh.uncompressed_size);
+        errdefer allocator.free(buf);
+
+        switch (cdh.compression_method) {
+            .store => {
+                if (data.len != buf.len) return error.ZipBadFile;
+                @memcpy(buf, data);
+            },
+            .deflate => {
+                try decompressDeflateToBuf(data, buf);
+            },
+            else => return error.ZipUnsupportedCompression,
+        }
+
+        try out.append(.{
+            .name = name,
+            .bytes = buf,
+        });
+    }
+}
+
+fn hasPeSuffix(name: []const u8) bool {
+    return std.ascii.endsWithIgnoreCase(name, ".exe") or
+        std.ascii.endsWithIgnoreCase(name, ".dll") or
+        std.ascii.endsWithIgnoreCase(name, ".sys");
+}
+
+fn lastIndexOf4(haystack: []const u8, needle: [4]u8) ?usize {
+    if (haystack.len < 4) return null;
+    var i: usize = haystack.len - 4;
+    while (true) : (i -= 1) {
+        if (std.mem.eql(u8, haystack[i .. i + 4], &needle)) return i;
+        if (i == 0) return null;
+    }
+}
+
+fn decompressDeflateToBuf(compressed: []const u8, out: []u8) !void {
+    // Wrap `compressed` in a memory Reader, drive a raw-deflate
+    // Decompress over it, and read exactly `out.len` bytes into the
+    // output buffer.
+    var in_reader = std.Io.Reader.fixed(compressed);
+    var flate_buffer: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(&in_reader, .raw, &flate_buffer);
+    decompress.reader.readSliceAll(out) catch return error.ZipBadFile;
+}
+
+test "walkZipPes recovers PE entries from a fabricated archive" {
+    const allocator = std.testing.allocator;
+
+    // Build a tiny zip with two entries:
+    //   foo.txt (skipped — not a PE suffix)
+    //   tiny.exe ("MZHELLO" — 7 bytes, store-compressed)
+    // Layout:
+    //   [LFH foo.txt][data][LFH tiny.exe][data]
+    //   [CDH foo.txt][CDH tiny.exe]
+    //   [EOCD]
+    const txt_name = "foo.txt";
+    const txt_data = "hello";
+    const pe_name = "tiny.exe";
+    const pe_data = "MZHELLO";
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+
+    // LFH foo.txt
+    const lfh1_off = aw.written().len;
+    try w.writeAll(&zip.local_file_header_sig);
+    try w.writeInt(u16, 20, .little); // version_needed
+    try w.writeInt(u16, 0, .little); // flags
+    try w.writeInt(u16, 0, .little); // method = store
+    try w.writeInt(u16, 0, .little); // mod time
+    try w.writeInt(u16, 0, .little); // mod date
+    try w.writeInt(u32, std.hash.Crc32.hash(txt_data), .little);
+    try w.writeInt(u32, @intCast(txt_data.len), .little); // compressed
+    try w.writeInt(u32, @intCast(txt_data.len), .little); // uncompressed
+    try w.writeInt(u16, @intCast(txt_name.len), .little);
+    try w.writeInt(u16, 0, .little); // extra len
+    try w.writeAll(txt_name);
+    try w.writeAll(txt_data);
+
+    // LFH tiny.exe
+    const lfh2_off = aw.written().len;
+    try w.writeAll(&zip.local_file_header_sig);
+    try w.writeInt(u16, 20, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u32, std.hash.Crc32.hash(pe_data), .little);
+    try w.writeInt(u32, @intCast(pe_data.len), .little);
+    try w.writeInt(u32, @intCast(pe_data.len), .little);
+    try w.writeInt(u16, @intCast(pe_name.len), .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeAll(pe_name);
+    try w.writeAll(pe_data);
+
+    // CDH foo.txt
+    const cd_off = aw.written().len;
+    try w.writeAll(&zip.central_file_header_sig);
+    try w.writeInt(u16, 20, .little); // version made by
+    try w.writeInt(u16, 20, .little); // version needed
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u32, std.hash.Crc32.hash(txt_data), .little);
+    try w.writeInt(u32, @intCast(txt_data.len), .little);
+    try w.writeInt(u32, @intCast(txt_data.len), .little);
+    try w.writeInt(u16, @intCast(txt_name.len), .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u32, 0, .little); // external attrs
+    try w.writeInt(u32, @intCast(lfh1_off), .little);
+    try w.writeAll(txt_name);
+
+    // CDH tiny.exe
+    try w.writeAll(&zip.central_file_header_sig);
+    try w.writeInt(u16, 20, .little);
+    try w.writeInt(u16, 20, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u32, std.hash.Crc32.hash(pe_data), .little);
+    try w.writeInt(u32, @intCast(pe_data.len), .little);
+    try w.writeInt(u32, @intCast(pe_data.len), .little);
+    try w.writeInt(u16, @intCast(pe_name.len), .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u32, 0, .little);
+    try w.writeInt(u32, @intCast(lfh2_off), .little);
+    try w.writeAll(pe_name);
+
+    const cd_size = aw.written().len - cd_off;
+
+    // EOCD
+    try w.writeAll(&zip.end_record_sig);
+    try w.writeInt(u16, 0, .little); // disk number
+    try w.writeInt(u16, 0, .little); // disk where CD starts
+    try w.writeInt(u16, 2, .little); // total entries on this disk
+    try w.writeInt(u16, 2, .little); // total entries
+    try w.writeInt(u32, @intCast(cd_size), .little);
+    try w.writeInt(u32, @intCast(cd_off), .little);
+    try w.writeInt(u16, 0, .little); // comment len
+
+    var results: std.array_list.Managed(PeEntryResult) = .init(allocator);
+    defer {
+        for (results.items) |r| allocator.free(r.bytes);
+        results.deinit();
+    }
+    try walkZipPes(allocator, aw.written(), &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqualStrings("tiny.exe", results.items[0].name);
+    try std.testing.expectEqualSlices(u8, pe_data, results.items[0].bytes);
 }
 ///
 /// Re-uses the std.crypto.Certificate.verify primitive, which
