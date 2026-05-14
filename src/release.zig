@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const http = @import("http.zig");
 const sigstore = @import("sigstore.zig");
 const minisign = @import("minisign.zig");
+const authenticode = @import("authenticode.zig");
 const version = @import("build_options").version;
 
 const Io = std.Io;
@@ -611,6 +612,10 @@ pub const VerifyOutcome = enum {
     /// minisign public key verified both the artifact and trusted-comment
     /// signatures.
     minisign_verified,
+    /// An embedded Authenticode signature on the downloaded PE (or on a
+    /// PE inside a downloaded `.zip`) verified against an embedded MS /
+    /// commercial CA trust root, with a valid RFC 3161 timestamp.
+    authenticode_verified,
     /// A sigstore bundle was found and verification (chain, signature, Rekor
     /// SET) succeeded. This implies SHA256 verification too — the bundle's
     /// `messageDigest` is checked against the cached file.
@@ -964,6 +969,139 @@ pub fn verifyDownloadedAssetSigstore(
     return .sigstore_verified;
 }
 
+/// Run Authenticode verification on `download_path`. Auto-detects the
+/// file shape:
+///
+///   * MZ-prefixed → treat as a single PE, verify its embedded
+///     PKCS#7 SignedData.
+///   * `PK\x03\x04`-prefixed → walk the zip in memory, find any
+///     `.exe` / `.dll` / `.sys` entries, and verify each PE that
+///     carries an Authenticode signature.
+///   * Anything else → return `.no_verification`.
+///
+/// Fail-closed when a PE carries an Authenticode signature but it
+/// doesn't verify. Fail-open (return `.no_verification`) when no PE
+/// in the file carries any Authenticode signature — same model as
+/// the sigstore / sha256 verifiers.
+pub fn verifyDownloadedAssetAuthenticode(
+    allocator: std.mem.Allocator,
+    io: Io,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    var file = try Dir.openFileAbsolute(io, download_path, .{});
+    defer file.close(io);
+
+    // Peek at the first 4 bytes to short-circuit on non-PE/non-zip
+    // downloads before slurping the whole file into memory.
+    var magic: [4]u8 = undefined;
+    {
+        var peek_buf: [4]u8 = undefined;
+        var fr = file.reader(io, &peek_buf);
+        const n = fr.interface.readSliceShort(&magic) catch 0;
+        if (n < 4) return .no_verification;
+    }
+    const is_pe = magic[0] == 'M' and magic[1] == 'Z';
+    const is_zip = std.mem.eql(u8, &magic, &[_]u8{ 'P', 'K', 0x03, 0x04 });
+    if (!is_pe and !is_zip) return .no_verification;
+
+    const stat = try file.stat(io);
+    if (stat.size > authenticode.max_entry_size) {
+        debugLog(debug_w, "debug: authenticode: skipping (file > {d} bytes)\n", .{authenticode.max_entry_size});
+        return .no_verification;
+    }
+
+    // Read the whole file with a fresh reader (the peek above consumed
+    // some bytes from the first one).
+    var file2 = try Dir.openFileAbsolute(io, download_path, .{});
+    defer file2.close(io);
+    var read_buf: [64 * 1024]u8 = undefined;
+    var fr2 = file2.reader(io, &read_buf);
+    const bytes = try allocator.alloc(u8, @intCast(stat.size));
+    defer allocator.free(bytes);
+    try fr2.interface.readSliceAll(bytes);
+
+    var trust = try authenticode.buildTrustBundle(allocator, Io.Clock.now(.real, io).toSeconds());
+    defer trust.deinit(allocator);
+
+    const now = Io.Clock.now(.real, io).toSeconds();
+
+    if (is_pe) {
+        return verifySinglePe(allocator, bytes, trust, now, "asset", debug_w, w, err_w);
+    }
+    return verifyZipPes(allocator, bytes, trust, now, debug_w, w, err_w);
+}
+
+fn verifySinglePe(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    trust: std.crypto.Certificate.Bundle,
+    now: i64,
+    display_name: []const u8,
+    debug_w: ?*Writer,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    _ = debug_w;
+    const image = authenticode.parsePe(bytes) catch return .no_verification;
+    const cert_entry = (authenticode.findFirstPkcs7Entry(image) catch null) orelse
+        return .no_verification;
+    _ = cert_entry;
+
+    const outcome = authenticode.verifyPe(allocator, bytes, trust, trust, now) catch |err| {
+        try err_w.print("error: authenticode verification failed for '{s}': {s}\n", .{ display_name, @errorName(err) });
+        try err_w.flush();
+        return error.AuthenticodeVerificationFailed;
+    };
+
+    var digest_hex: [64]u8 = undefined;
+    sha256ToHex(outcome.digest, &digest_hex);
+    try w.print("verified authenticode: sha256 {s}… (genTime {d})\n", .{ digest_hex[0..12], outcome.gen_time });
+    if (outcome.subject_cn.len > 0) {
+        try w.print("  subject: {s}\n", .{outcome.subject_cn});
+    }
+    if (outcome.organization.len > 0) {
+        try w.print("  org:     {s}\n", .{outcome.organization});
+    }
+    try w.flush();
+    return .authenticode_verified;
+}
+
+fn verifyZipPes(
+    allocator: std.mem.Allocator,
+    zip_bytes: []const u8,
+    trust: std.crypto.Certificate.Bundle,
+    now: i64,
+    debug_w: ?*Writer,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    var results: std.array_list.Managed(authenticode.PeEntryResult) = .init(allocator);
+    defer {
+        for (results.items) |r| allocator.free(r.bytes);
+        results.deinit();
+    }
+    authenticode.walkZipPes(allocator, zip_bytes, &results) catch |err| {
+        debugLog(debug_w, "debug: authenticode zip walk failed: {s}\n", .{@errorName(err)});
+        return .no_verification;
+    };
+
+    var any_signed = false;
+    var last_outcome: VerifyOutcome = .no_verification;
+    for (results.items) |entry| {
+        const image = authenticode.parsePe(entry.bytes) catch continue;
+        const cert_entry = (authenticode.findFirstPkcs7Entry(image) catch null) orelse continue;
+        _ = cert_entry;
+        any_signed = true;
+        const out = try verifySinglePe(allocator, entry.bytes, trust, now, entry.name, debug_w, w, err_w);
+        if (out == .authenticode_verified) last_outcome = .authenticode_verified;
+    }
+    if (!any_signed) return .no_verification;
+    return last_outcome;
+}
+
 // ---------------------------------------------------------------------------
 // Asset matching by name and unified verification wrapper.
 // ---------------------------------------------------------------------------
@@ -1306,11 +1444,21 @@ pub fn verifyAssetOnDisk(
         err_w,
     );
 
+    const ac_outcome = try verifyDownloadedAssetAuthenticode(
+        allocator,
+        io,
+        download_path,
+        debug_w,
+        w,
+        err_w,
+    );
+
     if (sig_outcome == .sigstore_verified) return .sigstore_verified;
     if (mini_outcome == .minisign_verified) return .minisign_verified;
+    if (ac_outcome == .authenticode_verified) return .authenticode_verified;
     if (sha_outcome == .sha256_verified) return .sha256_verified;
 
-    try w.print("note: download is unverified (no checksum, minisign, or sigstore)\n", .{});
+    try w.print("note: download is unverified (no checksum, minisign, sigstore, or authenticode)\n", .{});
     try w.flush();
     return .no_verification;
 }
@@ -1322,6 +1470,7 @@ pub fn verifyAssetOnDisk(
 test {
     _ = @import("sigstore.zig");
     _ = @import("minisign.zig");
+    _ = @import("authenticode.zig");
 }
 
 test "parseRepoSpec with tag" {

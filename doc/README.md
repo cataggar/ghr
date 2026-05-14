@@ -198,11 +198,46 @@ publishes:
   ignoring a published signature would silently skip a real verification
   opportunity, so the caller must opt in (pass `--minisign <pubkey>`) or
   opt out (`--skip-verify`).
+- **Authenticode (Windows)** — auto-detected from the downloaded bytes.
+  When the asset is a PE (DOS `MZ` magic) or a `.zip` containing one or
+  more `.exe` / `.dll` / `.sys` entries, ghr verifies each PE's embedded
+  PKCS#7 SignedData natively in Zig:
+
+  1. Recompute the SHA-256 Authenticode digest (CheckSum, Security
+     data-directory entry, and certificate table excluded — per the
+     Authenticode whitepaper / `signify`).
+  2. Parse the embedded `SpcIndirectDataContent` and bind its declared
+     digest to the recomputed one.
+  3. Verify the SignerInfo signature over `signedAttrs` (replacing the
+     IMPLICIT `[0]` tag with the SET-OF tag for the CMS-canonical input)
+     against the signer cert's public key. RSA-PKCS#1 v1.5 with SHA-256
+     / SHA-384 / SHA-512 and ECDSA-P256 / -P384 are all accepted.
+  4. Locate the RFC 3161 timestamp counter-signature (either
+     `id-aa-signatureTimeStampToken` or Microsoft's
+     `szOID_RFC3161_counterSign`), verify the TimeStampToken's own
+     SignerInfo signature, walk the TSA cert chain to a trusted TSA
+     root, and bind `TSTInfo.messageImprint` to `sha256(signer
+     signature)`.
+  5. Walk the X.509 chain from the signer cert through the
+     intermediates carried in the SignedData's `certificates` SET to
+     one of the 14 embedded trust roots (Microsoft Identity
+     Verification Root 2020, Microsoft Root CA 2011, DigiCert Trusted
+     Root G4 / Global G3 / Global / High Assurance EV / Assured ID G3,
+     GlobalSign Root CA R3 / R6 / Code Signing R45, USERTrust RSA /
+     ECC, Entrust Root G2 / EC1). The TSA's `genTime` is used as the
+     validity clock so signatures remain trustworthy past the signer
+     cert's `notAfter`.
+
+  Authenticode is fail-closed when a PE inside the asset carries a
+  signature that doesn't verify, and fail-open when no PE carries any
+  signature (consistent with the other verifiers). Untimestamped
+  signatures are rejected since the cert-validity clock can't be
+  derived without a TSA witness.
 
 On any verification failure the operation is aborted and the cached
-download is deleted. If no checksum, minisign sidecar, or bundle is
-published the download proceeds with a `note:` line so you know it was
-unverified.
+download is deleted. If no checksum, minisign sidecar, sigstore bundle,
+or Authenticode signature is published the download proceeds with a
+`note:` line so you know it was unverified.
 
 Pass `--skip-verify` to bypass all checks. For `install`, the strongest
 result is recorded in each tool's `ghr.json` metadata as `"verified"`:
@@ -211,17 +246,24 @@ result is recorded in each tool's `ghr.json` metadata as `"verified"`:
   declared SHA256 matches the file).
 - `"minisign"` — minisign sidecar verified by the caller-supplied
   `--minisign` key (artifact + trusted-comment signatures).
+- `"authenticode"` — Authenticode signature on the downloaded PE (or on
+  a PE inside the downloaded `.zip`) verified against an embedded MS /
+  commercial CA trust root, with a valid RFC 3161 timestamp.
 - `"sha256"` — SHA256 checksum verified.
 - `"none"` — no verification material was published.
 - `"skipped"` — `--skip-verify` was passed.
 
 When more than one verifier succeeds (e.g. sha256 *and* sigstore, or
-sha256 *and* minisign) the strongest one is recorded — precedence is
-sigstore > minisign > sha256. All successful verifiers still print their
-own diagnostic line, so the full set is visible at install time.
+sha256 *and* Authenticode) the strongest one is recorded — precedence
+is sigstore > minisign > authenticode > sha256. All successful
+verifiers still print their own diagnostic line, so the full set is
+visible at install time.
 
-The trust roots embedded in ghr come from
-[`sigstore/root-signing`](https://github.com/sigstore/root-signing).
+The trust roots embedded in ghr come from two sources:
+[`sigstore/root-signing`](https://github.com/sigstore/root-signing)
+for the sigstore + Rekor anchor, and a Mozilla CCADB snapshot plus
+direct issuing-CA fetches for the Authenticode + RFC 3161 roots
+(documented per-root in [`src/authenticode/trust/README.md`](../src/authenticode/trust/README.md)).
 Rotating them requires a new ghr release.
 
 ## Reproducible builds
