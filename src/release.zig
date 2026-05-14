@@ -936,14 +936,14 @@ pub fn verifyDownloadedAssetSigstore(
     var file = try Dir.openFileAbsolute(io, download_path, .{});
     defer file.close(io);
 
-    const identity = sigstore.verifyBundle(allocator, io, bundle, rekor, file) catch |err| {
+    const identity = sigstore.verifyBundle(allocator, io, bundle, rekor, file, asset_name) catch |err| {
         try err_w.print("error: sigstore verification failed for '{s}': {s}\n", .{ asset_name, @errorName(err) });
         try err_w.flush();
         return error.SigstoreVerificationFailed;
     };
 
     var digest_hex: [64]u8 = undefined;
-    sha256ToHex(bundle.artifact_digest, &digest_hex);
+    sha256ToHex(identity.artifact_digest, &digest_hex);
     try w.print(
         "verified sigstore: sha256 {s}… (rekor t={d}, log {d})\n",
         .{ digest_hex[0..12], identity.integrated_time, bundle.rekor_log_index },
@@ -1310,7 +1310,7 @@ pub fn verifyAssetOnDisk(
     if (mini_outcome == .minisign_verified) return .minisign_verified;
     if (sha_outcome == .sha256_verified) return .sha256_verified;
 
-    try w.print("note: download is unverified (no SHA256 checksum, minisign sidecar, or sigstore bundle published)\n", .{});
+    try w.print("note: download is unverified (no checksum, minisign, or sigstore)\n", .{});
     try w.flush();
     return .no_verification;
 }

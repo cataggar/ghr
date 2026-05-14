@@ -158,6 +158,29 @@ publishes:
   observable log root. The signer's SAN (URI/email) and OIDC issuer are
   extracted from the leaf cert and printed to stdout for visual review;
   ghr does not yet enforce a specific identity.
+
+  Two artifact-binding shapes are supported, matching the two Rekor entry
+  kinds we see in the wild:
+
+  - `hashedrekord` — cosign's classic blob-signing form. The bundle's
+    `messageSignature` covers a single artifact whose sha256 is the
+    `messageDigest`. ghr requires a sibling `<asset>.sigstore.json`.
+  - `dsse` — a DSSE envelope wrapping an
+    [in-toto v1 Statement](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md),
+    typically a [SLSA Provenance v1](https://slsa.dev/provenance/v1)
+    attestation produced by `slsa-github-generator` or
+    `cosign attest`. The Statement's `subject` list binds one or more
+    artifacts by `name` + `sha256`. ghr falls back to any bare
+    `*.sigstore.json` asset (e.g. `wash.sigstore.json` covering all
+    `wash-<platform>` binaries) when no per-asset sidecar is published,
+    and requires the downloaded asset's name + sha256 to appear as one
+    of the Statement's subjects.
+
+  DSSE signatures are verified against the
+  [DSSE v1 pre-authenticated encoding](https://github.com/secure-systems-lab/dsse/blob/master/protocol.md)
+  of the payload; the Rekor `dsse / 0.0.1` body is checked to bind back
+  to the bundle's envelope (`payloadHash` equals sha256 of the payload;
+  signature + verifier cert equal the bundle's).
 - **Minisign signatures** — `<asset>.minisig` sidecars
   ([minisign v2](https://jedisct1.github.io/minisign/)) are verified when
   the caller passes `--minisign <base64-pubkey>`. The flag value is the
