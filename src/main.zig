@@ -4,6 +4,7 @@ const Dirs = @import("dirs.zig").Dirs;
 const install = @import("install.zig");
 const download = @import("download.zig");
 const ensurepath = @import("ensurepath.zig");
+const validate = @import("validate.zig");
 
 pub const version = build_options.version;
 
@@ -101,6 +102,8 @@ pub fn main(init: std.process.Init) !void {
         try install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "download")) {
         try download.cmdDownload(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
+    } else if (eql(cmd_str, "validate")) {
+        try validate.cmdValidate(allocator, io, &args, &stdout.interface, &stderr.interface);
     } else {
         try stderr.interface.print("error: unknown command '{s}'\n\n", .{cmd_str});
         try printUsage(&stderr.interface);
@@ -328,6 +331,7 @@ fn printUsage(w: *Writer) !void {
         \\    download <owner/repo/file[@tag]>     Download a specific asset by name
         \\    path ensure [--dry-run]              Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
+        \\    validate <SUBCOMMAND>                Run validations against published artifacts
         \\    version                              Print version and exit
         \\    help                                 Print this help and exit
         \\
@@ -354,4 +358,5 @@ test {
     _ = @import("archive.zig");
     _ = @import("auth.zig");
     _ = @import("download.zig");
+    _ = @import("validate.zig");
 }
