@@ -1,8 +1,15 @@
 name: Reproducibility
 
-# Validates that the published tar.gz archives for a release tag can be
-# byte-reproduced from source. Windows zips contain a code-signed .exe and
-# are intentionally not covered.
+# Validates that the published archives for a release tag can be byte-
+# reproduced from source.
+#
+# - Linux + macOS .tar.gz archives are compared whole (deterministic
+#   packaging via scripts/pack.py).
+# - Windows .zip archives embed an Authenticode-signed .exe and are
+#   therefore not byte-reproducible at the .zip level. For those, the
+#   reproduce-windows job strips the Authenticode signature off the
+#   published .exe and compares its sha256 against a locally-rebuilt
+#   unsigned .exe (issue #78, Option E).
 #
 # Triggers:
 #   * workflow_run on "Release" success — automatically validates each new tag.
@@ -204,4 +211,186 @@ jobs:
           path: |
             published/
             rebuilt/
+            diag/
+
+  # ---------------------------------------------------------------------------
+  # Windows reproducibility (issue #78, Option E).
+  #
+  # The published Windows .zip embeds an Authenticode-signed .exe, so the
+  # .zip itself is intentionally not byte-reproducible. We compare the
+  # signed .exe against a locally-rebuilt unsigned .exe by stripping the
+  # signature off the published one. The strip is performed by a
+  # host-native ghr binary we build in the same job (the cross-target
+  # rebuild — e.g. aarch64-windows — isn't necessarily runnable on the
+  # x64 runner).
+  # ---------------------------------------------------------------------------
+  reproduce-windows:
+    name: Reproduce ${{ matrix.name }}
+    needs: resolve-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-windows
+            name: windows-x64
+          - os: windows-latest
+            target: aarch64-windows
+            name: windows-arm64
+
+    steps:
+      - name: Checkout source at ${{ needs.resolve-tag.outputs.tag }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Compute SOURCE_DATE_EPOCH
+        shell: bash
+        run: |
+          SDE=$(git log -1 --pretty=%ct HEAD)
+          echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
+          echo "Using SOURCE_DATE_EPOCH=$SDE"
+
+      - name: Build host stripper (x86_64-windows native)
+        shell: bash
+        run: |
+          # No -Dtarget: builds for the host. On windows-latest this is
+          # x86_64-windows; the resulting ghr.exe is runnable directly
+          # and supplies `validate strip-authenticode` for the strip
+          # step below. We don't care that this binary is itself
+          # reproducible — only that it executes correctly.
+          zig build -Doptimize=ReleaseSafe -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
+          mv zig-out/bin/ghr.exe stripper.exe
+          ./stripper.exe version
+
+      - name: Build target unsigned ghr.exe
+        shell: bash
+        run: |
+          rm -rf zig-out
+          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
+          PKGNAME="ghr-${{ needs.resolve-tag.outputs.version }}-${{ matrix.name }}"
+          echo "PKGNAME=$PKGNAME" >> "$GITHUB_ENV"
+          ls -l zig-out/bin/ghr.exe
+
+      - name: Download published .zip + .sha256
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p published
+          cd published
+          gh release download "${{ needs.resolve-tag.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${PKGNAME}.zip" \
+            --pattern "${PKGNAME}.zip.sha256"
+          ls -la
+
+      - name: Verify published sha256 matches its archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd published
+          # GitHub-served sha256 of the signed zip — we don't compare
+          # this to anything, but confirm the download is internally
+          # consistent.
+          if command -v sha256sum >/dev/null; then
+            sha256sum -c "${PKGNAME}.zip.sha256"
+          else
+            shasum -a 256 -c "${PKGNAME}.zip.sha256"
+          fi
+
+      - name: Extract published .exe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p published-extract
+          unzip -o "published/${PKGNAME}.zip" -d published-extract
+          ls -l "published-extract/${PKGNAME}/bin/ghr.exe"
+
+      - name: Strip Authenticode signature off published .exe
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./stripper.exe validate strip-authenticode \
+            "published-extract/${PKGNAME}/bin/ghr.exe" \
+            "stripped.exe"
+          ls -l stripped.exe
+
+      - name: Compare stripped published vs rebuilt
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v sha256sum >/dev/null; then
+            HASHER="sha256sum"
+          else
+            HASHER="shasum -a 256"
+          fi
+          STRIPPED=$($HASHER stripped.exe | awk '{print $1}')
+          REBUILT=$($HASHER zig-out/bin/ghr.exe | awk '{print $1}')
+          echo "stripped=$STRIPPED" >> "$GITHUB_OUTPUT"
+          echo "rebuilt=$REBUILT"   >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${{ matrix.name }}"
+            echo ""
+            echo "| | sha256 |"
+            echo "|---|---|"
+            echo "| stripped published | \`$STRIPPED\` |"
+            echo "| rebuilt            | \`$REBUILT\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$STRIPPED" == "$REBUILT" ]]; then
+            echo "result=match" >> "$GITHUB_OUTPUT"
+            echo "✅ REPRODUCIBLE: ${{ matrix.name }} (stripped == rebuilt)"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "✅ Reproducible (Option E: signed → strip == unsigned rebuild)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "result=mismatch" >> "$GITHUB_OUTPUT"
+            echo "::error::Reproducibility mismatch for ${{ matrix.name }}: stripped=$STRIPPED rebuilt=$REBUILT"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "❌ Mismatch — see diagnostics step for details." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Diagnose mismatch
+        if: steps.compare.outputs.result == 'mismatch'
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p diag
+          if command -v sha256sum >/dev/null; then
+            sha256sum stripped.exe zig-out/bin/ghr.exe > diag/sha256.txt || true
+          else
+            shasum -a 256 stripped.exe zig-out/bin/ghr.exe > diag/sha256.txt || true
+          fi
+          echo "=== sha256 ==="
+          cat diag/sha256.txt
+          echo "=== sizes ==="
+          ls -l stripped.exe zig-out/bin/ghr.exe
+          echo "=== Binary diff (first 200 byte differences) ==="
+          cmp -l stripped.exe zig-out/bin/ghr.exe | head -200 || true
+          # The first ~512 bytes contain the DOS + NT headers; print
+          # them side-by-side to make any header-level drift obvious.
+          echo "=== Header dump: stripped ==="
+          od -An -t x1 -N 512 stripped.exe | head -32
+          echo "=== Header dump: rebuilt ==="
+          od -An -t x1 -N 512 zig-out/bin/ghr.exe | head -32
+          exit 1
+
+      - name: Upload diagnostic artifacts
+        if: always() && steps.compare.outputs.result == 'mismatch'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: repro-diag-${{ matrix.name }}
+          path: |
+            published/
+            published-extract/
+            stripped.exe
+            zig-out/bin/ghr.exe
             diag/
