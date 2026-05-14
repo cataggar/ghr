@@ -341,6 +341,496 @@ pub fn findFirstPkcs7Entry(image: PeImage) WinCertError!?WinCertificate {
 }
 
 // ---------------------------------------------------------------------------
+// PKCS#7 SignedData (CMS) parser for Authenticode signatures.
+//
+// Authenticode embeds a single PKCS#7 `SignedData` structure in each
+// `WIN_CERTIFICATE` entry. The relevant ASN.1 shape (RFC 5652 / PKCS#7
+// + Microsoft's Authenticode extensions):
+//
+//   ContentInfo ::= SEQUENCE {
+//       contentType OBJECT IDENTIFIER,   -- 1.2.840.113549.1.7.2 (signedData)
+//       content     [0] EXPLICIT SignedData
+//   }
+//
+//   SignedData ::= SEQUENCE {
+//       version              INTEGER,
+//       digestAlgorithms     SET OF AlgorithmIdentifier,
+//       encapContentInfo     EncapsulatedContentInfo,  -- spcIndirectData
+//       certificates         [0] IMPLICIT CertificateSet OPTIONAL,
+//       crls                 [1] IMPLICIT RevocationInfoChoices OPTIONAL,
+//       signerInfos          SET OF SignerInfo
+//   }
+//
+//   EncapsulatedContentInfo ::= SEQUENCE {
+//       eContentType         OBJECT IDENTIFIER,  -- 1.3.6.1.4.1.311.2.1.4
+//       eContent             [0] EXPLICIT OCTET STRING OPTIONAL  -- SpcIndirectDataContent
+//   }
+//
+//   SpcIndirectDataContent ::= SEQUENCE {
+//       data                 SpcAttributeTypeAndOptionalValue,
+//       messageDigest        DigestInfo
+//   }
+//
+//   DigestInfo ::= SEQUENCE {
+//       digestAlgorithm      AlgorithmIdentifier,
+//       digest               OCTET STRING
+//   }
+//
+//   SignerInfo ::= SEQUENCE {
+//       version              INTEGER,
+//       sid                  SignerIdentifier,    -- IssuerAndSerialNumber or [0] SKI
+//       digestAlgorithm      AlgorithmIdentifier,
+//       signedAttrs          [0] IMPLICIT SET OF Attribute OPTIONAL,
+//       signatureAlgorithm   AlgorithmIdentifier,
+//       signature            OCTET STRING,
+//       unsignedAttrs        [1] IMPLICIT SET OF Attribute OPTIONAL
+//   }
+//
+//   Attribute ::= SEQUENCE {
+//       attrType             OBJECT IDENTIFIER,
+//       attrValues           SET OF AttrValue
+//   }
+//
+// The CMS signer signature is computed over the DER re-encoding of the
+// signedAttrs SET with its IMPLICIT [0] tag (0xA0) replaced by the
+// explicit SET OF tag (0x31). That re-encoding is a documented CMS
+// quirk; we materialise it on demand for verification.
+// ---------------------------------------------------------------------------
+
+const Certificate = std.crypto.Certificate;
+const der = Certificate.der;
+
+/// Well-known OIDs in raw DER content form (without the leading tag +
+/// length prefix). These match `Certificate.der.Element.slice` content
+/// for an OID element.
+pub const oid = struct {
+    pub const signed_data = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02 };
+    pub const spc_indirect_data = [_]u8{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x01, 0x04 };
+    pub const message_digest = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04 };
+    pub const content_type = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x03 };
+    pub const signing_time = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x05 };
+    pub const timestamp_token = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x10, 0x02, 0x0E };
+    pub const nested_signature = [_]u8{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x04, 0x01 };
+
+    pub const sha256 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01 };
+    pub const sha384 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02 };
+    pub const sha512 = [_]u8{ 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03 };
+
+    pub const rsa_encryption = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01 };
+    pub const sha256_with_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B };
+    pub const sha384_with_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C };
+    pub const sha512_with_rsa = [_]u8{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0D };
+    pub const ecdsa_with_sha256 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02 };
+    pub const ecdsa_with_sha384 = [_]u8{ 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03 };
+};
+
+/// Hash algorithm referenced by an Authenticode SignedData. Authenticode
+/// itself is restricted to SHA-256 in practice; SHA-1 historically and
+/// SHA-384/-512 in newer specs.
+pub const HashAlgorithm = enum { sha256, sha384, sha512 };
+
+/// Signature algorithm of the SignerInfo / TSA SignerInfo.
+pub const SignatureAlgorithm = enum {
+    rsa_pkcs1_v15_sha256,
+    rsa_pkcs1_v15_sha384,
+    rsa_pkcs1_v15_sha512,
+    /// "Plain" rsaEncryption (no hash baked into the OID) — the hash is
+    /// supplied separately via the SignerInfo's `digestAlgorithm`.
+    rsa_pkcs1_v15_implicit_hash,
+    ecdsa_sha256,
+    ecdsa_sha384,
+};
+
+pub const Pkcs7Error = error{
+    InvalidContentInfo,
+    UnsupportedContentType,
+    InvalidSignedData,
+    UnsupportedSignedDataVersion,
+    UnsupportedEncapContentType,
+    InvalidSpcIndirectData,
+    UnsupportedDigestAlgorithm,
+    UnsupportedSignatureAlgorithm,
+    InvalidSignerInfo,
+    MissingSignedAttrs,
+    MissingMessageDigestAttr,
+    MissingContentTypeAttr,
+    UnsupportedCertificateSet,
+    SignedAttrsTooLarge,
+} || der.Element.ParseError;
+
+/// One signer of an Authenticode SignedData. We only model what we need
+/// to verify: the message digest claim, the signed-attrs re-encoding,
+/// and the signer's signature.
+pub const SignerInfo = struct {
+    /// `version` integer (must be 1 for IssuerAndSerialNumber form).
+    version: u8,
+    /// Hash algorithm declared by `digestAlgorithm`.
+    digest_alg: HashAlgorithm,
+    /// Signature algorithm declared by `signatureAlgorithm`.
+    signature_alg: SignatureAlgorithm,
+    /// Raw DER bytes of the `signedAttrs` SET (with its IMPLICIT [0]
+    /// tag still in place). The CMS-canonical message-to-be-signed is
+    /// obtained by replacing the leading 0xA0 with 0x31; see
+    /// `signedAttrsForSigning`.
+    signed_attrs_raw: []const u8,
+    /// Decrypted-on-verify signature bytes. For RSA, this is the raw
+    /// PKCS#1 v1.5 signature; for ECDSA, the DER-encoded (r,s) pair.
+    signature: []const u8,
+    /// Raw DER bytes of the `unsignedAttrs` SET (or empty when absent).
+    /// The IMPLICIT [1] tag (0xA1) is still in place.
+    unsigned_attrs_raw: []const u8,
+    /// `messageDigest` attribute value (the file's digest, per the
+    /// signer).
+    message_digest: []const u8,
+    /// Raw DER bytes of `SignerIdentifier`. For our purposes this is
+    /// IssuerAndSerialNumber; we treat it as an opaque blob used only
+    /// for "did this cert sign this SignerInfo?" lookups.
+    sid_raw: []const u8,
+};
+
+/// Parsed Authenticode SignedData. All slices are sub-slices of the
+/// input PKCS#7 blob; the struct does not own any memory.
+pub const SignedData = struct {
+    /// The whole PKCS#7 ContentInfo blob this was parsed from.
+    raw: []const u8,
+    /// `eContentType` of the encapContentInfo (always
+    /// `oid.spc_indirect_data` for Authenticode).
+    encap_content_type: []const u8,
+    /// Raw DER bytes of the SpcIndirectDataContent SEQUENCE (without
+    /// the OCTET STRING wrapper). Useful for the Rekor-like binding
+    /// check: sha256(spc_indirect_data) must equal the
+    /// `messageDigest` signed attribute on the SignerInfo.
+    spc_indirect_data: []const u8,
+    /// File digest extracted from SpcIndirectDataContent.messageDigest.
+    file_digest_alg: HashAlgorithm,
+    file_digest: []const u8,
+    /// Raw DER of the certificates SET ([0] IMPLICIT). Each child
+    /// is a complete X.509 certificate.
+    certificates_raw: []const u8,
+    /// The first SignerInfo. Authenticode signatures are
+    /// single-signer; nested signatures live in the SignerInfo's
+    /// `unsignedAttrs` and are walked separately.
+    signer: SignerInfo,
+};
+
+/// Parse a PKCS#7 ContentInfo blob carrying SignedData. The returned
+/// `SignedData` borrows from `pkcs7_bytes`.
+pub fn parseSignedData(pkcs7_bytes: []const u8) Pkcs7Error!SignedData {
+    // ContentInfo := SEQUENCE { contentType OID, content [0] EXPLICIT SignedData }
+    const ci = try der.Element.parse(pkcs7_bytes, 0);
+    if (ci.identifier.tag != .sequence) return error.InvalidContentInfo;
+    const ci_end = ci.slice.end;
+
+    const ci_oid = try der.Element.parse(pkcs7_bytes, ci.slice.start);
+    if (ci_oid.identifier.tag != .object_identifier) return error.InvalidContentInfo;
+    if (!std.mem.eql(u8, pkcs7_bytes[ci_oid.slice.start..ci_oid.slice.end], &oid.signed_data))
+        return error.UnsupportedContentType;
+
+    const ci_content_explicit = try der.Element.parse(pkcs7_bytes, ci_oid.slice.end);
+    if (!isContextSpecificTag(ci_content_explicit.identifier, 0))
+        return error.InvalidContentInfo;
+    if (ci_content_explicit.slice.end > ci_end) return error.InvalidContentInfo;
+
+    // SignedData := SEQUENCE { ... }
+    const sd = try der.Element.parse(pkcs7_bytes, ci_content_explicit.slice.start);
+    if (sd.identifier.tag != .sequence) return error.InvalidSignedData;
+
+    var i: u32 = sd.slice.start;
+    const sd_end: u32 = sd.slice.end;
+
+    // version INTEGER
+    const ver_elem = try der.Element.parse(pkcs7_bytes, i);
+    if (ver_elem.identifier.tag != .integer) return error.InvalidSignedData;
+    if (ver_elem.slice.end - ver_elem.slice.start != 1) return error.UnsupportedSignedDataVersion;
+    // version 1 (PKCS#7) or 3 (CMS with SubjectKeyIdentifier signer) are
+    // both seen in the wild. Authenticode uses 1.
+    const version = pkcs7_bytes[ver_elem.slice.start];
+    if (version != 1 and version != 3) return error.UnsupportedSignedDataVersion;
+    i = ver_elem.slice.end;
+
+    // digestAlgorithms SET OF AlgorithmIdentifier — skipped; we trust
+    // the SignerInfo's own digestAlgorithm.
+    const dalgs = try der.Element.parse(pkcs7_bytes, i);
+    i = dalgs.slice.end;
+
+    // encapContentInfo SEQUENCE { eContentType, [0] EXPLICIT eContent OCTET STRING }
+    const enc = try der.Element.parse(pkcs7_bytes, i);
+    if (enc.identifier.tag != .sequence) return error.InvalidSignedData;
+    i = enc.slice.end;
+
+    const enc_ct = try der.Element.parse(pkcs7_bytes, enc.slice.start);
+    if (enc_ct.identifier.tag != .object_identifier) return error.InvalidSignedData;
+    const encap_content_type = pkcs7_bytes[enc_ct.slice.start..enc_ct.slice.end];
+    // Authenticode only: must be spcIndirectData. For RFC 3161
+    // TimeStampToken we parse via a different entry point.
+    if (!std.mem.eql(u8, encap_content_type, &oid.spc_indirect_data))
+        return error.UnsupportedEncapContentType;
+
+    const enc_content_wrap = try der.Element.parse(pkcs7_bytes, enc_ct.slice.end);
+    if (!isContextSpecificTag(enc_content_wrap.identifier, 0))
+        return error.InvalidSpcIndirectData;
+    const enc_content = try der.Element.parse(pkcs7_bytes, enc_content_wrap.slice.start);
+    if (enc_content.identifier.tag != .octetstring) return error.InvalidSpcIndirectData;
+
+    const spc_indirect_data = pkcs7_bytes[enc_content.slice.start..enc_content.slice.end];
+    const file_digest = try parseSpcIndirectDataMessageDigest(spc_indirect_data);
+
+    // certificates [0] IMPLICIT CertificateSet OPTIONAL — required for our path.
+    var certificates_raw: []const u8 = &.{};
+    var ji = i;
+    if (ji < sd_end) {
+        const next = try der.Element.parse(pkcs7_bytes, ji);
+        if (isContextSpecificTag(next.identifier, 0)) {
+            certificates_raw = pkcs7_bytes[next.slice.start..next.slice.end];
+            ji = next.slice.end;
+        }
+    }
+    // crls [1] IMPLICIT — skipped.
+    if (ji < sd_end) {
+        const next = try der.Element.parse(pkcs7_bytes, ji);
+        if (isContextSpecificTag(next.identifier, 1)) ji = next.slice.end;
+    }
+
+    // signerInfos SET OF SignerInfo
+    const sinfos = try der.Element.parse(pkcs7_bytes, ji);
+    if (sinfos.identifier.tag != .sequence_of and sinfos.identifier.tag != .sequence)
+        return error.InvalidSignedData;
+
+    const first_signer = try der.Element.parse(pkcs7_bytes, sinfos.slice.start);
+    if (first_signer.identifier.tag != .sequence) return error.InvalidSignerInfo;
+    const signer = try parseSignerInfo(pkcs7_bytes, first_signer);
+
+    return .{
+        .raw = pkcs7_bytes[ci.slice.start - 0 .. ci.slice.end], // span of ContentInfo content body
+        .encap_content_type = encap_content_type,
+        .spc_indirect_data = spc_indirect_data,
+        .file_digest_alg = file_digest.alg,
+        .file_digest = file_digest.digest,
+        .certificates_raw = certificates_raw,
+        .signer = signer,
+    };
+}
+
+const FileDigest = struct { alg: HashAlgorithm, digest: []const u8 };
+
+fn parseSpcIndirectDataMessageDigest(spc: []const u8) Pkcs7Error!FileDigest {
+    const root = try der.Element.parse(spc, 0);
+    if (root.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
+
+    // SpcIndirectDataContent := SEQUENCE { data SpcAttributeTypeAndOptionalValue, messageDigest DigestInfo }
+    const data = try der.Element.parse(spc, root.slice.start);
+    if (data.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
+
+    const digest_info = try der.Element.parse(spc, data.slice.end);
+    if (digest_info.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
+
+    // DigestInfo := SEQUENCE { digestAlgorithm AlgorithmIdentifier, digest OCTET STRING }
+    const algo_seq = try der.Element.parse(spc, digest_info.slice.start);
+    if (algo_seq.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
+    const algo_oid = try der.Element.parse(spc, algo_seq.slice.start);
+    if (algo_oid.identifier.tag != .object_identifier) return error.InvalidSpcIndirectData;
+    const alg = try hashAlgFromOid(spc[algo_oid.slice.start..algo_oid.slice.end]);
+
+    const digest_oct = try der.Element.parse(spc, algo_seq.slice.end);
+    if (digest_oct.identifier.tag != .octetstring) return error.InvalidSpcIndirectData;
+
+    return .{ .alg = alg, .digest = spc[digest_oct.slice.start..digest_oct.slice.end] };
+}
+
+fn parseSignerInfo(buf: []const u8, sinfo: der.Element) Pkcs7Error!SignerInfo {
+    var i: u32 = sinfo.slice.start;
+    const end: u32 = sinfo.slice.end;
+
+    // version INTEGER
+    const ver = try der.Element.parse(buf, i);
+    if (ver.identifier.tag != .integer) return error.InvalidSignerInfo;
+    if (ver.slice.end - ver.slice.start != 1) return error.InvalidSignerInfo;
+    const version = buf[ver.slice.start];
+    i = ver.slice.end;
+
+    // sid SignerIdentifier
+    const sid = try der.Element.parse(buf, i);
+    const sid_raw = buf[sid.slice.start - elementHeaderLen(buf, sid) .. sid.slice.end];
+    i = sid.slice.end;
+
+    // digestAlgorithm AlgorithmIdentifier
+    const dalg = try der.Element.parse(buf, i);
+    if (dalg.identifier.tag != .sequence) return error.InvalidSignerInfo;
+    const dalg_oid = try der.Element.parse(buf, dalg.slice.start);
+    if (dalg_oid.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
+    const digest_alg = try hashAlgFromOid(buf[dalg_oid.slice.start..dalg_oid.slice.end]);
+    i = dalg.slice.end;
+
+    // signedAttrs [0] IMPLICIT SET OF Attribute (required for Authenticode)
+    const sa = try der.Element.parse(buf, i);
+    if (!isContextSpecificTag(sa.identifier, 0)) return error.MissingSignedAttrs;
+    // Raw signed-attrs span (including its own [0] tag + length header)
+    // so we can re-emit it as SET OF for signature verification.
+    const sa_full_start: usize = i;
+    const sa_full_end: usize = sa.slice.end;
+    const signed_attrs_raw = buf[sa_full_start..sa_full_end];
+    if (signed_attrs_raw.len > std.math.maxInt(u32)) return error.SignedAttrsTooLarge;
+
+    // Walk signedAttrs to find messageDigest + contentType.
+    var msg_digest: []const u8 = &.{};
+    var found_content_type = false;
+    var ai: u32 = sa.slice.start;
+    while (ai < sa.slice.end) {
+        const attr = try der.Element.parse(buf, ai);
+        if (attr.identifier.tag != .sequence) return error.InvalidSignerInfo;
+        ai = attr.slice.end;
+
+        const attr_oid_e = try der.Element.parse(buf, attr.slice.start);
+        if (attr_oid_e.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
+        const attr_oid_bytes = buf[attr_oid_e.slice.start..attr_oid_e.slice.end];
+
+        const attr_vals = try der.Element.parse(buf, attr_oid_e.slice.end);
+        // SET OF AttrValue — first value is what we want.
+        const first_val = try der.Element.parse(buf, attr_vals.slice.start);
+
+        if (std.mem.eql(u8, attr_oid_bytes, &oid.message_digest)) {
+            if (first_val.identifier.tag != .octetstring) return error.InvalidSignerInfo;
+            msg_digest = buf[first_val.slice.start..first_val.slice.end];
+        } else if (std.mem.eql(u8, attr_oid_bytes, &oid.content_type)) {
+            found_content_type = true;
+        }
+    }
+    if (msg_digest.len == 0) return error.MissingMessageDigestAttr;
+    if (!found_content_type) return error.MissingContentTypeAttr;
+    i = sa_full_end;
+
+    // signatureAlgorithm AlgorithmIdentifier
+    const salg = try der.Element.parse(buf, i);
+    if (salg.identifier.tag != .sequence) return error.InvalidSignerInfo;
+    const salg_oid_e = try der.Element.parse(buf, salg.slice.start);
+    if (salg_oid_e.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
+    const salg_oid_bytes = buf[salg_oid_e.slice.start..salg_oid_e.slice.end];
+    const sig_alg = try sigAlgFromOid(salg_oid_bytes);
+    i = salg.slice.end;
+
+    // signature OCTET STRING
+    const sig_e = try der.Element.parse(buf, i);
+    if (sig_e.identifier.tag != .octetstring) return error.InvalidSignerInfo;
+    const signature = buf[sig_e.slice.start..sig_e.slice.end];
+    i = sig_e.slice.end;
+
+    // unsignedAttrs [1] IMPLICIT SET OF Attribute OPTIONAL
+    var unsigned_attrs_raw: []const u8 = &.{};
+    if (i < end) {
+        const ua = try der.Element.parse(buf, i);
+        if (isContextSpecificTag(ua.identifier, 1)) {
+            unsigned_attrs_raw = buf[i..ua.slice.end];
+            i = ua.slice.end;
+        }
+    }
+
+    return .{
+        .version = version,
+        .digest_alg = digest_alg,
+        .signature_alg = sig_alg,
+        .signed_attrs_raw = signed_attrs_raw,
+        .signature = signature,
+        .unsigned_attrs_raw = unsigned_attrs_raw,
+        .message_digest = msg_digest,
+        .sid_raw = sid_raw,
+    };
+}
+
+/// Materialise the CMS-canonical message-to-be-signed from
+/// `SignerInfo.signed_attrs_raw`: replace the leading IMPLICIT [0]
+/// tag (0xA0) with the universal SET OF tag (0x31). The body bytes
+/// are unchanged; only the first byte differs.
+///
+/// The returned buffer is allocated from `allocator`; ownership is
+/// transferred to the caller. (We don't slice-in-place because
+/// `signed_attrs_raw` may be a sub-slice of an `@embedFile`'d const
+/// blob.)
+pub fn signedAttrsForSigning(
+    allocator: std.mem.Allocator,
+    signer: SignerInfo,
+) ![]u8 {
+    if (signer.signed_attrs_raw.len == 0 or signer.signed_attrs_raw[0] != 0xA0)
+        return error.InvalidSignerInfo;
+    const buf = try allocator.alloc(u8, signer.signed_attrs_raw.len);
+    @memcpy(buf, signer.signed_attrs_raw);
+    buf[0] = 0x31; // [0] IMPLICIT → SET OF
+    return buf;
+}
+
+/// Find the first unsigned-attribute value with the given OID in
+/// `signer.unsigned_attrs_raw`. Returns the raw bytes of the first
+/// `AttrValue` for that attribute, or null when the attribute is
+/// absent.
+pub fn findUnsignedAttr(signer: SignerInfo, target_oid: []const u8) Pkcs7Error!?[]const u8 {
+    if (signer.unsigned_attrs_raw.len == 0) return null;
+    // unsigned_attrs_raw starts with the [1] IMPLICIT tag (0xA1).
+    const ua = try der.Element.parse(signer.unsigned_attrs_raw, 0);
+    if (!isContextSpecificTag(ua.identifier, 1)) return error.InvalidSignerInfo;
+
+    var ai: u32 = ua.slice.start;
+    while (ai < ua.slice.end) {
+        const attr = try der.Element.parse(signer.unsigned_attrs_raw, ai);
+        if (attr.identifier.tag != .sequence) return error.InvalidSignerInfo;
+        ai = attr.slice.end;
+
+        const attr_oid_e = try der.Element.parse(signer.unsigned_attrs_raw, attr.slice.start);
+        if (attr_oid_e.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
+        const this_oid = signer.unsigned_attrs_raw[attr_oid_e.slice.start..attr_oid_e.slice.end];
+        if (!std.mem.eql(u8, this_oid, target_oid)) continue;
+
+        const attr_vals = try der.Element.parse(signer.unsigned_attrs_raw, attr_oid_e.slice.end);
+        const first_val = try der.Element.parse(signer.unsigned_attrs_raw, attr_vals.slice.start);
+        return signer.unsigned_attrs_raw[first_val.slice.start..first_val.slice.end];
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// DER helpers.
+// ---------------------------------------------------------------------------
+
+fn isContextSpecificTag(id: der.Identifier, tag_no: u5) bool {
+    return id.class == .context_specific and @intFromEnum(id.tag) == tag_no;
+}
+
+fn hashAlgFromOid(oid_bytes: []const u8) Pkcs7Error!HashAlgorithm {
+    if (std.mem.eql(u8, oid_bytes, &oid.sha256)) return .sha256;
+    if (std.mem.eql(u8, oid_bytes, &oid.sha384)) return .sha384;
+    if (std.mem.eql(u8, oid_bytes, &oid.sha512)) return .sha512;
+    return error.UnsupportedDigestAlgorithm;
+}
+
+fn sigAlgFromOid(oid_bytes: []const u8) Pkcs7Error!SignatureAlgorithm {
+    if (std.mem.eql(u8, oid_bytes, &oid.sha256_with_rsa)) return .rsa_pkcs1_v15_sha256;
+    if (std.mem.eql(u8, oid_bytes, &oid.sha384_with_rsa)) return .rsa_pkcs1_v15_sha384;
+    if (std.mem.eql(u8, oid_bytes, &oid.sha512_with_rsa)) return .rsa_pkcs1_v15_sha512;
+    if (std.mem.eql(u8, oid_bytes, &oid.rsa_encryption)) return .rsa_pkcs1_v15_implicit_hash;
+    if (std.mem.eql(u8, oid_bytes, &oid.ecdsa_with_sha256)) return .ecdsa_sha256;
+    if (std.mem.eql(u8, oid_bytes, &oid.ecdsa_with_sha384)) return .ecdsa_sha384;
+    return error.UnsupportedSignatureAlgorithm;
+}
+
+/// Number of header bytes (tag + length octets) preceding the content
+/// bytes of `elem`. Used to recover the "whole TLV" span when we need
+/// to copy/re-encode an element.
+fn elementHeaderLen(buf: []const u8, elem: der.Element) u32 {
+    // The element starts at `elem.slice.start - header_len`. We must
+    // back-calculate from `(elem.slice.end - elem.slice.start)` (the
+    // content length) and the length-encoding rules in
+    // `der.Element.parse`. content_len < 0x80 ⇒ 1 length byte.
+    // Otherwise the low-7-bits of the first length byte give the
+    // number of length octets that follow.
+    _ = buf;
+    const content_len = elem.slice.end - elem.slice.start;
+    if (content_len < 0x80) return 2; // tag + 1 length byte
+    // Long-form length: count bytes needed for the integer.
+    var n: u32 = 0;
+    var v: u32 = content_len;
+    while (v != 0) : (v >>= 8) n += 1;
+    return 2 + n; // tag + (0x80|len_len) + len_len bytes
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
