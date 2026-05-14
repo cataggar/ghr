@@ -341,6 +341,195 @@ pub fn findFirstPkcs7Entry(image: PeImage) WinCertError!?WinCertificate {
 }
 
 // ---------------------------------------------------------------------------
+// Authenticode signature stripping.
+//
+// Reverses what Trusted Signing (and signtool-style signers) append to a
+// PE: the certificate table at end of file, and the
+// `DataDirectory[Security]` entry pointing at it. Strict bit-equivalence
+// to the pre-sign binary is the goal — every byte the signer touched is
+// reverted to the value it would have had pre-signing. See issue #78
+// Option E for why we need this exact bit-identity (not just
+// Authenticode-digest equivalence).
+//
+// Constraints:
+//   * The published PE MUST be signed (Security data-directory entry
+//     non-zero, cert table size > 0). Stripping an unsigned binary is
+//     never meaningful in this workflow.
+//   * The certificate table MUST live at the very tail of the file (per
+//     the Authenticode spec). We allow no slack beyond what `parsePe`
+//     already permits (≤ 8 bytes of zero padding after the cert table).
+//   * `OptionalHeader.CheckSum` is reset to 0. Zig's `build-exe` emits 0
+//     for PE32+ binaries; Trusted Signing leaves it at 0 in practice.
+//     If a future signer or compiler starts writing a non-zero CheckSum,
+//     the stripper will produce a 4-byte mismatch which is unambiguous
+//     and easy to diagnose.
+// ---------------------------------------------------------------------------
+
+pub const StripError = error{
+    NotSigned,
+    CertTableNotAtEnd,
+    OutOfMemory,
+} || ParseError;
+
+pub const StripOutcome = struct {
+    /// Stripped PE bytes. Owned by the caller; freed via `allocator.free`.
+    bytes: []u8,
+    /// File offset at which the cert table started — useful for logs.
+    stripped_at: u32,
+    /// Number of bytes removed (cert table + any trailing padding).
+    stripped_bytes: u32,
+};
+
+/// Strip the Authenticode signature from a signed PE and return the
+/// resulting bit-identical-to-unsigned bytes.
+pub fn stripAuthenticodeIntoBuffer(
+    allocator: std.mem.Allocator,
+    pe_bytes: []const u8,
+) StripError!StripOutcome {
+    const image = try parsePe(pe_bytes);
+
+    if (image.cert_table_offset == 0 or image.cert_table_size == 0)
+        return error.NotSigned;
+
+    // The cert table must run to the end of the file, modulo the same
+    // 8-byte alignment slack `parsePe` already allowed.
+    const cert_table_end: usize = @as(usize, image.cert_table_offset) +
+        @as(usize, image.cert_table_size);
+    if (cert_table_end > pe_bytes.len) return error.CertTableNotAtEnd;
+    if (pe_bytes.len - cert_table_end > 8) return error.CertTableNotAtEnd;
+
+    // Output is the file truncated to the start of the cert table.
+    const stripped_len: usize = image.cert_table_offset;
+    const out = try allocator.alloc(u8, stripped_len);
+    errdefer allocator.free(out);
+    @memcpy(out, pe_bytes[0..stripped_len]);
+
+    // Zero the Security data-directory entry (RVA + size, 8 bytes).
+    @memset(out[image.security_dir_offset .. image.security_dir_offset + 8], 0);
+
+    // Reset OptionalHeader.CheckSum to 0 — the canonical unsigned
+    // value for Zig-emitted PE32+ binaries.
+    @memset(out[image.checksum_offset .. image.checksum_offset + 4], 0);
+
+    return .{
+        .bytes = out,
+        .stripped_at = image.cert_table_offset,
+        .stripped_bytes = @intCast(pe_bytes.len - stripped_len),
+    };
+}
+
+test "stripAuthenticodeIntoBuffer round-trips a synthetic signed PE" {
+    const allocator = std.testing.allocator;
+
+    // Build a minimal PE32+ image — same shape as the digest test
+    // fixture. The "unsigned" buffer is the reference we expect to
+    // recover after stripping.
+    var unsigned = try allocator.alloc(u8, 0x58 + 240);
+    defer allocator.free(unsigned);
+    @memset(unsigned, 0);
+    @memcpy(unsigned[0..2], &dos_signature);
+    std.mem.writeInt(u32, unsigned[0x3C..0x40], 0x40, .little);
+    @memcpy(unsigned[0x40..0x44], &nt_signature);
+    std.mem.writeInt(u16, unsigned[0x44 + 16 .. 0x44 + 18][0..2], 240, .little);
+    std.mem.writeInt(u16, unsigned[0x58..0x5A][0..2], pe32_plus_magic, .little);
+    std.mem.writeInt(u32, unsigned[0x58 + 108 .. 0x58 + 112][0..4], 16, .little);
+
+    // Stuff a couple of non-zero bytes into the headers so a flipped
+    // strip would be easy to spot if it accidentally zeroed them.
+    unsigned[0x58 + 28] = 0xAB; // some innocuous OptionalHeader byte
+    unsigned[0x58 + 200] = 0xCD;
+
+    // Build the "signed" version: a copy with a fake WIN_CERTIFICATE
+    // table appended and a non-zero CheckSum simulating a signer that
+    // recomputed it.
+    const fake_cert_payload = "fake-pkcs7-blob";
+    const cert_entry_len: u32 = @intCast(8 + fake_cert_payload.len);
+    const padded_cert_entry_len: u32 = std.mem.alignForward(u32, cert_entry_len, 8);
+    const cert_table_offset: u32 = @intCast(unsigned.len);
+    const cert_table_size: u32 = padded_cert_entry_len;
+
+    var signed = try allocator.alloc(u8, cert_table_offset + cert_table_size);
+    defer allocator.free(signed);
+    @memcpy(signed[0..unsigned.len], unsigned);
+    // Set CheckSum to a non-zero value (signer-emitted).
+    std.mem.writeInt(u32, signed[0x58 + 64 .. 0x58 + 68][0..4], 0xDEAD_BEEF, .little);
+    // Fill the Security data-directory entry.
+    const sec_dir = 0x58 + 112 + 32;
+    std.mem.writeInt(u32, signed[sec_dir .. sec_dir + 4][0..4], cert_table_offset, .little);
+    std.mem.writeInt(u32, signed[sec_dir + 4 .. sec_dir + 8][0..4], cert_table_size, .little);
+    // WIN_CERTIFICATE header + payload + zero padding.
+    std.mem.writeInt(u32, signed[cert_table_offset .. cert_table_offset + 4][0..4], cert_entry_len, .little);
+    std.mem.writeInt(u16, signed[cert_table_offset + 4 .. cert_table_offset + 6][0..2], win_cert_revision_2_0, .little);
+    std.mem.writeInt(u16, signed[cert_table_offset + 6 .. cert_table_offset + 8][0..2], win_cert_type_pkcs_signed_data, .little);
+    @memcpy(signed[cert_table_offset + 8 .. cert_table_offset + 8 + fake_cert_payload.len], fake_cert_payload);
+    // padding bytes between cert_entry_len and padded_cert_entry_len
+    // are already zero from the alloc.
+
+    // Strip it.
+    const outcome = try stripAuthenticodeIntoBuffer(allocator, signed);
+    defer allocator.free(outcome.bytes);
+
+    // Strict bit-identity with the unsigned reference.
+    try std.testing.expectEqualSlices(u8, unsigned, outcome.bytes);
+    try std.testing.expectEqual(cert_table_offset, outcome.stripped_at);
+    try std.testing.expectEqual(cert_table_size, outcome.stripped_bytes);
+}
+
+test "stripAuthenticodeIntoBuffer rejects unsigned input" {
+    const allocator = std.testing.allocator;
+    var unsigned = try allocator.alloc(u8, 0x58 + 240);
+    defer allocator.free(unsigned);
+    @memset(unsigned, 0);
+    @memcpy(unsigned[0..2], &dos_signature);
+    std.mem.writeInt(u32, unsigned[0x3C..0x40], 0x40, .little);
+    @memcpy(unsigned[0x40..0x44], &nt_signature);
+    std.mem.writeInt(u16, unsigned[0x44 + 16 .. 0x44 + 18][0..2], 240, .little);
+    std.mem.writeInt(u16, unsigned[0x58..0x5A][0..2], pe32_plus_magic, .little);
+    std.mem.writeInt(u32, unsigned[0x58 + 108 .. 0x58 + 112][0..4], 16, .little);
+
+    try std.testing.expectError(error.NotSigned, stripAuthenticodeIntoBuffer(allocator, unsigned));
+}
+
+test "stripAuthenticodeIntoBuffer rejects cert table not at end" {
+    const allocator = std.testing.allocator;
+    // Build a signed-ish PE where the cert table is NOT at end of file —
+    // append 16 bytes of trailing data after the cert table. The
+    // stripper must refuse rather than guess.
+    var unsigned = try allocator.alloc(u8, 0x58 + 240);
+    defer allocator.free(unsigned);
+    @memset(unsigned, 0);
+    @memcpy(unsigned[0..2], &dos_signature);
+    std.mem.writeInt(u32, unsigned[0x3C..0x40], 0x40, .little);
+    @memcpy(unsigned[0x40..0x44], &nt_signature);
+    std.mem.writeInt(u16, unsigned[0x44 + 16 .. 0x44 + 18][0..2], 240, .little);
+    std.mem.writeInt(u16, unsigned[0x58..0x5A][0..2], pe32_plus_magic, .little);
+    std.mem.writeInt(u32, unsigned[0x58 + 108 .. 0x58 + 112][0..4], 16, .little);
+
+    const cert_table_offset: u32 = @intCast(unsigned.len);
+    const cert_payload = "x" ** 24;
+    const cert_entry_len: u32 = 8 + cert_payload.len;
+    const cert_table_size: u32 = cert_entry_len; // already 8-aligned
+    const trailing: u32 = 16; // extra data past the cert table
+
+    var signed = try allocator.alloc(u8, cert_table_offset + cert_table_size + trailing);
+    defer allocator.free(signed);
+    @memcpy(signed[0..unsigned.len], unsigned);
+    const sec_dir = 0x58 + 112 + 32;
+    std.mem.writeInt(u32, signed[sec_dir .. sec_dir + 4][0..4], cert_table_offset, .little);
+    std.mem.writeInt(u32, signed[sec_dir + 4 .. sec_dir + 8][0..4], cert_table_size, .little);
+    std.mem.writeInt(u32, signed[cert_table_offset .. cert_table_offset + 4][0..4], cert_entry_len, .little);
+    std.mem.writeInt(u16, signed[cert_table_offset + 4 .. cert_table_offset + 6][0..2], win_cert_revision_2_0, .little);
+    std.mem.writeInt(u16, signed[cert_table_offset + 6 .. cert_table_offset + 8][0..2], win_cert_type_pkcs_signed_data, .little);
+    @memset(signed[cert_table_offset + 8 ..][0..cert_payload.len], 'x');
+    @memset(signed[cert_table_offset + cert_table_size ..][0..trailing], 0xAA);
+
+    // parsePe itself catches the "more than 8 bytes after cert table"
+    // case via error.InvalidCertTable; the stripper inherits that.
+    const result = stripAuthenticodeIntoBuffer(allocator, signed);
+    try std.testing.expectError(error.InvalidCertTable, result);
+}
+
+// ---------------------------------------------------------------------------
 // PKCS#7 SignedData (CMS) parser for Authenticode signatures.
 //
 // Authenticode embeds a single PKCS#7 `SignedData` structure in each
