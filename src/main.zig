@@ -59,8 +59,10 @@ pub fn main(init: std.process.Init) !void {
         var debug = false;
         var no_auth = false;
         var skip_verify = false;
+        var keep_going = false;
         var minisign_pubkey: ?[]const u8 = null;
-        var spec: ?[]const u8 = null;
+        var specs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer specs.deinit(allocator);
         while (args.next()) |arg| {
             if (eql(arg, "--debug")) {
                 debug = true;
@@ -68,6 +70,8 @@ pub fn main(init: std.process.Init) !void {
                 no_auth = true;
             } else if (eql(arg, "--skip-verify")) {
                 skip_verify = true;
+            } else if (eql(arg, "--keep-going")) {
+                keep_going = true;
             } else if (eql(arg, "--minisign")) {
                 const v = args.next() orelse {
                     try stderr.interface.print("error: '--minisign' requires a base64 minisign public key value\n", .{});
@@ -75,20 +79,31 @@ pub fn main(init: std.process.Init) !void {
                     std.process.exit(1);
                 };
                 minisign_pubkey = v;
-            } else if (spec == null) {
-                if (eql(arg, "help")) {
-                    try printInstallUsage(&stdout.interface);
-                    return;
-                }
-                spec = arg;
+            } else if (eql(arg, "help") and specs.items.len == 0) {
+                try printInstallUsage(&stdout.interface);
+                return;
+            } else {
+                try specs.append(allocator, arg);
             }
         }
-        const spec_val = spec orelse {
+        if (specs.items.len == 0) {
             try stderr.interface.print("error: 'ghr install' requires <owner/repo[@tag]> or <owner/repo/file[@tag]>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
-        };
-        try install.cmdInstall(allocator, io, environ, spec_val, &stdout.interface, &stderr.interface, debug, no_auth, skip_verify, minisign_pubkey);
+        }
+        try install.cmdInstallMany(
+            allocator,
+            io,
+            environ,
+            specs.items,
+            &stdout.interface,
+            &stderr.interface,
+            debug,
+            no_auth,
+            skip_verify,
+            minisign_pubkey,
+            keep_going,
+        );
     } else if (eql(cmd_str, "uninstall")) {
         const spec = args.next() orelse {
             try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
@@ -207,22 +222,31 @@ fn printListUsage(w: *Writer) !void {
 
 fn printInstallUsage(w: *Writer) !void {
     try w.print(
-        \\ghr install - install a tool from a GitHub release
+        \\ghr install - install one or more tools from GitHub releases
         \\
         \\USAGE:
-        \\    ghr install <owner/repo[@tag]> [options]
-        \\    ghr install <owner/repo/file[@tag]> [options]
+        \\    ghr install <spec> [<spec> ...] [options]
         \\
-        \\Downloads the best-matching release asset (first form) or a specific
-        \\named asset (second form), extracts it if needed, and installs the
-        \\resulting binary into ghr's bin directory.
+        \\Each <spec> is one of:
+        \\    owner/repo[@tag]              Auto-pick the best asset for this platform
+        \\    owner/repo/file[@tag]         Install a specific asset by name
+        \\
+        \\Downloads the matching release asset(s), extracts each if needed,
+        \\and installs the resulting binaries into ghr's bin directory.
+        \\Multi-spec invocations share a single HTTP client + auth context.
         \\
         \\OPTIONS:
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
         \\    --skip-verify           Skip sigstore + SHA256 + minisign verification
-        \\    --minisign <pubkey>     Require minisign signature; <pubkey> is a
-        \\                            base64 minisign public key string
+        \\    --minisign <pubkey>     Require minisign signature for every spec;
+        \\                            <pubkey> is a base64 minisign public key string
+        \\    --keep-going            Continue past per-spec failures; exit non-zero
+        \\                            with a summary at the end if any spec failed
+        \\
+        \\EXAMPLES:
+        \\    ghr install burntsushi/ripgrep@15.1.0
+        \\    ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
         \\
         \\Run 'ghr install help' to show this help.
         \\
@@ -324,17 +348,17 @@ fn printUsage(w: *Writer) !void {
         \\
         \\COMMANDS:
         \\    list                                 List installed tools
-        \\    install <owner/repo[@tag]>           Install a tool from a GitHub release
-        \\    install <owner/repo/file[@tag]>      Install a specific asset by name
+        \\    install <spec> [<spec> ...]          Install one or more tools from GitHub releases
         \\    uninstall <owner/repo>               Remove an installed tool
-        \\    download <owner/repo[@tag]>          Download the asset 'install' would pick
-        \\    download <owner/repo/file[@tag]>     Download a specific asset by name
+        \\    download <spec> [<spec> ...]         Download one or more release assets
         \\    path ensure [--dry-run]              Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
         \\    validate <SUBCOMMAND>                Run validations against published artifacts
         \\    version                              Print version and exit
         \\    help                                 Print this help and exit
         \\
+        \\Each <spec> is `owner/repo[@tag]` (auto-pick asset) or
+        \\`owner/repo/file[@tag]` (specific asset).
         \\Run 'ghr <COMMAND> help' to show help for a specific command.
         \\
         \\OPTIONS:
@@ -343,6 +367,8 @@ fn printUsage(w: *Writer) !void {
         \\    --skip-verify           Skip sigstore + SHA256 + minisign verification
         \\    --minisign <pubkey>     Require minisign signature (install/download only);
         \\                            <pubkey> is a base64 minisign public key string
+        \\    --keep-going            For multi-spec install/download, continue past
+        \\                            per-spec failures and exit non-zero with a summary
         \\
     , .{});
 }

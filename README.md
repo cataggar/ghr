@@ -12,18 +12,18 @@ GitHub-hosted runner with `pipx install ghr-bin`.
 
 ```
 ghr list                                 List installed tools
-ghr install <owner/repo[@tag]>           Install a tool from a GitHub release
-ghr install <owner/repo/file[@tag]>      Install a specific asset by name
+ghr install <spec> [<spec> ...]          Install one or more tools from GitHub releases
 ghr uninstall <name>                     Remove an installed tool
-ghr download <owner/repo[@tag]>          Download the asset 'install' would pick
-ghr download <owner/repo/file[@tag]>     Download a specific asset by name
+ghr download <spec> [<spec> ...]         Download one or more release assets
 ghr path ensure [--dry-run]              Add ghr's bin dir to your user PATH
 ghr path [bin|tools|cache]               Show ghr directories
 ghr version                              Print version and exit
 ghr help                                 Print this help and exit
 ```
 
-Run `ghr <COMMAND> help` to show help for a specific command, e.g. `ghr download help`.
+Each `<spec>` is `owner/repo[@tag]` (auto-pick asset) or
+`owner/repo/file[@tag]` (specific asset). Run `ghr <COMMAND> help` to
+show help for a specific command, e.g. `ghr download help`.
 
 ### Examples
 
@@ -34,6 +34,9 @@ ghr install burntsushi/ripgrep
 # Install a specific version
 # https://github.com/bytecodealliance/wasmtime/releases/tag/v44.0.1
 ghr install bytecodealliance/wasmtime@v44.0.1
+
+# Install several tools in one invocation (shared HTTP client + auth)
+ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
 
 # Install minisign itself, verifying the release with the upstream
 # minisign public key from https://jedisct1.github.io/minisign/
@@ -52,6 +55,27 @@ brew install cataggar/ghr/ghr
 
 See [doc/README.md](doc/README.md) for download, install, directories,
 uninstall, and verification details.
+
+## GitHub Actions
+
+For workflows, install several tools in one cached step:
+
+```yaml
+- uses: cataggar/ghr/actions/install@v0.3.0  # pin to the matching ghr release
+  with:
+    tools: |
+      BurntSushi/ripgrep@14.1.1
+      sharkdp/fd@v10.2.0
+```
+
+The action shares git tags with the `ghr` CLI — pinning `@v0.3.0` pins
+both the action body and the `ghr-bin` binary. Pick the latest tag from
+[the releases page](https://github.com/cataggar/ghr/releases).
+
+See [`actions/install`](actions/install/README.md),
+[`actions/download`](actions/download/README.md), and the
+[Caching in GitHub Actions](doc/README.md#caching-in-github-actions)
+section for details.
 
 ## License
 

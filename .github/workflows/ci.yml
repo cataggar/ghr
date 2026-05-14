@@ -50,3 +50,172 @@ jobs:
 
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+  action-install-smoke:
+    # End-to-end smoke for the multi-spec install path on every OS the
+    # composite action targets. Builds ghr from source (so the test
+    # validates the PR's code rather than a released ghr-bin) and
+    # exercises a hand-rolled equivalent of `actions/install` — cache
+    # restore on the second run proves the round-trip works.
+    name: action-install smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Build ghr from source (ReleaseSafe)
+        shell: bash
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Put ghr on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$PWD/zig-out/bin"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/ghr" version
+
+      - name: Point ghr at a cacheable directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ghr-tools" "$RUNNER_TEMP/ghr-bin" "$RUNNER_TEMP/ghr-cache"
+          echo "GHR_TOOL_DIR=$RUNNER_TEMP/ghr-tools"   >> "$GITHUB_ENV"
+          echo "GHR_BIN_DIR=$RUNNER_TEMP/ghr-bin"      >> "$GITHUB_ENV"
+          echo "GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache"  >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/ghr-bin" >> "$GITHUB_PATH"
+
+      - name: Restore tool cache (cold expected on first push)
+        id: ghr-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ${{ runner.temp }}/ghr-tools
+            ${{ runner.temp }}/ghr-bin
+            ${{ runner.temp }}/ghr-cache
+          key: ghr-smoke-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0-${{ github.sha }}
+
+      - name: Install ripgrep + fd in one ghr invocation
+        if: steps.ghr-cache.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ghr install --keep-going \
+            BurntSushi/ripgrep@14.1.1 \
+            sharkdp/fd@v10.2.0
+
+      - name: Sanity check
+        shell: bash
+        run: |
+          set -euo pipefail
+          ghr list
+          rg --version
+          fd --version
+
+  action-download-smoke:
+    # Parallel smoke for the multi-spec download path. Same matrix as
+    # the install smoke. Verifies multi-spec download lands every asset
+    # in the destination dir and survives a cache round-trip.
+    name: action-download smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Build ghr from source (ReleaseSafe)
+        shell: bash
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Put ghr on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$PWD/zig-out/bin"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/ghr" version
+
+      - name: Prepare download destination
+        id: dest
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/ghr-download"
+          mkdir -p "$dest"
+          # Canonicalise to an absolute path for cache stability.
+          dest_abs="$(cd "$dest" && pwd)"
+          echo "dest=$dest_abs" >> "$GITHUB_OUTPUT"
+
+      - name: Restore download cache
+        id: ghr-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ${{ steps.dest.outputs.dest }}
+          key: ghr-dl-smoke-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0-${{ github.sha }}
+
+      - name: Download ripgrep + fd in one ghr invocation
+        if: steps.ghr-cache.outputs.cache-hit != 'true'
+        shell: bash
+        working-directory: ${{ steps.dest.outputs.dest }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ghr download --keep-going \
+            BurntSushi/ripgrep@14.1.1 \
+            sharkdp/fd@v10.2.0
+
+      - name: Confirm both archives landed
+        shell: bash
+        working-directory: ${{ steps.dest.outputs.dest }}
+        run: |
+          set -euo pipefail
+          ls -la
+          # Both archives should be present regardless of cache hit.
+          ls ripgrep-*.tar.gz fd-*.tar.gz fd-*.zip ripgrep-*.zip 2>/dev/null | head -10 || true
+          # At minimum we expect at least two files in dest.
+          count="$(find . -maxdepth 1 -type f | wc -l)"
+          if [[ "$count" -lt 2 ]]; then
+            echo "error: expected at least 2 downloaded files in dest, found $count" >&2
+            exit 1
+          fi
+
+      - name: Reject -o + multi (regression guard)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ghr download BurntSushi/ripgrep@14.1.1 sharkdp/fd@v10.2.0 -o /tmp/x.tar.gz 2>/dev/null; then
+            echo "error: '-o' with multi-spec should have failed" >&2
+            exit 1
+          fi
+          echo "ok: '-o' with multi-spec was rejected as expected"
+
+      - name: Reject --sha256 + multi (regression guard)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ghr download BurntSushi/ripgrep@14.1.1 sharkdp/fd@v10.2.0 \
+              --sha256 0000000000000000000000000000000000000000000000000000000000000000 \
+              2>/dev/null; then
+            echo "error: '--sha256' with multi-spec should have failed" >&2
+            exit 1
+          fi
+          echo "ok: '--sha256' with multi-spec was rejected as expected"
+
