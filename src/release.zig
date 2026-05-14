@@ -1322,6 +1322,7 @@ pub fn verifyAssetOnDisk(
 test {
     _ = @import("sigstore.zig");
     _ = @import("minisign.zig");
+    _ = @import("authenticode.zig");
 }
 
 test "parseRepoSpec with tag" {
