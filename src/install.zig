@@ -1268,22 +1268,33 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Remove old tool directory. On Windows, running executables can be renamed
     // but not deleted, so fall back to renaming the old dir as a tombstone.
-    deleteTreeAbsolute(io, tool_path) catch {
-        if (comptime builtin.os.tag == .windows) {
-            var tombstone_buf: [Dir.max_path_bytes]u8 = undefined;
-            const tombstone = std.fmt.bufPrint(&tombstone_buf, "{s}.old", .{tool_path}) catch {
-                try err_w.print("error: tool path too long\n", .{});
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-            deleteTreeAbsolute(io, tombstone) catch {};
-            Dir.renameAbsolute(tool_path, tombstone, io) catch {
-                try err_w.print("error: cannot replace tool directory (files may be locked by a running process)\n", .{});
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-        }
+    // Pre-check existence so the Windows fallback only runs when there is
+    // actually something to move out of the way — without this, a first
+    // install on Windows surfaces deleteTreeAbsolute's PathNotFound as a
+    // misleading "files may be locked" error from the rename fallback.
+    const tool_dir_exists = blk: {
+        var d_check = Dir.openDirAbsolute(io, tool_path, .{}) catch break :blk false;
+        d_check.close(io);
+        break :blk true;
     };
+    if (tool_dir_exists) {
+        deleteTreeAbsolute(io, tool_path) catch {
+            if (comptime builtin.os.tag == .windows) {
+                var tombstone_buf: [Dir.max_path_bytes]u8 = undefined;
+                const tombstone = std.fmt.bufPrint(&tombstone_buf, "{s}.old", .{tool_path}) catch {
+                    try err_w.print("error: tool path too long\n", .{});
+                    try err_w.flush();
+                    return error.InstallStepFailed;
+                };
+                deleteTreeAbsolute(io, tombstone) catch {};
+                Dir.renameAbsolute(tool_path, tombstone, io) catch {
+                    try err_w.print("error: cannot replace tool directory (files may be locked by a running process)\n", .{});
+                    try err_w.flush();
+                    return error.InstallStepFailed;
+                };
+            }
+        };
+    }
 
     // Ensure tools and owner dirs exist (create full path)
     const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{

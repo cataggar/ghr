@@ -782,9 +782,49 @@ fn checksumNameMatches(entry_name: []const u8, target: []const u8) bool {
 
 /// Search a SHA256 checksum-file body for the entry matching `target_name`
 /// and return its 64-char hex hash. Returns null if no entry matches.
+///
+/// Recognised formats:
+///   - GNU coreutils: `<hex>  <name>` or `<hex> *<name>`
+///   - BSD shasum:    `SHA256 (<name>) = <hex>`
+///   - Windows `certutil -hashfile <name> SHA256`, which BurntSushi/ripgrep
+///     and friends publish as Windows `.sha256` sidecars:
+///         SHA256 hash of <name>:
+///         <hex>
+///         CertUtil: -hashfile command completed successfully.
 fn lookupSha256(content: []const u8, target_name: []const u8) ?[]const u8 {
+    const certutil_prefix = "SHA256 hash of ";
+    var pending_certutil_name: ?[]const u8 = null;
     var it = std.mem.splitScalar(u8, content, '\n');
-    while (it.next()) |line| {
+    while (it.next()) |raw_line| {
+        // Trim trailing whitespace/CR so we can recognise certutil's CRLF
+        // output without dragging the trim logic into every branch below.
+        var line = raw_line;
+        while (line.len > 0 and (line[line.len - 1] == '\r' or
+            line[line.len - 1] == ' ' or line[line.len - 1] == '\t'))
+        {
+            line = line[0 .. line.len - 1];
+        }
+
+        // certutil header line: capture the asset name; the next bare 64-hex
+        // line is its digest.
+        if (std.mem.startsWith(u8, line, certutil_prefix) and
+            std.mem.endsWith(u8, line, ":"))
+        {
+            pending_certutil_name = line[certutil_prefix.len .. line.len - 1];
+            continue;
+        }
+
+        // certutil digest line: a bare 64-hex line immediately following a
+        // header. Any other non-empty line terminates the certutil block.
+        if (pending_certutil_name) |name| {
+            if (line.len == 64 and isHex64(line)) {
+                if (checksumNameMatches(name, target_name)) return line;
+                pending_certutil_name = null;
+                continue;
+            }
+            if (line.len > 0) pending_certutil_name = null;
+        }
+
         const entry = parseSha256Line(line) orelse continue;
         if (checksumNameMatches(entry.name, target_name)) return entry.hex;
     }
@@ -2022,6 +2062,35 @@ test "lookupSha256 finds entry across formats" {
     const got2 = lookupSha256(body, "alt.zip") orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("1111111111111111111111111111111111111111111111111111111111111111", got2);
     try std.testing.expect(lookupSha256(body, "missing") == null);
+}
+
+test "lookupSha256 parses certutil format (Windows .sha256 sidecars)" {
+    // Verbatim shape of `certutil -hashfile <name> SHA256` output, which
+    // BurntSushi/ripgrep publishes as its Windows `.sha256` sidecars (CRLF
+    // line endings, three lines: header, bare digest, trailing status).
+    const body =
+        "SHA256 hash of ripgrep-14.1.1-x86_64-pc-windows-gnu.zip:\r\n" ++
+        "01469c43c3fffdb4baff80469a75a7bf1dc3d0bf4ef63cda72a22f885f27465a\r\n" ++
+        "CertUtil: -hashfile command completed successfully.\r\n";
+    const got = lookupSha256(body, "ripgrep-14.1.1-x86_64-pc-windows-gnu.zip") orelse
+        return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings(
+        "01469c43c3fffdb4baff80469a75a7bf1dc3d0bf4ef63cda72a22f885f27465a",
+        got,
+    );
+    try std.testing.expect(lookupSha256(body, "wrong-name.zip") == null);
+}
+
+test "lookupSha256 mixes certutil and gnu entries in one file" {
+    const body =
+        "SHA256 hash of asset-a.zip:\r\n" ++
+        ("a" ** 64) ++ "\r\n" ++
+        "CertUtil: -hashfile command completed successfully.\r\n" ++
+        ("b" ** 64) ++ "  asset-b.zip\n";
+    const a = lookupSha256(body, "asset-a.zip") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("a" ** 64, a);
+    const b = lookupSha256(body, "asset-b.zip") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("b" ** 64, b);
 }
 
 test "checksumNameMatches strips path and ignores case" {
