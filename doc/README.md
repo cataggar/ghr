@@ -476,6 +476,12 @@ is sigstore > minisign > authenticode > checksum. All successful
 verifiers still print their own diagnostic line, so the full set is
 visible at install time.
 
+When the install actually verifies the asset with a minisign key
+(inline per-spec or `--minisign`), the key itself is also recorded in
+`ghr.json` as `"minisign"` and `ghr list` appends it to the matching
+line so the full output is directly pasteable as `ghr install <line>`
+on the next upgrade.
+
 The trust roots embedded in ghr come from two sources:
 [`sigstore/root-signing`](https://github.com/sigstore/root-signing)
 for the sigstore + Rekor anchor, and a Mozilla CCADB snapshot plus

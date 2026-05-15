@@ -258,6 +258,9 @@ fn printListUsage(w: *Writer) !void {
         \\    ghr list
         \\
         \\Prints each installed tool as 'owner/repo[@tag]', one per line.
+        \\When the install actually verified the asset with a minisign key
+        \\(inline or via --minisign), the pubkey is appended on the same line
+        \\so it is directly pasteable back as `ghr install <line>`.
         \\
         \\Run 'ghr list help' to show this help.
         \\
@@ -348,12 +351,9 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
         while (try repo_iter.next(io)) |repo_entry| {
             if (repo_entry.kind != .directory) continue;
             if (std.mem.endsWith(u8, repo_entry.name, ".old")) continue; // skip tombstones
-            const tag = readToolTag(allocator, io, owner_dir, repo_entry.name);
-            defer if (tag) |t| allocator.free(t);
-            const line = if (tag) |t|
-                try std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ entry.name, repo_entry.name, t })
-            else
-                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.name, repo_entry.name });
+            const meta = readToolMeta(allocator, io, owner_dir, repo_entry.name);
+            defer if (meta) |m| m.deinit(allocator);
+            const line = try formatToolLine(allocator, entry.name, repo_entry.name, meta);
             errdefer allocator.free(line);
             try lines.append(allocator, line);
         }
@@ -375,7 +375,20 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
     }
 }
 
-fn readToolTag(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_name: []const u8) ?[]const u8 {
+/// Subset of `ghr.json` surfaced by `ghr list`. Owned strings.
+const ToolListMeta = struct {
+    tag: ?[]const u8 = null,
+    minisign: ?[]const u8 = null,
+
+    fn deinit(self: ToolListMeta, allocator: std.mem.Allocator) void {
+        if (self.tag) |t| allocator.free(t);
+        if (self.minisign) |k| allocator.free(k);
+    }
+};
+
+/// Read the `tag` and `minisign` fields from a tool's `ghr.json`.
+/// Returns `null` when the file is missing or malformed.
+fn readToolMeta(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_name: []const u8) ?ToolListMeta {
     var repo_dir = owner_dir.openDir(io, repo_name, .{}) catch return null;
     defer repo_dir.close(io);
 
@@ -383,14 +396,90 @@ fn readToolTag(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_nam
     defer allocator.free(json_bytes);
 
     const parsed = std.json.parseFromSlice(
-        struct { tag: []const u8 },
+        struct {
+            tag: ?[]const u8 = null,
+            minisign: ?[]const u8 = null,
+        },
         allocator,
         json_bytes,
         .{ .ignore_unknown_fields = true },
     ) catch return null;
     defer parsed.deinit();
 
-    return allocator.dupe(u8, parsed.value.tag) catch return null;
+    var result: ToolListMeta = .{};
+    if (parsed.value.tag) |t| {
+        result.tag = allocator.dupe(u8, t) catch {
+            result.deinit(allocator);
+            return null;
+        };
+    }
+    if (parsed.value.minisign) |k| {
+        if (k.len > 0) {
+            result.minisign = allocator.dupe(u8, k) catch {
+                result.deinit(allocator);
+                return null;
+            };
+        }
+    }
+    return result;
+}
+
+/// Format a single `ghr list` line. The whole line is designed to be
+/// directly pasteable as arguments to `ghr install`, so the optional
+/// minisign pubkey is appended after a space (matching the per-spec
+/// positional inline-key form accepted by `ghr install`).
+fn formatToolLine(
+    allocator: std.mem.Allocator,
+    owner: []const u8,
+    repo: []const u8,
+    meta: ?ToolListMeta,
+) ![]u8 {
+    const tag: ?[]const u8 = if (meta) |m| m.tag else null;
+    const key: ?[]const u8 = if (meta) |m| m.minisign else null;
+    if (tag) |t| {
+        if (key) |k| {
+            return std.fmt.allocPrint(allocator, "{s}/{s}@{s} {s}", .{ owner, repo, t, k });
+        }
+        return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ owner, repo, t });
+    }
+    if (key) |k| {
+        return std.fmt.allocPrint(allocator, "{s}/{s} {s}", .{ owner, repo, k });
+    }
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner, repo });
+}
+
+test "formatToolLine: tag and key" {
+    const line = try formatToolLine(std.testing.allocator, "cataggar", "ghr", .{
+        .tag = "v0.3.0-dev.1",
+        .minisign = "RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0",
+    });
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings(
+        "cataggar/ghr@v0.3.0-dev.1 RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0",
+        line,
+    );
+}
+
+test "formatToolLine: tag without key" {
+    const line = try formatToolLine(std.testing.allocator, "BurntSushi", "ripgrep", .{
+        .tag = "14.1.0",
+    });
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("BurntSushi/ripgrep@14.1.0", line);
+}
+
+test "formatToolLine: no metadata" {
+    const line = try formatToolLine(std.testing.allocator, "foo", "bar", null);
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("foo/bar", line);
+}
+
+test "formatToolLine: key without tag" {
+    const line = try formatToolLine(std.testing.allocator, "foo", "bar", .{
+        .minisign = "RWSXXXX",
+    });
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("foo/bar RWSXXXX", line);
 }
 
 fn printUsage(w: *Writer) !void {

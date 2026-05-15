@@ -587,6 +587,13 @@ fn copyDirRecursive(io: Io, src_dir: Dir, dest_dir: Dir) !void {
 }
 
 /// Write ghr.json metadata.
+///
+/// `minisign_pubkey` is the base64 minisign public key that the install
+/// actually verified the asset with (i.e., the caller-supplied key from
+/// either `--minisign` or the per-spec positional form). It is recorded
+/// only when minisign verification succeeded, so that `ghr list` can
+/// surface a copy-pasteable key for the same spec on future installs.
+/// Pass `null` (or an empty string) when minisign was not used.
 fn writeMetadata(
     allocator: std.mem.Allocator,
     io: Io,
@@ -596,6 +603,7 @@ fn writeMetadata(
     bins: []const []const u8,
     apps: []const []const u8,
     verified: []const u8,
+    minisign_pubkey: ?[]const u8,
 ) !void {
     _ = allocator;
     var file = try tool_dir.createFile(io, "ghr.json", .{});
@@ -603,7 +611,15 @@ fn writeMetadata(
     var buf: [4096]u8 = undefined;
     var fw = file.writer(io, &buf);
     const w = &fw.interface;
-    try w.print("{{\"tag\":\"{s}\",\"asset\":\"{s}\",\"verified\":\"{s}\",\"bins\":[", .{ tag, asset_name, verified });
+    try w.print("{{\"tag\":\"{s}\",\"asset\":\"{s}\",\"verified\":\"{s}\"", .{ tag, asset_name, verified });
+    if (minisign_pubkey) |k| {
+        if (k.len > 0) {
+            try w.print(",\"minisign\":\"", .{});
+            try writeJsonEscaped(w, k);
+            try w.print("\"", .{});
+        }
+    }
+    try w.print(",\"bins\":[", .{});
     for (bins, 0..) |bin, i| {
         if (i > 0) try w.print(",", .{});
         try w.print("\"", .{});
@@ -637,6 +653,11 @@ const Metadata = struct {
     tag: []const u8,
     asset: []const u8,
     verified: []const u8 = "none",
+    /// Base64 minisign public key that was used to verify the asset at
+    /// install time. Empty string means the install did not opt in to
+    /// minisign verification. Older `ghr.json` files (predating this
+    /// field) also parse as the empty default.
+    minisign: []const u8 = "",
     bins: []const []const u8 = &.{},
     apps: []const []const u8 = &.{},
 };
@@ -1056,6 +1077,10 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     // is published, unless the matching skip flag suppresses one. Outcome
     // precedence for the metadata label: sigstore > minisign > authenticode > checksum.
     var verified_label: []const u8 = "none";
+    // Pubkey the install actually verified against (sticky across the
+    // other verifiers' outcomes). Recorded in `ghr.json` and surfaced by
+    // `ghr list` so users can copy it back into future installs.
+    var recorded_minisign_key: ?[]const u8 = null;
     if (gates.skip_verify) {
         verified_label = "skipped";
         try w.print("note: verification skipped (--skip-verify)\n", .{});
@@ -1115,7 +1140,10 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
             Dir.deleteFileAbsolute(io, download_path) catch {};
             return error.InstallStepFailed;
         };
-        if (mini_outcome == .minisign_verified) verified_label = "minisign";
+        if (mini_outcome == .minisign_verified) {
+            verified_label = "minisign";
+            recorded_minisign_key = minisign_pubkey_b64;
+        }
 
         const ac_outcome: release_mod.VerifyOutcome = if (gates.skip_authenticode) blk: {
             try w.print("note: authenticode verification skipped (--skip-authenticode)\n", .{});
@@ -1331,7 +1359,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     // Write metadata
     const bins_slice = exes.items;
     const apps_slice = apps.items;
-    writeMetadata(allocator, io, tool_dir, tag_name, asset.name, bins_slice, apps_slice, verified_label) catch |err| {
+    writeMetadata(allocator, io, tool_dir, tag_name, asset.name, bins_slice, apps_slice, verified_label, recorded_minisign_key) catch |err| {
         try err_w.print("warning: failed to write metadata: {}\n", .{err});
     };
 
@@ -1882,7 +1910,7 @@ test "writeMetadata and readMetadata round-trip" {
 
     const bins = [_][]const u8{ "sub\\dir\\tool.exe", "other.exe" };
     const apps = [_][]const u8{};
-    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.0.0", "tool-windows.zip", &bins, &apps, "checksum");
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.0.0", "tool-windows.zip", &bins, &apps, "checksum", null);
 
     // Verify it's valid JSON by reading it back
     const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
@@ -1890,6 +1918,8 @@ test "writeMetadata and readMetadata round-trip" {
 
     // Backslashes must be escaped in JSON
     try std.testing.expect(std.mem.indexOf(u8, body, "sub\\\\dir\\\\tool.exe") != null);
+    // Tools installed without a minisign key must not emit the field.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"minisign\"") == null);
 
     // Parse it back
     const parsed = try std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1897,6 +1927,7 @@ test "writeMetadata and readMetadata round-trip" {
     try std.testing.expectEqualStrings("v1.0.0", parsed.value.tag);
     try std.testing.expectEqualStrings("tool-windows.zip", parsed.value.asset);
     try std.testing.expectEqualStrings("checksum", parsed.value.verified);
+    try std.testing.expectEqualStrings("", parsed.value.minisign);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.bins.len);
     try std.testing.expectEqualStrings("sub\\dir\\tool.exe", parsed.value.bins[0]);
     try std.testing.expectEqualStrings("other.exe", parsed.value.bins[1]);
@@ -1909,7 +1940,7 @@ test "writeMetadata round-trips the minisign verified label" {
 
     const bins = [_][]const u8{"tool"};
     const apps = [_][]const u8{};
-    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.2.3", "tool-linux.tar.xz", &bins, &apps, "minisign");
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.2.3", "tool-linux.tar.xz", &bins, &apps, "minisign", null);
 
     const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
     defer allocator.free(body);
@@ -1917,6 +1948,40 @@ test "writeMetadata round-trips the minisign verified label" {
     const parsed = try std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqualStrings("minisign", parsed.value.verified);
+}
+
+test "writeMetadata round-trips a minisign pubkey" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bins = [_][]const u8{"tool"};
+    const apps = [_][]const u8{};
+    const pubkey = "RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0";
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.2.3", "tool-linux.tar.xz", &bins, &apps, "sigstore", pubkey);
+
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("sigstore", parsed.value.verified);
+    try std.testing.expectEqualStrings(pubkey, parsed.value.minisign);
+}
+
+test "writeMetadata omits the minisign field for an empty pubkey" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bins = [_][]const u8{"tool"};
+    const apps = [_][]const u8{};
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.2.3", "tool-linux.tar.xz", &bins, &apps, "checksum", "");
+
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"minisign\"") == null);
 }
 
 test "readMetadata returns null for missing file" {
