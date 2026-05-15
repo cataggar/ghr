@@ -318,12 +318,34 @@ brew uninstall ghr
 ## Verification
 
 ghr's own releases ship per-asset `*.sigstore.json` sidecars (cosign
-v0.3 bundles) for every published `.tar.gz` and `.zip`, signed by the
-release workflow's GitHub Actions OIDC identity. `ghr install
-cataggar/ghr@<tag>` verifies them automatically, prints the leaf
-certificate's SAN (the release-workflow URL) and OIDC issuer
+v0.3 bundles) and `*.minisig` sidecars (minisign v2) for every
+published `.tar.gz` and `.zip`. The sigstore bundle is signed by the
+release workflow's GitHub Actions OIDC identity; the minisign sidecar
+is signed by a long-lived project key whose public token is:
+
+```
+RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+```
+
+`ghr install cataggar/ghr@<tag>` verifies the sigstore bundle
+automatically, prints the leaf certificate's SAN (the release-workflow
+URL) and OIDC issuer
 (`https://token.actions.githubusercontent.com`) for visual review, and
-fails-closed on any verification error.
+fails-closed on any verification error. To also require minisign
+verification, pass the public key inline (per-spec) or via
+`--minisign`:
+
+```sh
+ghr install cataggar/ghr@v0.4.0 \
+    RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+```
+
+Minisign sidecars start appearing with the release that introduced
+`.github/workflows/release.yml`'s signing step; pre-existing tags
+have no `.minisig` and fail closed if a key is supplied. Key
+rotation, if needed, will land as a new pubkey published in this
+README and the previous key marked as deprecated alongside the last
+tag it signed.
 
 When you install or download a release asset, ghr automatically verifies
 the downloaded bytes against any verification material the release

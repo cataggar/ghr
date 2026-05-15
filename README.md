@@ -59,6 +59,23 @@ brew install cataggar/ghr/ghr
 See [doc/README.md](doc/README.md) for download, install, directories,
 uninstall, and verification details.
 
+## Verifying ghr itself
+
+Every published `ghr-*.tar.gz` and `ghr-*.zip` ships with a sibling
+`.sigstore.json` (verified automatically) and `.minisig` sidecar. Pass
+ghr's minisign public key inline to require minisign verification on
+top of the default sigstore check:
+
+```sh
+ghr install cataggar/ghr@v0.4.0 \
+    RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+```
+
+The same token works with `ghr download`. Minisign sidecars are
+published starting with releases that include the signing step in
+`.github/workflows/release.yml`; tags pre-dating that change fail
+closed when this key is supplied.
+
 ## GitHub Actions
 
 For workflows, install several tools in one cached step:
