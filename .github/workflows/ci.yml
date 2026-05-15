@@ -157,11 +157,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Use $RUNNER_TEMP directly: on Windows, `cd $dest && pwd` returns a
+          # POSIX-style path (`/d/a/_temp/ghr-download`) that the Actions
+          # runner can't chdir into when it resolves `working-directory:` for
+          # downstream steps. `$RUNNER_TEMP` is already absolute on every OS.
           dest="$RUNNER_TEMP/ghr-download"
           mkdir -p "$dest"
-          # Canonicalise to an absolute path for cache stability.
-          dest_abs="$(cd "$dest" && pwd)"
-          echo "dest=$dest_abs" >> "$GITHUB_OUTPUT"
+          echo "dest=$dest" >> "$GITHUB_OUTPUT"
 
       - name: Restore download cache
         id: ghr-cache
