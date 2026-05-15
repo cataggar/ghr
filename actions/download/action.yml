@@ -47,7 +47,31 @@ inputs:
     default: ''
   skip-verify:
     description: >-
-      Skip sigstore + sha256 + minisign verification. Default: false.
+      Umbrella flag: skip every verification step (checksum, minisign,
+      sigstore, authenticode). Default: false.
+    required: false
+    default: 'false'
+  skip-checksum:
+    description: >-
+      Skip just the checksum-sidecar verification step. Default: false.
+    required: false
+    default: 'false'
+  skip-minisign:
+    description: >-
+      Skip just the minisign verification step. Bypasses the fail-closed
+      behavior that would otherwise reject a published `.minisig` sidecar
+      when no key is configured. Default: false.
+    required: false
+    default: 'false'
+  skip-sigstore:
+    description: >-
+      Skip just the sigstore-bundle verification step. Default: false.
+    required: false
+    default: 'false'
+  skip-authenticode:
+    description: >-
+      Skip just the Authenticode (Windows PE) verification step.
+      Default: false.
     required: false
     default: 'false'
   keep-going:
@@ -174,6 +198,10 @@ runs:
         DEST: ${{ steps.ghr-dest.outputs.dest }}
         MINISIGN: ${{ inputs.minisign }}
         SKIP_VERIFY: ${{ inputs.skip-verify }}
+        SKIP_CHECKSUM: ${{ inputs.skip-checksum }}
+        SKIP_MINISIGN: ${{ inputs.skip-minisign }}
+        SKIP_SIGSTORE: ${{ inputs.skip-sigstore }}
+        SKIP_AUTHENTICODE: ${{ inputs.skip-authenticode }}
         KEEP_GOING: ${{ inputs.keep-going }}
       run: |
         set -euo pipefail
@@ -182,6 +210,10 @@ runs:
         if [[ -n "${STRIP}" ]]; then flags+=(--strip-components "${STRIP}"); fi
         if [[ "${KEEP_GOING}" == "true" ]]; then flags+=(--keep-going); fi
         if [[ "${SKIP_VERIFY}" == "true" ]]; then flags+=(--skip-verify); fi
+        if [[ "${SKIP_CHECKSUM}" == "true" ]]; then flags+=(--skip-checksum); fi
+        if [[ "${SKIP_MINISIGN}" == "true" ]]; then flags+=(--skip-minisign); fi
+        if [[ "${SKIP_SIGSTORE}" == "true" ]]; then flags+=(--skip-sigstore); fi
+        if [[ "${SKIP_AUTHENTICODE}" == "true" ]]; then flags+=(--skip-authenticode); fi
         if [[ -n "${MINISIGN}" ]]; then flags+=(--minisign "${MINISIGN}"); fi
         readarray -t specs <<< "${SORTED_SPECS}"
         ghr download "${flags[@]}" "${specs[@]}"

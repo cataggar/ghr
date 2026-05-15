@@ -864,7 +864,12 @@ pub const InstallContext = struct {
     err_w: *Writer,
     debug: bool,
     no_auth: bool,
-    skip_verify: bool,
+    /// Verification skip flags (`--skip-verify` umbrella + four narrow
+    /// flags). Each gates a single `verifyDownloadedAsset*` call site in
+    /// `installOne`.
+    gates: release_mod.VerifyGates,
+    /// Global default minisign public key (from `--minisign`). Applied to
+    /// any spec whose `SpecWithKey.key` is null.
     minisign_pubkey_b64: ?[]const u8,
 };
 
@@ -874,7 +879,7 @@ pub const InstallContext = struct {
 /// and returns `error.InstallStepFailed`. Allocation / I/O errors that
 /// indicate environmental rather than per-spec problems propagate as
 /// their original error type.
-fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
+fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerror!void {
     const allocator = ctx.allocator;
     const io = ctx.io;
     const environ = ctx.environ;
@@ -883,8 +888,11 @@ fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
     const w = ctx.w;
     const err_w = ctx.err_w;
     const debug = ctx.debug;
-    const skip_verify = ctx.skip_verify;
-    const minisign_pubkey_b64 = ctx.minisign_pubkey_b64;
+    const gates = ctx.gates;
+    const spec_str = entry.spec;
+    // Effective minisign key: per-spec inline key overrides the global
+    // `--minisign` default for this one spec only.
+    const minisign_pubkey_b64: ?[]const u8 = entry.key orelse ctx.minisign_pubkey_b64;
 
     const classified = release_mod.classifyArg(spec_str) catch {
         try err_w.print("error: invalid argument '{s}'\n", .{spec_str});
@@ -985,13 +993,13 @@ fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
     };
 
     // Pre-flight verification check: if a `.minisig` sidecar exists but
-    // the caller did not pass `--minisign` (and is not using
-    // `--skip-verify`), abort BEFORE downloading. Mirrors the same check
-    // in cmdDownload.
+    // the caller did not pass a minisign key (inline or `--minisign`), and
+    // is not using `--skip-verify` / `--skip-minisign`, abort BEFORE
+    // downloading. Mirrors the same check in cmdDownload.
     release_mod.preflightVerification(
         release.parsed.value.assets,
         asset.name,
-        skip_verify,
+        gates,
         minisign_pubkey_b64,
         err_w,
     ) catch return error.InstallStepFailed;
@@ -1042,16 +1050,20 @@ fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
     }
 
     // Verification (issue #50 + issue #65). Runs after the asset is on
-    // disk, before we extract or move anything. SHA256 (Phase 1), minisign
-    // (issue #65, requires `--minisign`), and sigstore bundle (Phase 2)
-    // are independent — all run when material is published. Outcome
-    // precedence for the metadata label: sigstore > minisign > sha256.
+    // disk, before we extract or move anything. Checksum (Phase 1),
+    // minisign (issue #65, requires a key — inline or `--minisign`), and
+    // sigstore bundle (Phase 2) are independent — all run when material
+    // is published, unless the matching skip flag suppresses one. Outcome
+    // precedence for the metadata label: sigstore > minisign > authenticode > checksum.
     var verified_label: []const u8 = "none";
-    if (skip_verify) {
+    if (gates.skip_verify) {
         verified_label = "skipped";
         try w.print("note: verification skipped (--skip-verify)\n", .{});
     } else {
-        const sha_outcome = verifyDownloadedAssetSha256(
+        const sha_outcome: release_mod.VerifyOutcome = if (gates.skip_checksum) blk: {
+            try w.print("note: checksum sidecar verification skipped (--skip-checksum)\n", .{});
+            break :blk .no_verification;
+        } else verifyDownloadedAssetSha256(
             allocator,
             io,
             d.cache,
@@ -1072,16 +1084,21 @@ fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
                     return error.InstallStepFailed;
                 },
                 else => {
-                    try err_w.print("error: SHA256 verification failed: {}\n", .{verr});
+                    try err_w.print("error: checksum verification failed: {}\n", .{verr});
                     try err_w.flush();
                     Dir.deleteFileAbsolute(io, download_path) catch {};
                     return error.InstallStepFailed;
                 },
             }
         };
-        if (sha_outcome == .sha256_verified) verified_label = "sha256";
+        if (sha_outcome == .sha256_verified) verified_label = "checksum";
 
-        const mini_outcome = release_mod.verifyDownloadedAssetMinisign(
+        const mini_outcome: release_mod.VerifyOutcome = if (gates.skip_minisign) blk: {
+            if (minisign_pubkey_b64 != null) {
+                try w.print("note: minisign verification skipped (--skip-minisign)\n", .{});
+            }
+            break :blk .no_verification;
+        } else release_mod.verifyDownloadedAssetMinisign(
             allocator,
             io,
             d.cache,
@@ -1100,7 +1117,10 @@ fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
         };
         if (mini_outcome == .minisign_verified) verified_label = "minisign";
 
-        const ac_outcome = release_mod.verifyDownloadedAssetAuthenticode(
+        const ac_outcome: release_mod.VerifyOutcome = if (gates.skip_authenticode) blk: {
+            try w.print("note: authenticode verification skipped (--skip-authenticode)\n", .{});
+            break :blk .no_verification;
+        } else release_mod.verifyDownloadedAssetAuthenticode(
             allocator,
             io,
             download_path,
@@ -1115,7 +1135,10 @@ fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
         };
         if (ac_outcome == .authenticode_verified) verified_label = "authenticode";
 
-        const sig_outcome = verifyDownloadedAssetSigstore(
+        const sig_outcome: release_mod.VerifyOutcome = if (gates.skip_sigstore) blk: {
+            try w.print("note: sigstore verification skipped (--skip-sigstore)\n", .{});
+            break :blk .no_verification;
+        } else verifyDownloadedAssetSigstore(
             allocator,
             io,
             d.cache,
@@ -1332,6 +1355,10 @@ fn installOne(ctx: *const InstallContext, spec_str: []const u8) anyerror!void {
 /// shared HTTP client + auth context + `Dirs.detect` result once and
 /// reuses them across every spec.
 ///
+/// Each entry is a spec plus an optional inline minisign pubkey. The
+/// effective key for a spec is `entry.key orelse minisign_pubkey_b64`
+/// (the inline override beats the global default for that one spec).
+///
 /// `keep_going` controls failure semantics:
 ///   - `false` (default for `ghr install`): on the first per-spec
 ///     failure, exit the process with status 1. The current spec's
@@ -1343,16 +1370,16 @@ pub fn cmdInstallMany(
     allocator: std.mem.Allocator,
     io: Io,
     environ: *const EnvironMap,
-    specs: []const []const u8,
+    entries: []const release_mod.SpecWithKey,
     w: *Writer,
     err_w: *Writer,
     debug: bool,
     no_auth: bool,
-    skip_verify: bool,
+    gates: release_mod.VerifyGates,
     minisign_pubkey_b64: ?[]const u8,
     keep_going: bool,
 ) !void {
-    if (specs.len == 0) return;
+    if (entries.len == 0) return;
 
     const dirs = try Dirs.detect(allocator, environ);
     defer dirs.deinit();
@@ -1383,32 +1410,32 @@ pub fn cmdInstallMany(
         .err_w = err_w,
         .debug = debug,
         .no_auth = no_auth,
-        .skip_verify = skip_verify,
+        .gates = gates,
         .minisign_pubkey_b64 = minisign_pubkey_b64,
     };
 
     var failed_specs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer failed_specs.deinit(allocator);
 
-    for (specs, 0..) |spec, i| {
-        if (specs.len > 1) {
-            try w.print("[{d}/{d}] {s}\n", .{ i + 1, specs.len, spec });
+    for (entries, 0..) |entry, i| {
+        if (entries.len > 1) {
+            try w.print("[{d}/{d}] {s}\n", .{ i + 1, entries.len, entry.spec });
             try w.flush();
         }
-        installOne(&ctx, spec) catch |err| switch (err) {
+        installOne(&ctx, entry) catch |err| switch (err) {
             error.InstallStepFailed => {
-                try failed_specs.append(allocator, spec);
+                try failed_specs.append(allocator, entry.spec);
                 if (!keep_going) std.process.exit(1);
-                try err_w.print("note: --keep-going, continuing past failure for {s}\n", .{spec});
+                try err_w.print("note: --keep-going, continuing past failure for {s}\n", .{entry.spec});
                 try err_w.flush();
             },
             else => return err,
         };
     }
 
-    if (specs.len > 1) {
-        const ok = specs.len - failed_specs.items.len;
-        try w.print("installed {d}/{d}", .{ ok, specs.len });
+    if (entries.len > 1) {
+        const ok = entries.len - failed_specs.items.len;
+        try w.print("installed {d}/{d}", .{ ok, entries.len });
         if (failed_specs.items.len > 0) {
             try w.print(", failed:", .{});
             for (failed_specs.items) |s| try w.print(" {s}", .{s});
@@ -1434,17 +1461,18 @@ pub fn cmdInstall(
     skip_verify: bool,
     minisign_pubkey_b64: ?[]const u8,
 ) !void {
-    const specs: [1][]const u8 = .{spec_str};
+    const entries: [1]release_mod.SpecWithKey = .{.{ .spec = spec_str }};
+    const gates: release_mod.VerifyGates = .{ .skip_verify = skip_verify };
     return cmdInstallMany(
         allocator,
         io,
         environ,
-        specs[0..],
+        entries[0..],
         w,
         err_w,
         debug,
         no_auth,
-        skip_verify,
+        gates,
         minisign_pubkey_b64,
         false,
     );
@@ -1460,7 +1488,7 @@ test "cmdInstallMany short-circuits on empty spec list" {
     var environ_map = EnvironMap.init(std.testing.allocator);
     defer environ_map.deinit();
 
-    const empty: []const []const u8 = &.{};
+    const empty: []const release_mod.SpecWithKey = &.{};
     try cmdInstallMany(
         std.testing.allocator,
         std.testing.io,
@@ -1470,7 +1498,7 @@ test "cmdInstallMany short-circuits on empty spec list" {
         &err_w.writer,
         false,
         false,
-        false,
+        .{},
         null,
         false,
     );
@@ -1843,7 +1871,7 @@ test "writeMetadata and readMetadata round-trip" {
 
     const bins = [_][]const u8{ "sub\\dir\\tool.exe", "other.exe" };
     const apps = [_][]const u8{};
-    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.0.0", "tool-windows.zip", &bins, &apps, "sha256");
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.0.0", "tool-windows.zip", &bins, &apps, "checksum");
 
     // Verify it's valid JSON by reading it back
     const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
@@ -1857,7 +1885,7 @@ test "writeMetadata and readMetadata round-trip" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("v1.0.0", parsed.value.tag);
     try std.testing.expectEqualStrings("tool-windows.zip", parsed.value.asset);
-    try std.testing.expectEqualStrings("sha256", parsed.value.verified);
+    try std.testing.expectEqualStrings("checksum", parsed.value.verified);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.bins.len);
     try std.testing.expectEqualStrings("sub\\dir\\tool.exe", parsed.value.bins[0]);
     try std.testing.expectEqualStrings("other.exe", parsed.value.bins[1]);

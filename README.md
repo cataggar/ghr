@@ -11,19 +11,21 @@ GitHub-hosted runner with `pipx install ghr-bin`.
 ## Usage
 
 ```
-ghr list                                 List installed tools
-ghr install <spec> [<spec> ...]          Install one or more tools from GitHub releases
-ghr uninstall <name>                     Remove an installed tool
-ghr download <spec> [<spec> ...]         Download one or more release assets
-ghr path ensure [--dry-run]              Add ghr's bin dir to your user PATH
-ghr path [bin|tools|cache]               Show ghr directories
-ghr version                              Print version and exit
-ghr help                                 Print this help and exit
+ghr list                                          List installed tools
+ghr install <spec> [<pubkey>] [<spec> ...]        Install one or more tools from GitHub releases
+ghr uninstall <name>                              Remove an installed tool
+ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
+ghr path ensure [--dry-run]                       Add ghr's bin dir to your user PATH
+ghr path [bin|tools|cache]                        Show ghr directories
+ghr version                                       Print version and exit
+ghr help                                          Print this help and exit
 ```
 
 Each `<spec>` is `owner/repo[@tag]` (auto-pick asset) or
-`owner/repo/file[@tag]` (specific asset). Run `ghr <COMMAND> help` to
-show help for a specific command, e.g. `ghr download help`.
+`owner/repo/file[@tag]` (specific asset). A 56-char `RW`/`RU`-prefixed
+base64 token immediately after a spec is treated as that spec's
+minisign public key. Run `ghr <COMMAND> help` to show help for a
+specific command, e.g. `ghr download help`.
 
 ### Examples
 
@@ -39,9 +41,10 @@ ghr install bytecodealliance/wasmtime@v44.0.1
 ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
 
 # Install minisign itself, verifying the release with the upstream
-# minisign public key from https://jedisct1.github.io/minisign/
+# minisign public key (inline per-spec key).
+# https://jedisct1.github.io/minisign/
 ghr install jedisct1/minisign@0.12 \
-    --minisign RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+    RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
 ```
 
 ## Install

@@ -34,7 +34,11 @@ invalidates the cache cleanly.
 | `strip-components`  | _(none)_                         | When `extract: true`, strip N leading path components. |
 | `cache`             | `true`                           | Cache the `dest` directory across runs. |
 | `minisign`          | _(empty)_                        | Base64 minisign public key. When set, every spec is verified against a `.minisig` sidecar (fail-closed). |
-| `skip-verify`       | `false`                          | Skip sigstore + sha256 + minisign verification. |
+| `skip-verify`       | `false`                          | Umbrella: skip every verification step (checksum, minisign, sigstore, authenticode). |
+| `skip-checksum`     | `false`                          | Skip just the checksum-sidecar verification step. |
+| `skip-minisign`     | `false`                          | Skip just the minisign verification step. Bypasses the fail-closed "sidecar published but no key" behavior. |
+| `skip-sigstore`     | `false`                          | Skip just the sigstore-bundle verification step. |
+| `skip-authenticode` | `false`                          | Skip just the Authenticode (Windows PE) verification step. |
 | `keep-going`        | `false`                          | Continue past per-spec failures; exit non-zero with a summary if any spec failed. |
 | `ghr-version`       | _(derived from action ref)_      | Override the `ghr-bin` version installed. Default: derived from the action's git ref (e.g. `@v0.3.0` → `ghr-bin==0.3.0`). Pass `latest` to install the latest from PyPI. |
 

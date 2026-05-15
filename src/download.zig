@@ -25,9 +25,10 @@ pub const exit_sha256_mismatch: u8 = 3;
 /// Parsed `download` command-line options.
 pub const Options = struct {
     /// Positional arguments: URLs, `owner/repo[@tag]`, or
-    /// `owner/repo/file[@tag]`. Multi-spec downloads loop over this list
+    /// `owner/repo/file[@tag]`, each optionally followed by an inline
+    /// minisign public key. Multi-spec downloads loop over this list
     /// sharing a single HTTP client + auth resolution.
-    targets: std.ArrayListUnmanaged([]const u8) = .empty,
+    targets: std.ArrayListUnmanaged(release_mod.SpecWithKey) = .empty,
     /// Single-output path. Rejected when `targets.len > 1`.
     output: ?[]const u8 = null,
     extract: ?[]const u8 = null,
@@ -38,9 +39,20 @@ pub const Options = struct {
     quiet: bool = false,
     no_auth: bool = false,
     skip_verify: bool = false,
-    /// Raw base64 minisign public key (single token). When set, ghr fetches
-    /// `<asset>.minisig` from the release and verifies it; missing sidecar
-    /// is treated as a verification failure (fail-closed).
+    /// Skip just the checksum-sidecar verification step. Minisign,
+    /// sigstore, and authenticode continue to run as usual.
+    skip_checksum: bool = false,
+    /// Skip just the minisign-sidecar verification step. Bypasses the
+    /// fail-closed "sidecar present but no key" diagnostic.
+    skip_minisign: bool = false,
+    /// Skip just the sigstore-bundle verification step.
+    skip_sigstore: bool = false,
+    /// Skip just the Authenticode (Windows PE) verification step.
+    skip_authenticode: bool = false,
+    /// Raw base64 minisign public key (single token). Default applied to
+    /// every target that does not carry its own inline key. When set,
+    /// ghr fetches `<asset>.minisig` from the release and verifies it;
+    /// missing sidecar is treated as a verification failure (fail-closed).
     minisign_pubkey: ?[]const u8 = null,
     debug: bool = false,
     /// Continue past per-spec failures, then exit non-zero with a summary
@@ -50,6 +62,17 @@ pub const Options = struct {
     /// Free the targets list. Target slices themselves borrow from argv.
     pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.targets.deinit(allocator);
+    }
+
+    /// Snapshot of skip flags as a `VerifyGates`.
+    pub fn gates(self: *const Options) release_mod.VerifyGates {
+        return .{
+            .skip_verify = self.skip_verify,
+            .skip_checksum = self.skip_checksum,
+            .skip_minisign = self.skip_minisign,
+            .skip_sigstore = self.skip_sigstore,
+            .skip_authenticode = self.skip_authenticode,
+        };
     }
 };
 
@@ -172,17 +195,17 @@ pub fn cmdDownloadMany(
 
     for (opts.targets.items, 0..) |target, i| {
         if (opts.targets.items.len > 1 and !opts.quiet) {
-            try w.print("[{d}/{d}] {s}\n", .{ i + 1, opts.targets.items.len, target });
+            try w.print("[{d}/{d}] {s}\n", .{ i + 1, opts.targets.items.len, target.spec });
             try w.flush();
         }
         var step: StepResult = .{};
         downloadOne(&ctx, opts, target, &step) catch |err| switch (err) {
             error.DownloadStepFailed => {
-                try failed_specs.append(allocator, target);
+                try failed_specs.append(allocator, target.spec);
                 if (step.exit_code > max_exit_code) max_exit_code = step.exit_code;
                 if (!opts.keep_going) std.process.exit(if (step.exit_code == 0) exit_http_error else step.exit_code);
                 if (!opts.quiet) {
-                    try err_w.print("note: --keep-going, continuing past failure for {s}\n", .{target});
+                    try err_w.print("note: --keep-going, continuing past failure for {s}\n", .{target.spec});
                     try err_w.flush();
                 }
             },
@@ -212,7 +235,7 @@ pub fn cmdDownloadMany(
 fn downloadOne(
     ctx: *const DownloadContext,
     opts: *const Options,
-    target_str: []const u8,
+    entry: release_mod.SpecWithKey,
     step: *StepResult,
 ) anyerror!void {
     const allocator = ctx.allocator;
@@ -220,6 +243,11 @@ fn downloadOne(
     const environ = ctx.environ;
     const w = ctx.w;
     const err_w = ctx.err_w;
+
+    const target_str = entry.spec;
+    // Per-spec inline key beats the global `--minisign` default.
+    const effective_minisign_pubkey: ?[]const u8 = entry.key orelse opts.minisign_pubkey;
+    const gates = opts.gates();
 
     const debug_w: ?*Writer = if (opts.debug) err_w else null;
 
@@ -268,14 +296,15 @@ fn downloadOne(
 
     // 4) Pre-flight verification check: if a `.minisig` sidecar is
     //    published, refuse to download without explicit user intent
-    //    (either `--minisign <key>` or `--skip-verify`). Similarly, fail
-    //    early if `--minisign` was supplied but no sidecar exists.
+    //    (inline key, `--minisign <key>`, `--skip-minisign`, or
+    //    `--skip-verify`). Similarly, fail early if a minisign key was
+    //    supplied but no sidecar exists.
     if (target.release != null and target.asset_name != null) {
         release_mod.preflightVerification(
             target.release.?.parsed.value.assets,
             target.asset_name.?,
-            opts.skip_verify,
-            opts.minisign_pubkey,
+            gates,
+            effective_minisign_pubkey,
             err_w,
         ) catch |perr| switch (perr) {
             error.MinisignSidecarPresentButNoKey,
@@ -355,8 +384,8 @@ fn downloadOne(
             part_path,
             debug_w,
             per_spec_auth_header,
-            opts.skip_verify,
-            opts.minisign_pubkey,
+            gates,
+            effective_minisign_pubkey,
             w,
             err_w,
         ) catch |verr| {
@@ -747,6 +776,14 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
             opts.no_auth = true;
         } else if (eql(arg, "--skip-verify")) {
             opts.skip_verify = true;
+        } else if (eql(arg, "--skip-checksum")) {
+            opts.skip_checksum = true;
+        } else if (eql(arg, "--skip-minisign")) {
+            opts.skip_minisign = true;
+        } else if (eql(arg, "--skip-sigstore")) {
+            opts.skip_sigstore = true;
+        } else if (eql(arg, "--skip-authenticode")) {
+            opts.skip_authenticode = true;
         } else if (eql(arg, "--minisign")) {
             opts.minisign_pubkey = try takeValue(args, "--minisign", err_w);
         } else if (eql(arg, "--keep-going")) {
@@ -760,7 +797,31 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
         } else if (eql(arg, "help") and opts.targets.items.len == 0) {
             return error.HelpRequested;
         } else {
-            try opts.targets.append(allocator, arg);
+            switch (release_mod.classifySpecOrKey(arg, opts.targets.items)) {
+                .spec => |s| try opts.targets.append(allocator, .{ .spec = s }),
+                .key => |k| opts.targets.items[opts.targets.items.len - 1].key = k,
+                .lone_key => {
+                    try err_w.print(
+                        "error: positional minisign key '{s}' must follow a spec\n",
+                        .{arg},
+                    );
+                    try err_w.print(
+                        "  hint: write `<owner/repo[@tag]> <pubkey>` (key attaches to the preceding spec)\n",
+                        .{},
+                    );
+                    try err_w.flush();
+                    return error.InvalidArgument;
+                },
+                .double_key => {
+                    const last_spec = opts.targets.items[opts.targets.items.len - 1].spec;
+                    try err_w.print(
+                        "error: spec '{s}' already has an inline minisign key; second key '{s}' is not allowed\n",
+                        .{ last_spec, arg },
+                    );
+                    try err_w.flush();
+                    return error.InvalidArgument;
+                },
+            }
         }
     }
 
@@ -823,17 +884,22 @@ fn printDownloadUsage(w: *Writer) !void {
         \\ghr download - download one or more release assets
         \\
         \\USAGE:
-        \\    ghr download <spec> [<spec> ...] [options]
+        \\    ghr download <spec> [<minisign-pubkey>] [<spec> [<minisign-pubkey>] ...] [options]
         \\
         \\Each <spec> is one of:
         \\    owner/repo[@tag]              Auto-pick the asset 'ghr install' would pick
         \\    owner/repo/file[@tag]         Match a specific asset by name
         \\
+        \\An optional minisign public key (56-char base64, starts with `RW` or
+        \\`RU`) immediately after a spec attaches to that spec only and
+        \\overrides `--minisign` for that one download. Otherwise the global
+        \\`--minisign <pubkey>` default applies to every spec.
+        \\
         \\Picks the asset that 'ghr install' would install (first form), or the
         \\named asset (second form, exact match preferred, otherwise unique
         \\substring). Downloads are auto-verified against any sigstore bundle
-        \\or sha256 checksum file published with the release. Pass
-        \\`--minisign <base64-pubkey>` to also require minisign signature
+        \\or checksum sidecar published with the release. Pass a minisign key
+        \\(inline or `--minisign`) to also require minisign signature
         \\verification against a `<asset>.minisig` sidecar.
         \\
         \\Multi-spec invocations share a single HTTP client + auth context.
@@ -842,9 +908,13 @@ fn printDownloadUsage(w: *Writer) !void {
         \\    -o, --output <path>        Output file path (single-spec only)
         \\        --extract <dir>        Extract archive(s) into <dir> after download
         \\        --strip-components <N> Strip N leading path components when extracting
-        \\        --sha256 <hex>         Verify download against SHA-256 digest (single-spec only)
-        \\        --minisign <pubkey>    Require minisign signature; <pubkey> is a base64 minisign public key
-        \\        --skip-verify          Skip sigstore + sha256 + minisign release verification
+        \\        --sha256 <hex>         Verify download against literal SHA-256 digest (single-spec only)
+        \\        --minisign <pubkey>    Default minisign key, applied to specs without an inline key
+        \\        --skip-verify          Skip every verification step (checksum, minisign, sigstore, authenticode)
+        \\        --skip-checksum        Skip just the checksum-sidecar verification step
+        \\        --skip-minisign        Skip just the minisign verification step
+        \\        --skip-sigstore        Skip just the sigstore-bundle verification step
+        \\        --skip-authenticode    Skip just the Authenticode (Windows PE) verification step
         \\        --keep-archive         Keep archive on disk after extraction
         \\        --keep-going           For multi-spec, continue past per-spec failures
         \\        --quiet                Suppress progress output
@@ -856,6 +926,7 @@ fn printDownloadUsage(w: *Writer) !void {
         \\EXAMPLES:
         \\    ghr download burntsushi/ripgrep@15.1.0
         \\    ghr download burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0 --extract ./bin
+        \\    ghr download jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
         \\
         \\EXIT CODES:
         \\    0 success
@@ -939,7 +1010,7 @@ test "validateMultiTargetOptions accepts single target with -o" {
 
     var opts: Options = .{ .output = "/tmp/out.tar.gz" };
     defer opts.deinit(std.testing.allocator);
-    try opts.targets.append(std.testing.allocator, "owner/repo@1.0");
+    try opts.targets.append(std.testing.allocator, .{ .spec = "owner/repo@1.0" });
 
     try validateMultiTargetOptions(&opts, &err_w.writer);
 }
@@ -950,7 +1021,7 @@ test "validateMultiTargetOptions accepts single target with --sha256" {
 
     var opts: Options = .{ .sha256 = "0000000000000000000000000000000000000000000000000000000000000000" };
     defer opts.deinit(std.testing.allocator);
-    try opts.targets.append(std.testing.allocator, "owner/repo@1.0");
+    try opts.targets.append(std.testing.allocator, .{ .spec = "owner/repo@1.0" });
 
     try validateMultiTargetOptions(&opts, &err_w.writer);
 }
@@ -967,8 +1038,8 @@ test "validateMultiTargetOptions accepts multi-target with uniform flags" {
         .keep_going = true,
     };
     defer opts.deinit(std.testing.allocator);
-    try opts.targets.append(std.testing.allocator, "owner/repo@1.0");
-    try opts.targets.append(std.testing.allocator, "other/repo@2.0");
+    try opts.targets.append(std.testing.allocator, .{ .spec = "owner/repo@1.0" });
+    try opts.targets.append(std.testing.allocator, .{ .spec = "other/repo@2.0" });
 
     try validateMultiTargetOptions(&opts, &err_w.writer);
 }
@@ -979,8 +1050,8 @@ test "validateMultiTargetOptions rejects -o with multi-target" {
 
     var opts: Options = .{ .output = "/tmp/out.tar.gz" };
     defer opts.deinit(std.testing.allocator);
-    try opts.targets.append(std.testing.allocator, "owner/repo@1.0");
-    try opts.targets.append(std.testing.allocator, "other/repo@2.0");
+    try opts.targets.append(std.testing.allocator, .{ .spec = "owner/repo@1.0" });
+    try opts.targets.append(std.testing.allocator, .{ .spec = "other/repo@2.0" });
 
     try std.testing.expectError(error.ConflictingFlag, validateMultiTargetOptions(&opts, &err_w.writer));
 }
@@ -991,8 +1062,8 @@ test "validateMultiTargetOptions rejects --sha256 with multi-target" {
 
     var opts: Options = .{ .sha256 = "0000000000000000000000000000000000000000000000000000000000000000" };
     defer opts.deinit(std.testing.allocator);
-    try opts.targets.append(std.testing.allocator, "owner/repo@1.0");
-    try opts.targets.append(std.testing.allocator, "other/repo@2.0");
+    try opts.targets.append(std.testing.allocator, .{ .spec = "owner/repo@1.0" });
+    try opts.targets.append(std.testing.allocator, .{ .spec = "other/repo@2.0" });
 
     try std.testing.expectError(error.ConflictingFlag, validateMultiTargetOptions(&opts, &err_w.writer));
 }

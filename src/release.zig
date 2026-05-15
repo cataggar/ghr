@@ -35,6 +35,62 @@ pub const RepoSpec = struct {
     tag: ?[]const u8,
 };
 
+/// A single positional argument from the install/download CLI: a spec
+/// string plus an optional inline minisign public key that immediately
+/// followed the spec on the command line. Both slices borrow from argv.
+///
+/// When `key` is non-null, it has already passed `minisign.looksLikePubKey`
+/// (length 56, `RW`/`RV` prefix, decodes to a known algo). The downstream
+/// verifier re-parses it with `minisign.parsePublicKey` and surfaces a
+/// pointed error if it doesn't decode (covers the rare structural
+/// false-positive).
+pub const SpecWithKey = struct {
+    spec: []const u8,
+    key: ?[]const u8 = null,
+};
+
+/// Bundle of per-invocation verification skip flags. `skip_verify` is the
+/// umbrella (disables every check); the four narrow flags suppress one
+/// path apiece.
+pub const VerifyGates = struct {
+    skip_verify: bool = false,
+    skip_checksum: bool = false,
+    skip_minisign: bool = false,
+    skip_sigstore: bool = false,
+    skip_authenticode: bool = false,
+};
+
+/// CLI positional classifier outcome for one bare argument.
+pub const SpecOrKey = union(enum) {
+    /// A regular spec — caller should push a new `SpecWithKey` onto its
+    /// list.
+    spec: []const u8,
+    /// A minisign pubkey that follows a prior spec — caller should attach
+    /// it to the most recent entry's `key` field.
+    key: []const u8,
+    /// First positional was a pubkey-shaped token. Caller emits a "lone
+    /// key" diagnostic and aborts.
+    lone_key,
+    /// Pubkey-shaped token, but the previous spec already has one.
+    /// Caller emits a "double key" diagnostic and aborts.
+    double_key,
+};
+
+/// Classify one positional argument from the install/download CLI given
+/// the current accumulated entries. Pure: no allocation, no I/O.
+///
+/// The caller decides how to act on each variant:
+///   * `.spec`      — append a new `SpecWithKey` to its list.
+///   * `.key`       — set the last entry's `.key` field.
+///   * `.lone_key`  — print "key must follow a spec" and exit.
+///   * `.double_key`— print "spec already has a key" and exit.
+pub fn classifySpecOrKey(arg: []const u8, prior: []const SpecWithKey) SpecOrKey {
+    if (!minisign.looksLikePubKey(arg)) return .{ .spec = arg };
+    if (prior.len == 0) return .lone_key;
+    if (prior[prior.len - 1].key != null) return .double_key;
+    return .{ .key = arg };
+}
+
 /// Parse `owner/repo[@tag]`. Slices reference the input string.
 pub fn parseRepoSpec(s: []const u8) !RepoSpec {
     const slash = std.mem.indexOfScalar(u8, s, '/') orelse return error.InvalidSpec;
@@ -1326,11 +1382,11 @@ pub fn findAssetByName(
 pub fn preflightVerification(
     assets: []const Asset,
     asset_name: []const u8,
-    skip_verify: bool,
+    gates: VerifyGates,
     minisign_pubkey_b64: ?[]const u8,
     err_w: *Writer,
 ) !void {
-    if (skip_verify) return;
+    if (gates.skip_verify or gates.skip_minisign) return;
 
     var views_buf: [256]minisign.AssetView = undefined;
     if (assets.len > views_buf.len) {
@@ -1349,7 +1405,7 @@ pub fn preflightVerification(
     if (minisign_pubkey_b64) |key_b64| {
         _ = minisign.parsePublicKey(key_b64) catch |err| {
             try err_w.print(
-                "error: --minisign value is not a valid minisign public key ({s})\n",
+                "error: minisign value is not a valid minisign public key ({s})\n",
                 .{@errorName(err)},
             );
             try err_w.flush();
@@ -1358,7 +1414,7 @@ pub fn preflightVerification(
 
         if (sidecar_opt == null) {
             try err_w.print(
-                "error: --minisign was supplied but no '{s}.minisig' sidecar is published in this release\n",
+                "error: a minisign key was supplied but no '{s}.minisig' sidecar is published in this release\n",
                 .{asset_name},
             );
             try err_w.flush();
@@ -1369,11 +1425,15 @@ pub fn preflightVerification(
 
     if (sidecar_opt) |sidecar| {
         try err_w.print(
-            "error: '{s}' is published with a minisign signature ('{s}') but --minisign was not provided\n",
+            "error: '{s}' is published with a minisign signature ('{s}') but no minisign key was provided\n",
             .{ asset_name, sidecar.name },
         );
         try err_w.print(
-            "  hint: pass --minisign <base64-pubkey> to verify, or --skip-verify to bypass\n",
+            "  hint: pass a minisign key (positional after the spec, or --minisign <base64-pubkey>),\n",
+            .{},
+        );
+        try err_w.print(
+            "        or --skip-minisign / --skip-verify to bypass\n",
             .{},
         );
         try err_w.flush();
@@ -1393,18 +1453,21 @@ pub fn verifyAssetOnDisk(
     download_path: []const u8,
     debug_w: ?*Writer,
     auth_header: ?[]const u8,
-    skip_verify: bool,
+    gates: VerifyGates,
     minisign_pubkey_b64: ?[]const u8,
     w: *Writer,
     err_w: *Writer,
 ) !VerifyOutcome {
-    if (skip_verify) {
+    if (gates.skip_verify) {
         try w.print("note: verification skipped (--skip-verify)\n", .{});
         try w.flush();
         return .skipped;
     }
 
-    const sha_outcome = try verifyDownloadedAssetSha256(
+    const sha_outcome: VerifyOutcome = if (gates.skip_checksum) blk: {
+        try w.print("note: checksum sidecar verification skipped (--skip-checksum)\n", .{});
+        break :blk .no_verification;
+    } else try verifyDownloadedAssetSha256(
         allocator,
         io,
         cache_dir,
@@ -1417,7 +1480,12 @@ pub fn verifyAssetOnDisk(
         err_w,
     );
 
-    const mini_outcome = try verifyDownloadedAssetMinisign(
+    const mini_outcome: VerifyOutcome = if (gates.skip_minisign) blk: {
+        if (minisign_pubkey_b64 != null) {
+            try w.print("note: minisign verification skipped (--skip-minisign)\n", .{});
+        }
+        break :blk .no_verification;
+    } else try verifyDownloadedAssetMinisign(
         allocator,
         io,
         cache_dir,
@@ -1431,7 +1499,10 @@ pub fn verifyAssetOnDisk(
         err_w,
     );
 
-    const sig_outcome = try verifyDownloadedAssetSigstore(
+    const sig_outcome: VerifyOutcome = if (gates.skip_sigstore) blk: {
+        try w.print("note: sigstore verification skipped (--skip-sigstore)\n", .{});
+        break :blk .no_verification;
+    } else try verifyDownloadedAssetSigstore(
         allocator,
         io,
         cache_dir,
@@ -1444,7 +1515,10 @@ pub fn verifyAssetOnDisk(
         err_w,
     );
 
-    const ac_outcome = try verifyDownloadedAssetAuthenticode(
+    const ac_outcome: VerifyOutcome = if (gates.skip_authenticode) blk: {
+        try w.print("note: authenticode verification skipped (--skip-authenticode)\n", .{});
+        break :blk .no_verification;
+    } else try verifyDownloadedAssetAuthenticode(
         allocator,
         io,
         download_path,
@@ -1491,6 +1565,44 @@ test "parseRepoSpec invalid" {
     try std.testing.expectError(error.InvalidSpec, parseRepoSpec("noslash"));
     try std.testing.expectError(error.InvalidSpec, parseRepoSpec("/repo"));
     try std.testing.expectError(error.InvalidSpec, parseRepoSpec("owner/"));
+}
+
+test "classifySpecOrKey: plain spec without key" {
+    const result = classifySpecOrKey("BurntSushi/ripgrep@14.1.1", &.{});
+    try std.testing.expect(result == .spec);
+    try std.testing.expectEqualStrings("BurntSushi/ripgrep@14.1.1", result.spec);
+}
+
+test "classifySpecOrKey: pubkey-shaped token after unkeyed spec" {
+    const prior = [_]SpecWithKey{.{ .spec = "jedisct1/minisign@0.12" }};
+    const key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    const result = classifySpecOrKey(key, &prior);
+    try std.testing.expect(result == .key);
+    try std.testing.expectEqualStrings(key, result.key);
+}
+
+test "classifySpecOrKey: pubkey with no prior spec is a lone key" {
+    const key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    try std.testing.expect(classifySpecOrKey(key, &.{}) == .lone_key);
+}
+
+test "classifySpecOrKey: pubkey after already-keyed spec is a double key" {
+    const prior = [_]SpecWithKey{.{
+        .spec = "jedisct1/minisign@0.12",
+        .key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
+    }};
+    const second_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+    try std.testing.expect(classifySpecOrKey(second_key, &prior) == .double_key);
+}
+
+test "classifySpecOrKey: plain spec after keyed spec is still a spec" {
+    const prior = [_]SpecWithKey{.{
+        .spec = "jedisct1/minisign@0.12",
+        .key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3",
+    }};
+    const result = classifySpecOrKey("BurntSushi/ripgrep@14.1.1", &prior);
+    try std.testing.expect(result == .spec);
+    try std.testing.expectEqualStrings("BurntSushi/ripgrep@14.1.1", result.spec);
 }
 
 test "parseFileSpec with tag" {

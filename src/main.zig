@@ -5,6 +5,7 @@ const install = @import("install.zig");
 const download = @import("download.zig");
 const ensurepath = @import("ensurepath.zig");
 const validate = @import("validate.zig");
+const release_mod = @import("release.zig");
 
 pub const version = build_options.version;
 
@@ -59,10 +60,14 @@ pub fn main(init: std.process.Init) !void {
         var debug = false;
         var no_auth = false;
         var skip_verify = false;
+        var skip_checksum = false;
+        var skip_minisign = false;
+        var skip_sigstore = false;
+        var skip_authenticode = false;
         var keep_going = false;
         var minisign_pubkey: ?[]const u8 = null;
-        var specs: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer specs.deinit(allocator);
+        var entries: std.ArrayListUnmanaged(release_mod.SpecWithKey) = .empty;
+        defer entries.deinit(allocator);
         while (args.next()) |arg| {
             if (eql(arg, "--debug")) {
                 debug = true;
@@ -70,6 +75,14 @@ pub fn main(init: std.process.Init) !void {
                 no_auth = true;
             } else if (eql(arg, "--skip-verify")) {
                 skip_verify = true;
+            } else if (eql(arg, "--skip-checksum")) {
+                skip_checksum = true;
+            } else if (eql(arg, "--skip-minisign")) {
+                skip_minisign = true;
+            } else if (eql(arg, "--skip-sigstore")) {
+                skip_sigstore = true;
+            } else if (eql(arg, "--skip-authenticode")) {
+                skip_authenticode = true;
             } else if (eql(arg, "--keep-going")) {
                 keep_going = true;
             } else if (eql(arg, "--minisign")) {
@@ -79,28 +92,59 @@ pub fn main(init: std.process.Init) !void {
                     std.process.exit(1);
                 };
                 minisign_pubkey = v;
-            } else if (eql(arg, "help") and specs.items.len == 0) {
+            } else if (eql(arg, "help") and entries.items.len == 0) {
                 try printInstallUsage(&stdout.interface);
                 return;
             } else {
-                try specs.append(allocator, arg);
+                switch (release_mod.classifySpecOrKey(arg, entries.items)) {
+                    .spec => |s| try entries.append(allocator, .{ .spec = s }),
+                    .key => |k| entries.items[entries.items.len - 1].key = k,
+                    .lone_key => {
+                        try stderr.interface.print(
+                            "error: positional minisign key '{s}' must follow a spec\n",
+                            .{arg},
+                        );
+                        try stderr.interface.print(
+                            "  hint: write `<owner/repo[@tag]> <pubkey>` (key attaches to the preceding spec)\n",
+                            .{},
+                        );
+                        try stderr.interface.flush();
+                        std.process.exit(1);
+                    },
+                    .double_key => {
+                        const last_spec = entries.items[entries.items.len - 1].spec;
+                        try stderr.interface.print(
+                            "error: spec '{s}' already has an inline minisign key; second key '{s}' is not allowed\n",
+                            .{ last_spec, arg },
+                        );
+                        try stderr.interface.flush();
+                        std.process.exit(1);
+                    },
+                }
             }
         }
-        if (specs.items.len == 0) {
+        if (entries.items.len == 0) {
             try stderr.interface.print("error: 'ghr install' requires <owner/repo[@tag]> or <owner/repo/file[@tag]>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
         }
+        const gates: release_mod.VerifyGates = .{
+            .skip_verify = skip_verify,
+            .skip_checksum = skip_checksum,
+            .skip_minisign = skip_minisign,
+            .skip_sigstore = skip_sigstore,
+            .skip_authenticode = skip_authenticode,
+        };
         try install.cmdInstallMany(
             allocator,
             io,
             environ,
-            specs.items,
+            entries.items,
             &stdout.interface,
             &stderr.interface,
             debug,
             no_auth,
-            skip_verify,
+            gates,
             minisign_pubkey,
             keep_going,
         );
@@ -225,11 +269,16 @@ fn printInstallUsage(w: *Writer) !void {
         \\ghr install - install one or more tools from GitHub releases
         \\
         \\USAGE:
-        \\    ghr install <spec> [<spec> ...] [options]
+        \\    ghr install <spec> [<minisign-pubkey>] [<spec> [<minisign-pubkey>] ...] [options]
         \\
         \\Each <spec> is one of:
         \\    owner/repo[@tag]              Auto-pick the best asset for this platform
         \\    owner/repo/file[@tag]         Install a specific asset by name
+        \\
+        \\An optional minisign public key (56-char base64, starts with `RW` or
+        \\`RU`) immediately after a spec attaches to that spec only and
+        \\overrides `--minisign` for that one install. Otherwise the global
+        \\`--minisign <pubkey>` default applies to every spec.
         \\
         \\Downloads the matching release asset(s), extracts each if needed,
         \\and installs the resulting binaries into ghr's bin directory.
@@ -238,8 +287,12 @@ fn printInstallUsage(w: *Writer) !void {
         \\OPTIONS:
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
-        \\    --skip-verify           Skip sigstore + SHA256 + minisign verification
-        \\    --minisign <pubkey>     Require minisign signature for every spec;
+        \\    --skip-verify           Skip every verification step (checksum, minisign, sigstore, authenticode)
+        \\    --skip-checksum         Skip just the checksum-sidecar verification step
+        \\    --skip-minisign         Skip just the minisign verification step
+        \\    --skip-sigstore         Skip just the sigstore-bundle verification step
+        \\    --skip-authenticode     Skip just the Authenticode (Windows PE) verification step
+        \\    --minisign <pubkey>     Default minisign key, applied to specs without an inline key;
         \\                            <pubkey> is a base64 minisign public key string
         \\    --keep-going            Continue past per-spec failures; exit non-zero
         \\                            with a summary at the end if any spec failed
@@ -247,6 +300,7 @@ fn printInstallUsage(w: *Writer) !void {
         \\EXAMPLES:
         \\    ghr install burntsushi/ripgrep@15.1.0
         \\    ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
+        \\    ghr install jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
         \\
         \\Run 'ghr install help' to show this help.
         \\
