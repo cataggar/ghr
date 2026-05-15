@@ -295,6 +295,14 @@ brew uninstall ghr
 
 ## Verification
 
+ghr's own releases ship per-asset `*.sigstore.json` sidecars (cosign
+v0.3 bundles) for every published `.tar.gz` and `.zip`, signed by the
+release workflow's GitHub Actions OIDC identity. `ghr install
+cataggar/ghr@<tag>` verifies them automatically, prints the leaf
+certificate's SAN (the release-workflow URL) and OIDC issuer
+(`https://token.actions.githubusercontent.com`) for visual review, and
+fails-closed on any verification error.
+
 When you install or download a release asset, ghr automatically verifies
 the downloaded bytes against any verification material the release
 publishes:

@@ -153,6 +153,27 @@ jobs:
           PEP440=$(echo "$RAW" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-dev\.([0-9]+)$/\1.dev\2/')
           echo "pep440=${PEP440}" >> "$GITHUB_OUTPUT"
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign archives with cosign (per-asset sigstore bundles)
+        env:
+          # `cosign sign-blob` in unattended mode auto-accepts the
+          # Fulcio identity prompt when COSIGN_YES is set, so this
+          # step can run without manual intervention.
+          COSIGN_YES: 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for asset in ghr-*.tar.gz ghr-*.zip; do
+            cosign sign-blob \
+              --bundle "${asset}.sigstore.json" \
+              --output-signature /dev/null \
+              --output-certificate /dev/null \
+              "${asset}"
+          done
+          ls -la ghr-*.sigstore.json
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
         with:
@@ -173,9 +194,15 @@ jobs:
             uv tool install ghr-bin==${{ steps.version.outputs.pep440 }}
             winget install ghr --version ${{ steps.version.outputs.version }}
             ```
+
+            **Verification:** every archive ships with a sibling
+            `*.sigstore.json` sidecar (cosign v0.3 bundle). Installs via
+            `ghr install cataggar/ghr@${{ github.ref_name }}` verify it
+            automatically.
           files: |
             ghr-*.tar.gz
             ghr-*.tar.gz.sha256
+            ghr-*.sigstore.json
             ghr-*.zip
             ghr-*.zip.sha256
           draft: false
