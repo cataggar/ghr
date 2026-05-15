@@ -104,19 +104,14 @@ jobs:
           case "${{ matrix.target }}" in
             *-windows)
               # Windows zips contain a code-signed .exe (Azure Trusted Signing),
-              # so they are intentionally not byte-reproducible without the
-              # signing key. Pack with the platform's default zip tool and
-              # produce a plain sha256 sidecar.
-              if command -v zip &>/dev/null; then
-                zip -r "$PKGNAME.zip" "$PKGNAME"
-              else
-                powershell -Command "Compress-Archive -Path '$PKGNAME' -DestinationPath '$PKGNAME.zip'"
-              fi
-              if command -v sha256sum &>/dev/null; then
-                sha256sum "$PKGNAME.zip" > "$PKGNAME.zip.sha256"
-              else
-                shasum -a 256 "$PKGNAME.zip" > "$PKGNAME.zip.sha256"
-              fi
+              # so the embedded .exe is intentionally not byte-reproducible
+              # without the signing key. The zip *wrapper* still should be:
+              # scripts/pack-zip.py writes spec-compliant forward-slash paths
+              # (git-bash's `zip` emits backslashes, which break strict
+              # InfoZIP `unzip` pipelines — see issue from PR #92's CI run),
+              # uses SOURCE_DATE_EPOCH for every entry, and emits the sha256
+              # sidecar in sha256sum format.
+              python3 scripts/pack-zip.py "$PKGNAME" "$PKGNAME.zip"
               ;;
             *)
               # Deterministic tar.gz: fixed mtimes, sorted entries, fixed
