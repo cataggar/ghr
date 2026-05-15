@@ -213,14 +213,8 @@ jobs:
             pipx install ghr-bin==${{ steps.version.outputs.pep440 }}
             uv tool install ghr-bin==${{ steps.version.outputs.pep440 }}
             winget install ghr --version ${{ steps.version.outputs.version }}
+            ghr install cataggar/ghr@${{ github.ref_name }} RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
             ```
-
-            **Verification:** every archive ships with sibling
-            `*.sigstore.json` and `*.minisig` sidecars. Installs via
-            `ghr install cataggar/ghr@${{ github.ref_name }}` verify
-            the sigstore bundle automatically; pass the project's
-            minisign public key (see [README.md](https://github.com/cataggar/ghr#readme))
-            inline to also verify the minisign signature.
           files: |
             ghr-*.tar.gz
             ghr-*.tar.gz.sha256
