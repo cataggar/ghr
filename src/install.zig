@@ -38,6 +38,48 @@ fn deleteTreeAbsolute(io: Io, abs_path: []const u8) !void {
 }
 
 
+/// Magic-byte sniff for native executable formats on POSIX. Returns true for
+/// ELF, Mach-O (thin/fat, both endians), and shebang scripts. Used as a
+/// fallback when the on-disk executable bit is missing — notably for files
+/// extracted from a zip, since `std.zip.extract` does not preserve the Unix
+/// mode bits stored in the central directory's `external_file_attributes`.
+fn looksLikePosixExecutable(io: Io, dir: Dir, name: []const u8) bool {
+    var f = dir.openFile(io, name, .{}) catch return false;
+    defer f.close(io);
+    var head: [4]u8 = undefined;
+    var buf: [4]u8 = undefined;
+    var reader = f.reader(io, &buf);
+    const n = reader.interface.readSliceShort(&head) catch return false;
+    if (n >= 2 and head[0] == '#' and head[1] == '!') return true;
+    if (n < 4) return false;
+    if (std.mem.eql(u8, &head, "\x7fELF")) return true;
+    const macho_magics = [_][4]u8{
+        // Mach-O thin (32/64, both byte orders)
+        .{ 0xfe, 0xed, 0xfa, 0xce }, .{ 0xce, 0xfa, 0xed, 0xfe },
+        .{ 0xfe, 0xed, 0xfa, 0xcf }, .{ 0xcf, 0xfa, 0xed, 0xfe },
+        // Mach-O universal (fat) 32/64
+        .{ 0xca, 0xfe, 0xba, 0xbe }, .{ 0xbe, 0xba, 0xfe, 0xca },
+        .{ 0xca, 0xfe, 0xba, 0xbf }, .{ 0xbf, 0xba, 0xfe, 0xca },
+    };
+    for (macho_magics) |m| if (std.mem.eql(u8, &head, &m)) return true;
+    return false;
+}
+
+/// Add the executable bit (0o111) to a file's existing permissions. No-op on
+/// platforms without a Unix-style mode (Windows, WASI). Errors are swallowed:
+/// the worst case is that `findExecutables` ignores the file, matching the
+/// pre-existing behavior.
+fn addExecutableBit(io: Io, dir: Dir, name: []const u8) void {
+    if (comptime !File.Permissions.has_executable_bit) return;
+    var f = dir.openFile(io, name, .{}) catch return;
+    defer f.close(io);
+    const st = f.stat(io) catch return;
+    const mode = @as(u32, @intFromEnum(st.permissions));
+    if (mode & 0o111 != 0) return;
+    const new_perms: File.Permissions = @enumFromInt(mode | 0o111);
+    f.setPermissions(io, new_perms) catch {};
+}
+
 /// Returns true if the file is a shared library (not a program executable).
 fn isSharedLibrary(name: []const u8) bool {
     if (std.mem.endsWith(u8, name, ".dylib")) return true;
@@ -178,7 +220,15 @@ fn scanForExecutables(
                     allocator.free(rel_name);
                     continue;
                 };
-                break :blk (@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0;
+                if ((@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0)
+                    break :blk true;
+                // Fallback: zip archives drop Unix mode bits. If the file's
+                // magic bytes identify it as a native executable, chmod +x
+                // and treat it as installable.
+                if (!looksLikePosixExecutable(io, dir, entry.name))
+                    break :blk false;
+                addExecutableBit(io, dir, entry.name);
+                break :blk true;
             };
             if (is_exe) {
                 try result.append(allocator, rel_name);
@@ -226,7 +276,12 @@ fn scanAppBundle(
             std.mem.endsWith(u8, entry.name, ".exe")
         else blk: {
             const stat = macos_dir.statFile(io, entry.name, .{}) catch continue;
-            break :blk (@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0;
+            if ((@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0)
+                break :blk true;
+            if (!looksLikePosixExecutable(io, macos_dir, entry.name))
+                break :blk false;
+            addExecutableBit(io, macos_dir, entry.name);
+            break :blk true;
         };
         if (is_exe) {
             const rel_name = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name });
@@ -1698,6 +1753,62 @@ test "findExecutables skips shared libraries" {
 
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("pencil2d", exes.items[0]);
+}
+
+test "looksLikePosixExecutable recognises ELF, Mach-O, and shebang" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const cases = [_]struct { name: []const u8, head: []const u8, expect: bool }{
+        .{ .name = "elf", .head = "\x7fELF\x02\x01\x01\x00", .expect = true },
+        .{ .name = "macho64_le", .head = "\xcf\xfa\xed\xfe\x07\x00\x00\x01", .expect = true },
+        .{ .name = "macho64_be", .head = "\xfe\xed\xfa\xcf\x01\x00\x00\x07", .expect = true },
+        .{ .name = "macho32_le", .head = "\xce\xfa\xed\xfe", .expect = true },
+        .{ .name = "macho_fat", .head = "\xca\xfe\xba\xbe\x00\x00\x00\x02", .expect = true },
+        .{ .name = "macho_fat64", .head = "\xca\xfe\xba\xbf\x00\x00\x00\x02", .expect = true },
+        .{ .name = "shebang", .head = "#!/bin/sh\nexit 0\n", .expect = true },
+        .{ .name = "readme", .head = "# README\n\nThis is text.\n", .expect = false },
+        .{ .name = "json", .head = "{\"foo\":1}\n", .expect = false },
+        .{ .name = "empty", .head = "", .expect = false },
+        .{ .name = "one_byte", .head = "#", .expect = false },
+    };
+    for (cases) |c| {
+        var f = try tmp.dir.createFile(std.testing.io, c.name, .{});
+        try f.writeStreamingAll(std.testing.io, c.head);
+        f.close(std.testing.io);
+        try std.testing.expectEqual(c.expect, looksLikePosixExecutable(std.testing.io, tmp.dir, c.name));
+    }
+}
+
+test "findExecutables recovers Mach-O without exec bit (zip extraction)" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Simulate a file extracted by std.zip.extract: real Mach-O contents but
+    // no executable bit (zip extraction discards Unix mode bits).
+    var f = try tmp.dir.createFile(std.testing.io, "minisign", .{});
+    try f.writeStreamingAll(std.testing.io, "\xcf\xfa\xed\xfe" ++ "rest-of-mach-o");
+    f.close(std.testing.io);
+
+    // A plain text file should still be skipped.
+    var rf = try tmp.dir.createFile(std.testing.io, "README.md", .{});
+    try rf.writeStreamingAll(std.testing.io, "# minisign\n");
+    rf.close(std.testing.io);
+
+    const allocator = std.testing.allocator;
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("minisign", exes.items[0]);
+
+    // The fallback must also have chmod'd the file so `linkToBin` produces a
+    // runnable symlink target.
+    const stat = try tmp.dir.statFile(std.testing.io, "minisign", .{});
+    try std.testing.expect((@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0);
 }
 
 test "writeJsonEscaped escapes backslashes and quotes" {
