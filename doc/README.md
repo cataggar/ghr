@@ -67,15 +67,19 @@ given by `-o`). Use it as a cross-platform replacement for the common
 macOS, and Windows; no `choco install wget` step needed.
 
 ```
-ghr download <spec> [<spec> ...] [options]
+ghr download <spec> [<pubkey>] [<spec> [<pubkey>] ...] [options]
 
 OPTIONS:
     -o, --output <path>        Output file path (single-spec only)
         --extract <dir>        Extract archive(s) into <dir> after download
         --strip-components <N> Strip N leading path components when extracting
         --sha256 <hex>         Verify download against SHA-256 digest (single-spec only)
-        --minisign <pubkey>    Require minisign signature; <pubkey> is a base64 minisign public key
-        --skip-verify          Skip sigstore + sha256 + minisign verification
+        --minisign <pubkey>    Default minisign key, applied to specs without an inline key
+        --skip-verify          Umbrella: skip every verification step (checksum, minisign, sigstore, authenticode)
+        --skip-checksum        Skip just the checksum-sidecar verification step
+        --skip-minisign        Skip just the minisign verification step
+        --skip-sigstore        Skip just the sigstore-bundle verification step
+        --skip-authenticode    Skip just the Authenticode (Windows PE) verification step
         --keep-archive         Keep archive on disk after extraction
         --keep-going           For multi-spec, continue past per-spec failures
         --quiet                Suppress progress output
@@ -86,10 +90,13 @@ OPTIONS:
 Each `<spec>` is `owner/repo[@tag]` (auto-pick asset for the current
 OS/arch) or `owner/repo/file[@tag]` (exact match wins, otherwise a
 unique case-insensitive substring wins; multiple matches print the
-candidates). Recognised archive formats: `.zip`, `.tar.gz`, `.tgz`,
-`.tar.xz`, `.txz`. Format is detected from the filename. When
-`--extract` is used the archive is deleted after extraction unless
-`--keep-archive` (or `-o`) is set.
+candidates). A 56-char `RW`/`RU`-prefixed base64 token immediately
+after a spec is treated as that spec's minisign public key (overriding
+the global `--minisign <pubkey>` default for that single spec).
+Recognised archive formats: `.zip`, `.tar.gz`, `.tgz`, `.tar.xz`,
+`.txz`. Format is detected from the filename. When `--extract` is used
+the archive is deleted after extraction unless `--keep-archive` (or
+`-o`) is set.
 
 Multi-spec invocations share a single HTTP client + auth context, so
 adding more specs costs little beyond the per-asset bytes. `-o` and
@@ -101,12 +108,14 @@ failures and exits non-zero with a summary if any spec failed.
 
 GitHub auth is attached automatically (using `GH_TOKEN`,
 `GITHUB_TOKEN`, or `gh auth token`); pass `--no-auth` to skip it.
-Downloads are auto-verified against any sigstore bundle or sha256
-checksum file published with the release; pass `--minisign <pubkey>` to
-also require a minisign signature, or `--skip-verify` to bypass all
-checks. Exit codes: `0` success, `1` argument/IO error, `2` HTTP error
-after retries, `3` SHA-256/minisign mismatch. Multi-spec invocations
-exit with the most-severe code observed across the batch.
+Downloads are auto-verified against any sigstore bundle or checksum
+sidecar published with the release; pass `--minisign <pubkey>` to
+also require a minisign signature (or attach an inline key to a
+spec), `--skip-<step>` to bypass one verifier individually, or
+`--skip-verify` to bypass all checks. Exit codes: `0` success, `1`
+argument/IO error, `2` HTTP error after retries, `3` checksum or
+minisign mismatch. Multi-spec invocations exit with the most-severe
+code observed across the batch.
 
 ## Caching in GitHub Actions
 
@@ -136,6 +145,19 @@ end-to-end:
 - uses: cataggar/ghr/actions/install@v0.3.0  # pin to the matching ghr release
   with:
     tools: |
+      BurntSushi/ripgrep@14.1.1
+      sharkdp/fd@v10.2.0
+```
+
+To verify some tools with minisign, attach the public key as a second
+whitespace-separated token on the same line. Inline keys override the
+action-level `minisign:` default for that one spec:
+
+```yaml
+- uses: cataggar/ghr/actions/install@v0.3.0
+  with:
+    tools: |
+      jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
       BurntSushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
 ```
@@ -202,7 +224,7 @@ don't have to choose.
 
 ### Caveats
 
-- Verification metadata (`ghr.json`, sigstore bundles, sha256 sidecars)
+- Verification metadata (`ghr.json`, sigstore bundles, checksum sidecars)
   is stored under `GHR_TOOL_DIR` as regular files and survives a cache
   round-trip — verification happens at install time, not on restore.
 - Windows shims are regular files (the runtime resolves them through
@@ -307,7 +329,7 @@ When you install or download a release asset, ghr automatically verifies
 the downloaded bytes against any verification material the release
 publishes:
 
-- **SHA256 checksum files** — sidecar `<asset>.sha256` files and aggregate
+- **Checksum files** — sidecar `<asset>.sha256` files and aggregate
   `*checksums*` / `SHA256SUMS` files are both supported, in GNU and BSD
   formats.
 - **Sigstore bundles** — `<asset>.sigstore.json` (cosign bundle v0.3) is
@@ -348,21 +370,25 @@ publishes:
   signature + verifier cert equal the bundle's).
 - **Minisign signatures** — `<asset>.minisig` sidecars
   ([minisign v2](https://jedisct1.github.io/minisign/)) are verified when
-  the caller passes `--minisign <base64-pubkey>`. The flag value is the
+  the caller supplies a public key — either via `--minisign <base64-pubkey>`
+  (applied to every spec as a default) or as an inline positional
+  immediately after a spec (per-spec override). The key value is the
   single-line base64 token from a minisign `.pub` file (algorithm `Ed`
   or `ED`, 8-byte key id, 32-byte Ed25519 public key). Both the artifact
   signature (`Ed` = pure Ed25519 over the file, `ED` = Ed25519 over the
   Blake2b-512 digest, streamed from disk) and the trailing trusted-comment
   global signature are verified against the same key. The trusted comment
   (often a `timestamp:... file:... hashed` blob) is printed on success.
-  If `--minisign` is set but no `<asset>.minisig` is published, ghr
+  If a key is configured but no `<asset>.minisig` is published, ghr
   aborts before downloading — minisign verification is fail-closed when
   opted in.
-  If a `<asset>.minisig` IS published but neither `--minisign` nor
-  `--skip-verify` was passed, ghr also aborts before downloading:
-  ignoring a published signature would silently skip a real verification
-  opportunity, so the caller must opt in (pass `--minisign <pubkey>`) or
-  opt out (`--skip-verify`).
+  If a `<asset>.minisig` IS published but no key was configured and
+  neither `--skip-minisign` nor `--skip-verify` was passed, ghr also
+  aborts before downloading: ignoring a published signature would
+  silently skip a real verification opportunity, so the caller must
+  opt in (pass a key inline or via `--minisign <pubkey>`) or opt out
+  (`--skip-minisign` to bypass just minisign, or `--skip-verify` to
+  bypass every check).
 - **Authenticode (Windows)** — auto-detected from the downloaded bytes.
   When the asset is a PE (DOS `MZ` magic) or a `.zip` containing one or
   more `.exe` / `.dll` / `.sys` entries, ghr verifies each PE's embedded
@@ -404,23 +430,27 @@ download is deleted. If no checksum, minisign sidecar, sigstore bundle,
 or Authenticode signature is published the download proceeds with a
 `note:` line so you know it was unverified.
 
-Pass `--skip-verify` to bypass all checks. For `install`, the strongest
-result is recorded in each tool's `ghr.json` metadata as `"verified"`:
+Pass `--skip-verify` to bypass every check at once. To bypass only one
+step (e.g. when its sidecar is broken in a particular release while the
+others still apply), use the narrower flags: `--skip-checksum`,
+`--skip-minisign`, `--skip-sigstore`, `--skip-authenticode`. For
+`install`, the strongest result is recorded in each tool's `ghr.json`
+metadata as `"verified"`:
 
 - `"sigstore"` — sigstore bundle verified (also implies the bundle's
   declared SHA256 matches the file).
 - `"minisign"` — minisign sidecar verified by the caller-supplied
-  `--minisign` key (artifact + trusted-comment signatures).
+  minisign key (artifact + trusted-comment signatures).
 - `"authenticode"` — Authenticode signature on the downloaded PE (or on
   a PE inside the downloaded `.zip`) verified against an embedded MS /
   commercial CA trust root, with a valid RFC 3161 timestamp.
-- `"sha256"` — SHA256 checksum verified.
+- `"checksum"` — checksum sidecar verified.
 - `"none"` — no verification material was published.
 - `"skipped"` — `--skip-verify` was passed.
 
-When more than one verifier succeeds (e.g. sha256 *and* sigstore, or
-sha256 *and* Authenticode) the strongest one is recorded — precedence
-is sigstore > minisign > authenticode > sha256. All successful
+When more than one verifier succeeds (e.g. checksum *and* sigstore, or
+checksum *and* Authenticode) the strongest one is recorded — precedence
+is sigstore > minisign > authenticode > checksum. All successful
 verifiers still print their own diagnostic line, so the full set is
 visible at install time.
 

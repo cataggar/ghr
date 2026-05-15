@@ -171,6 +171,27 @@ pub fn parsePublicKey(input: []const u8) ParseError!PublicKey {
     return pk;
 }
 
+/// Cheap structural check: is `token` shaped like a minisign v2 public key?
+/// Used by the install/download CLI parsers to disambiguate a positional
+/// `<owner/repo[@tag]>` spec from an inline minisign pubkey token that
+/// follows a spec.
+///
+/// A minisign v2 public key is always:
+///   * exactly 56 base64 characters (decodes to 42 bytes: `algo:2 | key_id:8 | pubkey:32`),
+///   * starts with `RW` (algo `Ed` = 0x45 0x64, pure Ed25519) or
+///     `RU` (algo `ED` = 0x45 0x44, Blake2b-512 prehashed Ed25519),
+///   * base64-decodes cleanly with a known algo tag.
+///
+/// A real GitHub `owner/repo[@tag]` cannot satisfy all three: it contains
+/// `/` (not a base64 char) and almost certainly is not 56 chars long with
+/// an `RW`/`RU` prefix.
+pub fn looksLikePubKey(token: []const u8) bool {
+    if (token.len != 56) return false;
+    if (!(std.mem.startsWith(u8, token, "RW") or std.mem.startsWith(u8, token, "RU"))) return false;
+    _ = parsePublicKey(token) catch return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // `.minisig` parsing.
 // ---------------------------------------------------------------------------
@@ -382,6 +403,29 @@ test "parsePublicKey: rejects garbage" {
     try testing.expectError(ParseError.MinisignPubKeyParseError, parsePublicKey("not base64 at all !!!"));
     // Wrong decoded length.
     try testing.expectError(ParseError.MinisignPubKeyParseError, parsePublicKey("AAAA"));
+}
+
+test "looksLikePubKey: classifies real keys, rejects specs" {
+    // Real minisign pubkey from jedisct1/minisign 0.12 release notes (algo `Ed`).
+    try testing.expect(looksLikePubKey("RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3"));
+    // Upstream test fixture pubkey (also algo `Ed`).
+    try testing.expect(looksLikePubKey("RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U"));
+    // Synthetic prehashed-mode pubkey (algo `ED`, encoded `RU…`).
+    try testing.expect(looksLikePubKey("RUQLMFV6n8TpDjNYfaLH7BE2W4Clyu8UOV6DqM3yFzxhhqvQ9Ro/ZImu"));
+
+    // Plausible-looking owner/repo strings — always have '/', so always rejected.
+    try testing.expect(!looksLikePubKey("owner/repo"));
+    try testing.expect(!looksLikePubKey("BurntSushi/ripgrep@14.1.1"));
+    try testing.expect(!looksLikePubKey("very/long/owner/repo/file/name/with/many/slashes@1.0.0"));
+
+    // Wrong length.
+    try testing.expect(!looksLikePubKey("RW"));
+    try testing.expect(!looksLikePubKey("RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7"));
+    try testing.expect(!looksLikePubKey("RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3X"));
+
+    // Right length but wrong prefix (RV is not a valid algo encoding).
+    try testing.expect(!looksLikePubKey("RVQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3"));
+    try testing.expect(!looksLikePubKey("XYQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3"));
 }
 
 test "parseSignature: issue example" {

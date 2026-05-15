@@ -25,13 +25,41 @@ inputs:
     default: 'true'
   minisign:
     description: >-
-      Optional base64 minisign public key. When set, ghr also requires a
-      `.minisig` sidecar to be present for every spec and verifies it.
+      Optional base64 minisign public key applied as the default for every
+      `tools:` line that does not include its own inline key. When set, ghr
+      requires a `.minisig` sidecar to be present and verifies it. An inline
+      key on a `tools:` line (the second whitespace-separated token, e.g.
+      `jedisct1/minisign@0.12 RWQf6LR…`) overrides this default for that
+      single spec.
     required: false
     default: ''
   skip-verify:
     description: >-
-      Skip sigstore + sha256 + minisign verification. Default: false.
+      Umbrella flag: skip every verification step (checksum, minisign,
+      sigstore, authenticode). Default: false.
+    required: false
+    default: 'false'
+  skip-checksum:
+    description: >-
+      Skip just the checksum-sidecar verification step. Default: false.
+    required: false
+    default: 'false'
+  skip-minisign:
+    description: >-
+      Skip just the minisign verification step. Bypasses the fail-closed
+      behavior that would otherwise reject a published `.minisig` sidecar
+      when no key is configured. Default: false.
+    required: false
+    default: 'false'
+  skip-sigstore:
+    description: >-
+      Skip just the sigstore-bundle verification step. Default: false.
+    required: false
+    default: 'false'
+  skip-authenticode:
+    description: >-
+      Skip just the Authenticode (Windows PE) verification step.
+      Default: false.
     required: false
     default: 'false'
   keep-going:
@@ -112,16 +140,50 @@ runs:
       run: |
         set -euo pipefail
         ghr_version="$(ghr version)"
-        sorted_specs="$(printf '%s\n' "${TOOLS_INPUT}" \
-          | sed -e 's/[[:space:]]\{1,\}/\n/g' \
-          | grep -v '^$' \
-          | grep -v '^#' \
-          | LC_ALL=C sort -u)"
-        if [[ -z "$sorted_specs" ]]; then
+
+        # The `tools:` input is one entry per line: `spec` or `spec key`
+        # (whitespace-separated). Drop blanks and `#` comments, validate
+        # the optional key, and produce a deterministic sorted list of
+        # `spec [key]` lines.
+        canonical_lines=()
+        while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+          line="${raw_line#"${raw_line%%[![:space:]]*}"}"  # ltrim
+          line="${line%"${line##*[![:space:]]}"}"          # rtrim
+          [[ -z "$line" ]] && continue
+          [[ "${line:0:1}" == "#" ]] && continue
+          # Split on whitespace -> tokens
+          read -ra tokens <<< "$line"
+          n="${#tokens[@]}"
+          if (( n < 1 || n > 2 )); then
+            printf 'error: tools line must be `spec` or `spec key`, got %d tokens: %s\n' "$n" "$line" >&2
+            exit 1
+          fi
+          spec="${tokens[0]}"
+          if (( n == 2 )); then
+            key="${tokens[1]}"
+            # Structural validation: 56-char base64, starts with RW or RU.
+            # `ghr install` re-validates via parsePublicKey and surfaces
+            # any decode failure with a clear error.
+            if [[ ! "$key" =~ ^(RW|RU)[A-Za-z0-9+/]{53}[A-Za-z0-9+/=]$ ]]; then
+              printf 'error: invalid minisign key for spec %s: %s\n' "$spec" "$key" >&2
+              exit 1
+            fi
+            canonical_lines+=("$spec $key")
+          else
+            canonical_lines+=("$spec")
+          fi
+        done <<< "${TOOLS_INPUT}"
+
+        if (( ${#canonical_lines[@]} == 0 )); then
           echo "error: 'tools' input is empty" >&2
           exit 1
         fi
-        # Hash the sorted-specs list so the cache key is stable and short.
+
+        # Sort the (spec [key]) lines so the cache key is stable. Including
+        # the key in the hash makes the cache identity reflect the
+        # verification material — changing a tool's key forces a re-install
+        # and therefore re-verification.
+        sorted_specs="$(printf '%s\n' "${canonical_lines[@]}" | LC_ALL=C sort -u)"
         specs_hash="$(printf '%s' "$sorted_specs" | sha256sum | cut -c1-16)"
         key="ghr-${RUNNER_OS}-${RUNNER_ARCH}-ghrv${ghr_version}-${specs_hash}"
         {
@@ -150,16 +212,32 @@ runs:
         SORTED_SPECS: ${{ steps.cache-key.outputs.sorted_specs }}
         MINISIGN: ${{ inputs.minisign }}
         SKIP_VERIFY: ${{ inputs.skip-verify }}
+        SKIP_CHECKSUM: ${{ inputs.skip-checksum }}
+        SKIP_MINISIGN: ${{ inputs.skip-minisign }}
+        SKIP_SIGSTORE: ${{ inputs.skip-sigstore }}
+        SKIP_AUTHENTICODE: ${{ inputs.skip-authenticode }}
         KEEP_GOING: ${{ inputs.keep-going }}
       run: |
         set -euo pipefail
         flags=()
         if [[ "${KEEP_GOING}" == "true" ]]; then flags+=(--keep-going); fi
         if [[ "${SKIP_VERIFY}" == "true" ]]; then flags+=(--skip-verify); fi
+        if [[ "${SKIP_CHECKSUM}" == "true" ]]; then flags+=(--skip-checksum); fi
+        if [[ "${SKIP_MINISIGN}" == "true" ]]; then flags+=(--skip-minisign); fi
+        if [[ "${SKIP_SIGSTORE}" == "true" ]]; then flags+=(--skip-sigstore); fi
+        if [[ "${SKIP_AUTHENTICODE}" == "true" ]]; then flags+=(--skip-authenticode); fi
         if [[ -n "${MINISIGN}" ]]; then flags+=(--minisign "${MINISIGN}"); fi
-        # SORTED_SPECS is newline-separated; pass each as a positional spec.
-        readarray -t specs <<< "${SORTED_SPECS}"
-        ghr install "${flags[@]}" "${specs[@]}"
+        # SORTED_SPECS is newline-separated `spec` or `spec key` lines.
+        # Split each line into individual whitespace-separated tokens so
+        # ghr install sees `<spec> [<pubkey>] <spec> ...` as positional
+        # arguments.
+        positionals=()
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          read -ra tokens <<< "$line"
+          positionals+=("${tokens[@]}")
+        done <<< "${SORTED_SPECS}"
+        ghr install "${flags[@]}" "${positionals[@]}"
 
     - name: Sanity check (ghr list)
       shell: bash
