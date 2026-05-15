@@ -336,7 +336,7 @@ verification, pass the public key inline (per-spec) or via
 `--minisign`:
 
 ```sh
-ghr install cataggar/ghr@v0.4.0 \
+ghr install cataggar/ghr@v0.3.0 \
     RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 ```
 
