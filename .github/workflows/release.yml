@@ -141,6 +141,8 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
@@ -174,6 +176,29 @@ jobs:
           done
           ls -la ghr-*.sigstore.json
 
+      - name: Sign archives with minisign (per-asset .minisig sidecars)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y minisign expect
+          # Write the secret key to a file with 0600. The runner workspace
+          # is ephemeral; the trap removes it before the step exits.
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          trap 'rm -f minisign.key' EXIT
+          shopt -s nullglob
+          for asset in ghr-*.tar.gz ghr-*.zip; do
+            # Trusted comment is printed by `ghr install` on successful
+            # verification, so encode self-identifying metadata in it.
+            comment="timestamp:$(date +%s) file:${asset} commit:${GITHUB_SHA} tag:${GITHUB_REF_NAME}"
+            echo "signing ${asset} (trusted comment: ${comment})"
+            expect scripts/sign-asset.exp "$asset" "$comment"
+          done
+          ls -la ghr-*.minisig
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
         with:
@@ -195,14 +220,17 @@ jobs:
             winget install ghr --version ${{ steps.version.outputs.version }}
             ```
 
-            **Verification:** every archive ships with a sibling
-            `*.sigstore.json` sidecar (cosign v0.3 bundle). Installs via
-            `ghr install cataggar/ghr@${{ github.ref_name }}` verify it
-            automatically.
+            **Verification:** every archive ships with sibling
+            `*.sigstore.json` and `*.minisig` sidecars. Installs via
+            `ghr install cataggar/ghr@${{ github.ref_name }}` verify
+            the sigstore bundle automatically; pass the project's
+            minisign public key (see [README.md](https://github.com/cataggar/ghr#readme))
+            inline to also verify the minisign signature.
           files: |
             ghr-*.tar.gz
             ghr-*.tar.gz.sha256
             ghr-*.sigstore.json
+            ghr-*.minisig
             ghr-*.zip
             ghr-*.zip.sha256
           draft: false
