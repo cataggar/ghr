@@ -965,7 +965,7 @@ pub fn verifyDownloadedAssetSha256(
         return error.ChecksumMismatch;
     }
 
-    try w.print("verified sha256 {s}… ({s})\n", .{ actual_hex[0..12], checksum_asset.name });
+    try w.print("verified sha256 {s}... ({s})\n", .{ actual_hex[0..12], checksum_asset.name });
     try w.flush();
     return .sha256_verified;
 }
@@ -1046,7 +1046,7 @@ pub fn verifyDownloadedAssetSigstore(
     var digest_hex: [64]u8 = undefined;
     sha256ToHex(identity.artifact_digest, &digest_hex);
     try w.print(
-        "verified sigstore: sha256 {s}… (rekor t={d}, log {d})\n",
+        "verified sigstore: sha256 {s}... (rekor t={d}, log {d})\n",
         .{ digest_hex[0..12], identity.integrated_time, bundle.rekor_log_index },
     );
     if (identity.identity.primarySubject()) |subject| {
@@ -1154,7 +1154,7 @@ fn verifySinglePe(
 
     var digest_hex: [64]u8 = undefined;
     sha256ToHex(outcome.digest, &digest_hex);
-    try w.print("verified authenticode: sha256 {s}… (genTime {d})\n", .{ digest_hex[0..12], outcome.gen_time });
+    try w.print("verified authenticode: sha256 {s}... (genTime {d})\n", .{ digest_hex[0..12], outcome.gen_time });
     if (outcome.subject_cn.len > 0) {
         try w.print("  subject: {s}\n", .{outcome.subject_cn});
     }
