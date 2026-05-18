@@ -37,6 +37,30 @@ fn deleteTreeAbsolute(io: Io, abs_path: []const u8) !void {
     try dir.deleteTree(io, basename);
 }
 
+/// Best-effort `mkdir -p` for `abs_path`, walking up `max_parents` ancestor
+/// levels. Each create is wrapped in `catch {}`: existing directories and
+/// permission errors on outer ancestors that we don't own (e.g. `C:\Users`)
+/// are tolerated. The caller is expected to detect actual failure by then
+/// opening or using `abs_path` and reporting an error with the path.
+fn ensureDirWithParents(io: Io, abs_path: []const u8, max_parents: u8) void {
+    var ancestors: [8][]const u8 = undefined;
+    const cap: usize = @min(@as(usize, max_parents), ancestors.len);
+    var n: usize = 0;
+    var cur = abs_path;
+    while (n < cap) : (n += 1) {
+        const parent = std.fs.path.dirname(cur) orelse break;
+        ancestors[n] = parent;
+        cur = parent;
+    }
+    // Create ancestors top-down (outermost first) so each create has its
+    // parent in place.
+    var i: usize = n;
+    while (i > 0) {
+        i -= 1;
+        Dir.createDirAbsolute(io, ancestors[i], .default_dir) catch {};
+    }
+    Dir.createDirAbsolute(io, abs_path, .default_dir) catch {};
+}
 
 /// Magic-byte sniff for native executable formats on POSIX. Returns true for
 /// ELF, Mach-O (thin/fat, both endians), and shebang scripts. Used as a
@@ -1354,27 +1378,10 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         d.tools, std.fs.path.sep, spec.owner,
     });
     defer allocator.free(owner_path);
-    // Create all parent directories
-    var dir = Dir.openDirAbsolute(io, std.fs.path.dirname(d.tools) orelse ".", .{}) catch blk: {
-        // Create parents manually
-        if (std.fs.path.dirname(d.tools)) |parent| {
-            if (std.fs.path.dirname(parent)) |grandparent| {
-                Dir.createDirAbsolute(io, grandparent, .default_dir) catch {};
-            }
-            Dir.createDirAbsolute(io, parent, .default_dir) catch {};
-        }
-        Dir.createDirAbsolute(io, d.tools, .default_dir) catch {};
-        break :blk Dir.openDirAbsolute(io, d.tools, .{}) catch |err| {
-            try err_w.print(
-                "error: failed to create tools directory '{s}': {t}\n",
-                .{ d.tools, err },
-            );
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
-    };
-    dir.close(io);
-    Dir.createDirAbsolute(io, d.tools, .default_dir) catch {};
+    // Ensure the tools directory and its first two ancestor levels exist.
+    // On a fresh install on Windows this creates `%APPDATA%\ghr\data\tools`
+    // and its parents `…\ghr\data` and `…\ghr` if they are missing.
+    ensureDirWithParents(io, d.tools, 2);
     Dir.createDirAbsolute(io, owner_path, .default_dir) catch {};
 
     // Rename staging to final
@@ -1408,13 +1415,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     // Create bin dir and link executables. The bin directory normally lives
     // under `~/.local/bin`; on a fresh install neither `.local` nor `.local/bin`
     // may exist yet, so create parents up to two levels deep before opening.
-    if (std.fs.path.dirname(d.bin)) |bin_parent| {
-        if (std.fs.path.dirname(bin_parent)) |bin_grandparent| {
-            Dir.createDirAbsolute(io, bin_grandparent, .default_dir) catch {};
-        }
-        Dir.createDirAbsolute(io, bin_parent, .default_dir) catch {};
-    }
-    Dir.createDirAbsolute(io, d.bin, .default_dir) catch {};
+    ensureDirWithParents(io, d.bin, 2);
     var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
         try err_w.print(
             "error: failed to open bin directory '{s}': {t}\n",
@@ -2097,5 +2098,93 @@ test "shimPointsToToolDir validates path boundaries" {
         "nonexistent.shim",
         "C:\\tools\\owner\\repo",
     ));
+}
+
+test "ensureDirWithParents creates leaf and one missing parent" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var sub_buf: [Dir.max_path_bytes]u8 = undefined;
+    const leaf = try std.fmt.bufPrint(&sub_buf, "{s}{c}a{c}b", .{ base, std.fs.path.sep, std.fs.path.sep });
+
+    // Pre-condition: neither `a` nor `a/b` exist.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "a", .{}));
+
+    ensureDirWithParents(tio, leaf, 2);
+
+    // Post-condition: `a` and `a/b` both exist as directories.
+    try std.testing.expect((try tmp.dir.statFile(tio, "a", .{})).kind == .directory);
+    try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
+}
+
+test "ensureDirWithParents creates leaf and two missing parents" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var sub_buf: [Dir.max_path_bytes]u8 = undefined;
+    const leaf = try std.fmt.bufPrint(&sub_buf, "{s}{c}a{c}b{c}c", .{
+        base, std.fs.path.sep, std.fs.path.sep, std.fs.path.sep,
+    });
+
+    ensureDirWithParents(tio, leaf, 2);
+
+    try std.testing.expect((try tmp.dir.statFile(tio, "a", .{})).kind == .directory);
+    try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
+    try std.testing.expect((try tmp.dir.statFile(tio, "a/b/c", .{})).kind == .directory);
+}
+
+test "ensureDirWithParents tolerates already-existing path" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "a/b");
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var sub_buf: [Dir.max_path_bytes]u8 = undefined;
+    const leaf = try std.fmt.bufPrint(&sub_buf, "{s}{c}a{c}b", .{ base, std.fs.path.sep, std.fs.path.sep });
+
+    // Should be a no-op; in particular it must not raise.
+    ensureDirWithParents(tio, leaf, 2);
+
+    try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
+}
+
+test "ensureDirWithParents does not create beyond max_parents" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var sub_buf: [Dir.max_path_bytes]u8 = undefined;
+    // Four missing levels below base. With max_parents = 2 the helper can
+    // create the bottom three (two ancestors + the leaf), but cannot
+    // succeed because the outermost level `a` is still missing when it
+    // tries to create `a/b`. The function must not crash, and the
+    // mid-level `a/b/c` must not be created either.
+    const leaf = try std.fmt.bufPrint(&sub_buf, "{s}{c}a{c}b{c}c{c}d", .{
+        base, std.fs.path.sep, std.fs.path.sep, std.fs.path.sep, std.fs.path.sep,
+    });
+
+    ensureDirWithParents(tio, leaf, 2);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "a", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "a/b/c", .{}));
 }
 
