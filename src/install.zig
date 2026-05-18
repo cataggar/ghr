@@ -1203,9 +1203,17 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Clean up any leftover staging dir
     deleteTreeAbsolute(io, staging_path) catch {};
-    try Dir.createDirAbsolute(io, staging_path, .default_dir);
+    Dir.createDirAbsolute(io, staging_path, .default_dir) catch |err| {
+        try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
 
-    var staging_dir = try Dir.openDirAbsolute(io, staging_path, .{ .iterate = true });
+    var staging_dir = Dir.openDirAbsolute(io, staging_path, .{ .iterate = true }) catch |err| {
+        try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ staging_path, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
     defer staging_dir.close(io);
 
     // Extract
@@ -1215,7 +1223,10 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     switch (archive.detectFormat(asset.name)) {
         .zip, .tar_gz, .tar_xz => {
             archive.extractAuto(allocator, io, staging_dir, download_path, 0) catch |err| {
-                try err_w.print("error: extraction failed: {}\n", .{err});
+                try err_w.print(
+                    "error: failed to extract '{s}' from '{s}' into '{s}': {t}\n",
+                    .{ asset.name, download_path, staging_path, err },
+                );
                 try err_w.flush();
                 return error.InstallStepFailed;
             };
@@ -1234,12 +1245,26 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
             );
             defer allocator.free(exe_name);
 
-            try stageBareExecutable(allocator, io, d.cache, asset.name, staging_dir, exe_name);
+            stageBareExecutable(allocator, io, d.cache, asset.name, staging_dir, exe_name) catch |err| {
+                try err_w.print(
+                    "error: failed to stage bare executable '{s}' from '{s}' into '{s}' as '{s}': {t}\n",
+                    .{ asset.name, d.cache, staging_path, exe_name, err },
+                );
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
         },
     }
 
     // Find executables
-    var exes = try findExecutables(allocator, io, staging_dir);
+    var exes = findExecutables(allocator, io, staging_dir) catch |err| {
+        try err_w.print(
+            "error: failed to scan staging dir '{s}' for executables: {t}\n",
+            .{ staging_path, err },
+        );
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
@@ -1339,21 +1364,38 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
             Dir.createDirAbsolute(io, parent, .default_dir) catch {};
         }
         Dir.createDirAbsolute(io, d.tools, .default_dir) catch {};
-        break :blk try Dir.openDirAbsolute(io, d.tools, .{});
+        break :blk Dir.openDirAbsolute(io, d.tools, .{}) catch |err| {
+            try err_w.print(
+                "error: failed to create tools directory '{s}': {t}\n",
+                .{ d.tools, err },
+            );
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
     };
     dir.close(io);
     Dir.createDirAbsolute(io, d.tools, .default_dir) catch {};
     Dir.createDirAbsolute(io, owner_path, .default_dir) catch {};
 
     // Rename staging to final
-    Dir.renameAbsolute(staging_path, tool_path, io) catch {
-        try err_w.print("error: failed to move staging directory to tool directory\n", .{});
+    Dir.renameAbsolute(staging_path, tool_path, io) catch |err| {
+        try err_w.print(
+            "error: failed to move staging directory '{s}' to tool directory '{s}': {t}\n",
+            .{ staging_path, tool_path, err },
+        );
         try err_w.flush();
         return error.InstallStepFailed;
     };
 
     // Re-open the tool dir for metadata and linking
-    var tool_dir = try Dir.openDirAbsolute(io, tool_path, .{});
+    var tool_dir = Dir.openDirAbsolute(io, tool_path, .{}) catch |err| {
+        try err_w.print(
+            "error: failed to open tool directory '{s}': {t}\n",
+            .{ tool_path, err },
+        );
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
     defer tool_dir.close(io);
 
     // Write metadata
@@ -1363,9 +1405,24 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         try err_w.print("warning: failed to write metadata: {}\n", .{err});
     };
 
-    // Create bin dir and link executables
+    // Create bin dir and link executables. The bin directory normally lives
+    // under `~/.local/bin`; on a fresh install neither `.local` nor `.local/bin`
+    // may exist yet, so create parents up to two levels deep before opening.
+    if (std.fs.path.dirname(d.bin)) |bin_parent| {
+        if (std.fs.path.dirname(bin_parent)) |bin_grandparent| {
+            Dir.createDirAbsolute(io, bin_grandparent, .default_dir) catch {};
+        }
+        Dir.createDirAbsolute(io, bin_parent, .default_dir) catch {};
+    }
     Dir.createDirAbsolute(io, d.bin, .default_dir) catch {};
-    var bin_dir = try Dir.openDirAbsolute(io, d.bin, .{});
+    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
+        try err_w.print(
+            "error: failed to open bin directory '{s}': {t}\n",
+            .{ d.bin, err },
+        );
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
     defer bin_dir.close(io);
 
     try w.print("linking executables:\n", .{});

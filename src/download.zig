@@ -456,14 +456,17 @@ fn downloadOne(
         }
 
         var dest_dir = Dir.openDirAbsolute(io, edir, .{}) catch |err| {
-            try err_w.print("error: failed to open extract dir '{s}': {}\n", .{ edir, err });
+            try err_w.print("error: failed to open extract dir '{s}': {t}\n", .{ edir, err });
             try err_w.flush();
             return step.fail(exit_io_error);
         };
         defer dest_dir.close(io);
 
         archive.extractAuto(allocator, io, dest_dir, paths.archive_path, opts.strip_components) catch |err| {
-            try err_w.print("error: extraction failed: {}\n", .{err});
+            try err_w.print(
+                "error: failed to extract '{s}' from '{s}' into '{s}': {t}\n",
+                .{ paths.archive_name, paths.archive_path, edir, err },
+            );
             try err_w.flush();
             return step.fail(exit_io_error);
         };
