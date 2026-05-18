@@ -40,11 +40,8 @@ ghr install bytecodealliance/wasmtime@v44.0.1
 # Install several tools in one invocation (shared HTTP client + auth)
 ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
 
-# Install minisign itself, verifying the release with the upstream
-# minisign public key (inline per-spec key).
-# https://jedisct1.github.io/minisign/
-ghr install jedisct1/minisign@0.12 \
-    RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+# Install minisign itself, verifying with its minisign public key
+ghr install jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
 ```
 
 ## Install
@@ -54,6 +51,7 @@ pipx install ghr-bin
 uv tool install ghr-bin
 winget install ghr
 brew install cataggar/ghr/ghr
+ghr install cataggar/ghr RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 ```
 
 See [doc/README.md](doc/README.md) for download, install, directories,
@@ -65,7 +63,7 @@ uninstall, and verification details (including
 For workflows, install several tools in one cached step:
 
 ```yaml
-- uses: cataggar/ghr/actions/install@v0.3.0  # pin to the matching ghr release
+- uses: cataggar/ghr/actions/install@v0.3.1  # pin to the matching ghr release
   with:
     tools: |
       BurntSushi/ripgrep@14.1.1
