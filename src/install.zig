@@ -62,6 +62,22 @@ fn ensureDirWithParents(io: Io, abs_path: []const u8, max_parents: u8) void {
     Dir.createDirAbsolute(io, abs_path, .default_dir) catch {};
 }
 
+/// Best-effort recursive `mkdir -p` for an absolute path. Unlike
+/// `ensureDirWithParents`, this walks up an unbounded number of ancestor
+/// levels, recursing only when create fails because a parent is missing.
+/// All other errors (already-exists, access-denied on ancestors we don't
+/// own) are tolerated; the caller detects real failure by then trying to
+/// use `abs_path`.
+fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) void {
+    Dir.createDirAbsolute(io, abs_path, .default_dir) catch |err| {
+        if (err == error.FileNotFound) {
+            const parent = std.fs.path.dirname(abs_path) orelse return;
+            ensureDirAbsoluteRecursive(io, parent);
+            Dir.createDirAbsolute(io, abs_path, .default_dir) catch {};
+        }
+    };
+}
+
 /// Magic-byte sniff for native executable formats on POSIX. Returns true for
 /// ELF, Mach-O (thin/fat, both endians), and shebang scripts. Used as a
 /// fallback when the on-disk executable bit is missing — notably for files
@@ -1053,10 +1069,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     try w.flush();
 
     // Ensure cache directory tree exists
-    if (std.fs.path.dirname(d.cache)) |parent| {
-        Dir.createDirAbsolute(io, parent, .default_dir) catch {};
-    }
-    Dir.createDirAbsolute(io, d.cache, .default_dir) catch {};
+    ensureDirAbsoluteRecursive(io, d.cache);
 
     // Download to cache file
     const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
@@ -1378,10 +1391,13 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         d.tools, std.fs.path.sep, spec.owner,
     });
     defer allocator.free(owner_path);
-    // Ensure the tools directory and its first two ancestor levels exist.
-    // On a fresh install on Windows this creates `%APPDATA%\ghr\data\tools`
-    // and its parents `…\ghr\data` and `…\ghr` if they are missing.
-    ensureDirWithParents(io, d.tools, 2);
+    // Ensure the tools directory and all of its ancestors exist. On a fresh
+    // install on Linux this may need to create `~/.local`, `~/.local/share`,
+    // `~/.local/share/ghr`, and `~/.local/share/ghr/tools`; on Windows it
+    // creates `%APPDATA%\ghr\data\tools` and its parents. The previous
+    // 2-ancestor bound was insufficient for the tools layout and caused
+    // a misleading `FileNotFound` on `renameAbsolute` below.
+    ensureDirAbsoluteRecursive(io, d.tools);
     Dir.createDirAbsolute(io, owner_path, .default_dir) catch {};
 
     // Rename staging to final
@@ -1414,8 +1430,8 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Create bin dir and link executables. The bin directory normally lives
     // under `~/.local/bin`; on a fresh install neither `.local` nor `.local/bin`
-    // may exist yet, so create parents up to two levels deep before opening.
-    ensureDirWithParents(io, d.bin, 2);
+    // may exist yet, so create the full ancestor chain before opening.
+    ensureDirAbsoluteRecursive(io, d.bin);
     var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
         try err_w.print(
             "error: failed to open bin directory '{s}': {t}\n",
@@ -2186,5 +2202,50 @@ test "ensureDirWithParents does not create beyond max_parents" {
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "a", .{}));
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "a/b/c", .{}));
+}
+
+test "ensureDirAbsoluteRecursive creates arbitrarily deep missing tree" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    // Four missing levels below base — the scenario that caused the
+    // self-install `FileNotFound` on a fresh `~/.local/share/ghr/tools`.
+    var sub_buf: [Dir.max_path_bytes]u8 = undefined;
+    const leaf = try std.fmt.bufPrint(&sub_buf, "{s}{c}a{c}b{c}c{c}d", .{
+        base, std.fs.path.sep, std.fs.path.sep, std.fs.path.sep, std.fs.path.sep,
+    });
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "a", .{}));
+
+    ensureDirAbsoluteRecursive(tio, leaf);
+
+    try std.testing.expect((try tmp.dir.statFile(tio, "a", .{})).kind == .directory);
+    try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
+    try std.testing.expect((try tmp.dir.statFile(tio, "a/b/c", .{})).kind == .directory);
+    try std.testing.expect((try tmp.dir.statFile(tio, "a/b/c/d", .{})).kind == .directory);
+}
+
+test "ensureDirAbsoluteRecursive tolerates already-existing path" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "a/b");
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var sub_buf: [Dir.max_path_bytes]u8 = undefined;
+    const leaf = try std.fmt.bufPrint(&sub_buf, "{s}{c}a{c}b", .{ base, std.fs.path.sep, std.fs.path.sep });
+
+    ensureDirAbsoluteRecursive(tio, leaf);
+
+    try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
 }
 
