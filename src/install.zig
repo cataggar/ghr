@@ -218,6 +218,32 @@ fn findExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayLis
     return result;
 }
 
+fn findDebExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    var bin_dir = dir.openDir(io, "usr/bin", .{ .iterate = true }) catch return result;
+    defer bin_dir.close(io);
+
+    var iter = bin_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        const rel_name = try std.fmt.allocPrint(allocator, "usr/bin/{s}", .{entry.name});
+        try result.append(allocator, rel_name);
+    }
+
+    return result;
+}
+
+fn hasDebShims(io: Io, dir: Dir) bool {
+    var bin_dir = dir.openDir(io, "usr/bin", .{ .iterate = true }) catch return false;
+    defer bin_dir.close(io);
+
+    var iter = bin_dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind == .sym_link or entry.kind == .file) return true;
+    }
+    return false;
+}
+
 fn scanForExecutables(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1295,14 +1321,27 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     }
 
     // Find executables
-    var exes = findExecutables(allocator, io, staging_dir) catch |err| {
-        try err_w.print(
-            "error: failed to scan staging dir '{s}' for executables: {t}\n",
-            .{ staging_path, err },
-        );
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
+    const prefer_deb_shims = archive.detectFormat(asset.name) == .deb and hasDebShims(io, staging_dir);
+    var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (prefer_deb_shims) {
+        exes = findDebExecutables(allocator, io, staging_dir) catch |err| {
+            try err_w.print(
+                "error: failed to scan staging dir '{s}' for executables: {t}\n",
+                .{ staging_path, err },
+            );
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+    } else {
+        exes = findExecutables(allocator, io, staging_dir) catch |err| {
+            try err_w.print(
+                "error: failed to scan staging dir '{s}' for executables: {t}\n",
+                .{ staging_path, err },
+            );
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+    }
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
