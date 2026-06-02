@@ -133,7 +133,6 @@ fn isSharedLibrary(name: []const u8) bool {
 /// Returns true if the directory contains shared libraries rather than executables.
 fn isLibraryDir(name: []const u8) bool {
     if (std.mem.endsWith(u8, name, ".framework")) return true;
-    if (std.mem.eql(u8, name, "lib")) return true;
     if (std.mem.eql(u8, name, "Frameworks")) return true;
     if (std.mem.eql(u8, name, "PlugIns")) return true;
     return false;
@@ -156,7 +155,10 @@ fn deriveBareBinaryName(
     // Find the first '-' or '_' separator.
     var sep_idx: ?usize = null;
     for (name, 0..) |c, i| {
-        if (c == '-' or c == '_') { sep_idx = i; break; }
+        if (c == '-' or c == '_') {
+            sep_idx = i;
+            break;
+        }
     }
 
     if (sep_idx) |si| {
@@ -164,11 +166,11 @@ fn deriveBareBinaryName(
             const stem = name[0..si];
             const after = name[si + 1 ..];
             const archs = [_][]const u8{
-                "x86_64", "x64",    "amd64",
-                "aarch64", "arm64",
-                "armv7l", "armv7",  "armv6",
-                "x86",    "i686",   "i386",
-                "ppc64le", "ppc64", "s390x", "riscv64",
+                "x86_64",  "x64",   "amd64",
+                "aarch64", "arm64", "armv7l",
+                "armv7",   "armv6", "x86",
+                "i686",    "i386",  "ppc64le",
+                "ppc64",   "s390x", "riscv64",
             };
             for (archs) |a| {
                 if (after.len < a.len) continue;
@@ -188,7 +190,6 @@ fn deriveBareBinaryName(
     if (is_windows) return std.fmt.allocPrint(allocator, "{s}.exe", .{repo});
     return allocator.dupe(u8, repo);
 }
-
 
 /// Copy a bare executable from the cache into the staging directory,
 /// renaming it to `dest_name` and setting executable permissions.
@@ -215,6 +216,32 @@ fn findExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayLis
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
     try scanForExecutables(allocator, io, dir, &result, "");
     return result;
+}
+
+fn findDebExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
+    var result: std.ArrayListUnmanaged([]const u8) = .empty;
+    var bin_dir = dir.openDir(io, "usr/bin", .{ .iterate = true }) catch return result;
+    defer bin_dir.close(io);
+
+    var iter = bin_dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        const rel_name = try std.fmt.allocPrint(allocator, "usr/bin/{s}", .{entry.name});
+        try result.append(allocator, rel_name);
+    }
+
+    return result;
+}
+
+fn hasDebShims(io: Io, dir: Dir) bool {
+    var bin_dir = dir.openDir(io, "usr/bin", .{ .iterate = true }) catch return false;
+    defer bin_dir.close(io);
+
+    var iter = bin_dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind == .sym_link or entry.kind == .file) return true;
+    }
+    return false;
 }
 
 fn scanForExecutables(
@@ -1258,7 +1285,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     try w.flush();
 
     switch (archive.detectFormat(asset.name)) {
-        .zip, .tar_gz, .tar_xz => {
+        .zip, .tar_gz, .tar_xz, .deb => {
             archive.extractAuto(allocator, io, staging_dir, download_path, 0) catch |err| {
                 try err_w.print(
                     "error: failed to extract '{s}' from '{s}' into '{s}': {t}\n",
@@ -1294,14 +1321,27 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     }
 
     // Find executables
-    var exes = findExecutables(allocator, io, staging_dir) catch |err| {
-        try err_w.print(
-            "error: failed to scan staging dir '{s}' for executables: {t}\n",
-            .{ staging_path, err },
-        );
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
+    const prefer_deb_shims = archive.detectFormat(asset.name) == .deb and hasDebShims(io, staging_dir);
+    var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (prefer_deb_shims) {
+        exes = findDebExecutables(allocator, io, staging_dir) catch |err| {
+            try err_w.print(
+                "error: failed to scan staging dir '{s}' for executables: {t}\n",
+                .{ staging_path, err },
+            );
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+    } else {
+        exes = findExecutables(allocator, io, staging_dir) catch |err| {
+            try err_w.print(
+                "error: failed to scan staging dir '{s}' for executables: {t}\n",
+                .{ staging_path, err },
+            );
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+    }
     defer {
         for (exes.items) |e| allocator.free(e);
         exes.deinit(allocator);
@@ -1701,7 +1741,6 @@ test "stageBareExecutable copies file with executable permissions" {
     try std.testing.expectEqualStrings("tool.exe", exes.items[0]);
 }
 
-
 test "findExecutables discovers executable files" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1861,7 +1900,7 @@ test "isSharedLibrary identifies shared libraries" {
 
 test "isLibraryDir identifies library directories" {
     try std.testing.expect(isLibraryDir("QtCore.framework"));
-    try std.testing.expect(isLibraryDir("lib"));
+    try std.testing.expect(!isLibraryDir("lib"));
     try std.testing.expect(isLibraryDir("Frameworks"));
     try std.testing.expect(isLibraryDir("PlugIns"));
     try std.testing.expect(!isLibraryDir("bin"));
@@ -2248,4 +2287,3 @@ test "ensureDirAbsoluteRecursive tolerates already-existing path" {
 
     try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
 }
-

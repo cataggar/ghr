@@ -451,10 +451,9 @@ fn isInstallableAsset(name: []const u8) bool {
     if (std.mem.endsWith(u8, name, ".tar.xz")) return true;
     if (std.mem.endsWith(u8, name, ".exe")) return true;
     const non_installable = [_][]const u8{
-        ".json", ".txt", ".pub", ".sig", ".asc", ".pem", ".md",
-        ".sha256", ".sha512", ".md5", ".minisig",
-        ".rpm",  ".deb",  ".apk", ".msi", ".pkg", ".dmg",
-        ".yml",  ".yaml",
+        ".json",   ".txt",    ".pub", ".sig",     ".asc", ".pem", ".md",
+        ".sha256", ".sha512", ".md5", ".minisig", ".rpm", ".apk", ".msi",
+        ".pkg",    ".dmg",    ".yml", ".yaml",
     };
     for (non_installable) |ext| {
         if (std.mem.endsWith(u8, name, ext)) return false;
@@ -468,22 +467,28 @@ fn isInstallableAsset(name: []const u8) bool {
 /// also available.
 fn nonPrimaryPenalty(name: []const u8) u32 {
     const strong = [_][]const u8{
-        "c-api",    "capi",      "headers",   "sdk",
-        "dev",      "lib-only",  "src",       "source",
-        "sources",  "sbom",      "checksum",  "checksums",
-        "debug",    "dbg",       "symbols",
+        "c-api",   "capi",     "headers",  "sdk",
+        "dev",     "lib-only", "src",      "source",
+        "sources", "sbom",     "checksum", "checksums",
+        "debug",   "dbg",      "symbols",
     };
     const medium = [_][]const u8{
-        "plugin",   "plugins",   "wasi_nn",   "wasi-nn",
-        "ffmpeg",   "tensorflow", "image",    "opencvmini",
+        "plugin", "plugins",    "wasi_nn", "wasi-nn",
+        "ffmpeg", "tensorflow", "image",   "opencvmini",
     };
     const soft = [_][]const u8{
-        "static",   "min",       "minimal",
+        "static", "min", "minimal",
     };
     var penalty: u32 = 0;
-    for (strong) |m| if (containsIgnoreCaseBounded(name, m)) { penalty += 5; };
-    for (medium) |m| if (containsIgnoreCaseBounded(name, m)) { penalty += 3; };
-    for (soft) |m| if (containsIgnoreCaseBounded(name, m)) { penalty += 1; };
+    for (strong) |m| if (containsIgnoreCaseBounded(name, m)) {
+        penalty += 5;
+    };
+    for (medium) |m| if (containsIgnoreCaseBounded(name, m)) {
+        penalty += 3;
+    };
+    for (soft) |m| if (containsIgnoreCaseBounded(name, m)) {
+        penalty += 1;
+    };
     return penalty;
 }
 
@@ -495,8 +500,10 @@ fn nonPrimaryPenalty(name: []const u8) u32 {
 fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
     const always_wrong = [_][]const u8{
         "linux-android", "android",
-        "ios", "tvos", "watchos",
-        "wasi",  "wasm32", "wasm64", "emscripten",
+        "ios",           "tvos",
+        "watchos",       "wasi",
+        "wasm32",        "wasm64",
+        "emscripten",
     };
     for (always_wrong) |t| {
         if (containsIgnoreCaseBounded(name, t)) return true;
@@ -505,15 +512,17 @@ fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
         if (containsIgnoreCaseBounded(name, k)) return false;
     }
     const foreign = [_][]const u8{
-        "windows", "win32", "win64", "mingw",
-        "linux",
-        "darwin",  "macos", "osx",
-        "freebsd", "netbsd", "openbsd", "solaris", "illumos",
+        "windows", "win",     "win32",   "win64",   "mingw",
+        "linux",   "darwin",  "macos",   "osx",     "freebsd",
+        "netbsd",  "openbsd", "solaris", "illumos",
     };
     for (foreign) |t| {
         var is_host = false;
         for (plat_os) |k| {
-            if (std.ascii.eqlIgnoreCase(k, t)) { is_host = true; break; }
+            if (std.ascii.eqlIgnoreCase(k, t)) {
+                is_host = true;
+                break;
+            }
         }
         if (is_host) continue;
         if (containsIgnoreCaseBounded(name, t)) return true;
@@ -534,10 +543,10 @@ fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
 fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
     if (plat_arch.len == 0) return false;
     const all_arch = [_][]const u8{
-        "x86_64", "x64",   "amd64",
-        "aarch64", "arm64",
-        "armv7l", "armv7", "armv6",
-        "i386",   "i686",  "x86",
+        "x86_64",  "x64",   "amd64",
+        "aarch64", "arm64", "armv7l",
+        "armv7",   "armv6", "i386",
+        "i686",    "x86",
     };
     for (plat_arch) |k| {
         if (containsIgnoreCaseBounded(name, k)) return false;
@@ -545,7 +554,10 @@ fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
     for (all_arch) |t| {
         var is_host = false;
         for (plat_arch) |k| {
-            if (std.ascii.eqlIgnoreCase(k, t)) { is_host = true; break; }
+            if (std.ascii.eqlIgnoreCase(k, t)) {
+                is_host = true;
+                break;
+            }
         }
         if (is_host) continue;
         if (containsIgnoreCaseBounded(name, t)) return true;
@@ -558,23 +570,34 @@ fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
 fn linuxPortabilityBonus(name: []const u8, plat_os: []const []const u8) i32 {
     var is_linux_host = false;
     for (plat_os) |k| {
-        if (std.ascii.eqlIgnoreCase(k, "linux")) { is_linux_host = true; break; }
+        if (std.ascii.eqlIgnoreCase(k, "linux")) {
+            is_linux_host = true;
+            break;
+        }
     }
     if (!is_linux_host) return 0;
     var s: i32 = 0;
     const generic = [_][]const u8{
         "manylinux",
-        "unknown-linux-gnu", "unknown-linux-musl",
-        "linux-gnu", "linux-musl",
+        "unknown-linux-gnu",
+        "unknown-linux-musl",
+        "linux-gnu",
+        "linux-musl",
     };
     for (generic) |t| {
-        if (containsIgnoreCaseBounded(name, t)) { s += 2; break; }
+        if (containsIgnoreCaseBounded(name, t)) {
+            s += 2;
+            break;
+        }
     }
     const distros = [_][]const u8{
         "ubuntu", "debian", "alpine", "fedora", "centos", "rhel", "suse",
     };
     for (distros) |t| {
-        if (containsIgnoreCaseBounded(name, t)) { s -= 1; break; }
+        if (containsIgnoreCaseBounded(name, t)) {
+            s -= 1;
+            break;
+        }
     }
     return s;
 }
@@ -598,10 +621,16 @@ fn tieBreakPrefers(a: []const u8, b: []const u8) bool {
 fn scoreAsset(name: []const u8, plat: PlatformKeywords) i32 {
     var score: i32 = 0;
     for (plat.os) |kw| {
-        if (containsIgnoreCaseBounded(name, kw)) { score += 10; break; }
+        if (containsIgnoreCaseBounded(name, kw)) {
+            score += 10;
+            break;
+        }
     }
     for (plat.arch) |kw| {
-        if (containsIgnoreCaseBounded(name, kw)) { score += 5; break; }
+        if (containsIgnoreCaseBounded(name, kw)) {
+            score += 5;
+            break;
+        }
     }
     score -= @as(i32, @intCast(nonPrimaryPenalty(name)));
     score += linuxPortabilityBonus(name, plat.os);
@@ -835,10 +864,9 @@ fn lookupSha256(content: []const u8, target_name: []const u8) ?[]const u8 {
 /// signature, key, or unrelated checksum (sha512/md5).
 fn isSha256ChecksumFile(name: []const u8) bool {
     const reject_suffixes = [_][]const u8{
-        ".sig", ".asc", ".pem", ".pub", ".gpg", ".minisig",
-        ".sha512", ".sha512sum", ".sha512sums",
-        ".md5", ".md5sum", ".md5sums",
-        ".sha1", ".sha1sum",
+        ".sig",    ".asc",       ".pem",        ".pub", ".gpg",    ".minisig",
+        ".sha512", ".sha512sum", ".sha512sums", ".md5", ".md5sum", ".md5sums",
+        ".sha1",   ".sha1sum",
     };
     for (reject_suffixes) |s| {
         if (std.ascii.endsWithIgnoreCase(name, s)) return false;
@@ -1774,6 +1802,7 @@ test "isInstallableAsset" {
     try std.testing.expect(isInstallableAsset("foo.tar.gz"));
     try std.testing.expect(isInstallableAsset("foo.tgz"));
     try std.testing.expect(isInstallableAsset("foo.tar.xz"));
+    try std.testing.expect(isInstallableAsset("foo.deb"));
     try std.testing.expect(isInstallableAsset("cosign-windows-amd64.exe"));
     try std.testing.expect(isInstallableAsset("tool.exe"));
     try std.testing.expect(isInstallableAsset("cosign-linux-amd64"));
@@ -1782,7 +1811,6 @@ test "isInstallableAsset" {
     try std.testing.expect(!isInstallableAsset("foo.sha256"));
     try std.testing.expect(!isInstallableAsset("cosign-linux-amd64.sigstore.json"));
     try std.testing.expect(!isInstallableAsset("cosign-3.0.6-1.x86_64.rpm"));
-    try std.testing.expect(!isInstallableAsset("cosign_3.0.6_amd64.deb"));
     try std.testing.expect(!isInstallableAsset("cosign_3.0.6_aarch64.apk"));
     try std.testing.expect(!isInstallableAsset("release-cosign.pub"));
 }
@@ -1866,6 +1894,7 @@ test "isWrongPlatform basics" {
     try std.testing.expect(isWrongPlatform("wash-aarch64-linux-android", linux_os));
     try std.testing.expect(isWrongPlatform("tool-wasm32-wasi.tar.gz", linux_os));
     try std.testing.expect(isWrongPlatform("tool-x86_64-apple-darwin.tar.gz", linux_os));
+    try std.testing.expect(isWrongPlatform("azureauth-0.9.6-win-arm64.zip", linux_os));
     try std.testing.expect(!isWrongPlatform("tool-x86_64-unknown-linux-gnu.tar.gz", linux_os));
     try std.testing.expect(!isWrongPlatform("tool-aarch64-linux.tar.xz", linux_os));
 
@@ -1951,6 +1980,19 @@ test "findBestAsset selects host-arch Linux asset when both arches present" {
         .arch = &.{ "aarch64", "arm64" },
     });
     try std.testing.expectEqualStrings("tool-aarch64-linux.tar.gz", best.name);
+}
+
+test "findBestAsset selects .deb on Linux arm64 when no tarball exists" {
+    const assets = [_]Asset{
+        .{ .name = "azureauth-0.9.6-win-arm64.zip", .browser_download_url = "" },
+        .{ .name = "azureauth-0.9.6-osx-arm64.tar.gz", .browser_download_url = "" },
+        .{ .name = "azureauth-0.9.6-linux-arm64.deb", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "aarch64", "arm64" },
+    });
+    try std.testing.expectEqualStrings("azureauth-0.9.6-linux-arm64.deb", best.name);
 }
 
 test "findBestAsset selects cosign bare binary for Linux" {
