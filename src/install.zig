@@ -133,7 +133,6 @@ fn isSharedLibrary(name: []const u8) bool {
 /// Returns true if the directory contains shared libraries rather than executables.
 fn isLibraryDir(name: []const u8) bool {
     if (std.mem.endsWith(u8, name, ".framework")) return true;
-    if (std.mem.eql(u8, name, "lib")) return true;
     if (std.mem.eql(u8, name, "Frameworks")) return true;
     if (std.mem.eql(u8, name, "PlugIns")) return true;
     return false;
@@ -1862,7 +1861,7 @@ test "isSharedLibrary identifies shared libraries" {
 
 test "isLibraryDir identifies library directories" {
     try std.testing.expect(isLibraryDir("QtCore.framework"));
-    try std.testing.expect(isLibraryDir("lib"));
+    try std.testing.expect(!isLibraryDir("lib"));
     try std.testing.expect(isLibraryDir("Frameworks"));
     try std.testing.expect(isLibraryDir("PlugIns"));
     try std.testing.expect(!isLibraryDir("bin"));
