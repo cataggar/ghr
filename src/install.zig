@@ -156,7 +156,10 @@ fn deriveBareBinaryName(
     // Find the first '-' or '_' separator.
     var sep_idx: ?usize = null;
     for (name, 0..) |c, i| {
-        if (c == '-' or c == '_') { sep_idx = i; break; }
+        if (c == '-' or c == '_') {
+            sep_idx = i;
+            break;
+        }
     }
 
     if (sep_idx) |si| {
@@ -164,11 +167,11 @@ fn deriveBareBinaryName(
             const stem = name[0..si];
             const after = name[si + 1 ..];
             const archs = [_][]const u8{
-                "x86_64", "x64",    "amd64",
-                "aarch64", "arm64",
-                "armv7l", "armv7",  "armv6",
-                "x86",    "i686",   "i386",
-                "ppc64le", "ppc64", "s390x", "riscv64",
+                "x86_64",  "x64",   "amd64",
+                "aarch64", "arm64", "armv7l",
+                "armv7",   "armv6", "x86",
+                "i686",    "i386",  "ppc64le",
+                "ppc64",   "s390x", "riscv64",
             };
             for (archs) |a| {
                 if (after.len < a.len) continue;
@@ -188,7 +191,6 @@ fn deriveBareBinaryName(
     if (is_windows) return std.fmt.allocPrint(allocator, "{s}.exe", .{repo});
     return allocator.dupe(u8, repo);
 }
-
 
 /// Copy a bare executable from the cache into the staging directory,
 /// renaming it to `dest_name` and setting executable permissions.
@@ -1258,7 +1260,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     try w.flush();
 
     switch (archive.detectFormat(asset.name)) {
-        .zip, .tar_gz, .tar_xz => {
+        .zip, .tar_gz, .tar_xz, .deb => {
             archive.extractAuto(allocator, io, staging_dir, download_path, 0) catch |err| {
                 try err_w.print(
                     "error: failed to extract '{s}' from '{s}' into '{s}': {t}\n",
@@ -1700,7 +1702,6 @@ test "stageBareExecutable copies file with executable permissions" {
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("tool.exe", exes.items[0]);
 }
-
 
 test "findExecutables discovers executable files" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -2248,4 +2249,3 @@ test "ensureDirAbsoluteRecursive tolerates already-existing path" {
 
     try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
 }
-

@@ -45,10 +45,57 @@ pub fn extractTarXz(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *
     try std.tar.extract(io, dest_dir, &xz_decompress.reader, .{ .strip_components = strip_components });
 }
 
+fn parseDebMember(bytes: []const u8, member_name: []const u8) ![]const u8 {
+    if (!std.mem.startsWith(u8, bytes, "!<arch>\n")) return error.InvalidDebArchive;
+
+    var pos: usize = 8;
+    while (pos + 60 <= bytes.len) {
+        const header = bytes[pos .. pos + 60];
+        if (header[0] == 0 and header[1] == 0) break;
+
+        const name_field = std.mem.trimEnd(u8, header[0..16], " /");
+        var name: []const u8 = name_field;
+        var data_pos = pos + 60;
+
+        if (std.mem.startsWith(u8, name_field, "#1/")) {
+            const name_len = try std.fmt.parseUnsigned(usize, name_field[3..], 10);
+            name = bytes[data_pos .. data_pos + name_len];
+            data_pos += name_len;
+        }
+
+        const size = try std.fmt.parseUnsigned(usize, std.mem.trim(u8, header[48..58], " "), 10);
+        if (std.mem.eql(u8, name, member_name)) {
+            return bytes[data_pos .. data_pos + size];
+        }
+
+        pos = data_pos + size;
+        if (size % 2 != 0) pos += 1;
+    }
+
+    return error.DebMemberNotFound;
+}
+
+pub fn extractDeb(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *File) !void {
+    const stat = try file.stat(io);
+    const bytes = try allocator.alloc(u8, @intCast(stat.size));
+    defer allocator.free(bytes);
+
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_buf);
+    try file_reader.interface.readSliceAll(bytes);
+
+    const data = try parseDebMember(bytes, "data.tar.zst");
+    var in: std.Io.Reader = .fixed(data);
+    var zstd_buf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
+    var zstd_stream = std.compress.zstd.Decompress.init(&in, &zstd_buf, .{});
+    try std.tar.extract(io, dest_dir, &zstd_stream.reader, .{});
+}
+
 pub const Format = enum {
     zip,
     tar_gz,
     tar_xz,
+    deb,
     unknown,
 };
 
@@ -58,6 +105,7 @@ pub fn detectFormat(name: []const u8) Format {
     if (endsWithIgnoreCase(name, ".zip")) return .zip;
     if (endsWithIgnoreCase(name, ".tar.gz") or endsWithIgnoreCase(name, ".tgz")) return .tar_gz;
     if (endsWithIgnoreCase(name, ".tar.xz") or endsWithIgnoreCase(name, ".txz")) return .tar_xz;
+    if (endsWithIgnoreCase(name, ".deb")) return .deb;
     return .unknown;
 }
 
@@ -87,6 +135,7 @@ pub fn extractAuto(
         .zip => try extractZip(io, dest_dir, &file),
         .tar_gz => try extractTarGz(io, dest_dir, &file, strip_components),
         .tar_xz => try extractTarXz(allocator, io, dest_dir, &file, strip_components),
+        .deb => try extractDeb(allocator, io, dest_dir, &file),
         .unknown => return error.UnknownArchiveFormat,
     }
 }
@@ -99,6 +148,8 @@ test "detectFormat recognises common archive suffixes" {
     try std.testing.expectEqual(Format.tar_gz, detectFormat("foo.TGZ"));
     try std.testing.expectEqual(Format.tar_xz, detectFormat("foo.tar.xz"));
     try std.testing.expectEqual(Format.tar_xz, detectFormat("foo.txz"));
+    try std.testing.expectEqual(Format.deb, detectFormat("foo.deb"));
+    try std.testing.expectEqual(Format.deb, detectFormat("FOO.DEB"));
     try std.testing.expectEqual(Format.unknown, detectFormat("foo.exe"));
     try std.testing.expectEqual(Format.unknown, detectFormat("foo"));
     try std.testing.expectEqual(Format.unknown, detectFormat(""));
@@ -257,6 +308,66 @@ test "extractAuto dispatches on filename and strips components" {
 
     try std.testing.expect((try tmp.dir.statFile(std.testing.io, "inner/tool", .{})).kind == .file);
     try std.testing.expect((try tmp.dir.statFile(std.testing.io, "inner/data.txt", .{})).kind == .file);
+}
+
+fn createTestDeb(tmp: *std.testing.TmpDir) !File {
+    const tio = std.testing.io;
+
+    try tmp.dir.createDirPath(tio, "usr/bin");
+    try tmp.dir.createDirPath(tio, "usr/lib/azureauth");
+
+    var tool = try tmp.dir.createFile(tio, "usr/bin/azureauth", .{ .permissions = .executable_file });
+    try tool.writeStreamingAll(tio, "#!/bin/sh\n");
+    tool.close(tio);
+
+    var control = try tmp.dir.createFile(tio, "control", .{});
+    try control.writeStreamingAll(tio, "Package: azureauth\nVersion: 1.0\nArchitecture: arm64\n\n");
+    control.close(tio);
+
+    var debian_binary = try tmp.dir.createFile(tio, "debian-binary", .{});
+    try debian_binary.writeStreamingAll(tio, "2.0\n");
+    debian_binary.close(tio);
+
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(std.testing.allocator);
+
+    try argv.appendSlice(std.testing.allocator, &.{ "tar", "--zstd", "-cf", "control.tar.zst", "control" });
+    var child = try std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
+    _ = try child.wait(tio);
+    tmp.dir.deleteFile(tio, "control") catch {};
+
+    argv.items.len = 0;
+    try argv.appendSlice(std.testing.allocator, &.{ "tar", "--zstd", "-cf", "data.tar.zst", "usr" });
+    child = try std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
+    _ = try child.wait(tio);
+
+    argv.items.len = 0;
+    try argv.appendSlice(std.testing.allocator, &.{ "ar", "rcs", "archive.deb", "debian-binary", "control.tar.zst", "data.tar.zst" });
+    child = try std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
+    _ = try child.wait(tio);
+
+    return try tmp.dir.openFile(tio, "archive.deb", .{});
+}
+
+test "extractAuto handles .deb archives" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try createTestDeb(&tmp);
+    defer file.close(std.testing.io);
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const archive_len = try tmp.dir.realPathFile(std.testing.io, "archive.deb", &path_buf);
+    const archive_abs = path_buf[0..archive_len];
+
+    try tmp.dir.createDirPath(std.testing.io, "extract");
+    var extract_dir = try tmp.dir.openDir(std.testing.io, "extract", .{ .iterate = true });
+    defer extract_dir.close(std.testing.io);
+
+    try extractAuto(std.testing.allocator, std.testing.io, extract_dir, archive_abs, 0);
+
+    try std.testing.expect((try extract_dir.statFile(std.testing.io, "usr/bin/azureauth", .{})).kind == .file);
+    try std.testing.expect((try extract_dir.statFile(std.testing.io, "usr/lib/azureauth", .{})).kind == .directory);
 }
 
 test "extractAuto rejects unknown formats" {
