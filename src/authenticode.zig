@@ -1458,6 +1458,61 @@ test "parseGeneralizedTime round-trips a known instant" {
     try std.testing.expectEqual(@as(i64, 1776767071), t);
 }
 
+/// Format a Unix-epoch second count as a 20-byte ISO 8601 UTC string
+/// of the form `YYYY-MM-DDTHH:MM:SSZ`. The slice is borrowed from
+/// `buf` and is valid for the lifetime of `buf`.
+///
+/// Used to render RFC 3161 `genTime` values in human-readable logs;
+/// the inverse of `parseGeneralizedTime` for the common Z-suffixed
+/// shape. Year is clamped to four digits, so inputs outside
+/// 0001–9999 will be truncated — fine for any plausible timestamp.
+pub fn formatUnixTimeIso(epoch_sec: i64, buf: *[20]u8) []const u8 {
+    const day_seconds: i64 = 86400;
+    const days: i64 = @divFloor(epoch_sec, day_seconds);
+    const tod: u32 = @intCast(epoch_sec - days * day_seconds); // [0, 86399]
+    const ymd = civilFromDays(days);
+    const hh: u8 = @intCast(tod / 3600);
+    const mm: u8 = @intCast((tod / 60) % 60);
+    const ss: u8 = @intCast(tod % 60);
+    // We deliberately ignore fmt errors; the buffer is exactly 20 bytes
+    // and the format string emits exactly 20 ASCII characters.
+    _ = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        @as(u16, @intCast(ymd.year)),
+        ymd.month,
+        ymd.day,
+        hh,
+        mm,
+        ss,
+    }) catch unreachable;
+    return buf[0..20];
+}
+
+/// Howard Hinnant's "civil from days" — the inverse of `daysFromCivil`.
+/// See http://howardhinnant.github.io/date_algorithms.html#civil_from_days.
+fn civilFromDays(z_in: i64) struct { year: i64, month: u8, day: u8 } {
+    const z: i64 = z_in + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097); // [0, 146096]
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    const y: i64 = @as(i64, yoe) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    const mp: u32 = (5 * doy + 2) / 153; // [0, 11]
+    const d: u8 = @intCast(doy - (153 * mp + 2) / 5 + 1); // [1, 31]
+    const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9); // [1, 12]
+    return .{ .year = y + @as(i64, @intFromBool(m <= 2)), .month = m, .day = d };
+}
+
+test "formatUnixTimeIso renders known timestamps" {
+    var buf: [20]u8 = undefined;
+    // genTime printed by `ghr install AzureAD/microsoft-authentication-cli@0.9.6`.
+    try std.testing.expectEqualStrings("2026-04-24T21:00:53Z", formatUnixTimeIso(1777064453, &buf));
+    // Unix epoch itself.
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", formatUnixTimeIso(0, &buf));
+    // Round-trips with parseGeneralizedTime.
+    const parsed = try parseGeneralizedTime("20260421102431Z");
+    try std.testing.expectEqualStrings("2026-04-21T10:24:31Z", formatUnixTimeIso(parsed, &buf));
+}
+
 test "CertificateSetIterator skips non-certificate CertificateChoices" {
     // CMS CertificateSet body containing, in order:
     //   1. an X.509 certificate          (SEQUENCE,    universal tag 0x30)
