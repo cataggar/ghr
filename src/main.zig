@@ -428,6 +428,11 @@ fn readToolMeta(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_na
 /// directly pasteable as arguments to `ghr install`, so the optional
 /// minisign pubkey is appended after a space (matching the per-spec
 /// positional inline-key form accepted by `ghr install`).
+///
+/// `owner` and `repo` are ASCII-lowercased so output is canonical even
+/// when the on-disk dir is still a pre-migration mixed-case name like
+/// `AzureAD/foo` (GitHub is case-insensitive on slugs; we standardize).
+/// `tag` is preserved verbatim — tags are case-sensitive on GitHub.
 fn formatToolLine(
     allocator: std.mem.Allocator,
     owner: []const u8,
@@ -436,16 +441,30 @@ fn formatToolLine(
 ) ![]u8 {
     const tag: ?[]const u8 = if (meta) |m| m.tag else null;
     const key: ?[]const u8 = if (meta) |m| m.minisign else null;
+    var owner_buf: [256]u8 = undefined;
+    var repo_buf: [256]u8 = undefined;
+    const owner_lc = asciiLowerInto(&owner_buf, owner);
+    const repo_lc = asciiLowerInto(&repo_buf, repo);
     if (tag) |t| {
         if (key) |k| {
-            return std.fmt.allocPrint(allocator, "{s}/{s}@{s} {s}", .{ owner, repo, t, k });
+            return std.fmt.allocPrint(allocator, "{s}/{s}@{s} {s}", .{ owner_lc, repo_lc, t, k });
         }
-        return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ owner, repo, t });
+        return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ owner_lc, repo_lc, t });
     }
     if (key) |k| {
-        return std.fmt.allocPrint(allocator, "{s}/{s} {s}", .{ owner, repo, k });
+        return std.fmt.allocPrint(allocator, "{s}/{s} {s}", .{ owner_lc, repo_lc, k });
     }
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner, repo });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner_lc, repo_lc });
+}
+
+/// ASCII-lowercase `src` into the start of `dst`. Falls back to returning
+/// `src` verbatim when it doesn't fit (slug-length names always do in
+/// practice; this just keeps the helper allocation-free for the common
+/// case).
+fn asciiLowerInto(dst: []u8, src: []const u8) []const u8 {
+    if (src.len > dst.len) return src;
+    for (src, 0..) |c, i| dst[i] = std.ascii.toLower(c);
+    return dst[0..src.len];
 }
 
 test "formatToolLine: tag and key" {
@@ -465,7 +484,7 @@ test "formatToolLine: tag without key" {
         .tag = "14.1.0",
     });
     defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings("BurntSushi/ripgrep@14.1.0", line);
+    try std.testing.expectEqualStrings("burntsushi/ripgrep@14.1.0", line);
 }
 
 test "formatToolLine: no metadata" {
@@ -480,6 +499,14 @@ test "formatToolLine: key without tag" {
     });
     defer std.testing.allocator.free(line);
     try std.testing.expectEqualStrings("foo/bar RWSXXXX", line);
+}
+
+test "formatToolLine: lowercases mixed-case owner and repo, preserves tag" {
+    const line = try formatToolLine(std.testing.allocator, "AzureAD", "Microsoft-Authentication-CLI", .{
+        .tag = "0.9.6",
+    });
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("azuread/microsoft-authentication-cli@0.9.6", line);
 }
 
 fn printUsage(w: *Writer) !void {

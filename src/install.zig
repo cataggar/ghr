@@ -78,6 +78,129 @@ fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) void {
     };
 }
 
+/// ASCII case-insensitive equality. Cheap and allocation-free.
+fn eqlIgnoreAsciiCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+/// ASCII-lowercase `s` into a freshly-allocated slice.
+fn asciiLowerDup(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, s.len);
+    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out;
+}
+
+/// Rename a directory across a case-only difference in its leaf name.
+///
+/// On case-sensitive filesystems (typical Linux ext4) this is a direct
+/// `renameAbsolute`. On case-insensitive ones (NTFS by default, APFS
+/// usually) `rename("AzureAD", "azuread")` is a no-op since the entries
+/// alias to the same inode; we detour through a `<name>.casetmp` so the
+/// on-disk casing actually flips.
+///
+/// When `old_abs` and `new_abs` differ in more than just leaf casing
+/// (different parent, or same name byte-for-byte), this is a plain
+/// `renameAbsolute` — no temp dance is performed.
+fn caseRenameDir(io: Io, old_abs: []const u8, new_abs: []const u8) !void {
+    const old_parent = std.fs.path.dirname(old_abs) orelse return error.InvalidPath;
+    const new_parent = std.fs.path.dirname(new_abs) orelse return error.InvalidPath;
+    const leaf_old = std.fs.path.basename(old_abs);
+    const leaf_new = std.fs.path.basename(new_abs);
+    const same_parent = std.mem.eql(u8, old_parent, new_parent);
+    const leaf_case_only =
+        same_parent and
+        !std.mem.eql(u8, leaf_old, leaf_new) and
+        eqlIgnoreAsciiCase(leaf_old, leaf_new);
+
+    if (leaf_case_only) {
+        var tmp_buf: [Dir.max_path_bytes]u8 = undefined;
+        const tmp_abs = try std.fmt.bufPrint(&tmp_buf, "{s}.casetmp", .{old_abs});
+        // Clean up any leftover tombstone from a prior failed attempt.
+        deleteTreeAbsolute(io, tmp_abs) catch {};
+        try Dir.renameAbsolute(old_abs, tmp_abs, io);
+        try Dir.renameAbsolute(tmp_abs, new_abs, io);
+        return;
+    }
+    try Dir.renameAbsolute(old_abs, new_abs, io);
+}
+
+/// Search `parent` for a directory entry whose name matches `target`
+/// (case-insensitive). Returns the actual on-disk name (heap-owned by
+/// `allocator`) so callers preserve the casing already present on the
+/// filesystem.
+///
+/// Prefers an exact byte-for-byte match over a case-insensitive one when
+/// both happen to exist (only possible on case-sensitive filesystems).
+/// Returns `null` when no match exists.
+fn findDirEntryIgnoreCase(
+    allocator: std.mem.Allocator,
+    io: Io,
+    parent: Dir,
+    target: []const u8,
+) !?[]u8 {
+    var iter = parent.iterate();
+    var ci_hit: ?[]u8 = null;
+    errdefer if (ci_hit) |h| allocator.free(h);
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (std.mem.eql(u8, entry.name, target)) {
+            if (ci_hit) |h| {
+                allocator.free(h);
+                ci_hit = null;
+            }
+            return try allocator.dupe(u8, entry.name);
+        }
+        if (ci_hit == null and eqlIgnoreAsciiCase(entry.name, target)) {
+            ci_hit = try allocator.dupe(u8, entry.name);
+        }
+    }
+    return ci_hit;
+}
+
+/// Find the actual on-disk path for `<tools_dir>/<owner>/<repo>`,
+/// regardless of the on-disk casing. Prefers an exact lowercase match
+/// (the new canonical layout); falls back to a case-insensitive scan of
+/// `tools_dir/*` and `<owner-match>/*` so that pre-migration installs
+/// created with mixed-case slugs (e.g. `AzureAD/foo`) are still found.
+///
+/// `owner_lower` and `repo_lower` MUST be ASCII-lowercased by the caller
+/// (see `release.parseRepoSpecOwned`).
+///
+/// Returns the joined absolute path, owned by `allocator`, or `null` when
+/// no matching tool directory exists. The path uses the host path
+/// separator so it's directly usable with `openDirAbsolute`.
+pub fn resolveInstalledToolPath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tools_dir: []const u8,
+    owner_lower: []const u8,
+    repo_lower: []const u8,
+) !?[]u8 {
+    var tools = Dir.openDirAbsolute(io, tools_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    defer tools.close(io);
+
+    const owner_name = (try findDirEntryIgnoreCase(allocator, io, tools, owner_lower)) orelse return null;
+    defer allocator.free(owner_name);
+
+    var owner_dir = tools.openDir(io, owner_name, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    defer owner_dir.close(io);
+
+    const repo_name = (try findDirEntryIgnoreCase(allocator, io, owner_dir, repo_lower)) orelse return null;
+    defer allocator.free(repo_name);
+
+    return try std.fs.path.join(allocator, &.{ tools_dir, owner_name, repo_name });
+}
+
 /// Magic-byte sniff for native executable formats on POSIX. Returns true for
 /// ELF, Mach-O (thin/fat, both endians), and shebang scripts. Used as a
 /// fallback when the on-disk executable bit is missing — notably for files
@@ -809,14 +932,24 @@ fn cleanupWindowsBinEntry(io: Io, bin_dir: Dir, exe_name: []const u8, tool_path:
 }
 
 /// Check if a .shim file's target path starts with tool_path.
+///
+/// On Windows, the comparison is ASCII case-insensitive so a shim
+/// written before lowercase-tool-dir migration (`...\AzureAD\foo\...`)
+/// is still recognized as owned after the dir was renamed to
+/// `...\azuread\foo\...`. Windows paths are case-insensitive anyway.
 fn shimPointsToToolDir(io: Io, bin_dir: Dir, shim_name: []const u8, tool_path: []const u8) bool {
     var content_buf: [Dir.max_path_bytes]u8 = undefined;
     const file = bin_dir.openFile(io, shim_name, .{}) catch return false;
     defer file.close(io);
     const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
     const content = std.mem.trim(u8, content_buf[0..len], &[_]u8{ ' ', '\t', '\r', '\n' });
-    return std.mem.startsWith(u8, content, tool_path) and
-        (content.len == tool_path.len or content[tool_path.len] == '\\' or content[tool_path.len] == '/');
+    if (content.len < tool_path.len) return false;
+    const prefix_matches = if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(content[0..tool_path.len], tool_path)
+    else
+        std.mem.eql(u8, content[0..tool_path.len], tool_path);
+    if (!prefix_matches) return false;
+    return content.len == tool_path.len or content[tool_path.len] == '\\' or content[tool_path.len] == '/';
 }
 
 /// Remove bin entries from a previous install that are NOT present in the new install.
@@ -862,26 +995,25 @@ pub fn cmdUninstall(
     w: *Writer,
     err_w: *Writer,
 ) !void {
-    const spec = parseSpec(spec_str) catch {
+    const owned = release_mod.parseRepoSpecOwned(allocator, spec_str) catch {
         try err_w.print("error: invalid spec '{s}', expected owner/repo\n", .{spec_str});
         try err_w.flush();
         std.process.exit(1);
     };
+    defer owned.deinit();
 
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
-    const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
-        d.tools, std.fs.path.sep, spec.owner, std.fs.path.sep, spec.repo,
-    });
-    defer allocator.free(tool_path);
-
-    // Check the tool exists
-    Dir.accessAbsolute(io, tool_path, .{}) catch {
-        try err_w.print("error: {s}/{s} is not installed\n", .{ spec.owner, spec.repo });
+    // Look up the on-disk path case-insensitively so a user can run
+    // `ghr uninstall azuread/foo` against an existing pre-migration
+    // `<tools>/AzureAD/foo` directory.
+    const tool_path = (try resolveInstalledToolPath(allocator, io, d.tools, owned.owner, owned.repo)) orelse {
+        try err_w.print("error: {s}/{s} is not installed\n", .{ owned.owner, owned.repo });
         try err_w.flush();
         std.process.exit(1);
     };
+    defer allocator.free(tool_path);
 
     // Read metadata to know what to clean up
     const meta = readMetadata(allocator, io, tool_path);
@@ -928,7 +1060,7 @@ pub fn cmdUninstall(
         std.process.exit(1);
     };
 
-    try w.print("uninstalled {s}/{s}\n", .{ spec.owner, spec.repo });
+    try w.print("uninstalled {s}/{s}\n", .{ owned.owner, owned.repo });
 }
 
 /// Per-install error signalling a single spec's install path failed after
@@ -1023,6 +1155,16 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     if (spec.tag) |t| try w.print("@{s}", .{t});
     try w.print(" ...\n", .{});
     try w.flush();
+
+    // Canonical lowercase slug for on-disk paths (tools dir, cache dir,
+    // owner dir). GitHub is case-insensitive on slugs but Linux paths
+    // are not, so we standardize. The original mixed-case `spec.owner` /
+    // `spec.repo` are still used for the GitHub API call and for
+    // user-visible diagnostics.
+    const owner_lower = try asciiLowerDup(allocator, spec.owner);
+    defer allocator.free(owner_lower);
+    const repo_lower = try asciiLowerDup(allocator, spec.repo);
+    defer allocator.free(repo_lower);
 
     // Get release info
     var release = getRelease(allocator, ctx.client, spec.owner, spec.repo, spec.tag, auth_header) catch |err| {
@@ -1261,7 +1403,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Stage extraction
     const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging-{s}-{s}", .{
-        d.cache, std.fs.path.sep, spec.owner, spec.repo,
+        d.cache, std.fs.path.sep, owner_lower, repo_lower,
     });
     defer allocator.free(staging_path);
 
@@ -1377,9 +1519,46 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Move staging to final tool dir
     const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
-        d.tools, std.fs.path.sep, spec.owner, std.fs.path.sep, spec.repo,
+        d.tools, std.fs.path.sep, owner_lower, std.fs.path.sep, repo_lower,
     });
     defer allocator.free(tool_path);
+
+    // Opportunistic case-migration: a pre-migration install of the same
+    // repo may live at a mixed-case path (e.g. `<tools>/AzureAD/foo`).
+    // If found, rename it to the canonical lowercase path before we
+    // touch anything else. Best-effort: a collision with an already-
+    // canonical entry, or a failed rename, falls through to the
+    // normal delete-and-replace path.
+    if (try resolveInstalledToolPath(allocator, io, d.tools, owner_lower, repo_lower)) |existing| {
+        defer allocator.free(existing);
+        if (!std.mem.eql(u8, existing, tool_path)) {
+            const dest_already_present = blk: {
+                var dc = Dir.openDirAbsolute(io, tool_path, .{}) catch break :blk false;
+                dc.close(io);
+                break :blk true;
+            };
+            if (!dest_already_present) {
+                // Ensure the canonical owner dir exists at the right
+                // casing before moving the repo dir into it.
+                const canon_owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+                    d.tools, std.fs.path.sep, owner_lower,
+                });
+                defer allocator.free(canon_owner_path);
+                ensureDirAbsoluteRecursive(io, d.tools);
+                Dir.createDirAbsolute(io, canon_owner_path, .default_dir) catch {};
+
+                caseRenameDir(io, existing, tool_path) catch {};
+
+                // Best-effort: remove the now-empty mixed-case owner dir
+                // (only succeeds when there are no other repos under it).
+                if (std.fs.path.dirname(existing)) |old_owner_path| {
+                    if (!std.mem.eql(u8, old_owner_path, canon_owner_path)) {
+                        Dir.deleteDirAbsolute(io, old_owner_path) catch {};
+                    }
+                }
+            }
+        }
+    }
 
     // Clean up tombstone from a previous self-update (Windows)
     if (comptime builtin.os.tag == .windows) {
@@ -1428,7 +1607,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Ensure tools and owner dirs exist (create full path)
     const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
-        d.tools, std.fs.path.sep, spec.owner,
+        d.tools, std.fs.path.sep, owner_lower,
     });
     defer allocator.free(owner_path);
     // Ensure the tools directory and all of its ancestors exist. On a fresh
@@ -2153,6 +2332,24 @@ test "shimPointsToToolDir validates path boundaries" {
         "nonexistent.shim",
         "C:\\tools\\owner\\repo",
     ));
+
+    // On Windows, the prefix comparison is ASCII case-insensitive so a
+    // shim written before lowercase-tool-dir migration is still
+    // recognized as owned after the dir was case-renamed.
+    if (comptime builtin.os.tag == .windows) {
+        try std.testing.expect(shimPointsToToolDir(
+            std.testing.io,
+            tmp.dir,
+            "tool.shim",
+            "C:\\TOOLS\\OWNER\\REPO",
+        ));
+        try std.testing.expect(shimPointsToToolDir(
+            std.testing.io,
+            tmp.dir,
+            "tool.shim",
+            "c:\\tools\\OWNER\\repo",
+        ));
+    }
 }
 
 test "ensureDirWithParents creates leaf and one missing parent" {
@@ -2286,4 +2483,186 @@ test "ensureDirAbsoluteRecursive tolerates already-existing path" {
     ensureDirAbsoluteRecursive(tio, leaf);
 
     try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
+}
+
+test "resolveInstalledToolPath: exact lowercase match" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "azuread/microsoft-authentication-cli");
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    const got = try resolveInstalledToolPath(allocator, tio, base, "azuread", "microsoft-authentication-cli");
+    try std.testing.expect(got != null);
+    defer allocator.free(got.?);
+
+    var expect_buf: [Dir.max_path_bytes]u8 = undefined;
+    const expect = try std.fmt.bufPrint(&expect_buf, "{s}{c}azuread{c}microsoft-authentication-cli", .{ base, std.fs.path.sep, std.fs.path.sep });
+    try std.testing.expectEqualStrings(expect, got.?);
+}
+
+test "resolveInstalledToolPath: case-insensitive owner match" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Pre-migration mixed-case install
+    try tmp.dir.createDirPath(tio, "AzureAD/microsoft-authentication-cli");
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    const got = try resolveInstalledToolPath(allocator, tio, base, "azuread", "microsoft-authentication-cli");
+    try std.testing.expect(got != null);
+    defer allocator.free(got.?);
+
+    // Returned path preserves the actual on-disk casing.
+    try std.testing.expect(std.mem.indexOf(u8, got.?, "AzureAD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got.?, "microsoft-authentication-cli") != null);
+}
+
+test "resolveInstalledToolPath: case-insensitive repo match" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "owner/MixedCase-Repo");
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    const got = try resolveInstalledToolPath(allocator, tio, base, "owner", "mixedcase-repo");
+    try std.testing.expect(got != null);
+    defer allocator.free(got.?);
+
+    try std.testing.expect(std.mem.indexOf(u8, got.?, "MixedCase-Repo") != null);
+}
+
+test "resolveInstalledToolPath: prefers exact lowercase over case-insensitive match" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Only possible on case-sensitive filesystems. On case-insensitive
+    // ones the second createDirPath is a no-op and the test trivially
+    // succeeds (we still get a valid resolved path back).
+    try tmp.dir.createDirPath(tio, "AzureAD/foo");
+    tmp.dir.createDirPath(tio, "azuread/foo") catch {};
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    const got = try resolveInstalledToolPath(allocator, tio, base, "azuread", "foo");
+    try std.testing.expect(got != null);
+    defer allocator.free(got.?);
+    // Path is valid either way; on a case-sensitive FS the lowercase form
+    // wins, on case-insensitive it's the only entry.
+    try std.testing.expect(std.mem.endsWith(u8, got.?, "foo"));
+}
+
+test "resolveInstalledToolPath: returns null when missing" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    try std.testing.expect(try resolveInstalledToolPath(allocator, tio, base, "missing", "repo") == null);
+
+    try tmp.dir.createDirPath(tio, "owner");
+    try std.testing.expect(try resolveInstalledToolPath(allocator, tio, base, "owner", "repo") == null);
+}
+
+test "resolveInstalledToolPath: tools_dir missing returns null" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var nonexistent_buf: [Dir.max_path_bytes]u8 = undefined;
+    const nonexistent = try std.fmt.bufPrint(&nonexistent_buf, "{s}{c}nope", .{ base, std.fs.path.sep });
+
+    try std.testing.expect(try resolveInstalledToolPath(allocator, tio, nonexistent, "owner", "repo") == null);
+}
+
+test "caseRenameDir: leaf-case-only rename uses temp dance" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "AzureAD");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "AzureAD/marker", .data = "hi" });
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var old_buf: [Dir.max_path_bytes]u8 = undefined;
+    const old_abs = try std.fmt.bufPrint(&old_buf, "{s}{c}AzureAD", .{ base, std.fs.path.sep });
+    var new_buf: [Dir.max_path_bytes]u8 = undefined;
+    const new_abs = try std.fmt.bufPrint(&new_buf, "{s}{c}azuread", .{ base, std.fs.path.sep });
+
+    try caseRenameDir(tio, old_abs, new_abs);
+
+    // The marker file is preserved.
+    try std.testing.expect((try tmp.dir.statFile(tio, "azuread/marker", .{})).kind == .file);
+
+    // Verify the on-disk casing actually flipped by iterating the parent
+    // and looking for an exact-byte match. (Works the same on case-
+    // sensitive and case-insensitive filesystems.)
+    var iter_dir = try Dir.openDirAbsolute(tio, base, .{ .iterate = true });
+    defer iter_dir.close(tio);
+    var iter = iter_dir.iterate();
+    var saw_lower = false;
+    var saw_upper = false;
+    while (try iter.next(tio)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (std.mem.eql(u8, entry.name, "azuread")) saw_lower = true;
+        if (std.mem.eql(u8, entry.name, "AzureAD")) saw_upper = true;
+    }
+    try std.testing.expect(saw_lower);
+    try std.testing.expect(!saw_upper);
+
+    // Tombstone from the dance must be gone.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "AzureAD.casetmp", .{}));
+}
+
+test "caseRenameDir: cross-parent rename uses plain rename" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "Old/repo");
+    try tmp.dir.createDirPath(tio, "new");
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var old_buf: [Dir.max_path_bytes]u8 = undefined;
+    const old_abs = try std.fmt.bufPrint(&old_buf, "{s}{c}Old{c}repo", .{ base, std.fs.path.sep, std.fs.path.sep });
+    var new_buf: [Dir.max_path_bytes]u8 = undefined;
+    const new_abs = try std.fmt.bufPrint(&new_buf, "{s}{c}new{c}repo", .{ base, std.fs.path.sep, std.fs.path.sep });
+
+    try caseRenameDir(tio, old_abs, new_abs);
+    try std.testing.expect((try tmp.dir.statFile(tio, "new/repo", .{})).kind == .directory);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "Old/repo", .{}));
 }

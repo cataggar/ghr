@@ -111,6 +111,44 @@ pub fn parseRepoSpec(s: []const u8) !RepoSpec {
     return .{ .owner = owner, .repo = rest, .tag = null };
 }
 
+/// A `RepoSpec` whose `owner`/`repo`/`tag` strings are heap-owned. Used when
+/// the caller needs to construct on-disk paths that must be canonical
+/// lowercase regardless of the casing the user typed (GitHub is
+/// case-insensitive on slugs; Linux filesystems are not).
+pub const OwnedRepoSpec = struct {
+    owner: []u8,
+    repo: []u8,
+    tag: ?[]u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: OwnedRepoSpec) void {
+        self.allocator.free(self.owner);
+        self.allocator.free(self.repo);
+        if (self.tag) |t| self.allocator.free(t);
+    }
+};
+
+/// Like `parseRepoSpec` but ASCII-lowercases `owner` and `repo` and copies
+/// every field onto `allocator`. `tag` is preserved verbatim (tags are
+/// case-sensitive; only the slug halves are canonicalized). Use when
+/// building on-disk paths (`<tools>/<owner>/<repo>`); use `parseRepoSpec`
+/// for transient borrowing reads.
+pub fn parseRepoSpecOwned(allocator: std.mem.Allocator, s: []const u8) !OwnedRepoSpec {
+    const sp = try parseRepoSpec(s);
+    const owner = try asciiLowerDup(allocator, sp.owner);
+    errdefer allocator.free(owner);
+    const repo = try asciiLowerDup(allocator, sp.repo);
+    errdefer allocator.free(repo);
+    const tag: ?[]u8 = if (sp.tag) |t| try allocator.dupe(u8, t) else null;
+    return .{ .owner = owner, .repo = repo, .tag = tag, .allocator = allocator };
+}
+
+fn asciiLowerDup(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, s.len);
+    for (s, 0..) |c, i| out[i] = std.ascii.toLower(c);
+    return out;
+}
+
 /// A parsed `owner/repo/file[@tag]` spec. `file` is the asset name (or a
 /// case-insensitive substring of it) that the caller wants downloaded.
 pub const FileSpec = struct {
@@ -1661,6 +1699,26 @@ test "parseRepoSpec invalid" {
     try std.testing.expectError(error.InvalidSpec, parseRepoSpec("noslash"));
     try std.testing.expectError(error.InvalidSpec, parseRepoSpec("/repo"));
     try std.testing.expectError(error.InvalidSpec, parseRepoSpec("owner/"));
+}
+
+test "parseRepoSpecOwned: lowercases owner and repo, preserves tag case" {
+    const sp = try parseRepoSpecOwned(std.testing.allocator, "AzureAD/Microsoft-Authentication-CLI@v0.9.6");
+    defer sp.deinit();
+    try std.testing.expectEqualStrings("azuread", sp.owner);
+    try std.testing.expectEqualStrings("microsoft-authentication-cli", sp.repo);
+    try std.testing.expectEqualStrings("v0.9.6", sp.tag.?);
+}
+
+test "parseRepoSpecOwned: already-lowercase passes through" {
+    const sp = try parseRepoSpecOwned(std.testing.allocator, "ctaggart/ghr");
+    defer sp.deinit();
+    try std.testing.expectEqualStrings("ctaggart", sp.owner);
+    try std.testing.expectEqualStrings("ghr", sp.repo);
+    try std.testing.expect(sp.tag == null);
+}
+
+test "parseRepoSpecOwned: invalid spec error propagates" {
+    try std.testing.expectError(error.InvalidSpec, parseRepoSpecOwned(std.testing.allocator, "noslash"));
 }
 
 test "classifySpecOrKey: plain spec without key" {
