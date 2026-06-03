@@ -1182,7 +1182,9 @@ fn verifySinglePe(
 
     var digest_hex: [64]u8 = undefined;
     sha256ToHex(outcome.digest, &digest_hex);
-    try w.print("verified authenticode: sha256 {s}... (genTime {d})\n", .{ digest_hex[0..12], outcome.gen_time });
+    var gen_time_buf: [20]u8 = undefined;
+    const gen_time_iso = authenticode.formatUnixTimeIso(outcome.gen_time, &gen_time_buf);
+    try w.print("verified authenticode: sha256 {s}... (genTime {s})\n", .{ digest_hex[0..12], gen_time_iso });
     if (outcome.subject_cn.len > 0) {
         try w.print("  subject: {s}\n", .{outcome.subject_cn});
     }

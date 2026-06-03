@@ -433,13 +433,13 @@ publishes:
      signature)`.
   5. Walk the X.509 chain from the signer cert through the
      intermediates carried in the SignedData's `certificates` SET to
-     one of the 14 embedded trust roots (Microsoft Identity
-     Verification Root 2020, Microsoft Root CA 2011, DigiCert Trusted
-     Root G4 / Global G3 / Global / High Assurance EV / Assured ID G3,
-     GlobalSign Root CA R3 / R6 / Code Signing R45, USERTrust RSA /
-     ECC, Entrust Root G2 / EC1). The TSA's `genTime` is used as the
-     validity clock so signatures remain trustworthy past the signer
-     cert's `notAfter`.
+     one of the 15 embedded trust roots (Microsoft Identity
+     Verification Root 2020, Microsoft Root CA 2011, Microsoft Root
+     CA 2010, DigiCert Trusted Root G4 / Global G3 / Global / High
+     Assurance EV / Assured ID G3, GlobalSign Root CA R3 / R6 / Code
+     Signing R45, USERTrust RSA / ECC, Entrust Root G2 / EC1). The
+     TSA's `genTime` is used as the validity clock so signatures
+     remain trustworthy past the signer cert's `notAfter`.
 
   Authenticode is fail-closed when a PE inside the asset carries a
   signature that doesn't verify, and fail-open when no PE carries any

@@ -1080,9 +1080,49 @@ pub const VerifyError = error{
     SignerCertNotFound,
     BundleSignerMismatch,
     UnsupportedSignerKeyType,
-    InvalidCertificateSet,
+    InvalidCertificateChoice,
     OutOfMemory,
 } || Pkcs7Error || der.Element.ParseError || Certificate.ParseError || Certificate.Parsed.VerifyError;
+
+/// Iterator over a CMS `CertificateSet` body (i.e. `signed_data.certificates_raw`,
+/// the body of the `[0] IMPLICIT CertificateSet` wrapper).
+///
+/// `CertificateSet ::= SET OF CertificateChoices`, where `CertificateChoices`
+/// is a CHOICE between `Certificate` (SEQUENCE) and `extendedCertificate [0]`,
+/// `v1AttrCert [1]`, `v2AttrCert [2]`, `other [3]` — all `IMPLICIT`-tagged
+/// context-specific. Only the SEQUENCE choice carries an X.509 certificate
+/// usable for chain building; the rest are skipped.
+///
+/// Microsoft's Time-Stamp Service routinely includes a `v2AttrCert [2]` entry
+/// in the timestamp token's CertificateSet, so this skip behaviour is
+/// load-bearing for verifying Microsoft-signed binaries.
+const CertificateSetIterator = struct {
+    bytes: []const u8,
+    index: u32 = 0,
+
+    /// DER bytes of the next `certificate` (X.509) entry, or null when
+    /// exhausted. Non-`certificate` choices (attribute certs, etc.) are
+    /// silently skipped. Returns `error.InvalidCertificateChoice` if an
+    /// element has neither a universal SEQUENCE tag nor a context-specific
+    /// tag in the [0..3] CHOICE range.
+    fn next(self: *CertificateSetIterator) (der.Element.ParseError || error{InvalidCertificateChoice})!?[]const u8 {
+        while (self.index < self.bytes.len) {
+            const elem = try der.Element.parse(self.bytes, self.index);
+            const start = self.index;
+            self.index = elem.slice.end;
+
+            if (elem.identifier.tag == .sequence and elem.identifier.class == .universal) {
+                return self.bytes[start..elem.slice.end];
+            }
+            if (elem.identifier.class == .context_specific and @intFromEnum(elem.identifier.tag) <= 3) {
+                // Valid CertificateChoices alternative we don't care about.
+                continue;
+            }
+            return error.InvalidCertificateChoice;
+        }
+        return null;
+    }
+};
 
 /// Verify `signer.signature` against the message-to-be-signed
 /// (signedAttrs re-tagged as SET OF) using the signer cert's public
@@ -1209,24 +1249,8 @@ pub fn findSignerCertDer(signed_data: SignedData) VerifyError!?[]const u8 {
     const sid_serial = try der.Element.parse(sid, sid_issuer.slice.end);
     if (sid_serial.identifier.tag != .integer) return error.InvalidSignerInfo;
 
-    var i: u32 = 0;
-    while (i < signed_data.certificates_raw.len) {
-        const cert_elem = try der.Element.parse(signed_data.certificates_raw, i);
-        if (cert_elem.identifier.tag != .sequence) return error.InvalidCertificateSet;
-
-        // A cert's tbsCertificate's issuer + serial are accessible via
-        // Certificate.Parsed; let's walk via std.crypto.Certificate for
-        // robustness. The "cert" start in our buffer includes the
-        // outer SEQUENCE header; pass the start of that SEQUENCE as
-        // the .index hint and use Certificate.buffer = the raw slice
-        // beginning at that offset.
-        const cert_start = i;
-        const cert_end = cert_elem.slice.end;
-        const cert_der = signed_data.certificates_raw[cert_start..cert_end];
-
-        // Move iterator forward unconditionally.
-        i = cert_end;
-
+    var iter: CertificateSetIterator = .{ .bytes = signed_data.certificates_raw };
+    while (try iter.next()) |cert_der| {
         // Parse cert into Certificate.Parsed to grab issuer + serial.
         var cert: Certificate = .{ .buffer = cert_der, .index = 0 };
         const parsed = cert.parse() catch continue;
@@ -1432,6 +1456,99 @@ test "parseGeneralizedTime round-trips a known instant" {
     // 2026-04-21T10:24:31Z → 1776767071 epoch seconds.
     const t = try parseGeneralizedTime("20260421102431Z");
     try std.testing.expectEqual(@as(i64, 1776767071), t);
+}
+
+/// Format a Unix-epoch second count as a 20-byte ISO 8601 UTC string
+/// of the form `YYYY-MM-DDTHH:MM:SSZ`. The slice is borrowed from
+/// `buf` and is valid for the lifetime of `buf`.
+///
+/// Used to render RFC 3161 `genTime` values in human-readable logs;
+/// the inverse of `parseGeneralizedTime` for the common Z-suffixed
+/// shape. Year is clamped to four digits, so inputs outside
+/// 0001–9999 will be truncated — fine for any plausible timestamp.
+pub fn formatUnixTimeIso(epoch_sec: i64, buf: *[20]u8) []const u8 {
+    const day_seconds: i64 = 86400;
+    const days: i64 = @divFloor(epoch_sec, day_seconds);
+    const tod: u32 = @intCast(epoch_sec - days * day_seconds); // [0, 86399]
+    const ymd = civilFromDays(days);
+    const hh: u8 = @intCast(tod / 3600);
+    const mm: u8 = @intCast((tod / 60) % 60);
+    const ss: u8 = @intCast(tod % 60);
+    // We deliberately ignore fmt errors; the buffer is exactly 20 bytes
+    // and the format string emits exactly 20 ASCII characters.
+    _ = std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        @as(u16, @intCast(ymd.year)),
+        ymd.month,
+        ymd.day,
+        hh,
+        mm,
+        ss,
+    }) catch unreachable;
+    return buf[0..20];
+}
+
+/// Howard Hinnant's "civil from days" — the inverse of `daysFromCivil`.
+/// See http://howardhinnant.github.io/date_algorithms.html#civil_from_days.
+fn civilFromDays(z_in: i64) struct { year: i64, month: u8, day: u8 } {
+    const z: i64 = z_in + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097); // [0, 146096]
+    const yoe: u32 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    const y: i64 = @as(i64, yoe) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    const mp: u32 = (5 * doy + 2) / 153; // [0, 11]
+    const d: u8 = @intCast(doy - (153 * mp + 2) / 5 + 1); // [1, 31]
+    const m: u8 = @intCast(if (mp < 10) mp + 3 else mp - 9); // [1, 12]
+    return .{ .year = y + @as(i64, @intFromBool(m <= 2)), .month = m, .day = d };
+}
+
+test "formatUnixTimeIso renders known timestamps" {
+    var buf: [20]u8 = undefined;
+    // genTime printed by `ghr install AzureAD/microsoft-authentication-cli@0.9.6`.
+    try std.testing.expectEqualStrings("2026-04-24T21:00:53Z", formatUnixTimeIso(1777064453, &buf));
+    // Unix epoch itself.
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", formatUnixTimeIso(0, &buf));
+    // Round-trips with parseGeneralizedTime.
+    const parsed = try parseGeneralizedTime("20260421102431Z");
+    try std.testing.expectEqualStrings("2026-04-21T10:24:31Z", formatUnixTimeIso(parsed, &buf));
+}
+
+test "CertificateSetIterator skips non-certificate CertificateChoices" {
+    // CMS CertificateSet body containing, in order:
+    //   1. an X.509 certificate          (SEQUENCE,    universal tag 0x30)
+    //   2. a v2AttrCert                  ([2] IMPLICIT, context-specific 0xa2)
+    //   3. another X.509 certificate     (SEQUENCE,    universal tag 0x30)
+    //   4. an `other` CertificateFormat  ([3] IMPLICIT, context-specific 0xa3)
+    //
+    // Microsoft's Time-Stamp Service emits exactly the SEQUENCE + v2AttrCert
+    // pattern in the RFC 3161 timestamp token's certificate set; before this
+    // change the iterator hard-failed on the v2AttrCert with
+    // InvalidCertificateSet, breaking Authenticode verification for any
+    // Microsoft-signed binary (e.g. AdoPat.dll inside the AzureAD/
+    // microsoft-authentication-cli zip release).
+    const buf = [_]u8{
+        0x30, 0x03, 0x01, 0x02, 0x03, // SEQUENCE { 01 02 03 }
+        0xa2, 0x02, 0xff, 0xff, // [2] IMPLICIT { ff ff }
+        0x30, 0x02, 0x0a, 0x0b, // SEQUENCE { 0a 0b }
+        0xa3, 0x01, 0x77, // [3] IMPLICIT { 77 }
+    };
+
+    var iter: CertificateSetIterator = .{ .bytes = &buf };
+
+    const first = (try iter.next()) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualSlices(u8, &.{ 0x30, 0x03, 0x01, 0x02, 0x03 }, first);
+
+    const second = (try iter.next()) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualSlices(u8, &.{ 0x30, 0x02, 0x0a, 0x0b }, second);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), try iter.next());
+}
+
+test "CertificateSetIterator rejects elements outside the CHOICE grammar" {
+    // A universal INTEGER is not a valid CertificateChoices alternative.
+    const buf = [_]u8{ 0x02, 0x01, 0x01 }; // INTEGER 1
+    var iter: CertificateSetIterator = .{ .bytes = &buf };
+    try std.testing.expectError(error.InvalidCertificateChoice, iter.next());
 }
 
 // ---------------------------------------------------------------------------
@@ -1701,18 +1818,29 @@ fn lastIndexOf4(haystack: []const u8, needle: [4]u8) ?usize {
 // ---------------------------------------------------------------------------
 // Embedded Authenticode + RFC 3161 trust roots.
 //
-// Vendored under `src/authenticode/trust/`. See the README in that
-// directory for provenance and rotation notes. The same bundle is
-// used for both signer-cert and TSA-cert chain verification: every
-// public TSA used by mainstream Authenticode signers chains to one
-// of these same roots (Microsoft TSAs chain to MS Root 2011,
-// DigiCert TSAs chain to DigiCert G4, GlobalSign TSAs chain to
-// GlobalSign Root, etc.).
+// Vendored at fixture-capture time from the sources listed below.
+// Rotation: refresh this directory + bump ghr's version when a CA
+// rotates or adds an Authenticode-trusted root.
+//
+// Most roots were extracted from `/etc/ssl/certs/ca-bundle.crt` on a
+// Microsoft Azure Linux 3 host (the same Mozilla CCADB snapshot most
+// Linux distros ship). The Microsoft Identity Verification Root 2020
+// and GlobalSign Code Signing Root R45 were fetched directly from
+// their issuing CAs because they aren't yet in Mozilla's TLS bundle.
+//
+// Microsoft has *two* operational PKI hierarchies in active use for
+// Authenticode and RFC 3161 timestamping: the 2011 root (signs the
+// "Microsoft Code Signing PCA" series) and the 2010 root (signs the
+// "Microsoft Time-Stamp PCA 2010" — emitted by the Microsoft Time-
+// Stamp Service that counter-signs most Microsoft binaries today,
+// e.g. inside `AdoPat.dll` shipped in
+// `AzureAD/microsoft-authentication-cli`). Both roots are required.
 // ---------------------------------------------------------------------------
 
 const embedded_roots = [_][]const u8{
     @embedFile("authenticode/trust/microsoft_identity_verification_root_2020.crt.pem"),
     @embedFile("authenticode/trust/microsoft_root_ca_2011.crt.pem"),
+    @embedFile("authenticode/trust/microsoft_root_ca_2010.crt.pem"),
     @embedFile("authenticode/trust/digicert_trusted_root_g4.crt.pem"),
     @embedFile("authenticode/trust/digicert_global_root_g3.crt.pem"),
     @embedFile("authenticode/trust/digicert_global_root_ca.crt.pem"),
@@ -1732,7 +1860,7 @@ const embedded_roots = [_][]const u8{
 /// must call `bundle.deinit(allocator)`.
 ///
 /// `now_sec` is used by `parseCert` to skip already-expired roots;
-/// passing the current wall-clock time is fine since all 14 embedded
+/// passing the current wall-clock time is fine since all 15 embedded
 /// roots are valid through 2029 or later.
 pub fn buildTrustBundle(allocator: std.mem.Allocator, now_sec: i64) !Certificate.Bundle {
     var bundle: Certificate.Bundle = .empty;
@@ -1794,7 +1922,7 @@ test "buildTrustBundle parses all embedded Authenticode roots" {
     var bundle = try buildTrustBundle(allocator, now);
     defer bundle.deinit(allocator);
     try std.testing.expect(bundle.bytes.items.len > 0);
-    // 14 embedded roots; map_size grows by 1 per parsed cert.
+    // 15 embedded roots; map_size grows by 1 per parsed cert.
     try std.testing.expectEqual(@as(usize, embedded_roots.len), bundle.map.count());
 }
 
@@ -1937,12 +2065,9 @@ pub fn verifyChain(
     var pool = std.array_list.Managed(Certificate).init(allocator);
     defer pool.deinit();
 
-    var ii: u32 = 0;
-    while (ii < intermediates_raw.len) {
-        const e = try der.Element.parse(intermediates_raw, ii);
-        if (e.identifier.tag != .sequence) return error.InvalidCertificateSet;
-        try pool.append(.{ .buffer = intermediates_raw[ii..e.slice.end], .index = 0 });
-        ii = e.slice.end;
+    var iter: CertificateSetIterator = .{ .bytes = intermediates_raw };
+    while (try iter.next()) |cert_der| {
+        try pool.append(.{ .buffer = cert_der, .index = 0 });
     }
 
     var subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
