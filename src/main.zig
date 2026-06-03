@@ -6,6 +6,7 @@ const download = @import("download.zig");
 const ensurepath = @import("ensurepath.zig");
 const validate = @import("validate.zig");
 const release_mod = @import("release.zig");
+const link = @import("link.zig");
 
 pub const version = build_options.version;
 
@@ -161,6 +162,10 @@ pub fn main(init: std.process.Init) !void {
         try install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "download")) {
         try download.cmdDownload(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
+    } else if (eql(cmd_str, "link")) {
+        try runLinkCmd(allocator, io, environ, &args, &stdout.interface, &stderr.interface, .link);
+    } else if (eql(cmd_str, "unlink")) {
+        try runLinkCmd(allocator, io, environ, &args, &stdout.interface, &stderr.interface, .unlink);
     } else if (eql(cmd_str, "validate")) {
         try validate.cmdValidate(allocator, io, &args, &stdout.interface, &stderr.interface);
     } else {
@@ -231,6 +236,126 @@ fn cmdPath(
     try printPathUsage(err_w);
     try err_w.flush();
     std.process.exit(1);
+}
+
+const LinkKind = enum { link, unlink };
+
+fn runLinkCmd(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const std.process.Environ.Map,
+    args: *std.process.Args.Iterator,
+    w: *Writer,
+    err_w: *Writer,
+    kind: LinkKind,
+) !void {
+    var spec: ?[]const u8 = null;
+    var filters: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer filters.deinit(allocator);
+
+    while (args.next()) |arg| {
+        if (eql(arg, "--bin")) {
+            const v = args.next() orelse {
+                try err_w.print("error: '--bin' requires a bin name\n", .{});
+                try err_w.flush();
+                std.process.exit(1);
+            };
+            try filters.append(allocator, v);
+        } else if (eql(arg, "help") and spec == null) {
+            switch (kind) {
+                .link => try printLinkUsage(w),
+                .unlink => try printUnlinkUsage(w),
+            }
+            return;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            try err_w.print("error: unknown flag '{s}' for 'ghr {s}'\n", .{ arg, @tagName(kind) });
+            try err_w.flush();
+            std.process.exit(1);
+        } else {
+            if (spec != null) {
+                try err_w.print(
+                    "error: 'ghr {s}' accepts a single <owner/repo> spec (got '{s}' and '{s}')\n",
+                    .{ @tagName(kind), spec.?, arg },
+                );
+                try err_w.flush();
+                std.process.exit(1);
+            }
+            spec = arg;
+        }
+    }
+
+    const spec_str = spec orelse {
+        try err_w.print("error: 'ghr {s}' requires <owner/repo>\n", .{@tagName(kind)});
+        try err_w.flush();
+        std.process.exit(1);
+    };
+
+    const result = switch (kind) {
+        .link => link.cmdLink(allocator, io, environ, spec_str, filters.items, w, err_w),
+        .unlink => link.cmdUnlink(allocator, io, environ, spec_str, filters.items, w, err_w),
+    };
+    result catch |err| switch (err) {
+        link.LinkCmdError.LinkStepFailed => std.process.exit(1),
+        else => return err,
+    };
+}
+
+fn printLinkUsage(w: *Writer) !void {
+    try w.print(
+        \\ghr link - link Windows-side installed bins into WSL's ~/.local/bin
+        \\
+        \\USAGE:
+        \\    ghr link <owner/repo> [--bin <name>] [--bin <name> ...]
+        \\
+        \\Reads `ghr.json` from the Windows-side install of <owner/repo>
+        \\and creates Linux symlinks in ghr's bin directory pointing at
+        \\the original `.exe` binaries (via `/mnt/c/...`). WSL interop
+        \\executes the `.exe` transparently.
+        \\
+        \\Without `--bin`, links every bin advertised by the Windows
+        \\install and removes any previously-linked bins that no longer
+        \\exist (the command is a reconciler).
+        \\
+        \\With one or more `--bin <name>` filters, only the named bins
+        \\are touched; other previously-linked entries are left alone.
+        \\
+        \\Requires WSL_INTEROP to be set (i.e., running in WSL).
+        \\
+        \\Environment:
+        \\    GHR_WIN_TOOLS_DIR    Override Windows tools dir discovery.
+        \\                         Accepts either a WSL path
+        \\                         (e.g. /mnt/c/Users/x/AppData/Roaming/ghr/data/tools)
+        \\                         or a Windows path (e.g. C:\Users\x\AppData\Roaming\ghr\data\tools).
+        \\
+        \\EXAMPLES:
+        \\    ghr link AzureAD/microsoft-authentication-cli
+        \\    ghr link cataggar/microsoft-authentication-cli --bin azureauth
+        \\
+        \\Run 'ghr link help' to show this help.
+        \\
+    , .{});
+}
+
+fn printUnlinkUsage(w: *Writer) !void {
+    try w.print(
+        \\ghr unlink - remove WSL symlinks created by 'ghr link'
+        \\
+        \\USAGE:
+        \\    ghr unlink <owner/repo> [--bin <name> ...]
+        \\
+        \\Removes every symlink ghr created for <owner/repo> from the
+        \\bin directory. Verifies each symlink still points where the
+        \\manifest recorded before deleting, so a user-rewritten symlink
+        \\is never clobbered.
+        \\
+        \\With `--bin <name>` filters, only the named entries are
+        \\removed.
+        \\
+        \\Requires WSL_INTEROP to be set (i.e., running in WSL).
+        \\
+        \\Run 'ghr unlink help' to show this help.
+        \\
+    , .{});
 }
 
 fn printPathUsage(w: *Writer) !void {
@@ -428,6 +553,11 @@ fn readToolMeta(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_na
 /// directly pasteable as arguments to `ghr install`, so the optional
 /// minisign pubkey is appended after a space (matching the per-spec
 /// positional inline-key form accepted by `ghr install`).
+///
+/// `owner` and `repo` are ASCII-lowercased so output is canonical even
+/// when the on-disk dir is still a pre-migration mixed-case name like
+/// `AzureAD/foo` (GitHub is case-insensitive on slugs; we standardize).
+/// `tag` is preserved verbatim — tags are case-sensitive on GitHub.
 fn formatToolLine(
     allocator: std.mem.Allocator,
     owner: []const u8,
@@ -436,16 +566,30 @@ fn formatToolLine(
 ) ![]u8 {
     const tag: ?[]const u8 = if (meta) |m| m.tag else null;
     const key: ?[]const u8 = if (meta) |m| m.minisign else null;
+    var owner_buf: [256]u8 = undefined;
+    var repo_buf: [256]u8 = undefined;
+    const owner_lc = asciiLowerInto(&owner_buf, owner);
+    const repo_lc = asciiLowerInto(&repo_buf, repo);
     if (tag) |t| {
         if (key) |k| {
-            return std.fmt.allocPrint(allocator, "{s}/{s}@{s} {s}", .{ owner, repo, t, k });
+            return std.fmt.allocPrint(allocator, "{s}/{s}@{s} {s}", .{ owner_lc, repo_lc, t, k });
         }
-        return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ owner, repo, t });
+        return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ owner_lc, repo_lc, t });
     }
     if (key) |k| {
-        return std.fmt.allocPrint(allocator, "{s}/{s} {s}", .{ owner, repo, k });
+        return std.fmt.allocPrint(allocator, "{s}/{s} {s}", .{ owner_lc, repo_lc, k });
     }
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner, repo });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner_lc, repo_lc });
+}
+
+/// ASCII-lowercase `src` into the start of `dst`. Falls back to returning
+/// `src` verbatim when it doesn't fit (slug-length names always do in
+/// practice; this just keeps the helper allocation-free for the common
+/// case).
+fn asciiLowerInto(dst: []u8, src: []const u8) []const u8 {
+    if (src.len > dst.len) return src;
+    for (src, 0..) |c, i| dst[i] = std.ascii.toLower(c);
+    return dst[0..src.len];
 }
 
 test "formatToolLine: tag and key" {
@@ -465,7 +609,7 @@ test "formatToolLine: tag without key" {
         .tag = "14.1.0",
     });
     defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings("BurntSushi/ripgrep@14.1.0", line);
+    try std.testing.expectEqualStrings("burntsushi/ripgrep@14.1.0", line);
 }
 
 test "formatToolLine: no metadata" {
@@ -482,6 +626,14 @@ test "formatToolLine: key without tag" {
     try std.testing.expectEqualStrings("foo/bar RWSXXXX", line);
 }
 
+test "formatToolLine: lowercases mixed-case owner and repo, preserves tag" {
+    const line = try formatToolLine(std.testing.allocator, "AzureAD", "Microsoft-Authentication-CLI", .{
+        .tag = "0.9.6",
+    });
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("azuread/microsoft-authentication-cli@0.9.6", line);
+}
+
 fn printUsage(w: *Writer) !void {
     try w.print(
         \\ghr - A toolkit for GitHub releases
@@ -494,6 +646,8 @@ fn printUsage(w: *Writer) !void {
         \\    install <spec> [<spec> ...]          Install one or more tools from GitHub releases
         \\    uninstall <owner/repo>               Remove an installed tool
         \\    download <spec> [<spec> ...]         Download one or more release assets
+        \\    link <owner/repo> [--bin <n> ...]    (WSL) Symlink Windows-side bins into ghr's bin dir
+        \\    unlink <owner/repo> [--bin <n> ...]  (WSL) Remove ghr-created WSL symlinks
         \\    path ensure [--dry-run]              Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
         \\    validate <SUBCOMMAND>                Run validations against published artifacts
@@ -528,4 +682,5 @@ test {
     _ = @import("auth.zig");
     _ = @import("download.zig");
     _ = @import("validate.zig");
+    _ = @import("link.zig");
 }

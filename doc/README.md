@@ -296,6 +296,40 @@ The bin directory is frequently not on `PATH` by default, especially on Windows.
 
 `ghr path ensure --dry-run` prints the changes it would make without writing.
 
+## WSL: linking Windows-side bins (`ghr link` / `ghr unlink`)
+
+When ghr is installed on Windows, a parallel WSL distribution can expose the same tools without re-downloading them. `ghr link` creates Linux symlinks in `~/.local/bin` that point directly at the Windows-side `.exe` (via `/mnt/c/...`); WSL interop runs the binary transparently.
+
+```sh
+# Link every bin advertised by the Windows install.
+ghr link cataggar/microsoft-authentication-cli
+
+# Or restrict to specific bins (repeatable).
+ghr link cataggar/microsoft-authentication-cli --bin azureauth
+
+# Remove the symlinks again (does not touch the Windows install).
+ghr unlink cataggar/microsoft-authentication-cli
+```
+
+Notes:
+
+- `ghr link` is a **reconciler**. Without `--bin`, it makes the WSL link set match the current Windows install — adding new bins, updating moved ones, and removing entries that disappeared from `ghr.json`. With `--bin <name>` filters, only the named entries are touched.
+- The symlink target is the real `.exe` under `<tools>/<owner>/<repo>/`, not the Windows shim. A `C:\…` target would not trigger interop; the WSL path is required.
+- Both commands require `WSL_INTEROP` to be set. They refuse to run outside WSL so you don't accidentally create dangling links on bare Linux or macOS.
+- The owner/repo path is case-canonicalized to lowercase. `ghr link AzureAD/foo` and `ghr link azuread/foo` are equivalent regardless of how the install was created on Windows.
+
+### Locating the Windows tools dir
+
+`ghr link` resolves the Windows-side tools dir in this order:
+
+1. `GHR_WIN_TOOLS_DIR` — explicit override. Accepts either a WSL path (`/mnt/c/Users/x/AppData/Roaming/ghr/data/tools`) or a Windows path (`C:\Users\x\AppData\Roaming\ghr\data\tools`).
+2. `cmd.exe /c echo %APPDATA%`, run through `wslpath -u`. This is the canonical lookup and handles non-default Windows usernames and redirected APPDATA.
+3. Fallback to `/mnt/c/Users/$USER/AppData/Roaming/ghr/data/tools` with a warning, assuming the WSL username matches the Windows one.
+
+### Per-link manifest
+
+For each linked repo, ghr records what it created at `$XDG_DATA_HOME/ghr/links/<owner>/<repo>.json` (or `~/.local/share/ghr/links/...`). The manifest is what `ghr unlink` consults; it verifies each live symlink still points where the manifest recorded before deleting, so a user-rewritten symlink is never clobbered.
+
 ## Uninstall
 
 ```sh
