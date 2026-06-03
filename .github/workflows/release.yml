@@ -213,6 +213,8 @@ jobs:
             pipx install ghr-bin==${{ steps.version.outputs.pep440 }}
             uv tool install ghr-bin==${{ steps.version.outputs.pep440 }}
             winget install ghr --version ${{ steps.version.outputs.version }}
+            curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | GHR_VERSION=${{ github.ref_name }} sh
+            $env:GHR_VERSION = '${{ github.ref_name }}'; iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
             ghr install cataggar/ghr@${{ github.ref_name }} RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
             ```
           files: |

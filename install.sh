@@ -160,7 +160,15 @@ do_install() {
     fi
 
     info "running self-install with pinned minisign pubkey"
-    "$BOOTSTRAP" install "$REPO" "$MINISIGN_PUBKEY"
+    # Thread the tag through when the user pinned a version, otherwise the
+    # self-install would resolve to the latest *stable* release and silently
+    # downgrade away from a pinned pre-release (e.g. -dev.N).
+    if [ -n "${GHR_VERSION:-}" ]; then
+        spec="${REPO}@${TAG}"
+    else
+        spec="$REPO"
+    fi
+    "$BOOTSTRAP" install "$spec" "$MINISIGN_PUBKEY"
 }
 
 post_install_hint() {
