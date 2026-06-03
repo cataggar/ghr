@@ -492,6 +492,101 @@ pub fn computeDesiredLinks(
 
 pub const LinkCmdError = error{LinkStepFailed};
 
+/// Emit a friendly "not installed" error for `ghr link`. The original
+/// wording printed only the tools dir path, which read like a wrong-dir
+/// bug whenever the real issue was a typo in the owner or repo. We now
+/// distinguish three cases:
+///
+///   1. tools dir doesn't exist on disk
+///   2. tools dir exists but is empty
+///   3. tools dir has other tools installed — list them so a typo is
+///      immediately obvious
+///
+/// On any I/O error while listing, we degrade to a generic message
+/// rather than failing the command with a confusing nested error.
+fn writeNotInstalledError(
+    allocator: std.mem.Allocator,
+    io: Io,
+    err_w: *Writer,
+    win_tools: []const u8,
+    owner: []const u8,
+    repo: []const u8,
+) !void {
+    try err_w.print("error: {s}/{s} is not installed on the Windows side\n", .{ owner, repo });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    if (listInstalledSlugs(aa, io, win_tools)) |result| {
+        if (result.present) {
+            if (result.slugs.len == 0) {
+                try err_w.print("       Windows tools dir exists but is empty: {s}\n", .{win_tools});
+            } else {
+                try err_w.print("       installed tools under {s}:\n", .{win_tools});
+                for (result.slugs) |slug| try err_w.print("         {s}\n", .{slug});
+            }
+        } else {
+            try err_w.print("       Windows tools dir does not exist: {s}\n", .{win_tools});
+        }
+    } else |_| {
+        try err_w.print("       looked under {s}\n", .{win_tools});
+    }
+
+    try err_w.print("       run `ghr install {s}/{s}` from Windows to add it\n", .{ owner, repo });
+    try err_w.flush();
+}
+
+const InstalledListing = struct {
+    /// True when `tools_dir` exists on disk (whether or not any tools
+    /// are installed inside it).
+    present: bool,
+    /// `<owner>/<repo>` slugs of installed tools, sorted alphabetically.
+    /// `.old` tombstone directories are filtered out so they don't
+    /// pollute user-facing output.
+    slugs: []const []const u8,
+};
+
+/// Enumerate `<tools_dir>/<owner>/<repo>` entries, returning the listing
+/// in `arena`-owned memory. The arena owns every returned slice.
+fn listInstalledSlugs(
+    arena: std.mem.Allocator,
+    io: Io,
+    tools_dir: []const u8,
+) !InstalledListing {
+    var tools = Dir.openDirAbsolute(io, tools_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .{ .present = false, .slugs = &.{} },
+        else => return err,
+    };
+    defer tools.close(io);
+
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    var it = tools.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        if (std.mem.endsWith(u8, entry.name, ".old")) continue;
+        const owner_name = entry.name;
+        var owner_dir = tools.openDir(io, owner_name, .{ .iterate = true }) catch continue;
+        defer owner_dir.close(io);
+        var it2 = owner_dir.iterate();
+        while (try it2.next(io)) |sub| {
+            if (sub.kind != .directory) continue;
+            if (std.mem.endsWith(u8, sub.name, ".old")) continue;
+            const slug = try std.fmt.allocPrint(arena, "{s}/{s}", .{ owner_name, sub.name });
+            try out.append(arena, slug);
+        }
+    }
+
+    std.mem.sort([]const u8, out.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    return .{ .present = true, .slugs = out.items };
+}
+
 pub fn cmdLink(
     allocator: std.mem.Allocator,
     io: Io,
@@ -520,12 +615,7 @@ pub fn cmdLink(
     defer allocator.free(win_tools);
 
     const tool_path = (try install.resolveInstalledToolPath(allocator, io, win_tools, owned.owner, owned.repo)) orelse {
-        try err_w.print(
-            "error: {s}/{s} is not installed on the Windows side (looked under {s})\n",
-            .{ owned.owner, owned.repo, win_tools },
-        );
-        try err_w.print("       install it first with `ghr install {s}/{s}` from Windows\n", .{ owned.owner, owned.repo });
-        try err_w.flush();
+        try writeNotInstalledError(allocator, io, err_w, win_tools, owned.owner, owned.repo);
         return LinkCmdError.LinkStepFailed;
     };
     defer allocator.free(tool_path);
@@ -1121,4 +1211,118 @@ test "writeJsonEscaped: escapes control characters per RFC 8259" {
         "a\\nb\\tc\\\"d\\\\e\\u0001f",
         out,
     );
+}
+
+test "listInstalledSlugs: reports tools dir missing" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var nonexistent_buf: [Dir.max_path_bytes]u8 = undefined;
+    const nonexistent = try std.fmt.bufPrint(&nonexistent_buf, "{s}{c}nope", .{ base, std.fs.path.sep });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const result = try listInstalledSlugs(arena.allocator(), tio, nonexistent);
+    try std.testing.expect(!result.present);
+    try std.testing.expectEqual(@as(usize, 0), result.slugs.len);
+}
+
+test "listInstalledSlugs: empty dir reports present with no slugs" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const result = try listInstalledSlugs(arena.allocator(), tio, base);
+    try std.testing.expect(result.present);
+    try std.testing.expectEqual(@as(usize, 0), result.slugs.len);
+}
+
+test "listInstalledSlugs: lists owner/repo slugs sorted and skips tombstones" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "azuread/microsoft-authentication-cli");
+    try tmp.dir.createDirPath(tio, "cataggar/ghr");
+    try tmp.dir.createDirPath(tio, "cataggar/ghr.old"); // tombstone
+    try tmp.dir.createDirPath(tio, "ctaggart/zig");
+    try tmp.dir.createDirPath(tio, "lonely-owner"); // owner with no repos
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const result = try listInstalledSlugs(arena.allocator(), tio, base);
+    try std.testing.expect(result.present);
+    try std.testing.expectEqual(@as(usize, 3), result.slugs.len);
+    try std.testing.expectEqualStrings("azuread/microsoft-authentication-cli", result.slugs[0]);
+    try std.testing.expectEqualStrings("cataggar/ghr", result.slugs[1]);
+    try std.testing.expectEqualStrings("ctaggart/zig", result.slugs[2]);
+}
+
+test "writeNotInstalledError: lists siblings so typos are obvious" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "azuread/microsoft-authentication-cli");
+    try tmp.dir.createDirPath(tio, "ctaggart/zig");
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try writeNotInstalledError(allocator, tio, &out.writer, base, "cataggar", "microsoft-authentication-cli");
+
+    const text = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "error: cataggar/microsoft-authentication-cli is not installed on the Windows side\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "azuread/microsoft-authentication-cli") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ctaggart/zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "run `ghr install cataggar/microsoft-authentication-cli` from Windows") != null);
+}
+
+test "writeNotInstalledError: distinguishes missing tools dir from empty" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var nonexistent_buf: [Dir.max_path_bytes]u8 = undefined;
+    const nonexistent = try std.fmt.bufPrint(&nonexistent_buf, "{s}{c}nope", .{ base, std.fs.path.sep });
+
+    var out1 = std.Io.Writer.Allocating.init(allocator);
+    defer out1.deinit();
+    try writeNotInstalledError(allocator, tio, &out1.writer, nonexistent, "x", "y");
+    try std.testing.expect(std.mem.indexOf(u8, out1.written(), "Windows tools dir does not exist") != null);
+
+    var out2 = std.Io.Writer.Allocating.init(allocator);
+    defer out2.deinit();
+    try writeNotInstalledError(allocator, tio, &out2.writer, base, "x", "y");
+    try std.testing.expect(std.mem.indexOf(u8, out2.written(), "Windows tools dir exists but is empty") != null);
 }
