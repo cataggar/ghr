@@ -1111,9 +1111,11 @@ pub fn verifyDownloadedAssetSigstore(
 
     var digest_hex: [64]u8 = undefined;
     sha256ToHex(identity.artifact_digest, &digest_hex);
+    var rekor_time_buf: [20]u8 = undefined;
+    const rekor_time_iso = authenticode.formatUnixTimeIso(identity.integrated_time, &rekor_time_buf);
     try w.print(
-        "verified sigstore: sha256 {s}... (rekor t={d}, log {d})\n",
-        .{ digest_hex[0..12], identity.integrated_time, bundle.rekor_log_index },
+        "verified sigstore: sha256 {s}... (rekor t={s}, log {d})\n",
+        .{ digest_hex[0..12], rekor_time_iso, bundle.rekor_log_index },
     );
     if (identity.identity.primarySubject()) |subject| {
         try w.print("  identity: {s}\n", .{subject});
@@ -1276,10 +1278,14 @@ fn verifyZipPes(
     if (verified_count == 0) return .no_verification;
 
     if (first_outcome) |s| {
+        var min_buf: [20]u8 = undefined;
+        var max_buf: [20]u8 = undefined;
+        const min_iso = authenticode.formatUnixTimeIso(min_gen_time, &min_buf);
+        const max_iso = authenticode.formatUnixTimeIso(max_gen_time, &max_buf);
         if (min_gen_time == max_gen_time) {
-            try w.print("verified authenticode: {d} PEs (genTime {d})\n", .{ verified_count, s.gen_time });
+            try w.print("verified authenticode: {d} PEs (genTime {s})\n", .{ verified_count, min_iso });
         } else {
-            try w.print("verified authenticode: {d} PEs (genTime {d}..{d})\n", .{ verified_count, min_gen_time, max_gen_time });
+            try w.print("verified authenticode: {d} PEs (genTime {s}..{s})\n", .{ verified_count, min_iso, max_iso });
         }
         if (s.subject_cn.len > 0) {
             try w.print("  subject: {s}\n", .{s.subject_cn});
@@ -1436,9 +1442,40 @@ pub fn verifyDownloadedAssetMinisign(
 
     var key_hex: [16]u8 = undefined;
     minisign.keyIdToHex(pk.key_id, &key_hex);
-    try w.print("verified minisign: key {s} ({s})\n", .{ &key_hex, sig.trusted_comment });
+    try w.print("verified minisign: key {s} (", .{&key_hex});
+    try writeTrustedCommentFormatted(w, sig.trusted_comment);
+    try w.writeAll(")\n");
     try w.flush();
     return .minisign_verified;
+}
+
+/// Print a minisign trusted comment, rewriting the leading `timestamp:<unix>`
+/// field as an ISO-8601 datetime so humans can read it. Everything else is
+/// emitted verbatim. If no `timestamp:` prefix is found, or the digits don't
+/// parse, the comment is written unchanged.
+fn writeTrustedCommentFormatted(w: *Writer, comment: []const u8) !void {
+    const prefix = "timestamp:";
+    const idx = std.mem.indexOf(u8, comment, prefix) orelse {
+        try w.writeAll(comment);
+        return;
+    };
+    const after = comment[idx + prefix.len ..];
+    var end: usize = 0;
+    while (end < after.len and after[end] >= '0' and after[end] <= '9') : (end += 1) {}
+    if (end == 0) {
+        try w.writeAll(comment);
+        return;
+    }
+    const ts = std.fmt.parseInt(i64, after[0..end], 10) catch {
+        try w.writeAll(comment);
+        return;
+    };
+    var iso_buf: [20]u8 = undefined;
+    const iso = authenticode.formatUnixTimeIso(ts, &iso_buf);
+    try w.writeAll(comment[0..idx]);
+    try w.writeAll(prefix);
+    try w.writeAll(iso);
+    try w.writeAll(after[end..]);
 }
 
 /// Result of `findAssetByName`. The `ambiguous` slice references entries in
@@ -1679,6 +1716,27 @@ test {
     _ = @import("sigstore.zig");
     _ = @import("minisign.zig");
     _ = @import("authenticode.zig");
+}
+
+test "writeTrustedCommentFormatted rewrites unix timestamp as ISO" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try writeTrustedCommentFormatted(
+        &aw.writer,
+        "timestamp:1780495437\tfile:ghr-0.5.0-dev.1-windows-x64.zip\tcommit:abc\ttag:v0.5.0-dev.1",
+    );
+    try std.testing.expectEqualStrings(
+        "timestamp:2026-06-03T14:03:57Z\tfile:ghr-0.5.0-dev.1-windows-x64.zip\tcommit:abc\ttag:v0.5.0-dev.1",
+        aw.written(),
+    );
+}
+
+test "writeTrustedCommentFormatted passes through when timestamp is missing" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const input = "file:msg.bin\thashed";
+    try writeTrustedCommentFormatted(&aw.writer, input);
+    try std.testing.expectEqualStrings(input, aw.written());
 }
 
 test "parseRepoSpec with tag" {
