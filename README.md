@@ -52,6 +52,7 @@ uv tool install ghr-bin
 winget install ghr
 brew install cataggar/ghr/ghr
 curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | sh
+iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
 ghr install cataggar/ghr RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 ```
 
