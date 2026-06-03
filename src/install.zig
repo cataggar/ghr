@@ -68,7 +68,7 @@ fn ensureDirWithParents(io: Io, abs_path: []const u8, max_parents: u8) void {
 /// All other errors (already-exists, access-denied on ancestors we don't
 /// own) are tolerated; the caller detects real failure by then trying to
 /// use `abs_path`.
-fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) void {
+pub fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) void {
     Dir.createDirAbsolute(io, abs_path, .default_dir) catch |err| {
         if (err == error.FileNotFound) {
             const parent = std.fs.path.dirname(abs_path) orelse return;
@@ -839,7 +839,7 @@ fn writeJsonEscaped(w: *Writer, s: []const u8) !void {
 }
 
 /// Metadata stored in ghr.json.
-const Metadata = struct {
+pub const Metadata = struct {
     tag: []const u8,
     asset: []const u8,
     verified: []const u8 = "none",
@@ -853,7 +853,7 @@ const Metadata = struct {
 };
 
 /// Read ghr.json metadata from a tool directory.
-fn readMetadata(allocator: std.mem.Allocator, io: Io, tool_dir_path: []const u8) ?struct {
+pub fn readMetadata(allocator: std.mem.Allocator, io: Io, tool_dir_path: []const u8) ?struct {
     parsed: std.json.Parsed(Metadata),
     body: []const u8,
 } {
