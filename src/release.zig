@@ -1215,17 +1215,43 @@ fn verifyZipPes(
     };
 
     var any_signed = false;
-    var last_outcome: VerifyOutcome = .no_verification;
+    var verified_count: usize = 0;
+    var min_gen_time: i64 = std.math.maxInt(i64);
+    var max_gen_time: i64 = std.math.minInt(i64);
+    var first_outcome: ?authenticode.Outcome = null;
     for (results.items) |entry| {
         const image = authenticode.parsePe(entry.bytes) catch continue;
         const cert_entry = (authenticode.findFirstPkcs7Entry(image) catch null) orelse continue;
         _ = cert_entry;
         any_signed = true;
-        const out = try verifySinglePe(allocator, entry.bytes, trust, now, entry.name, debug_w, w, err_w);
-        if (out == .authenticode_verified) last_outcome = .authenticode_verified;
+        const outcome = authenticode.verifyPe(allocator, entry.bytes, trust, trust, now) catch |err| {
+            try err_w.print("error: authenticode verification failed for '{s}': {s}\n", .{ entry.name, @errorName(err) });
+            try err_w.flush();
+            return error.AuthenticodeVerificationFailed;
+        };
+        verified_count += 1;
+        if (outcome.gen_time < min_gen_time) min_gen_time = outcome.gen_time;
+        if (outcome.gen_time > max_gen_time) max_gen_time = outcome.gen_time;
+        if (first_outcome == null) first_outcome = outcome;
     }
     if (!any_signed) return .no_verification;
-    return last_outcome;
+    if (verified_count == 0) return .no_verification;
+
+    if (first_outcome) |s| {
+        if (min_gen_time == max_gen_time) {
+            try w.print("verified authenticode: {d} PEs (genTime {d})\n", .{ verified_count, s.gen_time });
+        } else {
+            try w.print("verified authenticode: {d} PEs (genTime {d}..{d})\n", .{ verified_count, min_gen_time, max_gen_time });
+        }
+        if (s.subject_cn.len > 0) {
+            try w.print("  subject: {s}\n", .{s.subject_cn});
+        }
+        if (s.organization.len > 0) {
+            try w.print("  org:     {s}\n", .{s.organization});
+        }
+        try w.flush();
+    }
+    return .authenticode_verified;
 }
 
 // ---------------------------------------------------------------------------
