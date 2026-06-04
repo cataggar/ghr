@@ -422,9 +422,17 @@ pub fn getRelease(
 // Asset selection: platform-keyword scoring (`findBestAsset`).
 // ---------------------------------------------------------------------------
 
+/// Host C library family on Linux. Rust target triples encode this as the
+/// `-gnu` / `-musl` suffix, and a glibc binary will not run on a musl host
+/// (or vice versa). `null` means "don't let libc influence scoring".
+pub const Libc = enum { gnu, musl };
+
 pub const PlatformKeywords = struct {
     os: []const []const u8,
     arch: []const []const u8,
+    /// Host libc on Linux; `null` on other platforms (and in tests that don't
+    /// care), where it leaves scoring untouched.
+    libc: ?Libc = null,
 };
 
 pub fn currentPlatformKeywords() PlatformKeywords {
@@ -438,9 +446,19 @@ pub fn currentPlatformKeywords() PlatformKeywords {
         .x86_64 => &.{ "x86_64", "x64", "amd64" },
         .aarch64 => &.{ "aarch64", "arm64" },
         .x86 => &.{ "x86", "i686", "i386" },
+        .riscv64 => &.{ "riscv64gc", "riscv64" },
         else => &.{},
     };
-    return .{ .os = os_keywords, .arch = arch_keywords };
+    // ghr ships a separate glibc and musl binary for each Linux arch, and every
+    // install path places the libc-matched build on the host: install.sh probes
+    // for musl, and the PyPI wheels carry musllinux/manylinux platform tags that
+    // pip resolves per host. So our own compiled ABI is a reliable, zero-I/O
+    // proxy for the host's libc.
+    const libc: ?Libc = switch (builtin.os.tag) {
+        .linux => if (std.mem.startsWith(u8, @tagName(builtin.abi), "musl")) .musl else .gnu,
+        else => null,
+    };
+    return .{ .os = os_keywords, .arch = arch_keywords, .libc = libc };
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -581,10 +599,10 @@ fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
 fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
     if (plat_arch.len == 0) return false;
     const all_arch = [_][]const u8{
-        "x86_64",  "x64",   "amd64",
-        "aarch64", "arm64", "armv7l",
-        "armv7",   "armv6", "i386",
-        "i686",    "x86",
+        "x86_64",  "x64",     "amd64",
+        "aarch64", "arm64",   "armv7l",
+        "armv7",   "armv6",   "i386",
+        "i686",    "x86",     "riscv64",
     };
     for (plat_arch) |k| {
         if (containsIgnoreCaseBounded(name, k)) return false;
@@ -649,6 +667,22 @@ fn archiveFormatBonus(name: []const u8) i32 {
     return 0;
 }
 
+/// On Linux, reward the asset built for the host's C library. Rust target
+/// triples encode this as `-gnu` vs `-musl`. The bonus is intentionally
+/// positive-only: it breaks a gnu-vs-musl tie in favour of the host libc but
+/// never penalizes an asset, so a release that only ships the "wrong" libc (or
+/// names assets without a libc marker) is unaffected and still installable.
+fn libcBonus(name: []const u8, libc: ?Libc) i32 {
+    const want = libc orelse return 0;
+    const has_musl = containsIgnoreCaseBounded(name, "musl");
+    const has_gnu = containsIgnoreCaseBounded(name, "gnu");
+    if (has_musl == has_gnu) return 0; // neither marker, or (ambiguously) both
+    return switch (want) {
+        .musl => if (has_musl) 3 else 0,
+        .gnu => if (has_gnu) 3 else 0,
+    };
+}
+
 /// Tie-break: prefer shorter, then lexicographically smaller. Returns true
 /// if `a` should beat `b`.
 fn tieBreakPrefers(a: []const u8, b: []const u8) bool {
@@ -672,6 +706,7 @@ fn scoreAsset(name: []const u8, plat: PlatformKeywords) i32 {
     }
     score -= @as(i32, @intCast(nonPrimaryPenalty(name)));
     score += linuxPortabilityBonus(name, plat.os);
+    score += libcBonus(name, plat.libc);
     score += archiveFormatBonus(name);
     return score;
 }
@@ -2071,6 +2106,75 @@ test "isForeignArch basics" {
 
     const empty: []const []const u8 = &.{};
     try std.testing.expect(!isForeignArch("tool-x86_64-linux.tar.gz", empty));
+}
+
+test "isForeignArch handles riscv64 (issue #116)" {
+    const x86_64_arch: []const []const u8 = &.{ "x86_64", "x64", "amd64" };
+    const riscv64_arch: []const []const u8 = &.{ "riscv64gc", "riscv64" };
+    // A riscv64 asset is foreign on an x86_64 host (riscv64gc matches riscv64).
+    try std.testing.expect(isForeignArch("rustup-riscv64gc-unknown-linux-gnu.tar.gz", x86_64_arch));
+    // An x86_64 / aarch64 asset is foreign on a riscv64 host.
+    try std.testing.expect(isForeignArch("rustup-x86_64-unknown-linux-gnu.tar.gz", riscv64_arch));
+    try std.testing.expect(isForeignArch("rustup-aarch64-unknown-linux-gnu.tar.gz", riscv64_arch));
+    // The native riscv64 asset is not foreign on a riscv64 host.
+    try std.testing.expect(!isForeignArch("rustup-riscv64gc-unknown-linux-gnu.tar.gz", riscv64_arch));
+}
+
+test "findBestAsset selects riscv64 build on riscv64 host (issue #116)" {
+    const assets = [_]Asset{
+        .{ .name = "rustup-1.29.0-x86_64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "rustup-1.29.0-aarch64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "rustup-1.29.0-riscv64gc-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "riscv64gc", "riscv64" },
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("rustup-1.29.0-riscv64gc-unknown-linux-gnu.tar.gz", best.name);
+}
+
+test "libcBonus rewards the matching libc and is otherwise neutral (issue #116)" {
+    // No host libc, or no libc marker in the name: neutral.
+    try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-x86_64-unknown-linux-gnu.tar.gz", null));
+    try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-linux-x64.tar.gz", .gnu));
+    // Matching libc is rewarded; the mismatching one is never penalized.
+    try std.testing.expectEqual(@as(i32, 3), libcBonus("tool-x86_64-unknown-linux-gnu.tar.gz", .gnu));
+    try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-x86_64-unknown-linux-gnu.tar.gz", .musl));
+    try std.testing.expectEqual(@as(i32, 3), libcBonus("tool-x86_64-unknown-linux-musl.tar.gz", .musl));
+    try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-x86_64-unknown-linux-musl.tar.gz", .gnu));
+}
+
+test "findBestAsset picks gnu on glibc host and musl on musl host (issue #116)" {
+    const assets = [_]Asset{
+        .{ .name = "rustup-1.29.0-x86_64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "rustup-1.29.0-x86_64-unknown-linux-musl.tar.gz", .browser_download_url = "" },
+    };
+    const x86_64_arch: []const []const u8 = &.{ "x86_64", "x64", "amd64" };
+    const gnu_best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = x86_64_arch,
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("rustup-1.29.0-x86_64-unknown-linux-gnu.tar.gz", gnu_best.name);
+    const musl_best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = x86_64_arch,
+        .libc = .musl,
+    });
+    try std.testing.expectEqualStrings("rustup-1.29.0-x86_64-unknown-linux-musl.tar.gz", musl_best.name);
+}
+
+test "musl-only release still installs on a glibc host (issue #116)" {
+    const assets = [_]Asset{
+        .{ .name = "tool-x86_64-unknown-linux-musl.tar.gz", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "x86_64", "x64", "amd64" },
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("tool-x86_64-unknown-linux-musl.tar.gz", best.name);
 }
 
 test "findBestAsset errors on aarch64 when only amd64 Linux assets exist (issue #55 lunatic)" {
