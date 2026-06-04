@@ -3,6 +3,7 @@
 # Usage:
 #   iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
 #   $env:GHR_VERSION = "v0.3.1"; iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
+#   $env:GHR_NO_PATH_ADD = "1"; iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
 #
 # With named params (iex/pipe discards args, so use the scriptblock form):
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1))) -Version v0.3.1
@@ -10,7 +11,9 @@
 # Downloads the latest ghr release into a temp dir, then uses that
 # bootstrap binary to self-install via `ghr install cataggar/ghr <pubkey>`,
 # which re-downloads the real artifact and verifies it with the pinned
-# minisign public key. The temp dir is always removed.
+# minisign public key. After install, runs `ghr path add` to update your
+# user PATH (skip by setting GHR_NO_PATH_ADD=1). The temp dir is always
+# removed.
 #
 # Pure ASCII -- Windows PowerShell 5.1 parser compatible.
 
@@ -21,6 +24,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Honored as an env var only (not a named param) so the `iwr | iex`
+# pattern -- which discards positional args -- can still opt out by
+# exporting it first.
+$script:NoPathAdd = [bool]$env:GHR_NO_PATH_ADD
 
 # Invoke-WebRequest's per-chunk progress bar on PS 5.1 repaints synchronously
 # on every received byte, pegs one CPU core, and throttles downloads 10-100x
@@ -205,18 +213,52 @@ function Invoke-GhrInstall {
 }
 
 # ---------- post-install ----------
+# Resolve the installed ghr binary. `ghr install` (via the bootstrap)
+# places it under %USERPROFILE%\.local\bin\ghr.exe unless GHR_BIN_DIR
+# is set. We mirror the same default here; if GHR_BIN_DIR is set we
+# defer to whatever the bootstrap reports.
+function Get-InstalledGhrPath {
+    Join-Path $env:USERPROFILE '.local\bin\ghr.exe'
+}
+
+function Invoke-PathAdd {
+    $ghrExe = Get-InstalledGhrPath
+    if (-not (Test-Path -LiteralPath $ghrExe)) {
+        Write-Warn "skipping 'path add': $ghrExe not found"
+        return
+    }
+    Write-Info "running 'ghr path add' to update your user PATH"
+    # `path add` is the current spelling; older ghr (<= v0.4.x) only
+    # knows `path ensure`. Fall back transparently so this script keeps
+    # working against the latest stable while v0.5+ propagates.
+    & $ghrExe path add 2>$null
+    if ($LASTEXITCODE -eq 0) { return }
+    & $ghrExe path ensure
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "'ghr path add' failed (exit $LASTEXITCODE)"
+    }
+}
+
 function Show-PostInstallHint {
+    # `path add` updates HKCU\Environment\Path; the change only takes
+    # effect in newly-launched shells (the broadcast doesn't refresh the
+    # current process). Detect whether the current session already has
+    # ghr on PATH; if not, tell the user to open a new terminal.
     if (Get-Command ghr -ErrorAction SilentlyContinue) { return }
 
-    $ghrExe = Join-Path $env:USERPROFILE '.local\bin\ghr.exe'
+    $ghrExe = Get-InstalledGhrPath
     Write-Host ''
-    Write-Warn 'ghr is installed but not on your PATH'
-    if (Test-Path -LiteralPath $ghrExe) {
-        Write-Warn "run:  & '$ghrExe' path ensure"
+    if ($script:NoPathAdd) {
+        Write-Warn 'ghr is installed but not on your PATH'
+        if (Test-Path -LiteralPath $ghrExe) {
+            Write-Warn "run:  & '$ghrExe' path add"
+        } else {
+            Write-Warn "add  $env:USERPROFILE\.local\bin  to your user PATH"
+        }
+        Write-Warn 'then open a new terminal'
     } else {
-        Write-Warn "add  $env:USERPROFILE\.local\bin  to your user PATH"
+        Write-Warn 'open a new terminal to pick up the updated PATH'
     }
-    Write-Warn 'then open a new terminal'
 }
 
 # ---------- main ----------
@@ -228,6 +270,9 @@ try {
 
     $tag = Resolve-GhrVersion -Pinned $Version
     Invoke-GhrInstall -Tag $tag -Arch $arch -Pinned ([bool]$Version)
+    if (-not $script:NoPathAdd) {
+        Invoke-PathAdd
+    }
     Show-PostInstallHint
 
     Write-Info "done -- run 'ghr help' to get started"
