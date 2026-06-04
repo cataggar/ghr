@@ -217,11 +217,15 @@ fn createTestTarXz(tmp: *std.testing.TmpDir, names: []const []const u8, contents
     try argv.appendSlice(std.testing.allocator, &.{ "tar", "cJf", "archive.tar.xz" });
     try argv.appendSlice(std.testing.allocator, names);
 
-    var child = try std.process.spawn(tio, .{
+    // `tar cJf` shells out to `xz`. Skip the test when the platform lacks
+    // either `tar` or `xz` so CI on Windows / minimal Linux images keeps
+    // passing without false negatives.
+    var child = std.process.spawn(tio, .{
         .argv = argv.items,
         .cwd = .{ .dir = tmp.dir },
-    });
-    _ = try child.wait(tio);
+    }) catch return error.SkipZigTest;
+    const term = child.wait(tio) catch return error.SkipZigTest;
+    if (term != .exited or term.exited != 0) return error.SkipZigTest;
 
     for (names) |name| {
         tmp.dir.deleteFile(tio, name) catch {};
@@ -331,20 +335,26 @@ fn createTestDeb(tmp: *std.testing.TmpDir) !File {
     var argv = std.ArrayListUnmanaged([]const u8).empty;
     defer argv.deinit(std.testing.allocator);
 
+    // Each helper invocation requires `tar`, `zstd`, and `ar`. Skip the
+    // test if any of them are missing or fail; CI environments without
+    // dpkg tooling (e.g. Windows, minimal Linux images) shouldn't fail.
     try argv.appendSlice(std.testing.allocator, &.{ "tar", "--zstd", "-cf", "control.tar.zst", "control" });
-    var child = try std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
-    _ = try child.wait(tio);
+    var child = std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } }) catch return error.SkipZigTest;
+    var term = child.wait(tio) catch return error.SkipZigTest;
+    if (term != .exited or term.exited != 0) return error.SkipZigTest;
     tmp.dir.deleteFile(tio, "control") catch {};
 
     argv.items.len = 0;
     try argv.appendSlice(std.testing.allocator, &.{ "tar", "--zstd", "-cf", "data.tar.zst", "usr" });
-    child = try std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
-    _ = try child.wait(tio);
+    child = std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } }) catch return error.SkipZigTest;
+    term = child.wait(tio) catch return error.SkipZigTest;
+    if (term != .exited or term.exited != 0) return error.SkipZigTest;
 
     argv.items.len = 0;
     try argv.appendSlice(std.testing.allocator, &.{ "ar", "rcs", "archive.deb", "debian-binary", "control.tar.zst", "data.tar.zst" });
-    child = try std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
-    _ = try child.wait(tio);
+    child = std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } }) catch return error.SkipZigTest;
+    term = child.wait(tio) catch return error.SkipZigTest;
+    if (term != .exited or term.exited != 0) return error.SkipZigTest;
 
     return try tmp.dir.openFile(tio, "archive.deb", .{});
 }

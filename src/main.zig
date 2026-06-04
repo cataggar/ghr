@@ -274,7 +274,7 @@ fn runLinkCmd(
         } else {
             if (spec != null) {
                 try err_w.print(
-                    "error: 'ghr {s}' accepts a single <owner/repo> spec (got '{s}' and '{s}')\n",
+                    "error: 'ghr {s}' accepts a single spec (got '{s}' and '{s}')\n",
                     .{ @tagName(kind), spec.?, arg },
                 );
                 try err_w.flush();
@@ -285,12 +285,28 @@ fn runLinkCmd(
     }
 
     const spec_str = spec orelse {
-        try err_w.print("error: 'ghr {s}' requires <owner/repo>\n", .{@tagName(kind)});
+        try err_w.print("error: 'ghr {s}' requires <owner/repo> or a bare executable name\n", .{@tagName(kind)});
         try err_w.flush();
         std.process.exit(1);
     };
 
-    const result = switch (kind) {
+    // A spec with no `/` is interpreted as a bare Windows-PATH executable
+    // name (e.g. `ghr link git`). An owner/repo spec must contain `/`.
+    // Reject `@` in bare form upfront so `git@1.0` doesn't slip through.
+    const looks_bare = std.mem.indexOfScalar(u8, spec_str, '/') == null;
+    if (looks_bare and std.mem.indexOfScalar(u8, spec_str, '@') != null) {
+        try err_w.print(
+            "error: bare executable names cannot contain '@' (got '{s}')\n",
+            .{spec_str},
+        );
+        try err_w.flush();
+        std.process.exit(1);
+    }
+
+    const result = if (looks_bare) switch (kind) {
+        .link => link.cmdLinkBareExe(allocator, io, environ, spec_str, filters.items, w, err_w),
+        .unlink => link.cmdUnlinkBareExe(allocator, io, environ, spec_str, filters.items, w, err_w),
+    } else switch (kind) {
         .link => link.cmdLink(allocator, io, environ, spec_str, filters.items, w, err_w),
         .unlink => link.cmdUnlink(allocator, io, environ, spec_str, filters.items, w, err_w),
     };
@@ -302,15 +318,16 @@ fn runLinkCmd(
 
 fn printLinkUsage(w: *Writer) !void {
     try w.print(
-        \\ghr link - link Windows-side installed bins into WSL's ~/.local/bin
+        \\ghr link - link Windows-side bins or PATH executables into WSL
         \\
         \\USAGE:
         \\    ghr link <owner/repo> [--bin <name>] [--bin <name> ...]
+        \\    ghr link <name>                              (e.g. 'ghr link git')
         \\
-        \\Reads `ghr.json` from the Windows-side install of <owner/repo>
-        \\and creates Linux symlinks in ghr's bin directory pointing at
-        \\the original `.exe` binaries (via `/mnt/c/...`). WSL interop
-        \\executes the `.exe` transparently.
+        \\With <owner/repo>, reads `ghr.json` from the Windows-side install
+        \\of that tool and creates Linux symlinks in ghr's bin directory
+        \\pointing at the original `.exe` binaries (via `/mnt/c/...`). WSL
+        \\interop executes the `.exe` transparently.
         \\
         \\Without `--bin`, links every bin advertised by the Windows
         \\install and removes any previously-linked bins that no longer
@@ -318,6 +335,13 @@ fn printLinkUsage(w: *Writer) !void {
         \\
         \\With one or more `--bin <name>` filters, only the named bins
         \\are touched; other previously-linked entries are left alone.
+        \\
+        \\With a bare <name> (no `/`), resolves `<name>.exe` on the
+        \\Windows `%PATH%` via `where.exe`, converts the result with
+        \\`wslpath -u`, and creates a single symlink in ghr's bin
+        \\directory pointing at it. Only `.exe` results are accepted —
+        \\`.cmd`/`.bat`/`.ps1` shims do not work through WSL interop.
+        \\`--bin` is not supported with the bare form.
         \\
         \\Requires WSL_INTEROP to be set (i.e., running in WSL).
         \\
@@ -330,6 +354,7 @@ fn printLinkUsage(w: *Writer) !void {
         \\EXAMPLES:
         \\    ghr link AzureAD/microsoft-authentication-cli
         \\    ghr link cataggar/microsoft-authentication-cli --bin azureauth
+        \\    ghr link git
         \\
         \\Run 'ghr link help' to show this help.
         \\
@@ -342,14 +367,19 @@ fn printUnlinkUsage(w: *Writer) !void {
         \\
         \\USAGE:
         \\    ghr unlink <owner/repo> [--bin <name> ...]
+        \\    ghr unlink <name>                            (bare executable form)
         \\
-        \\Removes every symlink ghr created for <owner/repo> from the
-        \\bin directory. Verifies each symlink still points where the
-        \\manifest recorded before deleting, so a user-rewritten symlink
-        \\is never clobbered.
+        \\With <owner/repo>, removes every symlink ghr created for that
+        \\tool from the bin directory. Verifies each symlink still points
+        \\where the manifest recorded before deleting, so a user-rewritten
+        \\symlink is never clobbered.
         \\
         \\With `--bin <name>` filters, only the named entries are
         \\removed.
+        \\
+        \\With a bare <name> (no `/`), removes the single symlink that
+        \\was created by `ghr link <name>`. `--bin` is not supported
+        \\with the bare form.
         \\
         \\Requires WSL_INTEROP to be set (i.e., running in WSL).
         \\
@@ -646,8 +676,8 @@ fn printUsage(w: *Writer) !void {
         \\    install <spec> [<spec> ...]          Install one or more tools from GitHub releases
         \\    uninstall <owner/repo>               Remove an installed tool
         \\    download <spec> [<spec> ...]         Download one or more release assets
-        \\    link <owner/repo> [--bin <n> ...]    (WSL) Symlink Windows-side bins into ghr's bin dir
-        \\    unlink <owner/repo> [--bin <n> ...]  (WSL) Remove ghr-created WSL symlinks
+        \\    link <owner/repo>|<name>             (WSL) Symlink Windows bins/PATH exes into ghr's bin dir
+        \\    unlink <owner/repo>|<name>           (WSL) Remove ghr-created WSL symlinks
         \\    path ensure [--dry-run]              Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
         \\    validate <SUBCOMMAND>                Run validations against published artifacts

@@ -1000,6 +1000,482 @@ pub fn cmdUnlink(
 }
 
 // ---------------------------------------------------------------------------
+// Bare-executable mode: `ghr link <name>` / `ghr unlink <name>`.
+//
+// When the spec has no `/`, the user is asking ghr to link an executable
+// that already exists on the Windows `%PATH%`, not a Windows-side ghr
+// install. We resolve the path via `where.exe <name>.exe`, convert to
+// `/mnt/<drive>/...` with `wslpath -u`, and create a symlink in ghr's
+// bin dir just like the owner/repo flow.
+//
+// Bookkeeping lives in a separate manifest tree so the namespaces can't
+// collide with any real GitHub owner/repo:
+//
+//   ~/.local/share/ghr/links/by-path/<name>.json
+//
+// The `kind` field is `"wsl-path"` so future readers can tell the two
+// classes of manifest apart.
+// ---------------------------------------------------------------------------
+
+/// Validate a bare executable name supplied as the spec. Accepts a
+/// short ASCII identifier optionally suffixed with `.exe` (any case).
+/// Rejects any character that could be misread as a path, redirection,
+/// flag, shell metacharacter, or `where.exe` query operator.
+pub fn isValidBareExeName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    if (name[0] == '-' or name[0] == '.') return false;
+    for (name) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.', '+' => {},
+            else => return false,
+        }
+    }
+    // Reject patterns like `..` or `.` even though `.` alone is caught above.
+    if (std.mem.eql(u8, name, "..")) return false;
+    if (std.mem.indexOf(u8, name, "..") != null) return false;
+    return true;
+}
+
+/// Append `.exe` to `name` if not already present (case-insensitive).
+/// Returned slice is owned by `allocator`.
+fn ensureExeSuffix(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    if (name.len >= 4) {
+        const tail = name[name.len - 4 ..];
+        if (std.ascii.eqlIgnoreCase(tail, ".exe")) return allocator.dupe(u8, name);
+    }
+    return std.fmt.allocPrint(allocator, "{s}.exe", .{name});
+}
+
+/// Drop a single trailing `.exe` (case-insensitive). Returns the original
+/// slice if no `.exe` suffix is present. Borrows from the input.
+fn stripExeSuffix(name: []const u8) []const u8 {
+    if (name.len > 4) {
+        const tail = name[name.len - 4 ..];
+        if (std.ascii.eqlIgnoreCase(tail, ".exe")) return name[0 .. name.len - 4];
+    }
+    return name;
+}
+
+/// Extract the first non-blank line from `where.exe` stdout. `where.exe`
+/// emits one path per line in CRLF form, ordered by PATH precedence.
+/// Returns `null` when there is no usable line.
+pub fn parseFirstWherePath(stdout: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeAny(u8, stdout, "\r\n");
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t' });
+        if (trimmed.len == 0) continue;
+        return trimmed;
+    }
+    return null;
+}
+
+/// True for a path that lives under a drvfs mount — i.e. `/mnt/<letter>/...`
+/// with a single ASCII letter drive. Refuses `/mnt/wsl/...`, `/mnt/`,
+/// `\\wsl$\...`, and anything else where WSL interop would not pass the
+/// translated Win32 path through to CreateProcess.
+pub fn looksLikeMntDrvfsPath(p: []const u8) bool {
+    const prefix = "/mnt/";
+    if (!std.mem.startsWith(u8, p, prefix)) return false;
+    if (p.len < prefix.len + 2) return false;
+    const drive = p[prefix.len];
+    if (!std.ascii.isAlphabetic(drive)) return false;
+    if (p[prefix.len + 1] != '/') return false;
+    return true;
+}
+
+/// Full path of the bare-exec manifest file for `name_lower`. Owned by caller.
+fn bareExeManifestPath(
+    allocator: std.mem.Allocator,
+    environ: *const EnvironMap,
+    name_lower: []const u8,
+) ![]u8 {
+    const root = try linksRoot(allocator, environ);
+    defer allocator.free(root);
+    var fname_buf: [128]u8 = undefined;
+    const fname = try std.fmt.bufPrint(&fname_buf, "{s}.json", .{name_lower});
+    return std.fs.path.join(allocator, &.{ root, "by-path", fname });
+}
+
+/// Containing directory of bare-exec manifests. Owned by caller.
+fn bareExeManifestDir(
+    allocator: std.mem.Allocator,
+    environ: *const EnvironMap,
+) ![]u8 {
+    const root = try linksRoot(allocator, environ);
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "by-path" });
+}
+
+/// Atomically write a bare-exec manifest at `by-path/<name_lower>.json`.
+/// Mirrors `writeManifest` but uses the flat `by-path/` tree and stamps
+/// `kind = "wsl-path"`.
+fn writeBareExeManifest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    name_lower: []const u8,
+    source: []const u8,
+    entry: LinkEntry,
+) !void {
+    const dir = try bareExeManifestDir(allocator, environ);
+    defer allocator.free(dir);
+    install.ensureDirAbsoluteRecursive(io, dir);
+
+    const final_path = try bareExeManifestPath(allocator, environ, name_lower);
+    defer allocator.free(final_path);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{final_path});
+    defer allocator.free(tmp_path);
+
+    Dir.deleteFileAbsolute(io, tmp_path) catch {};
+
+    {
+        var f = try Dir.createFileAbsolute(io, tmp_path, .{});
+        defer f.close(io);
+        var wbuf: [4096]u8 = undefined;
+        var fw = f.writer(io, &wbuf);
+        const w = &fw.interface;
+        try w.print("{{\"kind\":\"wsl-path\",\"source\":\"", .{});
+        try writeJsonEscaped(w, source);
+        try w.print("\",\"links\":[{{\"name\":\"", .{});
+        try writeJsonEscaped(w, entry.name);
+        try w.print("\",\"target\":\"", .{});
+        try writeJsonEscaped(w, entry.target);
+        try w.print("\"}}]}}\n", .{});
+        try fw.end();
+    }
+
+    Dir.renameAbsolute(tmp_path, final_path, io) catch |err| {
+        Dir.deleteFileAbsolute(io, tmp_path) catch {};
+        return err;
+    };
+}
+
+fn deleteBareExeManifest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    name_lower: []const u8,
+) !void {
+    const final_path = try bareExeManifestPath(allocator, environ, name_lower);
+    defer allocator.free(final_path);
+    Dir.deleteFileAbsolute(io, final_path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+}
+
+/// Run `where.exe <query>` via WSL interop and return its trimmed stdout.
+/// Caller owns the returned slice. Returns `error.NotFound` when
+/// `where.exe` exits non-zero (the canonical "no match" outcome) or
+/// when its stdout is empty.
+fn runWhereExe(allocator: std.mem.Allocator, io: Io, query: []const u8) ![]u8 {
+    const r = std.process.run(allocator, io, .{
+        .argv = &.{ "where.exe", query },
+        .stdout_limit = Io.Limit.limited(64 * 1024),
+        .stderr_limit = Io.Limit.limited(16 * 1024),
+    }) catch return error.WhereExeFailed;
+    defer allocator.free(r.stderr);
+    errdefer allocator.free(r.stdout);
+    if (r.term != .exited or r.term.exited != 0) {
+        allocator.free(r.stdout);
+        return error.NotFound;
+    }
+    if (parseFirstWherePath(r.stdout) == null) {
+        allocator.free(r.stdout);
+        return error.NotFound;
+    }
+    return r.stdout;
+}
+
+pub fn cmdLinkBareExe(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    name: []const u8,
+    bin_filters: []const []const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !void {
+    requireWsl(environ, err_w, "link") catch return LinkCmdError.LinkStepFailed;
+
+    if (bin_filters.len > 0) {
+        try err_w.print("error: '--bin' is not supported with a bare executable name\n", .{});
+        try err_w.print("       (the bare-name form links exactly one Windows-PATH executable)\n", .{});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+
+    if (!isValidBareExeName(name)) {
+        try err_w.print("error: invalid spec '{s}'\n", .{name});
+        try err_w.print("       expected either <owner/repo> or a bare executable name (e.g. 'git')\n", .{});
+        try err_w.print("       allowed characters: letters, digits, '_', '-', '.', '+'\n", .{});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+
+    const query = try ensureExeSuffix(allocator, name);
+    defer allocator.free(query);
+
+    const where_out = runWhereExe(allocator, io, query) catch |err| switch (err) {
+        error.NotFound => {
+            try err_w.print("error: '{s}' was not found on the Windows %PATH%\n", .{query});
+            try err_w.print("       (looked up via `where.exe {s}`)\n", .{query});
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        },
+        error.WhereExeFailed => {
+            try err_w.print("error: failed to run `where.exe` via WSL interop\n", .{});
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        },
+    };
+    defer allocator.free(where_out);
+
+    const win_path_raw = parseFirstWherePath(where_out) orelse {
+        try err_w.print("error: `where.exe {s}` returned no usable path\n", .{query});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+    const win_path = try allocator.dupe(u8, win_path_raw);
+    defer allocator.free(win_path);
+
+    const wsl_path = wslpathToUnix(allocator, io, win_path) catch {
+        try err_w.print(
+            "error: could not convert Windows path '{s}' to a WSL path\n",
+            .{win_path},
+        );
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+    defer allocator.free(wsl_path);
+
+    if (!looksLikeMntDrvfsPath(wsl_path)) {
+        try err_w.print(
+            "error: resolved path '{s}' is not under /mnt/<drive>/ (drvfs); refusing to link\n",
+            .{wsl_path},
+        );
+        try err_w.print("       WSL interop only runs Windows .exe files reached via /mnt/<letter>/\n", .{});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+
+    // Enforce that the target is a real `.exe`. WSL interop only
+    // direct-executes `.exe`; `.bat` / `.cmd` / `.ps1` shims would dangle
+    // when invoked through the symlink.
+    if (!std.ascii.endsWithIgnoreCase(wsl_path, ".exe")) {
+        try err_w.print(
+            "error: resolved path '{s}' is not a .exe; refusing to link\n",
+            .{wsl_path},
+        );
+        try err_w.print("       (WSL interop only direct-executes .exe — .bat/.cmd/.ps1 shims will not work via symlink)\n", .{});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+
+    Dir.accessAbsolute(io, wsl_path, .{}) catch |err| {
+        try err_w.print(
+            "error: resolved path '{s}' does not exist in WSL: {t}\n",
+            .{ wsl_path, err },
+        );
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+
+    const link_name_raw = std.fs.path.basenamePosix(wsl_path);
+    const link_name = stripExeSuffix(link_name_raw);
+    if (link_name.len == 0) {
+        try err_w.print("error: derived link name is empty for '{s}'\n", .{wsl_path});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+
+    var name_lower_buf: [128]u8 = undefined;
+    if (link_name.len > name_lower_buf.len) {
+        try err_w.print("error: derived link name '{s}' exceeds 128 bytes\n", .{link_name});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+    for (link_name, 0..) |c, i| name_lower_buf[i] = std.ascii.toLower(c);
+    const name_lower = name_lower_buf[0..link_name.len];
+
+    const d = try Dirs.detect(allocator, environ);
+    defer d.deinit();
+    install.ensureDirAbsoluteRecursive(io, d.bin);
+    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
+        try err_w.print("error: failed to open bin directory '{s}': {t}\n", .{ d.bin, err });
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+    defer bin_dir.close(io);
+
+    // Load any prior bare-exec manifest so we can recognise our own
+    // symlink and avoid adopting a foreign one with the same target.
+    const manifest_abs = try bareExeManifestPath(allocator, environ, name_lower);
+    defer allocator.free(manifest_abs);
+    var prior_parsed = readManifest(allocator, io, manifest_abs) catch |err| switch (err) {
+        error.InvalidManifest => blk: {
+            try err_w.print("warning: ignoring corrupt manifest at {s}\n", .{manifest_abs});
+            break :blk null;
+        },
+        else => return err,
+    };
+    defer if (prior_parsed) |*p| p.deinit();
+    const prior_links: []const LinkEntry = if (prior_parsed) |p| p.value.links else &.{};
+
+    const desired = DesiredLink{ .name = link_name, .target = wsl_path };
+
+    // Distinct from the owner/repo path: an existing symlink whose target
+    // already matches the desired path is *only* treated as ours if it is
+    // recorded in our prior manifest. Otherwise we'd silently adopt a
+    // link installed by something else (or by the owner/repo flow under
+    // a different repo) and later clobber it on unlink.
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (bin_dir.readLink(io, desired.name, &link_buf)) |n| {
+        const current = link_buf[0..n];
+        var owned_by_us = false;
+        for (prior_links) |old| {
+            if (std.mem.eql(u8, old.name, desired.name)) {
+                owned_by_us = true;
+                break;
+            }
+        }
+        if (std.mem.eql(u8, current, desired.target) and owned_by_us) {
+            try w.print("  ok       {s} -> {s}\n", .{ desired.name, desired.target });
+            // Refresh manifest in case prior write was incomplete.
+            try writeBareExeManifest(allocator, io, environ, name_lower, desired.target, .{
+                .name = desired.name,
+                .target = desired.target,
+            });
+            return;
+        }
+        if (!owned_by_us) {
+            try err_w.print(
+                "error: {s}/{s} already exists and is not a ghr-created link; refusing to overwrite\n",
+                .{ d.bin, desired.name },
+            );
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        }
+        bin_dir.deleteFile(io, desired.name) catch {};
+        try bin_dir.symLink(io, desired.target, desired.name, .{});
+        try w.print("  updated  {s} -> {s}\n", .{ desired.name, desired.target });
+    } else |err| switch (err) {
+        error.FileNotFound => {
+            // No symlink — but could still be a regular file or directory
+            // standing in the way.
+            if (bin_dir.statFile(io, desired.name, .{})) |_| {
+                try err_w.print(
+                    "error: {s}/{s} already exists and is not a symlink; refusing to overwrite\n",
+                    .{ d.bin, desired.name },
+                );
+                try err_w.flush();
+                return LinkCmdError.LinkStepFailed;
+            } else |_| {}
+            try bin_dir.symLink(io, desired.target, desired.name, .{});
+            try w.print("  linked   {s} -> {s}\n", .{ desired.name, desired.target });
+        },
+        error.NotLink => {
+            try err_w.print(
+                "error: {s}/{s} already exists and is not a symlink; refusing to overwrite\n",
+                .{ d.bin, desired.name },
+            );
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        },
+        else => return err,
+    }
+
+    try writeBareExeManifest(allocator, io, environ, name_lower, desired.target, .{
+        .name = desired.name,
+        .target = desired.target,
+    });
+}
+
+pub fn cmdUnlinkBareExe(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    name: []const u8,
+    bin_filters: []const []const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !void {
+    requireWsl(environ, err_w, "unlink") catch return LinkCmdError.LinkStepFailed;
+
+    if (bin_filters.len > 0) {
+        try err_w.print("error: '--bin' is not supported with a bare executable name\n", .{});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+
+    if (!isValidBareExeName(name)) {
+        try err_w.print("error: invalid spec '{s}'\n", .{name});
+        try err_w.print("       expected either <owner/repo> or a bare executable name (e.g. 'git')\n", .{});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+
+    // Manifest key is the link name (basename minus `.exe`) lowercased.
+    const link_name_raw = stripExeSuffix(name);
+    var name_lower_buf: [128]u8 = undefined;
+    if (link_name_raw.len == 0 or link_name_raw.len > name_lower_buf.len) {
+        try err_w.print("error: invalid bare executable name '{s}'\n", .{name});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+    for (link_name_raw, 0..) |c, i| name_lower_buf[i] = std.ascii.toLower(c);
+    const name_lower = name_lower_buf[0..link_name_raw.len];
+
+    const manifest_abs = try bareExeManifestPath(allocator, environ, name_lower);
+    defer allocator.free(manifest_abs);
+    var parsed = readManifest(allocator, io, manifest_abs) catch |err| switch (err) {
+        error.InvalidManifest => null,
+        else => return err,
+    };
+    defer if (parsed) |*p| p.deinit();
+
+    const p = parsed orelse {
+        try err_w.print("error: no link manifest for bare executable '{s}'\n", .{name});
+        try err_w.print("       (looked at {s})\n", .{manifest_abs});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+
+    const d = try Dirs.detect(allocator, environ);
+    defer d.deinit();
+    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
+        try err_w.print("error: failed to open bin directory '{s}': {t}\n", .{ d.bin, err });
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+    defer bin_dir.close(io);
+
+    var any_kept = false;
+    for (p.value.links) |entry| {
+        const outcome = removeOwnedLink(io, bin_dir, entry) catch |err| {
+            try err_w.print("warning: failed to unlink {s}: {t}\n", .{ entry.name, err });
+            any_kept = true;
+            continue;
+        };
+        switch (outcome) {
+            .removed => try w.print("  unlinked {s}\n", .{entry.name}),
+            .missing => try w.print("  ok       {s} (already absent)\n", .{entry.name}),
+            .target_mismatch => {
+                try err_w.print(
+                    "warning: {s}/{s} no longer points where ghr recorded it; leaving it alone\n",
+                    .{ d.bin, entry.name },
+                );
+                any_kept = true;
+            },
+        }
+    }
+
+    if (!any_kept) {
+        deleteBareExeManifest(allocator, io, environ, name_lower) catch {};
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests for the pure helpers.
 // ---------------------------------------------------------------------------
 
@@ -1325,4 +1801,134 @@ test "writeNotInstalledError: distinguishes missing tools dir from empty" {
     defer out2.deinit();
     try writeNotInstalledError(allocator, tio, &out2.writer, base, "x", "y");
     try std.testing.expect(std.mem.indexOf(u8, out2.written(), "Windows tools dir exists but is empty") != null);
+}
+
+
+test "isValidBareExeName: accepts plain names and .exe suffix" {
+    try std.testing.expect(isValidBareExeName("git"));
+    try std.testing.expect(isValidBareExeName("git.exe"));
+    try std.testing.expect(isValidBareExeName("rg"));
+    try std.testing.expect(isValidBareExeName("clang-format"));
+    try std.testing.expect(isValidBareExeName("g++"));
+    try std.testing.expect(isValidBareExeName("python3.12.exe"));
+}
+
+test "isValidBareExeName: rejects path-y, flag-y, empty, and odd inputs" {
+    try std.testing.expect(!isValidBareExeName(""));
+    try std.testing.expect(!isValidBareExeName("."));
+    try std.testing.expect(!isValidBareExeName(".."));
+    try std.testing.expect(!isValidBareExeName(".git"));
+    try std.testing.expect(!isValidBareExeName("-h"));
+    try std.testing.expect(!isValidBareExeName("a/b"));
+    try std.testing.expect(!isValidBareExeName("a\\b"));
+    try std.testing.expect(!isValidBareExeName("a..b"));
+    try std.testing.expect(!isValidBareExeName("a b"));
+    try std.testing.expect(!isValidBareExeName("a*b"));
+    try std.testing.expect(!isValidBareExeName("a|b"));
+    try std.testing.expect(!isValidBareExeName("a;b"));
+    try std.testing.expect(!isValidBareExeName("C:foo"));
+    // 65 chars exceeds the cap
+    const long = "a" ** 65;
+    try std.testing.expect(!isValidBareExeName(long));
+}
+
+test "parseFirstWherePath: returns the first non-blank line trimmed" {
+    try std.testing.expectEqualStrings(
+        "C:\\Program Files\\Git\\cmd\\git.exe",
+        parseFirstWherePath("C:\\Program Files\\Git\\cmd\\git.exe\r\nC:\\foo\\git.exe\r\n").?,
+    );
+    try std.testing.expectEqualStrings(
+        "C:\\only.exe",
+        parseFirstWherePath("\r\n  C:\\only.exe  \r\n").?,
+    );
+    try std.testing.expect(parseFirstWherePath("") == null);
+    try std.testing.expect(parseFirstWherePath("\r\n\r\n   \r\n") == null);
+}
+
+test "looksLikeMntDrvfsPath: accepts drvfs and rejects others" {
+    try std.testing.expect(looksLikeMntDrvfsPath("/mnt/c/Program Files/Git/cmd/git.exe"));
+    try std.testing.expect(looksLikeMntDrvfsPath("/mnt/d/foo.exe"));
+    try std.testing.expect(!looksLikeMntDrvfsPath("/mnt/wsl/foo.exe"));
+    try std.testing.expect(!looksLikeMntDrvfsPath("/mnt//foo.exe"));
+    try std.testing.expect(!looksLikeMntDrvfsPath("/mnt/"));
+    try std.testing.expect(!looksLikeMntDrvfsPath("/mnt"));
+    try std.testing.expect(!looksLikeMntDrvfsPath(""));
+    try std.testing.expect(!looksLikeMntDrvfsPath("//wsl$/Ubuntu/usr/bin/foo.exe"));
+    try std.testing.expect(!looksLikeMntDrvfsPath("/usr/bin/foo.exe"));
+}
+
+test "ensureExeSuffix: appends .exe only when absent (case-insensitive)" {
+    const a = std.testing.allocator;
+    const s1 = try ensureExeSuffix(a, "git");
+    defer a.free(s1);
+    try std.testing.expectEqualStrings("git.exe", s1);
+
+    const s2 = try ensureExeSuffix(a, "git.exe");
+    defer a.free(s2);
+    try std.testing.expectEqualStrings("git.exe", s2);
+
+    const s3 = try ensureExeSuffix(a, "git.EXE");
+    defer a.free(s3);
+    try std.testing.expectEqualStrings("git.EXE", s3);
+}
+
+test "stripExeSuffix: drops trailing .exe case-insensitively" {
+    try std.testing.expectEqualStrings("git", stripExeSuffix("git.exe"));
+    try std.testing.expectEqualStrings("git", stripExeSuffix("git.EXE"));
+    try std.testing.expectEqualStrings("git", stripExeSuffix("git.Exe"));
+    try std.testing.expectEqualStrings("git", stripExeSuffix("git"));
+    // length guard: ".exe" alone is not stripped because there'd be no stem
+    try std.testing.expectEqualStrings(".exe", stripExeSuffix(".exe"));
+}
+
+test "bareExeManifestPath: builds the by-path/<name>.json under links root" {
+    const allocator = std.testing.allocator;
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", "/home/u/.local/share");
+
+    const p = try bareExeManifestPath(allocator, &env, "git");
+    defer allocator.free(p);
+    // Path separator differs between Linux and the test host; check shape
+    // by sentinel substrings rather than exact equality.
+    try std.testing.expect(std.mem.indexOf(u8, p, "ghr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "links") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p, "by-path") != null);
+    try std.testing.expect(std.mem.endsWith(u8, p, "git.json"));
+}
+
+test "writeBareExeManifest then readManifest round-trip" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+
+    try writeBareExeManifest(allocator, tio, &env, "git", "/mnt/c/Program Files/Git/cmd/git.exe", .{
+        .name = "git",
+        .target = "/mnt/c/Program Files/Git/cmd/git.exe",
+    });
+
+    const final_abs = try bareExeManifestPath(allocator, &env, "git");
+    defer allocator.free(final_abs);
+    const parsed = (try readManifest(allocator, tio, final_abs)) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("wsl-path", parsed.value.kind);
+    try std.testing.expectEqualStrings("/mnt/c/Program Files/Git/cmd/git.exe", parsed.value.source);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.links.len);
+    try std.testing.expectEqualStrings("git", parsed.value.links[0].name);
+    try std.testing.expectEqualStrings(
+        "/mnt/c/Program Files/Git/cmd/git.exe",
+        parsed.value.links[0].target,
+    );
 }

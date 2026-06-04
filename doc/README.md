@@ -309,6 +309,10 @@ ghr link cataggar/microsoft-authentication-cli --bin azureauth
 
 # Remove the symlinks again (does not touch the Windows install).
 ghr unlink cataggar/microsoft-authentication-cli
+
+# Link an executable already on the Windows %PATH% (no install needed).
+ghr link git
+ghr unlink git
 ```
 
 Notes:
@@ -317,6 +321,15 @@ Notes:
 - The symlink target is the real `.exe` under `<tools>/<owner>/<repo>/`, not the Windows shim. A `C:\…` target would not trigger interop; the WSL path is required.
 - Both commands require `WSL_INTEROP` to be set. They refuse to run outside WSL so you don't accidentally create dangling links on bare Linux or macOS.
 - The owner/repo path is case-canonicalized to lowercase. `ghr link AzureAD/foo` and `ghr link azuread/foo` are equivalent regardless of how the install was created on Windows.
+
+### Bare executable form
+
+A spec without a `/` (e.g. `ghr link git`) is treated as a bare Windows-PATH executable name. ghr resolves `<name>.exe` via `where.exe`, converts the result with `wslpath -u`, and creates a single symlink in ghr's bin directory pointing at it. This is the easiest way to expose any Windows-installed tool inside WSL without reinstalling it.
+
+- Only `.exe` matches are accepted — `.cmd`/`.bat`/`.ps1` shims do not work through WSL interop because the kernel only direct-executes PE images.
+- The resolved path must live under `/mnt/<letter>/` (drvfs); UNC and `/mnt/wsl/` paths are rejected.
+- `--bin` is not supported with the bare form (there is exactly one bin to link).
+- `ghr unlink <name>` removes the symlink created by `ghr link <name>`.
 
 ### Locating the Windows tools dir
 
@@ -328,7 +341,7 @@ Notes:
 
 ### Per-link manifest
 
-For each linked repo, ghr records what it created at `$XDG_DATA_HOME/ghr/links/<owner>/<repo>.json` (or `~/.local/share/ghr/links/...`). The manifest is what `ghr unlink` consults; it verifies each live symlink still points where the manifest recorded before deleting, so a user-rewritten symlink is never clobbered.
+For each linked repo, ghr records what it created at `$XDG_DATA_HOME/ghr/links/<owner>/<repo>.json` (or `~/.local/share/ghr/links/...`). Bare-executable links live in the sibling `by-path/<name>.json` tree (with `kind = "wsl-path"`). The manifest is what `ghr unlink` consults; it verifies each live symlink still points where the manifest recorded before deleting, so a user-rewritten symlink is never clobbered.
 
 ## Uninstall
 
