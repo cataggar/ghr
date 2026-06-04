@@ -194,13 +194,13 @@ fn cmdPath(
         std.process.exit(1);
     };
 
-    if (eql(sub, "ensure")) {
+    if (eql(sub, "add") or eql(sub, "ensure")) {
         var dry_run = false;
         while (args.next()) |arg| {
             if (eql(arg, "--dry-run")) {
                 dry_run = true;
             } else {
-                try err_w.print("error: unknown flag '{s}' for 'ghr path ensure'\n", .{arg});
+                try err_w.print("error: unknown flag '{s}' for 'ghr path {s}'\n", .{ arg, sub });
                 try err_w.flush();
                 std.process.exit(1);
             }
@@ -398,7 +398,7 @@ fn printPathUsage(w: *Writer) !void {
         \\    ghr path <SUBCOMMAND> [OPTIONS]
         \\
         \\SUBCOMMANDS:
-        \\    ensure [--dry-run]   Add ghr's bin dir to your user PATH
+        \\    add [--dry-run]      Add ghr's bin dir to your user PATH
         \\    bin                  Print the bin directory
         \\    tools                Print the tool storage directory
         \\    cache                Print the cache directory
@@ -680,7 +680,7 @@ fn printUsage(w: *Writer) !void {
         \\    download <spec> [<spec> ...]         Download one or more release assets
         \\    link <owner/repo>|<name>             (WSL) Symlink Windows bins/PATH exes into ghr's bin dir
         \\    unlink <owner/repo>|<name>           (WSL) Remove ghr-created WSL symlinks
-        \\    path ensure [--dry-run]              Add ghr's bin dir to your user PATH
+        \\    path add [--dry-run]                 Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
         \\    validate <SUBCOMMAND>                Run validations against published artifacts
         \\    version                              Print version and exit

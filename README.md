@@ -15,7 +15,7 @@ ghr list                                          List installed tools
 ghr install <spec> [<pubkey>] [<spec> ...]        Install one or more tools from GitHub releases
 ghr uninstall <name>                              Remove an installed tool
 ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
-ghr path ensure [--dry-run]                       Add ghr's bin dir to your user PATH
+ghr path add [--dry-run]                          Add ghr's bin dir to your user PATH
 ghr path [bin|tools|cache]                        Show ghr directories
 ghr version                                       Print version and exit
 ghr help                                          Print this help and exit

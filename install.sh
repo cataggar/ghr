@@ -4,11 +4,14 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | GHR_VERSION=v0.3.1 sh
+#   curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | GHR_NO_PATH_ADD=1 sh
 #
 # Downloads the latest ghr release into a temp dir, then uses that
 # bootstrap binary to self-install via `ghr install cataggar/ghr <pubkey>`,
 # which re-downloads the real artifact and verifies it with the pinned
-# minisign public key. The temp dir is always removed.
+# minisign public key. After install, runs `ghr path add` to update your
+# shell rc files (skip by setting GHR_NO_PATH_ADD=1). The temp dir is
+# always removed.
 #
 # POSIX sh — no bash-isms. Safe to pipe from curl.
 
@@ -16,6 +19,7 @@ set -eu
 
 REPO="cataggar/ghr"
 MINISIGN_PUBKEY="RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0"
+NO_PATH_ADD="${GHR_NO_PATH_ADD:-}"
 
 # ---------- output helpers ----------
 setup_colors() {
@@ -171,23 +175,87 @@ do_install() {
     "$BOOTSTRAP" install "$spec" "$MINISIGN_PUBKEY"
 }
 
-post_install_hint() {
-    if ! has ghr; then
-        printf '\n'
-        warn "ghr is installed but not on your PATH"
-        warn "run:  ~/.local/bin/ghr path ensure"
-        warn "or add ~/.local/bin to PATH in your shell profile"
+# Resolve the installed ghr binary. `ghr install` (via the bootstrap)
+# places it at ~/.local/bin/ghr unless GHR_BIN_DIR is set; we mirror that
+# default here. Falls back to the bootstrap binary (still alive in $TMP
+# until the script exits) if the installed copy isn't where we expect.
+installed_ghr_path() {
+    if [ -n "${GHR_BIN_DIR:-}" ]; then
+        printf '%s/ghr' "$GHR_BIN_DIR"
+    else
+        printf '%s/.local/bin/ghr' "$HOME"
     fi
+}
+
+run_path_add() {
+    ghr_bin="$(installed_ghr_path)"
+    if [ ! -x "$ghr_bin" ] && [ -x "${BOOTSTRAP:-}" ]; then
+        ghr_bin="$BOOTSTRAP"
+    fi
+    if [ ! -x "$ghr_bin" ]; then
+        warn "skipping 'path add': $ghr_bin not found"
+        return 0
+    fi
+    info "running 'ghr path add' to update your shell PATH"
+    # `path add` is the current spelling; older ghr (<= v0.4.x) only
+    # knows `path ensure`. Fall back transparently so this script keeps
+    # working against the latest stable while v0.5+ propagates.
+    if "$ghr_bin" path add 2>/dev/null; then
+        return 0
+    fi
+    if "$ghr_bin" path ensure; then
+        return 0
+    fi
+    warn "'ghr path add' failed"
+}
+
+post_install_hint() {
+    # `path add` appends a guarded block to your shell rc files; the
+    # current shell does not re-read them. Tell the user to open a new
+    # terminal (or source the file). If the user opted out of path add,
+    # surface the manual recovery instructions instead.
+    if has ghr; then
+        return
+    fi
+    printf '\n'
+    if [ -n "$NO_PATH_ADD" ]; then
+        warn "ghr is installed but not on your PATH"
+        warn "run:  ~/.local/bin/ghr path add"
+        warn "or add ~/.local/bin to PATH in your shell profile"
+    else
+        warn "open a new terminal to pick up the updated PATH"
+    fi
+}
+
+# Parse positional flags (everything else is intentionally rejected so
+# typos surface).
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                printf 'usage: install.sh\n'
+                printf '  GHR_VERSION=vX.Y.Z   pin a specific release\n'
+                printf '  GHR_NO_PATH_ADD=1    skip the post-install path add\n'
+                exit 0
+                ;;
+            *) die "unknown argument: $1" ;;
+        esac
+        shift
+    done
 }
 
 main() {
     setup_colors
+    parse_args "$@"
     detect_http_client
     detect_os
     detect_arch
     detect_libc
     resolve_version
     do_install
+    if [ -z "$NO_PATH_ADD" ]; then
+        run_path_add
+    fi
     post_install_hint
     info "done — run 'ghr help' to get started"
 }
