@@ -1921,6 +1921,7 @@ test "stageBareExecutable copies file with executable permissions" {
 }
 
 test "findExecutables discovers executable files" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -1945,6 +1946,7 @@ test "findExecutables discovers executable files" {
 }
 
 test "findExecutables discovers nested executables" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -1999,6 +2001,7 @@ test "isMacAppBundle detects valid .app bundles" {
 }
 
 test "findExecutables only scans Contents/MacOS in .app bundles" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -2033,6 +2036,7 @@ test "findExecutables only scans Contents/MacOS in .app bundles" {
 }
 
 test "findExecutables handles .app bundle alongside regular executables" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
@@ -2088,6 +2092,7 @@ test "isLibraryDir identifies library directories" {
 }
 
 test "findExecutables skips shared libraries" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
