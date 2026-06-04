@@ -336,12 +336,13 @@ fn printLinkUsage(w: *Writer) !void {
         \\With one or more `--bin <name>` filters, only the named bins
         \\are touched; other previously-linked entries are left alone.
         \\
-        \\With a bare <name> (no `/`), resolves `<name>.exe` on the
-        \\Windows `%PATH%` via `where.exe`, converts the result with
-        \\`wslpath -u`, and creates a single symlink in ghr's bin
-        \\directory pointing at it. Only `.exe` results are accepted —
-        \\`.cmd`/`.bat`/`.ps1` shims do not work through WSL interop.
-        \\`--bin` is not supported with the bare form.
+        \\With a bare <name> (no `/`), looks up the Windows `%PATH%` via
+        \\`where.exe`, converts the result with `wslpath -u`, and creates
+        \\an entry in ghr's bin directory:
+        \\  * `.exe` / `.com` targets  → symlink (WSL interop direct-executes)
+        \\  * `.cmd` / `.bat` targets  → bash wrapper invoking cmd.exe
+        \\`.ps1` and other extensions are rejected. `--bin` is not
+        \\supported with the bare form.
         \\
         \\Requires WSL_INTEROP to be set (i.e., running in WSL).
         \\
@@ -355,6 +356,7 @@ fn printLinkUsage(w: *Writer) !void {
         \\    ghr link AzureAD/microsoft-authentication-cli
         \\    ghr link cataggar/microsoft-authentication-cli --bin azureauth
         \\    ghr link git
+        \\    ghr link az
         \\
         \\Run 'ghr link help' to show this help.
         \\

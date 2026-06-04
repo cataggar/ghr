@@ -311,8 +311,10 @@ ghr link cataggar/microsoft-authentication-cli --bin azureauth
 ghr unlink cataggar/microsoft-authentication-cli
 
 # Link an executable already on the Windows %PATH% (no install needed).
-ghr link git
+ghr link git          # → symlink to git.exe
+ghr link az           # → bash wrapper that runs az.cmd via cmd.exe
 ghr unlink git
+ghr unlink az
 ```
 
 Notes:
@@ -324,12 +326,17 @@ Notes:
 
 ### Bare executable form
 
-A spec without a `/` (e.g. `ghr link git`) is treated as a bare Windows-PATH executable name. ghr resolves `<name>.exe` via `where.exe`, converts the result with `wslpath -u`, and creates a single symlink in ghr's bin directory pointing at it. This is the easiest way to expose any Windows-installed tool inside WSL without reinstalling it.
+A spec without a `/` (e.g. `ghr link git`, `ghr link az`) is treated as a bare Windows-PATH executable name. ghr resolves it via `where.exe` (honouring `PATHEXT`), converts the result with `wslpath -u`, and writes an entry in ghr's bin directory based on the resolved file's extension:
 
-- Only `.exe` matches are accepted — `.cmd`/`.bat`/`.ps1` shims do not work through WSL interop because the kernel only direct-executes PE images.
+- `.exe` / `.com` → symlink. WSL interop direct-executes the PE image, no extra process hop.
+- `.cmd` / `.bat` → small bash wrapper that runs `cmd.exe /c '<windows-path>' "$@"` via WSL interop. This is how `ghr link az` exposes Azure CLI's `az.cmd`, for example.
+- `.ps1` (and anything else) → rejected. Running PowerShell scripts safely needs a different launcher and arg-quoting model; install `pwsh` separately if you want it.
+
+Other guardrails:
+
 - The resolved path must live under `/mnt/<letter>/` (drvfs); UNC and `/mnt/wsl/` paths are rejected.
 - `--bin` is not supported with the bare form (there is exactly one bin to link).
-- `ghr unlink <name>` removes the symlink created by `ghr link <name>`.
+- `ghr unlink <name>` removes the symlink or wrapper created by `ghr link <name>`. Wrappers are only deleted when their magic comment and embedded Windows target match what the manifest recorded, so a user-edited wrapper is left alone.
 
 ### Locating the Windows tools dir
 

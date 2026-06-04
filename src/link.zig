@@ -82,6 +82,14 @@ pub fn linkNameForBin(rel_normalized: []const u8) []const u8 {
 pub const LinkEntry = struct {
     name: []const u8,
     target: []const u8,
+    /// How the bin-dir entry was created. `"symlink"` (default) means
+    /// `target` is the absolute path the symlink points at. `"script"`
+    /// means we wrote a bash wrapper file at this name and `target` is
+    /// the literal Windows path the wrapper exec's via cmd.exe.
+    ///
+    /// Optional in the JSON so existing manifests (owner/repo flow,
+    /// pre-existing bare-exec entries) keep parsing as `"symlink"`.
+    target_kind: []const u8 = "symlink",
 };
 
 pub const Manifest = struct {
@@ -343,6 +351,23 @@ fn queryAppDataViaCmd(allocator: std.mem.Allocator, io: Io) ![]u8 {
 fn wslpathToUnix(allocator: std.mem.Allocator, io: Io, win_path: []const u8) ![]u8 {
     const r = try std.process.run(allocator, io, .{
         .argv = &.{ "wslpath", "-u", win_path },
+        .stdout_limit = Io.Limit.limited(4096),
+        .stderr_limit = Io.Limit.limited(4096),
+    });
+    defer allocator.free(r.stderr);
+    defer allocator.free(r.stdout);
+    if (r.term != .exited or r.term.exited != 0) return error.WslpathFailed;
+    const trimmed = std.mem.trim(u8, r.stdout, &[_]u8{ ' ', '\t', '\r', '\n' });
+    if (trimmed.len == 0) return error.WslpathFailed;
+    return allocator.dupe(u8, trimmed);
+}
+
+/// Convert a WSL `/mnt/<drive>/...` path back to the Windows form
+/// (`C:\...`) via `wslpath -w`. Used when composing wrapper scripts
+/// that hand the path to `cmd.exe /c`.
+fn wslpathToWindows(allocator: std.mem.Allocator, io: Io, wsl_path: []const u8) ![]u8 {
+    const r = try std.process.run(allocator, io, .{
+        .argv = &.{ "wslpath", "-w", wsl_path },
         .stdout_limit = Io.Limit.limited(4096),
         .stderr_limit = Io.Limit.limited(4096),
     });
@@ -1036,22 +1061,34 @@ pub fn isValidBareExeName(name: []const u8) bool {
     return true;
 }
 
-/// Append `.exe` to `name` if not already present (case-insensitive).
-/// Returned slice is owned by `allocator`.
-fn ensureExeSuffix(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    if (name.len >= 4) {
-        const tail = name[name.len - 4 ..];
-        if (std.ascii.eqlIgnoreCase(tail, ".exe")) return allocator.dupe(u8, name);
-    }
-    return std.fmt.allocPrint(allocator, "{s}.exe", .{name});
+/// Recognised resolvable extension for `ghr link <name>`. `.exe` is
+/// linked via a symlink (WSL interop direct-executes the PE image).
+/// `.cmd` and `.bat` require a bash wrapper that routes through
+/// `cmd.exe`, because neither WSL interop nor `CreateProcessW` can
+/// execute them directly. `.com` is treated like `.exe` (it's a PE).
+const TargetKind = enum { exe, script };
+
+/// Classify a resolved Windows-PATH path by its file extension.
+/// Returns `null` for extensions we will not handle.
+fn classifyTarget(path: []const u8) ?TargetKind {
+    if (std.ascii.endsWithIgnoreCase(path, ".exe")) return .exe;
+    if (std.ascii.endsWithIgnoreCase(path, ".com")) return .exe;
+    if (std.ascii.endsWithIgnoreCase(path, ".cmd")) return .script;
+    if (std.ascii.endsWithIgnoreCase(path, ".bat")) return .script;
+    return null;
 }
 
-/// Drop a single trailing `.exe` (case-insensitive). Returns the original
-/// slice if no `.exe` suffix is present. Borrows from the input.
-fn stripExeSuffix(name: []const u8) []const u8 {
-    if (name.len > 4) {
-        const tail = name[name.len - 4 ..];
-        if (std.ascii.eqlIgnoreCase(tail, ".exe")) return name[0 .. name.len - 4];
+/// Drop a trailing executable extension recognised by `classifyTarget`.
+/// `.exe`, `.com`, `.cmd`, `.bat` are all stripped (case-insensitive).
+/// Returns the original slice when no recognised extension is present.
+/// Borrows from the input.
+fn stripExecutableExtension(name: []const u8) []const u8 {
+    const exts = [_][]const u8{ ".exe", ".com", ".cmd", ".bat" };
+    for (exts) |ext| {
+        if (name.len > ext.len) {
+            const tail = name[name.len - ext.len ..];
+            if (std.ascii.eqlIgnoreCase(tail, ext)) return name[0 .. name.len - ext.len];
+        }
     }
     return name;
 }
@@ -1066,6 +1103,50 @@ pub fn parseFirstWherePath(stdout: []const u8) ?[]const u8 {
         if (trimmed.len == 0) continue;
         return trimmed;
     }
+    return null;
+}
+
+/// Pick the most appropriate path from `where.exe` output.
+///
+/// `where.exe <name>` lists every match in the current directory and on
+/// `%PATH%`, including extensionless siblings of dispatchable files
+/// (e.g. `wbin/az` is listed alongside `wbin/az.cmd`). cmd.exe itself
+/// would dispatch via `PATHEXT` order, so `az` typed at a prompt runs
+/// `az.cmd`. We mirror that by preferring matches whose extension is
+/// in our supported set, ranked `.com > .exe > .cmd > .bat`. Within
+/// the same rank, the earlier line wins (preserving `%PATH%`
+/// precedence).
+///
+/// Falls back to the first non-blank line so callers can still report
+/// a precise "unsupported extension" error for genuinely unrecognised
+/// targets (e.g. `.ps1`).
+pub fn pickBestWherePath(stdout: []const u8) ?[]const u8 {
+    var fallback: ?[]const u8 = null;
+    var best: ?[]const u8 = null;
+    var best_rank: u8 = 255;
+    var it = std.mem.tokenizeAny(u8, stdout, "\r\n");
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, &[_]u8{ ' ', '\t' });
+        if (trimmed.len == 0) continue;
+        if (fallback == null) fallback = trimmed;
+        const rank = extensionRank(trimmed) orelse continue;
+        if (rank < best_rank) {
+            best = trimmed;
+            best_rank = rank;
+        }
+    }
+    return best orelse fallback;
+}
+
+/// Numeric rank for an extension recognised by `classifyTarget`. Lower
+/// is preferred. Mirrors the default `PATHEXT` order so a dispatchable
+/// file beats an extensionless sibling when both appear in the same
+/// directory.
+fn extensionRank(p: []const u8) ?u8 {
+    if (std.ascii.endsWithIgnoreCase(p, ".com")) return 0;
+    if (std.ascii.endsWithIgnoreCase(p, ".exe")) return 1;
+    if (std.ascii.endsWithIgnoreCase(p, ".cmd")) return 2;
+    if (std.ascii.endsWithIgnoreCase(p, ".bat")) return 3;
     return null;
 }
 
@@ -1140,6 +1221,8 @@ fn writeBareExeManifest(
         try writeJsonEscaped(w, entry.name);
         try w.print("\",\"target\":\"", .{});
         try writeJsonEscaped(w, entry.target);
+        try w.print("\",\"target_kind\":\"", .{});
+        try writeJsonEscaped(w, entry.target_kind);
         try w.print("\"}}]}}\n", .{});
         try fw.end();
     }
@@ -1180,11 +1263,75 @@ fn runWhereExe(allocator: std.mem.Allocator, io: Io, query: []const u8) ![]u8 {
         allocator.free(r.stdout);
         return error.NotFound;
     }
-    if (parseFirstWherePath(r.stdout) == null) {
+    if (pickBestWherePath(r.stdout) == null) {
         allocator.free(r.stdout);
         return error.NotFound;
     }
     return r.stdout;
+}
+
+// Magic comment that marks a bash wrapper script as created by ghr.
+// Used at unlink time so we never delete a file the user wrote themselves.
+const WRAPPER_MAGIC = "# ghr-link wrapper";
+
+/// Build the bash wrapper script bytes for a `.cmd`/`.bat` target. The
+/// returned slice is owned by `allocator`.
+///
+/// The wrapper invokes `cmd.exe /c '<win_path>' "$@"` via WSL interop.
+/// `cmd.exe` is referenced by absolute drvfs path so the wrapper works
+/// regardless of the user's `$PATH`. The Windows target path is single-
+/// quoted in bash with the `'\''` escape pattern so spaces and `&`
+/// characters in path components (e.g. `Program Files`) cannot break
+/// argument parsing.
+pub fn buildWrapperScript(
+    allocator: std.mem.Allocator,
+    link_name: []const u8,
+    win_path: []const u8,
+) ![]u8 {
+    var w = std.Io.Writer.Allocating.init(allocator);
+    errdefer w.deinit();
+    try w.writer.print(
+        "#!/usr/bin/env bash\n" ++
+            WRAPPER_MAGIC ++ " for {s}\n" ++
+            "# Created by 'ghr link {s}'. Edit at your own risk; 'ghr unlink {s}'\n" ++
+            "# refuses to remove a wrapper whose contents have been changed.\n" ++
+            "exec '/mnt/c/Windows/System32/cmd.exe' /c '",
+        .{ link_name, link_name, link_name },
+    );
+    // Escape single quotes in the Windows path so the bash single-quoted
+    // string above stays well-formed: ' -> '\''
+    for (win_path) |c| {
+        if (c == '\'') {
+            try w.writer.print("'\\''", .{});
+        } else {
+            try w.writer.print("{c}", .{c});
+        }
+    }
+    try w.writer.print("' \"$@\"\n", .{});
+    return w.toOwnedSlice();
+}
+
+/// Verify that `bytes` is a wrapper script we created, by checking for
+/// the magic comment AND the literal `'<expected_win_path>'` argument
+/// to cmd.exe. Returns false on any mismatch — at which point unlink
+/// leaves the file alone instead of clobbering user edits.
+pub fn wrapperMatches(allocator: std.mem.Allocator, bytes: []const u8, expected_win_path: []const u8) !bool {
+    if (std.mem.indexOf(u8, bytes, WRAPPER_MAGIC) == null) return false;
+    // The Windows path appears inside `cmd.exe /c '...'` with single
+    // quotes escaped as '\''. Re-encode the expected path the same way
+    // and check the wrapped form appears literally.
+    var quoted = std.ArrayListUnmanaged(u8).empty;
+    defer quoted.deinit(allocator);
+    try quoted.append(allocator, '\'');
+    for (expected_win_path) |c| {
+        if (c == '\'') {
+            try quoted.appendSlice(allocator, "'\\''");
+        } else {
+            try quoted.append(allocator, c);
+        }
+    }
+    try quoted.append(allocator, '\'');
+    return std.mem.indexOf(u8, bytes, quoted.items) != null;
 }
 
 pub fn cmdLinkBareExe(
@@ -1213,13 +1360,14 @@ pub fn cmdLinkBareExe(
         return LinkCmdError.LinkStepFailed;
     }
 
-    const query = try ensureExeSuffix(allocator, name);
-    defer allocator.free(query);
-
-    const where_out = runWhereExe(allocator, io, query) catch |err| switch (err) {
+    // Pass the user-supplied name as-is to where.exe so PATHEXT does its
+    // job: `where.exe az` returns `az.cmd` if that's the first match on
+    // PATH, `where.exe git` returns `git.exe`. We accept whichever
+    // extension comes back and dispatch on it below.
+    const where_out = runWhereExe(allocator, io, name) catch |err| switch (err) {
         error.NotFound => {
-            try err_w.print("error: '{s}' was not found on the Windows %PATH%\n", .{query});
-            try err_w.print("       (looked up via `where.exe {s}`)\n", .{query});
+            try err_w.print("error: '{s}' was not found on the Windows %PATH%\n", .{name});
+            try err_w.print("       (looked up via `where.exe {s}`)\n", .{name});
             try err_w.flush();
             return LinkCmdError.LinkStepFailed;
         },
@@ -1231,8 +1379,8 @@ pub fn cmdLinkBareExe(
     };
     defer allocator.free(where_out);
 
-    const win_path_raw = parseFirstWherePath(where_out) orelse {
-        try err_w.print("error: `where.exe {s}` returned no usable path\n", .{query});
+    const win_path_raw = pickBestWherePath(where_out) orelse {
+        try err_w.print("error: `where.exe {s}` returned no usable path\n", .{name});
         try err_w.flush();
         return LinkCmdError.LinkStepFailed;
     };
@@ -1254,23 +1402,26 @@ pub fn cmdLinkBareExe(
             "error: resolved path '{s}' is not under /mnt/<drive>/ (drvfs); refusing to link\n",
             .{wsl_path},
         );
-        try err_w.print("       WSL interop only runs Windows .exe files reached via /mnt/<letter>/\n", .{});
+        try err_w.print("       WSL interop only runs Windows executables reached via /mnt/<letter>/\n", .{});
         try err_w.flush();
         return LinkCmdError.LinkStepFailed;
     }
 
-    // Enforce that the target is a real `.exe`. WSL interop only
-    // direct-executes `.exe`; `.bat` / `.cmd` / `.ps1` shims would dangle
-    // when invoked through the symlink.
-    if (!std.ascii.endsWithIgnoreCase(wsl_path, ".exe")) {
+    // Dispatch on the resolved extension. `.exe`/`.com` get a direct
+    // symlink (WSL interop direct-executes the PE image). `.cmd`/`.bat`
+    // get a bash wrapper that routes through `cmd.exe`, because neither
+    // WSL interop nor `CreateProcessW` can run them directly. Everything
+    // else (notably `.ps1`) is rejected; running PowerShell scripts
+    // properly requires a different launcher and quoting model.
+    const kind = classifyTarget(wsl_path) orelse {
         try err_w.print(
-            "error: resolved path '{s}' is not a .exe; refusing to link\n",
+            "error: resolved path '{s}' has an unsupported extension\n",
             .{wsl_path},
         );
-        try err_w.print("       (WSL interop only direct-executes .exe — .bat/.cmd/.ps1 shims will not work via symlink)\n", .{});
+        try err_w.print("       supported: .exe, .com (symlink), .cmd, .bat (bash wrapper via cmd.exe)\n", .{});
         try err_w.flush();
         return LinkCmdError.LinkStepFailed;
-    }
+    };
 
     Dir.accessAbsolute(io, wsl_path, .{}) catch |err| {
         try err_w.print(
@@ -1282,7 +1433,7 @@ pub fn cmdLinkBareExe(
     };
 
     const link_name_raw = std.fs.path.basenamePosix(wsl_path);
-    const link_name = stripExeSuffix(link_name_raw);
+    const link_name = stripExecutableExtension(link_name_raw);
     if (link_name.len == 0) {
         try err_w.print("error: derived link name is empty for '{s}'\n", .{wsl_path});
         try err_w.flush();
@@ -1309,7 +1460,7 @@ pub fn cmdLinkBareExe(
     defer bin_dir.close(io);
 
     // Load any prior bare-exec manifest so we can recognise our own
-    // symlink and avoid adopting a foreign one with the same target.
+    // entry and avoid adopting a foreign one with the same target.
     const manifest_abs = try bareExeManifestPath(allocator, environ, name_lower);
     defer allocator.free(manifest_abs);
     var prior_parsed = readManifest(allocator, io, manifest_abs) catch |err| switch (err) {
@@ -1322,73 +1473,233 @@ pub fn cmdLinkBareExe(
     defer if (prior_parsed) |*p| p.deinit();
     const prior_links: []const LinkEntry = if (prior_parsed) |p| p.value.links else &.{};
 
-    const desired = DesiredLink{ .name = link_name, .target = wsl_path };
-
-    // Distinct from the owner/repo path: an existing symlink whose target
-    // already matches the desired path is *only* treated as ours if it is
-    // recorded in our prior manifest. Otherwise we'd silently adopt a
-    // link installed by something else (or by the owner/repo flow under
-    // a different repo) and later clobber it on unlink.
-    var link_buf: [Dir.max_path_bytes]u8 = undefined;
-    if (bin_dir.readLink(io, desired.name, &link_buf)) |n| {
-        const current = link_buf[0..n];
-        var owned_by_us = false;
-        for (prior_links) |old| {
-            if (std.mem.eql(u8, old.name, desired.name)) {
-                owned_by_us = true;
-                break;
-            }
+    // Look up whether the prior manifest already records this name, so
+    // we can distinguish "ghr is updating its own entry" from "something
+    // else owns this name; bail out".
+    var prior_owned: ?LinkEntry = null;
+    for (prior_links) |old| {
+        if (std.mem.eql(u8, old.name, link_name)) {
+            prior_owned = old;
+            break;
         }
-        if (std.mem.eql(u8, current, desired.target) and owned_by_us) {
-            try w.print("  ok       {s} -> {s}\n", .{ desired.name, desired.target });
-            // Refresh manifest in case prior write was incomplete.
-            try writeBareExeManifest(allocator, io, environ, name_lower, desired.target, .{
-                .name = desired.name,
-                .target = desired.target,
-            });
+    }
+
+    switch (kind) {
+        .exe => try installSymlinkEntry(io, bin_dir, d.bin, link_name, wsl_path, prior_owned, w, err_w),
+        .script => try installWrapperEntry(allocator, io, bin_dir, d.bin, link_name, wsl_path, win_path, prior_owned, w, err_w),
+    }
+
+    // Persist the manifest with the (possibly updated) target + kind.
+    const target_for_manifest = switch (kind) {
+        .exe => wsl_path,
+        // For wrapper scripts, store the Windows path so unlink can
+        // re-derive the literal embedded in the wrapper without
+        // shelling out to wslpath at teardown time.
+        .script => win_path,
+    };
+    const kind_str: []const u8 = switch (kind) {
+        .exe => "symlink",
+        .script => "script",
+    };
+    try writeBareExeManifest(allocator, io, environ, name_lower, wsl_path, .{
+        .name = link_name,
+        .target = target_for_manifest,
+        .target_kind = kind_str,
+    });
+}
+
+/// Create or refresh a symlink entry. Factored out of `cmdLinkBareExe`
+/// so the `.exe` and `.cmd` branches each stay readable. The
+/// already-loaded prior manifest entry (if any) is consulted to decide
+/// adopt-vs-overwrite-vs-conflict.
+fn installSymlinkEntry(
+    io: Io,
+    bin_dir: Dir,
+    bin_dir_str: []const u8,
+    link_name: []const u8,
+    wsl_path: []const u8,
+    prior_owned: ?LinkEntry,
+    w: *Writer,
+    err_w: *Writer,
+) !void {
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (bin_dir.readLink(io, link_name, &link_buf)) |n| {
+        const current = link_buf[0..n];
+        const owned_by_us = prior_owned != null;
+        if (std.mem.eql(u8, current, wsl_path) and owned_by_us) {
+            try w.print("  ok       {s} -> {s}\n", .{ link_name, wsl_path });
             return;
         }
         if (!owned_by_us) {
             try err_w.print(
                 "error: {s}/{s} already exists and is not a ghr-created link; refusing to overwrite\n",
-                .{ d.bin, desired.name },
+                .{ bin_dir_str, link_name },
             );
             try err_w.flush();
             return LinkCmdError.LinkStepFailed;
         }
-        bin_dir.deleteFile(io, desired.name) catch {};
-        try bin_dir.symLink(io, desired.target, desired.name, .{});
-        try w.print("  updated  {s} -> {s}\n", .{ desired.name, desired.target });
+        bin_dir.deleteFile(io, link_name) catch {};
+        try bin_dir.symLink(io, wsl_path, link_name, .{});
+        try w.print("  updated  {s} -> {s}\n", .{ link_name, wsl_path });
     } else |err| switch (err) {
         error.FileNotFound => {
             // No symlink — but could still be a regular file or directory
-            // standing in the way.
-            if (bin_dir.statFile(io, desired.name, .{})) |_| {
+            // (e.g. an old wrapper from a prior `.cmd` link). Adopt it
+            // only when our manifest already owns this name.
+            if (bin_dir.statFile(io, link_name, .{})) |_| {
+                if (prior_owned == null) {
+                    try err_w.print(
+                        "error: {s}/{s} already exists and is not a symlink; refusing to overwrite\n",
+                        .{ bin_dir_str, link_name },
+                    );
+                    try err_w.flush();
+                    return LinkCmdError.LinkStepFailed;
+                }
+                bin_dir.deleteFile(io, link_name) catch {};
+            } else |_| {}
+            try bin_dir.symLink(io, wsl_path, link_name, .{});
+            try w.print("  linked   {s} -> {s}\n", .{ link_name, wsl_path });
+        },
+        error.NotLink => {
+            if (prior_owned == null) {
                 try err_w.print(
                     "error: {s}/{s} already exists and is not a symlink; refusing to overwrite\n",
-                    .{ d.bin, desired.name },
+                    .{ bin_dir_str, link_name },
                 );
                 try err_w.flush();
                 return LinkCmdError.LinkStepFailed;
-            } else |_| {}
-            try bin_dir.symLink(io, desired.target, desired.name, .{});
-            try w.print("  linked   {s} -> {s}\n", .{ desired.name, desired.target });
-        },
-        error.NotLink => {
-            try err_w.print(
-                "error: {s}/{s} already exists and is not a symlink; refusing to overwrite\n",
-                .{ d.bin, desired.name },
-            );
-            try err_w.flush();
-            return LinkCmdError.LinkStepFailed;
+            }
+            bin_dir.deleteFile(io, link_name) catch {};
+            try bin_dir.symLink(io, wsl_path, link_name, .{});
+            try w.print("  updated  {s} -> {s}\n", .{ link_name, wsl_path });
         },
         else => return err,
     }
+}
 
-    try writeBareExeManifest(allocator, io, environ, name_lower, desired.target, .{
-        .name = desired.name,
-        .target = desired.target,
-    });
+/// Create or refresh a bash wrapper file that routes through cmd.exe.
+/// `win_path` is the Windows-style target path embedded into the
+/// wrapper; `wsl_path` is reported in user-facing messages.
+fn installWrapperEntry(
+    allocator: std.mem.Allocator,
+    io: Io,
+    bin_dir: Dir,
+    bin_dir_str: []const u8,
+    link_name: []const u8,
+    wsl_path: []const u8,
+    win_path: []const u8,
+    prior_owned: ?LinkEntry,
+    w: *Writer,
+    err_w: *Writer,
+) !void {
+    const new_bytes = try buildWrapperScript(allocator, link_name, win_path);
+    defer allocator.free(new_bytes);
+
+    // Inspect what's currently at `link_name`. We accept three states:
+    //   * absent             -> create
+    //   * existing symlink   -> only adopt if our manifest owns it; replace
+    //   * existing wrapper   -> if magic+target match -> "ok"
+    //                            elif owned by us       -> "updated"
+    //                            else                   -> conflict
+    //   * unrelated file     -> conflict
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const link_outcome = bin_dir.readLink(io, link_name, &link_buf);
+    if (link_outcome) |_| {
+        if (prior_owned == null) {
+            try err_w.print(
+                "error: {s}/{s} already exists as a symlink and is not a ghr-created entry; refusing to overwrite\n",
+                .{ bin_dir_str, link_name },
+            );
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        }
+        bin_dir.deleteFile(io, link_name) catch {};
+        try writeWrapperFile(io, bin_dir, link_name, new_bytes);
+        try w.print("  updated  {s} -> {s} (via cmd.exe)\n", .{ link_name, wsl_path });
+        return;
+    } else |readlink_err| switch (readlink_err) {
+        error.FileNotFound => {
+            // Nothing in the way (no symlink AND no regular file).
+            if (bin_dir.statFile(io, link_name, .{})) |_| {
+                // The stat surfaced something: it's a regular file or
+                // directory. Fall through to the existing-file branch.
+            } else |_| {
+                try writeWrapperFile(io, bin_dir, link_name, new_bytes);
+                try w.print("  linked   {s} -> {s} (via cmd.exe)\n", .{ link_name, wsl_path });
+                return;
+            }
+        },
+        error.NotLink => {}, // existing regular file; handled below
+        else => return readlink_err,
+    }
+
+    // Existing regular file path: read it and decide based on contents.
+    const existing = readFileBytes(allocator, io, bin_dir, link_name, 64 * 1024) catch |err| {
+        try err_w.print("warning: failed to read existing {s}/{s}: {t}\n", .{ bin_dir_str, link_name, err });
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+    defer allocator.free(existing);
+
+    if (std.mem.eql(u8, existing, new_bytes)) {
+        try w.print("  ok       {s} -> {s} (via cmd.exe)\n", .{ link_name, wsl_path });
+        return;
+    }
+
+    const looks_like_ours = std.mem.indexOf(u8, existing, WRAPPER_MAGIC) != null;
+    if (prior_owned != null or looks_like_ours) {
+        bin_dir.deleteFile(io, link_name) catch {};
+        try writeWrapperFile(io, bin_dir, link_name, new_bytes);
+        try w.print("  updated  {s} -> {s} (via cmd.exe)\n", .{ link_name, wsl_path });
+        return;
+    }
+
+    try err_w.print(
+        "error: {s}/{s} already exists and is not a ghr-created wrapper; refusing to overwrite\n",
+        .{ bin_dir_str, link_name },
+    );
+    try err_w.flush();
+    return LinkCmdError.LinkStepFailed;
+}
+
+/// Atomically write `bytes` to `bin_dir/<name>` with the executable bit
+/// set. Goes through a `.tmp` companion + rename so a crashed writer
+/// can never leave a half-written wrapper that bash would mis-execute.
+fn writeWrapperFile(io: Io, bin_dir: Dir, name: []const u8, bytes: []const u8) !void {
+    var tmp_buf: [Dir.max_path_bytes]u8 = undefined;
+    const tmp_name = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{name}) catch return error.PathTooLong;
+    bin_dir.deleteFile(io, tmp_name) catch {};
+    {
+        var f = try bin_dir.createFile(io, tmp_name, .{ .permissions = .executable_file });
+        defer f.close(io);
+        try f.writeStreamingAll(io, bytes);
+    }
+    bin_dir.rename(tmp_name, bin_dir, name, io) catch |err| {
+        bin_dir.deleteFile(io, tmp_name) catch {};
+        return err;
+    };
+}
+
+/// Slurp a regular file into a heap-allocated buffer. Caller owns the
+/// returned slice. Refuses files larger than `max_bytes` to avoid an
+/// arbitrarily-large allocation if the user replaced our wrapper with
+/// something huge.
+fn readFileBytes(
+    allocator: std.mem.Allocator,
+    io: Io,
+    bin_dir: Dir,
+    name: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    var f = try bin_dir.openFile(io, name, .{});
+    defer f.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var reader = f.reader(io, &read_buf);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    _ = reader.interface.streamRemaining(&aw.writer) catch |err| return err;
+    if (aw.written().len > max_bytes) return error.FileTooBig;
+    return aw.toOwnedSlice();
 }
 
 pub fn cmdUnlinkBareExe(
@@ -1415,8 +1726,9 @@ pub fn cmdUnlinkBareExe(
         return LinkCmdError.LinkStepFailed;
     }
 
-    // Manifest key is the link name (basename minus `.exe`) lowercased.
-    const link_name_raw = stripExeSuffix(name);
+    // Manifest key is the link name (basename minus its executable
+    // extension) lowercased.
+    const link_name_raw = stripExecutableExtension(name);
     var name_lower_buf: [128]u8 = undefined;
     if (link_name_raw.len == 0 or link_name_raw.len > name_lower_buf.len) {
         try err_w.print("error: invalid bare executable name '{s}'\n", .{name});
@@ -1452,27 +1764,71 @@ pub fn cmdUnlinkBareExe(
 
     var any_kept = false;
     for (p.value.links) |entry| {
-        const outcome = removeOwnedLink(io, bin_dir, entry) catch |err| {
-            try err_w.print("warning: failed to unlink {s}: {t}\n", .{ entry.name, err });
-            any_kept = true;
-            continue;
-        };
-        switch (outcome) {
-            .removed => try w.print("  unlinked {s}\n", .{entry.name}),
-            .missing => try w.print("  ok       {s} (already absent)\n", .{entry.name}),
-            .target_mismatch => {
-                try err_w.print(
-                    "warning: {s}/{s} no longer points where ghr recorded it; leaving it alone\n",
-                    .{ d.bin, entry.name },
-                );
+        // Dispatch on the recorded entry kind. Older manifests omit
+        // `target_kind` and parse as "symlink", preserving the existing
+        // behaviour for owner/repo and pre-script bare-exec entries.
+        if (std.mem.eql(u8, entry.target_kind, "script")) {
+            const outcome = removeOwnedWrapper(allocator, io, bin_dir, entry) catch |err| {
+                try err_w.print("warning: failed to unlink {s}: {t}\n", .{ entry.name, err });
                 any_kept = true;
-            },
+                continue;
+            };
+            switch (outcome) {
+                .removed => try w.print("  unlinked {s}\n", .{entry.name}),
+                .missing => try w.print("  ok       {s} (already absent)\n", .{entry.name}),
+                .target_mismatch => {
+                    try err_w.print(
+                        "warning: {s}/{s} is not a ghr-created wrapper (or its target changed); leaving it alone\n",
+                        .{ d.bin, entry.name },
+                    );
+                    any_kept = true;
+                },
+            }
+        } else {
+            const outcome = removeOwnedLink(io, bin_dir, entry) catch |err| {
+                try err_w.print("warning: failed to unlink {s}: {t}\n", .{ entry.name, err });
+                any_kept = true;
+                continue;
+            };
+            switch (outcome) {
+                .removed => try w.print("  unlinked {s}\n", .{entry.name}),
+                .missing => try w.print("  ok       {s} (already absent)\n", .{entry.name}),
+                .target_mismatch => {
+                    try err_w.print(
+                        "warning: {s}/{s} no longer points where ghr recorded it; leaving it alone\n",
+                        .{ d.bin, entry.name },
+                    );
+                    any_kept = true;
+                },
+            }
         }
     }
 
     if (!any_kept) {
         deleteBareExeManifest(allocator, io, environ, name_lower) catch {};
     }
+}
+
+/// Remove a wrapper-script entry safely: read the file, verify the
+/// magic comment and embedded Windows target match what the manifest
+/// recorded, then delete. Same safety posture as `removeOwnedLink` —
+/// a user-rewritten wrapper is reported as a target_mismatch and left
+/// in place.
+fn removeOwnedWrapper(
+    allocator: std.mem.Allocator,
+    io: Io,
+    bin_dir: Dir,
+    entry: LinkEntry,
+) !RemoveOutcome {
+    const existing = readFileBytes(allocator, io, bin_dir, entry.name, 64 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    if (!try wrapperMatches(allocator, existing, entry.target)) return .target_mismatch;
+    try bin_dir.deleteFile(io, entry.name);
+    return .removed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1845,6 +2201,42 @@ test "parseFirstWherePath: returns the first non-blank line trimmed" {
     try std.testing.expect(parseFirstWherePath("\r\n\r\n   \r\n") == null);
 }
 
+test "pickBestWherePath: prefers PATHEXT-dispatchable extension over extensionless" {
+    // The exact pattern from `where.exe az` against Azure CLI: a bare
+    // `az` file is enumerated before `az.cmd` in the same directory.
+    // cmd.exe would dispatch via PATHEXT and run `az.cmd`; we mirror
+    // that here.
+    const out = "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az\r\n" ++
+        "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd\r\n";
+    try std.testing.expectEqualStrings(
+        "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd",
+        pickBestWherePath(out).?,
+    );
+}
+
+test "pickBestWherePath: prefers .exe over .cmd over .bat (PATHEXT order)" {
+    const out = "C:\\x\\foo.bat\r\nC:\\x\\foo.cmd\r\nC:\\x\\foo.exe\r\n";
+    try std.testing.expectEqualStrings("C:\\x\\foo.exe", pickBestWherePath(out).?);
+
+    const out2 = "C:\\x\\foo.bat\r\nC:\\x\\foo.cmd\r\n";
+    try std.testing.expectEqualStrings("C:\\x\\foo.cmd", pickBestWherePath(out2).?);
+}
+
+test "pickBestWherePath: PATH order wins within same extension class" {
+    const out = "C:\\first\\foo.exe\r\nC:\\second\\foo.exe\r\n";
+    try std.testing.expectEqualStrings("C:\\first\\foo.exe", pickBestWherePath(out).?);
+}
+
+test "pickBestWherePath: falls back to first line when no recognised extension" {
+    const out = "C:\\x\\script.ps1\r\nC:\\x\\other.ps1\r\n";
+    try std.testing.expectEqualStrings("C:\\x\\script.ps1", pickBestWherePath(out).?);
+}
+
+test "pickBestWherePath: returns null on empty input" {
+    try std.testing.expect(pickBestWherePath("") == null);
+    try std.testing.expect(pickBestWherePath("\r\n\r\n") == null);
+}
+
 test "looksLikeMntDrvfsPath: accepts drvfs and rejects others" {
     try std.testing.expect(looksLikeMntDrvfsPath("/mnt/c/Program Files/Git/cmd/git.exe"));
     try std.testing.expect(looksLikeMntDrvfsPath("/mnt/d/foo.exe"));
@@ -1857,28 +2249,71 @@ test "looksLikeMntDrvfsPath: accepts drvfs and rejects others" {
     try std.testing.expect(!looksLikeMntDrvfsPath("/usr/bin/foo.exe"));
 }
 
-test "ensureExeSuffix: appends .exe only when absent (case-insensitive)" {
-    const a = std.testing.allocator;
-    const s1 = try ensureExeSuffix(a, "git");
-    defer a.free(s1);
-    try std.testing.expectEqualStrings("git.exe", s1);
-
-    const s2 = try ensureExeSuffix(a, "git.exe");
-    defer a.free(s2);
-    try std.testing.expectEqualStrings("git.exe", s2);
-
-    const s3 = try ensureExeSuffix(a, "git.EXE");
-    defer a.free(s3);
-    try std.testing.expectEqualStrings("git.EXE", s3);
+test "stripExecutableExtension: drops .exe/.com/.cmd/.bat case-insensitively" {
+    try std.testing.expectEqualStrings("git", stripExecutableExtension("git.exe"));
+    try std.testing.expectEqualStrings("git", stripExecutableExtension("git.EXE"));
+    try std.testing.expectEqualStrings("git", stripExecutableExtension("git.Exe"));
+    try std.testing.expectEqualStrings("az", stripExecutableExtension("az.cmd"));
+    try std.testing.expectEqualStrings("az", stripExecutableExtension("az.CMD"));
+    try std.testing.expectEqualStrings("setup", stripExecutableExtension("setup.bat"));
+    try std.testing.expectEqualStrings("foo", stripExecutableExtension("foo.com"));
+    try std.testing.expectEqualStrings("git", stripExecutableExtension("git"));
+    // length guard: ".exe" alone is not stripped because there'd be no stem
+    try std.testing.expectEqualStrings(".exe", stripExecutableExtension(".exe"));
+    try std.testing.expectEqualStrings(".cmd", stripExecutableExtension(".cmd"));
+    // Unrelated extensions are left alone.
+    try std.testing.expectEqualStrings("readme.txt", stripExecutableExtension("readme.txt"));
+    try std.testing.expectEqualStrings("script.ps1", stripExecutableExtension("script.ps1"));
 }
 
-test "stripExeSuffix: drops trailing .exe case-insensitively" {
-    try std.testing.expectEqualStrings("git", stripExeSuffix("git.exe"));
-    try std.testing.expectEqualStrings("git", stripExeSuffix("git.EXE"));
-    try std.testing.expectEqualStrings("git", stripExeSuffix("git.Exe"));
-    try std.testing.expectEqualStrings("git", stripExeSuffix("git"));
-    // length guard: ".exe" alone is not stripped because there'd be no stem
-    try std.testing.expectEqualStrings(".exe", stripExeSuffix(".exe"));
+test "classifyTarget: maps extensions to symlink/script/null" {
+    try std.testing.expectEqual(TargetKind.exe, classifyTarget("/mnt/c/x/git.exe").?);
+    try std.testing.expectEqual(TargetKind.exe, classifyTarget("/mnt/c/x/foo.COM").?);
+    try std.testing.expectEqual(TargetKind.script, classifyTarget("/mnt/c/x/az.cmd").?);
+    try std.testing.expectEqual(TargetKind.script, classifyTarget("/mnt/c/x/setup.BAT").?);
+    try std.testing.expect(classifyTarget("/mnt/c/x/script.ps1") == null);
+    try std.testing.expect(classifyTarget("/mnt/c/x/readme.txt") == null);
+    try std.testing.expect(classifyTarget("/mnt/c/x/nonext") == null);
+}
+
+test "buildWrapperScript: includes magic, name, escaped Windows target" {
+    const a = std.testing.allocator;
+    const s = try buildWrapperScript(a, "az", "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd");
+    defer a.free(s);
+    try std.testing.expect(std.mem.startsWith(u8, s, "#!/usr/bin/env bash\n"));
+    try std.testing.expect(std.mem.indexOf(u8, s, WRAPPER_MAGIC) != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "for az\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "'/mnt/c/Windows/System32/cmd.exe' /c '") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd") != null);
+    try std.testing.expect(std.mem.endsWith(u8, s, "\"$@\"\n"));
+}
+
+test "buildWrapperScript: escapes single quotes in target" {
+    const a = std.testing.allocator;
+    const s = try buildWrapperScript(a, "weird", "C:\\Tools\\it's a path\\foo.cmd");
+    defer a.free(s);
+    // Each ' in the path becomes '\'' inside the bash single-quoted
+    // argument so the surrounding 'cmd.exe /c ...' string stays valid.
+    try std.testing.expect(std.mem.indexOf(u8, s, "C:\\Tools\\it'\\''s a path\\foo.cmd") != null);
+}
+
+test "wrapperMatches: accepts our own output, rejects strangers" {
+    const a = std.testing.allocator;
+    const win = "C:\\Program Files\\Microsoft SDKs\\Azure\\CLI2\\wbin\\az.cmd";
+    const s = try buildWrapperScript(a, "az", win);
+    defer a.free(s);
+    try std.testing.expect(try wrapperMatches(a, s, win));
+    try std.testing.expect(!try wrapperMatches(a, s, "C:\\Wrong\\az.cmd"));
+    try std.testing.expect(!try wrapperMatches(a, "#!/bin/sh\necho hi\n", win));
+    try std.testing.expect(!try wrapperMatches(a, "", win));
+}
+
+test "wrapperMatches: round-trips through single-quote escaping" {
+    const a = std.testing.allocator;
+    const win = "C:\\Tools\\it's a path\\foo.cmd";
+    const s = try buildWrapperScript(a, "weird", win);
+    defer a.free(s);
+    try std.testing.expect(try wrapperMatches(a, s, win));
 }
 
 test "bareExeManifestPath: builds the by-path/<name>.json under links root" {
@@ -1897,7 +2332,7 @@ test "bareExeManifestPath: builds the by-path/<name>.json under links root" {
     try std.testing.expect(std.mem.endsWith(u8, p, "git.json"));
 }
 
-test "writeBareExeManifest then readManifest round-trip" {
+test "writeBareExeManifest then readManifest round-trip (symlink kind)" {
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1914,6 +2349,7 @@ test "writeBareExeManifest then readManifest round-trip" {
     try writeBareExeManifest(allocator, tio, &env, "git", "/mnt/c/Program Files/Git/cmd/git.exe", .{
         .name = "git",
         .target = "/mnt/c/Program Files/Git/cmd/git.exe",
+        .target_kind = "symlink",
     });
 
     const final_abs = try bareExeManifestPath(allocator, &env, "git");
@@ -1931,4 +2367,5 @@ test "writeBareExeManifest then readManifest round-trip" {
         "/mnt/c/Program Files/Git/cmd/git.exe",
         parsed.value.links[0].target,
     );
+    try std.testing.expectEqualStrings("symlink", parsed.value.links[0].target_kind);
 }
