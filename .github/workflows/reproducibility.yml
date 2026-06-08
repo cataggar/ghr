@@ -120,7 +120,7 @@ jobs:
           ( cd rebuilt && python3 ../scripts/pack.py "$PKGNAME" "$PKGNAME.tar.gz" )
           echo "PKGNAME=$PKGNAME" >> "$GITHUB_ENV"
 
-      - name: Download published archive + sha256
+      - name: Download published archive
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -130,29 +130,45 @@ jobs:
           cd published
           gh release download "${{ needs.resolve-tag.outputs.tag }}" \
             --repo "${{ github.repository }}" \
-            --pattern "${PKGNAME}.tar.gz" \
-            --pattern "${PKGNAME}.tar.gz.sha256"
+            --pattern "${PKGNAME}.tar.gz"
           ls -la
 
-      - name: Verify published sha256 matches its archive
+      - name: Verify GitHub asset digest matches downloaded archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          cd published
-          # The sidecar holds the published hash; this just confirms the
-          # downloaded archive matches what GitHub served alongside it.
-          if command -v sha256sum >/dev/null; then
-            sha256sum -c "${PKGNAME}.tar.gz.sha256"
-          else
-            shasum -a 256 -c "${PKGNAME}.tar.gz.sha256"
+          # GitHub computes a SHA-256 digest for every release asset and
+          # exposes it inline in the release JSON (added 2025-06-03). It
+          # replaces the old `.sha256` sidecar ghr no longer publishes.
+          # Fetch it and confirm the bytes we downloaded match what GitHub
+          # recorded.
+          DIGEST=$(gh api "repos/${{ github.repository }}/releases/tags/${{ needs.resolve-tag.outputs.tag }}" \
+            --jq ".assets[] | select(.name==\"${PKGNAME}.tar.gz\") | .digest")
+          if [[ -z "$DIGEST" || "$DIGEST" != sha256:* ]]; then
+            echo "::error::No sha256 digest published for ${PKGNAME}.tar.gz (got '$DIGEST')"
+            exit 1
           fi
+          PUB="${DIGEST#sha256:}"
+          if command -v sha256sum >/dev/null; then
+            GOT=$(sha256sum "published/${PKGNAME}.tar.gz" | awk '{print $1}')
+          else
+            GOT=$(shasum -a 256 "published/${PKGNAME}.tar.gz" | awk '{print $1}')
+          fi
+          if [[ "$GOT" != "$PUB" ]]; then
+            echo "::error::Downloaded archive does not match GitHub digest: github=$PUB got=$GOT"
+            exit 1
+          fi
+          echo "PUB_SHA256=$PUB" >> "$GITHUB_ENV"
+          echo "GitHub digest verified: $PUB"
 
       - name: Compare published vs rebuilt sha256
         id: compare
         shell: bash
         run: |
           set -euo pipefail
-          PUB=$(awk '{print $1}' "published/${PKGNAME}.tar.gz.sha256")
+          PUB="${PUB_SHA256}"
           NEW=$(awk '{print $1}' "rebuilt/${PKGNAME}.tar.gz.sha256")
           echo "published=$PUB" >> "$GITHUB_OUTPUT"
           echo "rebuilt=$NEW"   >> "$GITHUB_OUTPUT"
@@ -279,7 +295,7 @@ jobs:
           echo "PKGNAME=$PKGNAME" >> "$GITHUB_ENV"
           ls -l zig-out/bin/ghr.exe
 
-      - name: Download published .zip + .sha256
+      - name: Download published .zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -289,23 +305,36 @@ jobs:
           cd published
           gh release download "${{ needs.resolve-tag.outputs.tag }}" \
             --repo "${{ github.repository }}" \
-            --pattern "${PKGNAME}.zip" \
-            --pattern "${PKGNAME}.zip.sha256"
+            --pattern "${PKGNAME}.zip"
           ls -la
 
-      - name: Verify published sha256 matches its archive
+      - name: Verify GitHub asset digest matches downloaded .zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          cd published
-          # GitHub-served sha256 of the signed zip — we don't compare
-          # this to anything, but confirm the download is internally
-          # consistent.
-          if command -v sha256sum >/dev/null; then
-            sha256sum -c "${PKGNAME}.zip.sha256"
-          else
-            shasum -a 256 -c "${PKGNAME}.zip.sha256"
+          # GitHub's authoritative SHA-256 digest for the asset (inline in
+          # the release JSON, added 2025-06-03) replaces the old `.sha256`
+          # sidecar. Confirm the downloaded .zip is internally consistent
+          # with what GitHub recorded.
+          DIGEST=$(gh api "repos/${{ github.repository }}/releases/tags/${{ needs.resolve-tag.outputs.tag }}" \
+            --jq ".assets[] | select(.name==\"${PKGNAME}.zip\") | .digest")
+          if [[ -z "$DIGEST" || "$DIGEST" != sha256:* ]]; then
+            echo "::error::No sha256 digest published for ${PKGNAME}.zip (got '$DIGEST')"
+            exit 1
           fi
+          PUB="${DIGEST#sha256:}"
+          if command -v sha256sum >/dev/null; then
+            GOT=$(sha256sum "published/${PKGNAME}.zip" | awk '{print $1}')
+          else
+            GOT=$(shasum -a 256 "published/${PKGNAME}.zip" | awk '{print $1}')
+          fi
+          if [[ "$GOT" != "$PUB" ]]; then
+            echo "::error::Downloaded .zip does not match GitHub digest: github=$PUB got=$GOT"
+            exit 1
+          fi
+          echo "GitHub digest verified: $PUB"
 
       - name: Extract published .exe
         shell: bash

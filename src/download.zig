@@ -39,8 +39,9 @@ pub const Options = struct {
     quiet: bool = false,
     no_auth: bool = false,
     skip_verify: bool = false,
-    /// Skip just the checksum-sidecar verification step. Minisign,
-    /// sigstore, and authenticode continue to run as usual.
+    /// Skip the checksum verification step (GitHub asset digest and any
+    /// `.sha256` sidecar). Minisign, sigstore, and authenticode continue
+    /// to run as usual.
     skip_checksum: bool = false,
     /// Skip just the minisign-sidecar verification step. Bypasses the
     /// fail-closed "sidecar present but no key" diagnostic.
@@ -914,7 +915,7 @@ fn printDownloadUsage(w: *Writer) !void {
         \\        --sha256 <hex>         Verify download against literal SHA-256 digest (single-spec only)
         \\        --minisign <pubkey>    Default minisign key, applied to specs without an inline key
         \\        --skip-verify          Skip every verification step (checksum, minisign, sigstore, authenticode)
-        \\        --skip-checksum        Skip just the checksum-sidecar verification step
+        \\        --skip-checksum        Skip checksum verification (GitHub asset digest + .sha256 sidecar)
         \\        --skip-minisign        Skip just the minisign verification step
         \\        --skip-sigstore        Skip just the sigstore-bundle verification step
         \\        --skip-authenticode    Skip just the Authenticode (Windows PE) verification step

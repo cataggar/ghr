@@ -1292,37 +1292,66 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         try w.print("note: verification skipped (--skip-verify)\n", .{});
     } else {
         const sha_outcome: release_mod.VerifyOutcome = if (gates.skip_checksum) blk: {
-            try w.print("note: checksum sidecar verification skipped (--skip-checksum)\n", .{});
+            try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
             break :blk .no_verification;
-        } else verifyDownloadedAssetSha256(
-            allocator,
-            io,
-            d.cache,
-            release.parsed.value.assets,
-            asset.name,
-            download_path,
-            debug_w,
-            auth_header,
-            w,
-            err_w,
-        ) catch |verr| {
-            switch (verr) {
-                error.ChecksumMismatch,
-                error.ChecksumDownloadFailed,
-                error.ChecksumEntryMissing,
-                => {
-                    Dir.deleteFileAbsolute(io, download_path) catch {};
-                    return error.InstallStepFailed;
-                },
-                else => {
-                    try err_w.print("error: checksum verification failed: {}\n", .{verr});
-                    try err_w.flush();
-                    Dir.deleteFileAbsolute(io, download_path) catch {};
-                    return error.InstallStepFailed;
-                },
-            }
+        } else blk: {
+            // Verify GitHub's built-in asset digest (inline in the release
+            // JSON, no extra network request). Independently, if the
+            // release also publishes a `.sha256` / `SHA256SUMS` sidecar,
+            // validate that too — a published sidecar is never silently
+            // ignored. Both must pass; the sidecar drives the recorded
+            // label when present.
+            const gh_outcome = release_mod.verifyDownloadedAssetGithubDigest(
+                io,
+                release.parsed.value.assets,
+                asset.name,
+                download_path,
+                debug_w,
+                w,
+                err_w,
+            ) catch |verr| {
+                Dir.deleteFileAbsolute(io, download_path) catch {};
+                switch (verr) {
+                    error.ChecksumMismatch => return error.InstallStepFailed,
+                    else => {
+                        try err_w.print("error: checksum verification failed: {}\n", .{verr});
+                        try err_w.flush();
+                        return error.InstallStepFailed;
+                    },
+                }
+            };
+            const sidecar_outcome = verifyDownloadedAssetSha256(
+                allocator,
+                io,
+                d.cache,
+                release.parsed.value.assets,
+                asset.name,
+                download_path,
+                debug_w,
+                auth_header,
+                w,
+                err_w,
+            ) catch |verr| {
+                switch (verr) {
+                    error.ChecksumMismatch,
+                    error.ChecksumDownloadFailed,
+                    error.ChecksumEntryMissing,
+                    => {
+                        Dir.deleteFileAbsolute(io, download_path) catch {};
+                        return error.InstallStepFailed;
+                    },
+                    else => {
+                        try err_w.print("error: checksum verification failed: {}\n", .{verr});
+                        try err_w.flush();
+                        Dir.deleteFileAbsolute(io, download_path) catch {};
+                        return error.InstallStepFailed;
+                    },
+                }
+            };
+            break :blk if (sidecar_outcome == .sha256_verified) sidecar_outcome else gh_outcome;
         };
         if (sha_outcome == .sha256_verified) verified_label = "checksum";
+        if (sha_outcome == .github_digest_verified) verified_label = "github-digest";
 
         const mini_outcome: release_mod.VerifyOutcome = if (gates.skip_minisign) blk: {
             if (minisign_pubkey_b64 != null) {
