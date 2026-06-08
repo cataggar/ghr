@@ -1744,10 +1744,11 @@ pub fn verifyAssetOnDisk(
         try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
         break :blk .no_verification;
     } else blk: {
-        // Prefer GitHub's built-in asset digest: it arrives inline in the
-        // release JSON, so it costs no extra network request. Only fall
-        // back to a published `.sha256` / `SHA256SUMS` sidecar when the
-        // asset carries no digest (uploaded before 2025-06-03).
+        // Verify GitHub's built-in asset digest (inline in the release
+        // JSON, no extra network request). Independently, if the release
+        // also publishes a `.sha256` / `SHA256SUMS` sidecar, validate that
+        // too — a published sidecar is never silently ignored. Both must
+        // pass; the sidecar drives the reported outcome when present.
         const gh_outcome = try verifyDownloadedAssetGithubDigest(
             io,
             assets,
@@ -1757,8 +1758,7 @@ pub fn verifyAssetOnDisk(
             w,
             err_w,
         );
-        if (gh_outcome == .github_digest_verified) break :blk gh_outcome;
-        break :blk try verifyDownloadedAssetSha256(
+        const sidecar_outcome = try verifyDownloadedAssetSha256(
             allocator,
             io,
             cache_dir,
@@ -1770,6 +1770,7 @@ pub fn verifyAssetOnDisk(
             w,
             err_w,
         );
+        break :blk if (sidecar_outcome == .sha256_verified) sidecar_outcome else gh_outcome;
     };
 
     const mini_outcome: VerifyOutcome = if (gates.skip_minisign) blk: {

@@ -415,14 +415,16 @@ publishes:
   asset at upload time and exposes it inline in the release JSON as
   `"digest": "sha256:<hex>"` (added 2025-06-03). ghr verifies the download
   against it with **no extra network request** — the digest already
-  arrived with the release metadata — and prefers it over a `.sha256`
-  sidecar. Its trust root is GitHub itself (the same as a CI-generated
-  sidecar): it attests integrity, not independent provenance. Assets
-  uploaded before the rollout carry no digest, so ghr falls back to a
-  published checksum file.
+  arrived with the release metadata. Its trust root is GitHub itself (the
+  same as a CI-generated sidecar): it attests integrity, not independent
+  provenance. Assets uploaded before the rollout carry no digest.
 - **Checksum files** — sidecar `<asset>.sha256` files and aggregate
   `*checksums*` / `SHA256SUMS` files are both supported, in GNU and BSD
-  formats. Used only when the asset has no GitHub digest.
+  formats. When a release publishes one it is **always validated** (in
+  addition to the GitHub digest, never as a silent substitute); both must
+  match. The sidecar download is the only case that costs an extra
+  request, so releases that rely solely on the built-in digest verify for
+  free.
 - **Sigstore bundles** — `<asset>.sigstore.json` (cosign bundle v0.3) is
   verified entirely natively in Zig. The X.509 chain is walked from the
   bundle's leaf cert to embedded production Fulcio roots, the artifact's

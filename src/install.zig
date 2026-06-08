@@ -1295,10 +1295,12 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
             try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
             break :blk .no_verification;
         } else blk: {
-            // Prefer GitHub's built-in asset digest (inline in the release
-            // JSON, no extra network request); fall back to a published
-            // `.sha256` / `SHA256SUMS` sidecar only when the asset carries
-            // no digest (uploaded before 2025-06-03).
+            // Verify GitHub's built-in asset digest (inline in the release
+            // JSON, no extra network request). Independently, if the
+            // release also publishes a `.sha256` / `SHA256SUMS` sidecar,
+            // validate that too — a published sidecar is never silently
+            // ignored. Both must pass; the sidecar drives the recorded
+            // label when present.
             const gh_outcome = release_mod.verifyDownloadedAssetGithubDigest(
                 io,
                 release.parsed.value.assets,
@@ -1318,8 +1320,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
                     },
                 }
             };
-            if (gh_outcome == .github_digest_verified) break :blk gh_outcome;
-            break :blk verifyDownloadedAssetSha256(
+            const sidecar_outcome = verifyDownloadedAssetSha256(
                 allocator,
                 io,
                 d.cache,
@@ -1347,6 +1348,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
                     },
                 }
             };
+            break :blk if (sidecar_outcome == .sha256_verified) sidecar_outcome else gh_outcome;
         };
         if (sha_outcome == .sha256_verified) verified_label = "checksum";
         if (sha_outcome == .github_digest_verified) verified_label = "github-digest";
