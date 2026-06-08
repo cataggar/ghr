@@ -127,9 +127,7 @@ jobs:
           name: ${{ matrix.name }}
           path: |
             ghr-*.tar.gz
-            ghr-*.tar.gz.sha256
             ghr-*.zip
-            ghr-*.zip.sha256
 
   release:
     name: Create Release
@@ -219,10 +217,8 @@ jobs:
             ```
           files: |
             ghr-*.tar.gz
-            ghr-*.tar.gz.sha256
             ghr-*.sigstore.json
             ghr-*.minisig
             ghr-*.zip
-            ghr-*.zip.sha256
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}

@@ -309,6 +309,10 @@ pub fn classifyArg(arg: []const u8) !Classified {
 pub const Asset = struct {
     name: []const u8,
     browser_download_url: []const u8,
+    /// SHA-256 digest GitHub computes for every release asset at upload
+    /// time and exposes inline in the release JSON as `"sha256:<hex>"`
+    /// (added 2025-06-03). `null` for assets uploaded before that rollout.
+    digest: ?[]const u8 = null,
 };
 
 /// Parsed release info.
@@ -766,6 +770,12 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const VerifyOutcome = enum {
     /// A SHA256 checksum file was found and its hash matched the download.
     sha256_verified,
+    /// The asset's GitHub-published `digest` field (a SHA-256 GitHub
+    /// computes at upload time, added 2025-06-03) matched the download.
+    /// No extra network request — the digest arrives inline in the
+    /// release JSON. Same trust root as a CI-generated `.sha256` sidecar:
+    /// it attests integrity, not independent provenance.
+    github_digest_verified,
     /// A `<asset>.minisig` sidecar was found and the caller-supplied
     /// minisign public key verified both the artifact and trusted-comment
     /// signatures.
@@ -1071,7 +1081,67 @@ pub fn verifyDownloadedAssetSha256(
     return .sha256_verified;
 }
 
-/// Run Phase 2 verification (sigstore bundle) on `download_path`. Verifies
+/// Extract the 64-hex SHA-256 from an asset's GitHub `digest` field
+/// (`"sha256:<hex>"`). Returns null when the matching asset has no digest
+/// (uploaded before 2025-06-03), the algorithm isn't sha256, or the hex is
+/// malformed.
+fn lookupAssetDigest(assets: []const Asset, asset_name: []const u8) ?[]const u8 {
+    const prefix = "sha256:";
+    for (assets) |a| {
+        if (!std.mem.eql(u8, a.name, asset_name)) continue;
+        const d = a.digest orelse return null;
+        if (d.len <= prefix.len) return null;
+        if (!std.ascii.eqlIgnoreCase(d[0..prefix.len], prefix)) return null;
+        const hex = d[prefix.len..];
+        if (!isHex64(hex)) return null;
+        return hex;
+    }
+    return null;
+}
+
+/// Verify `download_path` against the SHA-256 `digest` GitHub publishes
+/// inline on the release asset (added 2025-06-03). Costs no extra network
+/// request — the digest already arrived in the release JSON. The trust root
+/// is GitHub itself (identical to a CI-generated `.sha256` sidecar): it
+/// attests integrity, not independent provenance. Returns `.no_verification`
+/// when the asset carries no usable digest. On mismatch, prints a diagnostic
+/// and returns `error.ChecksumMismatch`; the caller deletes the cached file.
+pub fn verifyDownloadedAssetGithubDigest(
+    io: Io,
+    assets: []const Asset,
+    asset_name: []const u8,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    const expected_hex = lookupAssetDigest(assets, asset_name) orelse {
+        return .no_verification;
+    };
+
+    debugLog(debug_w, "debug: github asset digest: sha256:{s}\n", .{expected_hex});
+
+    const digest = computeFileSha256(io, download_path) catch |err| {
+        try err_w.print("error: failed to hash '{s}': {}\n", .{ download_path, err });
+        try err_w.flush();
+        return err;
+    };
+    var actual_hex: [64]u8 = undefined;
+    sha256ToHex(digest, &actual_hex);
+
+    if (!hexEqIgnoreCase(expected_hex, &actual_hex)) {
+        try err_w.print(
+            "error: SHA256 mismatch for {s}\n  expected: {s}\n  actual:   {s}\n  source:   GitHub release asset digest\n",
+            .{ asset_name, expected_hex, &actual_hex },
+        );
+        try err_w.flush();
+        return error.ChecksumMismatch;
+    }
+
+    try w.print("verified github sha256 {s}... (release asset digest)\n", .{actual_hex[0..12]});
+    try w.flush();
+    return .github_digest_verified;
+}
 /// the X.509 chain to the embedded Fulcio root, the artifact ECDSA
 /// signature, and the Rekor SET. Returns `.no_verification` when no bundle
 /// asset is published. On any verification failure, prints a diagnostic and
@@ -1671,20 +1741,36 @@ pub fn verifyAssetOnDisk(
     }
 
     const sha_outcome: VerifyOutcome = if (gates.skip_checksum) blk: {
-        try w.print("note: checksum sidecar verification skipped (--skip-checksum)\n", .{});
+        try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
         break :blk .no_verification;
-    } else try verifyDownloadedAssetSha256(
-        allocator,
-        io,
-        cache_dir,
-        assets,
-        asset_name,
-        download_path,
-        debug_w,
-        auth_header,
-        w,
-        err_w,
-    );
+    } else blk: {
+        // Prefer GitHub's built-in asset digest: it arrives inline in the
+        // release JSON, so it costs no extra network request. Only fall
+        // back to a published `.sha256` / `SHA256SUMS` sidecar when the
+        // asset carries no digest (uploaded before 2025-06-03).
+        const gh_outcome = try verifyDownloadedAssetGithubDigest(
+            io,
+            assets,
+            asset_name,
+            download_path,
+            debug_w,
+            w,
+            err_w,
+        );
+        if (gh_outcome == .github_digest_verified) break :blk gh_outcome;
+        break :blk try verifyDownloadedAssetSha256(
+            allocator,
+            io,
+            cache_dir,
+            assets,
+            asset_name,
+            download_path,
+            debug_w,
+            auth_header,
+            w,
+            err_w,
+        );
+    };
 
     const mini_outcome: VerifyOutcome = if (gates.skip_minisign) blk: {
         if (minisign_pubkey_b64 != null) {
@@ -1737,6 +1823,7 @@ pub fn verifyAssetOnDisk(
     if (mini_outcome == .minisign_verified) return .minisign_verified;
     if (ac_outcome == .authenticode_verified) return .authenticode_verified;
     if (sha_outcome == .sha256_verified) return .sha256_verified;
+    if (sha_outcome == .github_digest_verified) return .github_digest_verified;
 
     try w.print("note: download is unverified (no checksum, minisign, sigstore, or authenticode)\n", .{});
     try w.flush();
@@ -2427,6 +2514,38 @@ test "findChecksumAsset returns null when only sha512 is present" {
         .{ .name = "release.sig", .browser_download_url = "" },
     };
     try std.testing.expect(findChecksumAsset(&assets, "app-linux.tar.gz") == null);
+}
+
+test "lookupAssetDigest extracts the GitHub sha256 digest" {
+    const hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const assets = [_]Asset{
+        .{ .name = "other.zip", .browser_download_url = "", .digest = "sha256:" ++ ("11" ** 32) },
+        .{ .name = "app.tar.gz", .browser_download_url = "", .digest = "sha256:" ++ hex },
+    };
+    const got = lookupAssetDigest(&assets, "app.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings(hex, got);
+    // Case-insensitive on the algorithm prefix.
+    const upper = [_]Asset{
+        .{ .name = "app.tar.gz", .browser_download_url = "", .digest = "SHA256:" ++ hex },
+    };
+    const got2 = lookupAssetDigest(&upper, "app.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings(hex, got2);
+}
+
+test "lookupAssetDigest rejects missing, malformed, and non-sha256 digests" {
+    const hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // No digest (pre-2025-06-03 asset).
+    const none = [_]Asset{.{ .name = "app.tar.gz", .browser_download_url = "" }};
+    try std.testing.expect(lookupAssetDigest(&none, "app.tar.gz") == null);
+    // Wrong algorithm.
+    const sha512 = [_]Asset{.{ .name = "app.tar.gz", .browser_download_url = "", .digest = "sha512:" ++ hex }};
+    try std.testing.expect(lookupAssetDigest(&sha512, "app.tar.gz") == null);
+    // Truncated hex.
+    const short = [_]Asset{.{ .name = "app.tar.gz", .browser_download_url = "", .digest = "sha256:dead" }};
+    try std.testing.expect(lookupAssetDigest(&short, "app.tar.gz") == null);
+    // No matching asset name.
+    const ok = [_]Asset{.{ .name = "app.tar.gz", .browser_download_url = "", .digest = "sha256:" ++ hex }};
+    try std.testing.expect(lookupAssetDigest(&ok, "missing.tar.gz") == null);
 }
 
 test "computeFileSha256 streams a synthetic file" {

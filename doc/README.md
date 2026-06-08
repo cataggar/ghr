@@ -76,7 +76,7 @@ OPTIONS:
         --sha256 <hex>         Verify download against SHA-256 digest (single-spec only)
         --minisign <pubkey>    Default minisign key, applied to specs without an inline key
         --skip-verify          Umbrella: skip every verification step (checksum, minisign, sigstore, authenticode)
-        --skip-checksum        Skip just the checksum-sidecar verification step
+        --skip-checksum        Skip checksum verification (GitHub asset digest + .sha256 sidecar)
         --skip-minisign        Skip just the minisign verification step
         --skip-sigstore        Skip just the sigstore-bundle verification step
         --skip-authenticode    Skip just the Authenticode (Windows PE) verification step
@@ -271,8 +271,8 @@ Hand-rolled equivalent:
 
 The same multi-spec rules apply: `-o` and `--sha256` are rejected when
 more than one spec is supplied — `--extract <dir>` is the multi-spec
-equivalent of `-o`, and verification falls back to whatever sigstore /
-sha256 sidecars the release publishes.
+equivalent of `-o`, and verification falls back to whatever GitHub asset
+digest, sigstore, or sha256 sidecars the release publishes.
 
 ## Directories
 
@@ -381,6 +381,12 @@ is signed by a long-lived project key whose public token is:
 RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 ```
 
+ghr no longer publishes `.sha256` sidecars: because releases are built on
+GitHub Actions, a CI-generated checksum shares GitHub's trust root and adds
+nothing over GitHub's built-in asset digest (added 2025-06-03), which ghr
+verifies for free. Independent provenance is covered by the sigstore and
+minisign signatures above.
+
 `ghr install cataggar/ghr@<tag>` verifies the sigstore bundle
 automatically, prints the leaf certificate's SAN (the release-workflow
 URL) and OIDC issuer
@@ -405,9 +411,18 @@ When you install or download a release asset, ghr automatically verifies
 the downloaded bytes against any verification material the release
 publishes:
 
+- **GitHub asset digest** — GitHub computes a SHA-256 for every release
+  asset at upload time and exposes it inline in the release JSON as
+  `"digest": "sha256:<hex>"` (added 2025-06-03). ghr verifies the download
+  against it with **no extra network request** — the digest already
+  arrived with the release metadata — and prefers it over a `.sha256`
+  sidecar. Its trust root is GitHub itself (the same as a CI-generated
+  sidecar): it attests integrity, not independent provenance. Assets
+  uploaded before the rollout carry no digest, so ghr falls back to a
+  published checksum file.
 - **Checksum files** — sidecar `<asset>.sha256` files and aggregate
   `*checksums*` / `SHA256SUMS` files are both supported, in GNU and BSD
-  formats.
+  formats. Used only when the asset has no GitHub digest.
 - **Sigstore bundles** — `<asset>.sigstore.json` (cosign bundle v0.3) is
   verified entirely natively in Zig. The X.509 chain is walked from the
   bundle's leaf cert to embedded production Fulcio roots, the artifact's
@@ -521,6 +536,8 @@ metadata as `"verified"`:
   a PE inside the downloaded `.zip`) verified against an embedded MS /
   commercial CA trust root, with a valid RFC 3161 timestamp.
 - `"checksum"` — checksum sidecar verified.
+- `"github-digest"` — the asset's GitHub-published SHA-256 `digest` field
+  matched the download (no extra request; integrity, not provenance).
 - `"none"` — no verification material was published.
 - `"skipped"` — `--skip-verify` was passed.
 
@@ -550,8 +567,8 @@ the gzip header carries `mtime=0` and no filename, and every tar entry has
 sorted order, fixed uid/gid 0, empty owner/group names, and `mtime` set to
 `SOURCE_DATE_EPOCH` derived from the tagged commit. Packaging is performed
 by [`scripts/pack.py`](../scripts/pack.py), and the same script is used
-both at release time and during validation, so the published `.sha256`
-sidecar can be reproduced bit-for-bit from source.
+both at release time and during validation, so each archive's SHA-256 can
+be reproduced bit-for-bit from source.
 
 Windows `.zip` archives **cannot** be byte-reproduced at the archive level
 — the `.exe` inside is Authenticode-signed by Azure Trusted Signing and
@@ -574,8 +591,9 @@ For every release target it:
 2. installs the pinned Zig version,
 3. rebuilds with the same flags as `release.yml`,
 4. **for non-Windows targets**: repackages with `scripts/pack.py`,
-   downloads the published `.tar.gz` + `.sha256`, and fails on hash
-   mismatch (with `tar tvf` and `cmp` diffs as a diagnostic artifact),
+   downloads the published `.tar.gz`, verifies it against GitHub's
+   published asset digest, and fails on hash mismatch against the rebuild
+   (with `tar tvf` and `cmp` diffs as a diagnostic artifact),
 5. **for Windows targets**: also builds a host-native `ghr.exe` as the
    stripper, downloads the published `.zip`, extracts `bin/ghr.exe`,
    strips its Authenticode signature, and fails if the stripped sha256

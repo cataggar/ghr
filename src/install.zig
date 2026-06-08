@@ -1292,37 +1292,64 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         try w.print("note: verification skipped (--skip-verify)\n", .{});
     } else {
         const sha_outcome: release_mod.VerifyOutcome = if (gates.skip_checksum) blk: {
-            try w.print("note: checksum sidecar verification skipped (--skip-checksum)\n", .{});
+            try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
             break :blk .no_verification;
-        } else verifyDownloadedAssetSha256(
-            allocator,
-            io,
-            d.cache,
-            release.parsed.value.assets,
-            asset.name,
-            download_path,
-            debug_w,
-            auth_header,
-            w,
-            err_w,
-        ) catch |verr| {
-            switch (verr) {
-                error.ChecksumMismatch,
-                error.ChecksumDownloadFailed,
-                error.ChecksumEntryMissing,
-                => {
-                    Dir.deleteFileAbsolute(io, download_path) catch {};
-                    return error.InstallStepFailed;
-                },
-                else => {
-                    try err_w.print("error: checksum verification failed: {}\n", .{verr});
-                    try err_w.flush();
-                    Dir.deleteFileAbsolute(io, download_path) catch {};
-                    return error.InstallStepFailed;
-                },
-            }
+        } else blk: {
+            // Prefer GitHub's built-in asset digest (inline in the release
+            // JSON, no extra network request); fall back to a published
+            // `.sha256` / `SHA256SUMS` sidecar only when the asset carries
+            // no digest (uploaded before 2025-06-03).
+            const gh_outcome = release_mod.verifyDownloadedAssetGithubDigest(
+                io,
+                release.parsed.value.assets,
+                asset.name,
+                download_path,
+                debug_w,
+                w,
+                err_w,
+            ) catch |verr| {
+                Dir.deleteFileAbsolute(io, download_path) catch {};
+                switch (verr) {
+                    error.ChecksumMismatch => return error.InstallStepFailed,
+                    else => {
+                        try err_w.print("error: checksum verification failed: {}\n", .{verr});
+                        try err_w.flush();
+                        return error.InstallStepFailed;
+                    },
+                }
+            };
+            if (gh_outcome == .github_digest_verified) break :blk gh_outcome;
+            break :blk verifyDownloadedAssetSha256(
+                allocator,
+                io,
+                d.cache,
+                release.parsed.value.assets,
+                asset.name,
+                download_path,
+                debug_w,
+                auth_header,
+                w,
+                err_w,
+            ) catch |verr| {
+                switch (verr) {
+                    error.ChecksumMismatch,
+                    error.ChecksumDownloadFailed,
+                    error.ChecksumEntryMissing,
+                    => {
+                        Dir.deleteFileAbsolute(io, download_path) catch {};
+                        return error.InstallStepFailed;
+                    },
+                    else => {
+                        try err_w.print("error: checksum verification failed: {}\n", .{verr});
+                        try err_w.flush();
+                        Dir.deleteFileAbsolute(io, download_path) catch {};
+                        return error.InstallStepFailed;
+                    },
+                }
+            };
         };
         if (sha_outcome == .sha256_verified) verified_label = "checksum";
+        if (sha_outcome == .github_digest_verified) verified_label = "github-digest";
 
         const mini_outcome: release_mod.VerifyOutcome = if (gates.skip_minisign) blk: {
             if (minisign_pubkey_b64 != null) {
