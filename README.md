@@ -65,14 +65,14 @@ uninstall, and verification details (including
 For workflows, install several tools in one cached step:
 
 ```yaml
-- uses: cataggar/ghr/actions/install@v0.3.1  # pin to the matching ghr release
+- uses: cataggar/ghr/actions/install@v0.5.1  # pin to the matching ghr release
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
 ```
 
-The action shares git tags with the `ghr` CLI — pinning `@v0.3.0` pins
+The action shares git tags with the `ghr` CLI — pinning `@v0.5.1` pins
 both the action body and the `ghr-bin` binary. Pick the latest tag from
 [the releases page](https://github.com/cataggar/ghr/releases).
 
