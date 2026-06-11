@@ -519,9 +519,27 @@ fn resolveTarget(
 
             const rel_opt = fetchRelease(ctx, opts, gh.owner, gh.repo, gh.tag) catch null;
             if (rel_opt) |rel| {
+                // When authenticated, map the public download URL to the
+                // asset API endpoint so private / SSO-protected releases
+                // work (browser_download_url redirects to an SSO page).
+                var dl_url: []const u8 = u;
+                var dl_accept: ?[]const u8 = null;
+                var default_name: ?[]const u8 = null;
+                if (ctx.auth_header != null) {
+                    for (rel.parsed.value.assets) |a| {
+                        if (std.mem.eql(u8, a.name, gh.file)) {
+                            const dl = release_mod.assetDownload(a, true);
+                            dl_url = dl.url;
+                            dl_accept = dl.accept;
+                            default_name = a.name;
+                            break;
+                        }
+                    }
+                }
                 return .{
-                    .download_url = u,
-                    .default_filename = null,
+                    .download_url = dl_url,
+                    .accept = dl_accept,
+                    .default_filename = default_name,
                     .release = rel,
                     .asset_name = gh.file,
                     .url_decoded = gh,
