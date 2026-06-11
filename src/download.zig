@@ -80,9 +80,13 @@ pub const Options = struct {
 /// Internal: target resolved from a single positional spec plus any release
 /// context needed for verification.
 const ResolvedTarget = struct {
-    /// Final URL to download from. Borrows from argv (URL form) or from
-    /// `release.parsed.value.assets[*].browser_download_url` (spec form).
+    /// Final URL to download from. Borrows from argv (URL form) or from a
+    /// release asset (spec form: the API asset URL when authenticated,
+    /// otherwise `browser_download_url`).
     download_url: []const u8,
+    /// Optional `Accept` header for `download_url` (set to
+    /// `application/octet-stream` when using the GitHub asset API endpoint).
+    accept: ?[]const u8 = null,
     /// Default output filename. When null, the caller derives one from the URL.
     default_filename: ?[]const u8,
     /// Release context for verification, when known.
@@ -333,6 +337,7 @@ fn downloadOne(
 
     http.downloadToFile(allocator, io, target.download_url, part_path, .{
         .auth_header = per_spec_auth_header,
+        .accept = if (per_spec_auth_header != null) target.accept else null,
         .debug_w = debug_w,
         .hasher = if (hasher != null) &hasher.? else null,
     }) catch |err| {
@@ -544,8 +549,10 @@ fn resolveTarget(
                 try err_w.flush();
                 return error.AssetMatchFailed;
             };
+            const dl = release_mod.assetDownload(asset, ctx.auth_header != null);
             return .{
-                .download_url = asset.browser_download_url,
+                .download_url = dl.url,
+                .accept = dl.accept,
                 .default_filename = asset.name,
                 .release = rel,
                 .asset_name = asset.name,
@@ -562,12 +569,16 @@ fn resolveTarget(
                 return error.AssetMatchFailed;
             };
             switch (m) {
-                .one => |asset| return .{
-                    .download_url = asset.browser_download_url,
-                    .default_filename = asset.name,
-                    .release = rel,
-                    .asset_name = asset.name,
-                    .url_decoded = null,
+                .one => |asset| {
+                    const dl = release_mod.assetDownload(asset, ctx.auth_header != null);
+                    return .{
+                        .download_url = dl.url,
+                        .accept = dl.accept,
+                        .default_filename = asset.name,
+                        .release = rel,
+                        .asset_name = asset.name,
+                        .url_decoded = null,
+                    };
                 },
                 .none => {
                     try err_w.print("error: no asset matching '{s}' in {s}/{s}@{s}\n", .{

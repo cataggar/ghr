@@ -30,6 +30,9 @@ pub const DownloadOptions = struct {
     /// Bearer token attached on the initial request only. Stripped on
     /// cross-domain redirects so we never leak credentials to a CDN.
     auth_header: ?[]const u8 = null,
+    /// Optional `Accept` header value attached on the initial request only
+    /// (e.g. `application/octet-stream` for the GitHub asset API endpoint).
+    accept: ?[]const u8 = null,
     /// Optional debug writer; verbose lines are written here when set.
     debug_w: ?*Writer = null,
     /// Maximum number of retry attempts (including the initial attempt).
@@ -72,9 +75,20 @@ pub fn downloadToFile(
         };
         defer client.deinit();
 
-        const auth_only = [_]std.http.Header{
-            .{ .name = "Authorization", .value = opts.auth_header orelse "" },
-        };
+        // Initial-request headers: Authorization (github hosts only) and an
+        // optional Accept override. Both are dropped before following any
+        // cross-domain redirect to a CDN.
+        var header_buf: [2]std.http.Header = undefined;
+        var header_count: usize = 0;
+        if (opts.auth_header) |a| {
+            header_buf[header_count] = .{ .name = "Authorization", .value = a };
+            header_count += 1;
+        }
+        if (opts.accept) |ac| {
+            header_buf[header_count] = .{ .name = "Accept", .value = ac };
+            header_count += 1;
+        }
+        const extra_headers = header_buf[0..header_count];
 
         const uri = std.Uri.parse(url) catch {
             debugLog(opts.debug_w, "  invalid URL: {s}\n", .{url});
@@ -87,7 +101,7 @@ pub fn downloadToFile(
         var req = client.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
             .headers = .{ .user_agent = .{ .override = default_user_agent } },
-            .extra_headers = if (opts.auth_header != null) &auth_only else &.{},
+            .extra_headers = extra_headers,
         }) catch |err| {
             debugLog(opts.debug_w, "  attempt {d}/{d} request error: {}\n", .{ attempts + 1, max_retries, err });
             if (attempts + 1 < max_retries) continue;
@@ -237,7 +251,21 @@ fn handleDownloadResponse(
 
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, &.{});
+    // Size the decompression window by the negotiated content-encoding.
+    // A zero-length buffer (the previous behaviour) underflows the flate
+    // window and panics when the server returns a compressed body, e.g. a
+    // gzip'd HTML error page. `.identity` needs no window.
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => allocator.alloc(u8, std.compress.zstd.default_window_len) catch return error.DownloadFailed,
+        .deflate, .gzip => allocator.alloc(u8, std.compress.flate.max_window_len) catch return error.DownloadFailed,
+        .compress => {
+            std.log.err("download failed: unsupported content-encoding 'compress'", .{});
+            return error.DownloadFailed;
+        },
+    };
+    defer if (decompress_buffer.len > 0) allocator.free(decompress_buffer);
+    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
     // Optional content-length for progress.
     const total: ?u64 = response.head.content_length;

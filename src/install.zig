@@ -1248,17 +1248,19 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     const debug_w: ?*Writer = if (debug) err_w else null;
 
+    const asset_dl = release_mod.assetDownload(asset, auth_header != null);
     debugLog(debug_w, "debug: ghr {s}\n", .{version});
     debugLog(debug_w, "debug: auth: {s}\n", .{ctx.auth_resolved.source});
-    debugLog(debug_w, "debug: url: {s}\n", .{asset.browser_download_url});
+    debugLog(debug_w, "debug: url: {s}\n", .{asset_dl.url});
     debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
 
-    http.downloadToFile(allocator, io, asset.browser_download_url, download_path, .{
+    http.downloadToFile(allocator, io, asset_dl.url, download_path, .{
         .auth_header = auth_header,
+        .accept = asset_dl.accept,
         .debug_w = debug_w,
     }) catch |err| {
         try err_w.print("error: download failed: {}\n", .{err});
-        try err_w.print("  url: {s}\n", .{asset.browser_download_url});
+        try err_w.print("  url: {s}\n", .{asset_dl.url});
         try err_w.flush();
         return error.InstallStepFailed;
     };
