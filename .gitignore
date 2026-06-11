@@ -17,3 +17,9 @@ __pycache__/
 *.o
 ghr
 ghr_debug
+
+# macOS
+.DS_Store
+
+# Local assets (not tracked)
+/assets/

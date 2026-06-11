@@ -309,11 +309,42 @@ pub fn classifyArg(arg: []const u8) !Classified {
 pub const Asset = struct {
     name: []const u8,
     browser_download_url: []const u8,
+    /// The `api.github.com/repos/<owner>/<repo>/releases/assets/<id>` URL.
+    /// Unlike `browser_download_url`, this endpoint honors `Authorization`
+    /// (with `Accept: application/octet-stream`) for private and
+    /// SSO-protected enterprise releases, where `browser_download_url`
+    /// redirects unauthenticated requests to an SSO/login page. Empty when
+    /// the field is absent from the release JSON.
+    url: []const u8 = "",
     /// SHA-256 digest GitHub computes for every release asset at upload
     /// time and exposes inline in the release JSON as `"sha256:<hex>"`
     /// (added 2025-06-03). `null` for assets uploaded before that rollout.
     digest: ?[]const u8 = null,
 };
+
+/// `Accept` header value for the GitHub release-asset API endpoint, which
+/// makes it return a redirect to the signed download URL instead of asset
+/// JSON metadata.
+pub const asset_octet_accept = "application/octet-stream";
+
+/// Resolved download URL plus the `Accept` header to send with it.
+pub const AssetDownload = struct {
+    url: []const u8,
+    accept: ?[]const u8,
+};
+
+/// Choose how to download `asset`. When an auth token is available and the
+/// API asset URL is known, prefer it: the `api.github.com` asset endpoint
+/// honors `Authorization` for private and SSO-protected enterprise releases,
+/// whereas `browser_download_url` redirects unauthenticated callers to an
+/// SSO/login page. Anonymous downloads keep using `browser_download_url` to
+/// avoid the stricter unauthenticated `api.github.com` rate limit.
+pub fn assetDownload(asset: Asset, have_auth: bool) AssetDownload {
+    if (have_auth and asset.url.len > 0) {
+        return .{ .url = asset.url, .accept = asset_octet_accept };
+    }
+    return .{ .url = asset.browser_download_url, .accept = null };
+}
 
 /// Parsed release info.
 pub const Release = struct {
@@ -1037,8 +1068,10 @@ pub fn verifyDownloadedAssetSha256(
     defer allocator.free(checksum_path);
     defer Dir.deleteFileAbsolute(io, checksum_path) catch {};
 
-    http.downloadToFile(allocator, io, checksum_asset.browser_download_url, checksum_path, .{
+    const checksum_dl = assetDownload(checksum_asset, auth_header != null);
+    http.downloadToFile(allocator, io, checksum_dl.url, checksum_path, .{
         .auth_header = auth_header,
+        .accept = checksum_dl.accept,
         .debug_w = debug_w,
     }) catch |err| {
         try err_w.print("error: failed to download checksum file '{s}': {}\n", .{ checksum_asset.name, err });
@@ -1160,8 +1193,9 @@ pub fn verifyDownloadedAssetSigstore(
 ) !VerifyOutcome {
     const views = try allocator.alloc(sigstore.AssetView, assets.len);
     defer allocator.free(views);
+    const have_auth = auth_header != null;
     for (assets, 0..) |a, i| {
-        views[i] = .{ .name = a.name, .browser_download_url = a.browser_download_url };
+        views[i] = .{ .name = a.name, .browser_download_url = assetDownload(a, have_auth).url };
     }
 
     const bundle_asset = sigstore.findBundleAsset(views, asset_name) orelse {
@@ -1178,6 +1212,7 @@ pub fn verifyDownloadedAssetSigstore(
 
     http.downloadToFile(allocator, io, bundle_asset.browser_download_url, bundle_path, .{
         .auth_header = auth_header,
+        .accept = if (have_auth) asset_octet_accept else null,
         .debug_w = debug_w,
     }) catch |err| {
         try err_w.print("error: failed to download sigstore bundle '{s}': {}\n", .{ bundle_asset.name, err });
@@ -1441,8 +1476,9 @@ pub fn verifyDownloadedAssetMinisign(
 ) !VerifyOutcome {
     const views = try allocator.alloc(minisign.AssetView, assets.len);
     defer allocator.free(views);
+    const have_auth = auth_header != null;
     for (assets, 0..) |a, i| {
-        views[i] = .{ .name = a.name, .browser_download_url = a.browser_download_url };
+        views[i] = .{ .name = a.name, .browser_download_url = assetDownload(a, have_auth).url };
     }
 
     const sidecar_opt = minisign.findMinisigAsset(views, asset_name);
@@ -1491,6 +1527,7 @@ pub fn verifyDownloadedAssetMinisign(
 
     http.downloadToFile(allocator, io, sidecar.browser_download_url, sidecar_path, .{
         .auth_header = auth_header,
+        .accept = if (have_auth) asset_octet_accept else null,
         .debug_w = debug_w,
     }) catch |err| {
         try err_w.print("error: failed to download minisign sidecar '{s}': {}\n", .{ sidecar.name, err });
@@ -1860,6 +1897,31 @@ test "writeTrustedCommentFormatted passes through when timestamp is missing" {
     const input = "file:msg.bin\thashed";
     try writeTrustedCommentFormatted(&aw.writer, input);
     try std.testing.expectEqualStrings(input, aw.written());
+}
+
+test "assetDownload prefers API url with octet-stream when authenticated" {
+    const asset: Asset = .{
+        .name = "tool-linux.tar.xz",
+        .browser_download_url = "https://github.com/o/r/releases/download/v1/tool-linux.tar.xz",
+        .url = "https://api.github.com/repos/o/r/releases/assets/123",
+    };
+    const auth = assetDownload(asset, true);
+    try std.testing.expectEqualStrings("https://api.github.com/repos/o/r/releases/assets/123", auth.url);
+    try std.testing.expectEqualStrings(asset_octet_accept, auth.accept.?);
+
+    const anon = assetDownload(asset, false);
+    try std.testing.expectEqualStrings(asset.browser_download_url, anon.url);
+    try std.testing.expect(anon.accept == null);
+}
+
+test "assetDownload falls back to browser url when API url is absent" {
+    const asset: Asset = .{
+        .name = "tool-linux.tar.xz",
+        .browser_download_url = "https://github.com/o/r/releases/download/v1/tool-linux.tar.xz",
+    };
+    const r = assetDownload(asset, true);
+    try std.testing.expectEqualStrings(asset.browser_download_url, r.url);
+    try std.testing.expect(r.accept == null);
 }
 
 test "parseRepoSpec with tag" {

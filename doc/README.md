@@ -108,6 +108,10 @@ failures and exits non-zero with a summary if any spec failed.
 
 GitHub auth is attached automatically (using `GH_TOKEN`,
 `GITHUB_TOKEN`, or `gh auth token`); pass `--no-auth` to skip it.
+When a token is present, release assets are fetched through the
+GitHub asset API endpoint rather than the public download URL, so
+private and SSO-protected enterprise releases work as long as the
+token is authorized for the organization.
 Downloads are auto-verified against any sigstore bundle or checksum
 sidecar published with the release; pass `--minisign <pubkey>` to
 also require a minisign signature (or attach an inline key to a
