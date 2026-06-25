@@ -533,23 +533,40 @@ fn containsIgnoreCaseBounded(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Returns true if the asset looks installable: archives, Windows .exe, or
-/// bare binaries (extensionless files common in Go/Rust releases).
+/// Returns true if the asset looks installable: archives, Windows .exe, wasm
+/// modules, or bare binaries (extensionless files common in Go/Rust releases).
 fn isInstallableAsset(name: []const u8) bool {
     if (std.mem.endsWith(u8, name, ".zip")) return true;
     if (std.mem.endsWith(u8, name, ".tar.gz")) return true;
     if (std.mem.endsWith(u8, name, ".tgz")) return true;
     if (std.mem.endsWith(u8, name, ".tar.xz")) return true;
     if (std.mem.endsWith(u8, name, ".exe")) return true;
+    if (std.mem.endsWith(u8, name, ".wasm")) return true;
     const non_installable = [_][]const u8{
         ".json",   ".txt",    ".pub", ".sig",     ".asc", ".pem", ".md",
         ".sha256", ".sha512", ".md5", ".minisig", ".rpm", ".apk", ".msi",
-        ".pkg",    ".dmg",    ".yml", ".yaml",
+        ".pkg",    ".dmg",    ".yml", ".yaml",    ".ghr",
     };
     for (non_installable) |ext| {
         if (std.mem.endsWith(u8, name, ext)) return false;
     }
     return true;
+}
+
+/// Returns true if `name` is a WebAssembly module installable by ghr.
+pub fn isWasmAssetName(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".wasm");
+}
+
+/// Find the companion `<wasm_name>.ghr` manifest asset for a wasm asset.
+/// Returns `null` when the release does not publish one.
+pub fn findGhrManifestAsset(assets: []const Asset, wasm_name: []const u8) ?Asset {
+    var buf: [512]u8 = undefined;
+    const want = std.fmt.bufPrint(&buf, "{s}.ghr", .{wasm_name}) catch return null;
+    for (assets) |a| {
+        if (std.mem.eql(u8, a.name, want)) return a;
+    }
+    return null;
 }
 
 /// Markers in asset names that indicate non-primary variants (libraries,
@@ -634,10 +651,10 @@ fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
 fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
     if (plat_arch.len == 0) return false;
     const all_arch = [_][]const u8{
-        "x86_64",  "x64",     "amd64",
-        "aarch64", "arm64",   "armv7l",
-        "armv7",   "armv6",   "i386",
-        "i686",    "x86",     "riscv64",
+        "x86_64",  "x64",   "amd64",
+        "aarch64", "arm64", "armv7l",
+        "armv7",   "armv6", "i386",
+        "i686",    "x86",   "riscv64",
     };
     for (plat_arch) |k| {
         if (containsIgnoreCaseBounded(name, k)) return false;
@@ -743,6 +760,9 @@ fn scoreAsset(name: []const u8, plat: PlatformKeywords) i32 {
     score += linuxPortabilityBonus(name, plat.os);
     score += libcBonus(name, plat.libc);
     score += archiveFormatBonus(name);
+    // wasm modules are platform-independent; give them a positive score so a
+    // release that ships only a `.wasm` (plus sidecars) selects it.
+    if (isWasmAssetName(name)) score += 5;
     return score;
 }
 
@@ -2142,6 +2162,37 @@ test "isInstallableAsset" {
     try std.testing.expect(!isInstallableAsset("cosign-3.0.6-1.x86_64.rpm"));
     try std.testing.expect(!isInstallableAsset("cosign_3.0.6_aarch64.apk"));
     try std.testing.expect(!isInstallableAsset("release-cosign.pub"));
+    // wasm modules are installable; the companion `.ghr` manifest is not.
+    try std.testing.expect(isInstallableAsset("hello.wasm"));
+    try std.testing.expect(!isInstallableAsset("hello.wasm.ghr"));
+}
+
+test "isWasmAssetName and findGhrManifestAsset" {
+    try std.testing.expect(isWasmAssetName("hello.wasm"));
+    try std.testing.expect(!isWasmAssetName("hello.wasm.ghr"));
+    try std.testing.expect(!isWasmAssetName("tool.tar.gz"));
+
+    const assets = [_]Asset{
+        .{ .name = "hello.wasm", .browser_download_url = "u1" },
+        .{ .name = "hello.wasm.ghr", .browser_download_url = "u2" },
+        .{ .name = "hello.wasm.minisig", .browser_download_url = "u3" },
+    };
+    const found = findGhrManifestAsset(&assets, "hello.wasm") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hello.wasm.ghr", found.name);
+    try std.testing.expect(findGhrManifestAsset(&assets, "missing.wasm") == null);
+}
+
+test "findBestAsset selects the lone wasm module over its sidecars" {
+    const assets = [_]Asset{
+        .{ .name = "hello.wasm", .browser_download_url = "" },
+        .{ .name = "hello.wasm.ghr", .browser_download_url = "" },
+        .{ .name = "hello.wasm.minisig", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "x86_64", "x64", "amd64" },
+    });
+    try std.testing.expectEqualStrings("hello.wasm", best.name);
 }
 
 test "findBestAsset selects cosign exe for Windows" {

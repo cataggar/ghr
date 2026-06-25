@@ -489,7 +489,13 @@ fn linkToBin(
     exe_rel_path: []const u8,
     w: *Writer,
 ) !void {
-    _ = allocator;
+    // A `.wasm` module is not directly executable: install a shim launcher
+    // (embedded in ghr) plus a `<stem>.ghr` manifest that the shim loads at
+    // run time.
+    if (release_mod.isWasmAssetName(exe_rel_path)) {
+        return linkWasmToBin(allocator, io, tool_dir_path, bin_dir, exe_rel_path, w);
+    }
+
     const exe_name = std.fs.path.basename(exe_rel_path);
     var src_path_buf: [Dir.max_path_bytes]u8 = undefined;
     const src_path = std.fmt.bufPrint(&src_path_buf, "{s}{c}{s}", .{
@@ -499,10 +505,10 @@ fn linkToBin(
     }) catch return error.PathTooLong;
 
     if (builtin.os.tag == .windows) {
-        // Use a shim .exe + .shim file instead of a .cmd wrapper.
-        // The shim is embedded in ghr at build time so it's always available,
-        // regardless of how ghr is installed (PyPI, GitHub release, etc.).
-        // This is the same technique used by npm and Scoop on Windows.
+        // Use an embedded shim .exe driven by a `<stem>.ghr` manifest instead
+        // of a .cmd wrapper. The shim is embedded in ghr at build time so it's
+        // always available, regardless of how ghr is installed (PyPI, GitHub
+        // release, etc.). This is the same technique used by npm and Scoop.
         const shim_exe_bytes = @import("shim_exe").bytes;
 
         const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
@@ -510,16 +516,21 @@ fn linkToBin(
         else
             exe_name;
 
-        // Write the .shim file with the target path
-        var shim_name_buf: [Dir.max_path_bytes]u8 = undefined;
-        const shim_name = std.fmt.bufPrint(&shim_name_buf, "{s}.shim", .{stem}) catch return error.PathTooLong;
-        bin_dir.deleteFile(io, shim_name) catch {};
-        var shim_file = bin_dir.createFile(io, shim_name, .{}) catch return error.CreateFailed;
-        defer shim_file.close(io);
-        var shim_buf: [4096]u8 = undefined;
-        var shim_w = shim_file.writer(io, &shim_buf);
-        shim_w.interface.print("{s}", .{src_path}) catch return error.WriteFailed;
-        shim_w.end() catch return error.WriteFailed;
+        // Write the `<stem>.ghr` manifest naming the native target. The shim
+        // reads this at run time; it replaces the legacy `.shim` file.
+        var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{stem}) catch return error.PathTooLong;
+        try writeNativeGhr(io, bin_dir, ghr_name, src_path);
+
+        // Remove any legacy `.shim` / `.cmd` left by previous installs.
+        var legacy_shim_buf: [Dir.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&legacy_shim_buf, "{s}.shim", .{stem})) |p| {
+            bin_dir.deleteFile(io, p) catch {};
+        } else |_| {}
+        var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem})) |p| {
+            bin_dir.deleteFile(io, p) catch {};
+        } else |_| {}
 
         // Write the embedded shim exe as <name>.exe
         const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe"))
@@ -539,21 +550,277 @@ fn linkToBin(
             defer exe_file.close(io);
             exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
         } else |_| {
-            // The shim exe is locked (self-update). The .shim file has already
+            // The shim exe is locked (self-update). The .ghr file has already
             // been updated with the new target path, so the existing shim exe
             // will work correctly on the next invocation. Skip replacing it.
         }
-
-        // Clean up any legacy .cmd wrapper from previous installs
-        var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
-        const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return error.PathTooLong;
-        bin_dir.deleteFile(io, cmd_name) catch {};
     } else {
         // Unix: symlink
         bin_dir.deleteFile(io, exe_name) catch {};
         try bin_dir.symLink(io, src_path, exe_name, .{});
     }
     try w.print("  linked {s}\n", .{exe_name});
+}
+
+/// Strip the trailing `.wasm` from a wasm asset basename to get the command
+/// stem (e.g. `hello.wasm` -> `hello`).
+fn wasmStem(wasm_rel_path: []const u8) []const u8 {
+    const base = std.fs.path.basename(wasm_rel_path);
+    return base[0 .. base.len - ".wasm".len];
+}
+
+/// Shape of a `.ghr` manifest (ZON). The release ships `<wasm>.ghr` with
+/// `version` + `runtime` + `runtimeArgs`; ghr writes a bin-dir `<stem>.ghr`
+/// that additionally carries `target` / `targetWasm` (absolute install paths)
+/// for the shim to read at run time.
+const GhrManifest = struct {
+    version: u32,
+    target: []const u8 = "",
+    targetWasm: []const u8 = "",
+    runtime: []const u8 = "wasmtime",
+    runtimeArgs: []const []const u8 = &.{},
+};
+
+const allowed_runtimes = [_][]const u8{ "wasmtime", "wamr" };
+
+/// Write a ZON string literal body (the bytes between the quotes), escaping
+/// per Zig string-literal rules so Windows paths (with `\`) round-trip.
+fn writeZonEscaped(w: *Writer, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '\\' => try w.print("\\\\", .{}),
+            '"' => try w.print("\\\"", .{}),
+            '\n' => try w.print("\\n", .{}),
+            '\r' => try w.print("\\r", .{}),
+            '\t' => try w.print("\\t", .{}),
+            else => {
+                if (c < 0x20) {
+                    try w.print("\\x{x:0>2}", .{c});
+                } else {
+                    try w.print("{c}", .{c});
+                }
+            },
+        }
+    }
+}
+
+/// Write a bin-dir `<stem>.ghr` for a native command: `.version = 1` plus a
+/// `.target` absolute path the shim spawns directly. Replaces the legacy
+/// `.shim` file.
+fn writeNativeGhr(io: Io, bin_dir: Dir, ghr_name: []const u8, target_abs: []const u8) !void {
+    bin_dir.deleteFile(io, ghr_name) catch {};
+    var ghr_file = bin_dir.createFile(io, ghr_name, .{}) catch return error.CreateFailed;
+    defer ghr_file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = ghr_file.writer(io, &buf);
+    const gw = &fw.interface;
+    gw.print(".{{\n    .version = 1,\n    .target = \"", .{}) catch return error.WriteFailed;
+    writeZonEscaped(gw, target_abs) catch return error.WriteFailed;
+    gw.print("\",\n}}\n", .{}) catch return error.WriteFailed;
+    fw.end() catch return error.WriteFailed;
+}
+
+/// Install the embedded shim launcher for a wasm module. Creates the launcher
+/// binary (`<stem>.exe` on Windows, `<stem>` on Unix) plus a `<stem>.ghr`
+/// manifest next to it. The manifest carries `targetWasm` (the absolute path
+/// to the installed wasm) along with the `runtime` / `runtimeArgs` copied from
+/// the release's `<wasm>.ghr`. No `.shim` file is written. Works identically on
+/// Windows, Linux, and macOS.
+fn linkWasmToBin(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tool_dir_path: []const u8,
+    bin_dir: Dir,
+    wasm_rel_path: []const u8,
+    w: *Writer,
+) !void {
+    const shim_exe_bytes = @import("shim_exe").bytes;
+    const stem = wasmStem(wasm_rel_path);
+    const wasm_base = std.fs.path.basename(wasm_rel_path);
+
+    // Absolute path to the installed wasm (the shim's run-time target).
+    var src_path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const src_path = std.fmt.bufPrint(&src_path_buf, "{s}{c}{s}", .{
+        tool_dir_path,
+        std.fs.path.sep,
+        wasm_rel_path,
+    }) catch return error.PathTooLong;
+
+    // Read the release manifest staged in the tool dir to recover the
+    // runtime + runtimeArgs.
+    var tool_dir = Dir.openDirAbsolute(io, tool_dir_path, .{}) catch return error.CreateFailed;
+    defer tool_dir.close(io);
+    var manifest_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const manifest_name = std.fmt.bufPrint(&manifest_name_buf, "{s}.ghr", .{wasm_base}) catch return error.PathTooLong;
+    const raw = tool_dir.readFileAlloc(io, manifest_name, allocator, Io.Limit.limited(64 * 1024)) catch return error.CreateFailed;
+    defer allocator.free(raw);
+    const source = try allocator.dupeZ(u8, raw);
+    defer allocator.free(source);
+    const manifest = std.zon.parse.fromSliceAlloc(GhrManifest, allocator, source, null, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.WriteFailed;
+    defer std.zon.parse.free(allocator, manifest);
+
+    // Write the bin-dir `<stem>.ghr` the shim reads at run time.
+    var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{stem}) catch return error.PathTooLong;
+    bin_dir.deleteFile(io, ghr_name) catch {};
+    {
+        var ghr_file = bin_dir.createFile(io, ghr_name, .{}) catch return error.CreateFailed;
+        defer ghr_file.close(io);
+        var ghr_buf: [4096]u8 = undefined;
+        var ghr_w = ghr_file.writer(io, &ghr_buf);
+        const gw = &ghr_w.interface;
+        gw.print(".{{\n    .version = 1,\n    .targetWasm = \"", .{}) catch return error.WriteFailed;
+        writeZonEscaped(gw, src_path) catch return error.WriteFailed;
+        gw.print("\",\n    .runtime = \"", .{}) catch return error.WriteFailed;
+        writeZonEscaped(gw, manifest.runtime) catch return error.WriteFailed;
+        gw.print("\",\n    .runtimeArgs = .{{", .{}) catch return error.WriteFailed;
+        for (manifest.runtimeArgs, 0..) |arg, i| {
+            if (i > 0) gw.print(",", .{}) catch return error.WriteFailed;
+            gw.print(" \"", .{}) catch return error.WriteFailed;
+            writeZonEscaped(gw, arg) catch return error.WriteFailed;
+            gw.print("\"", .{}) catch return error.WriteFailed;
+        }
+        if (manifest.runtimeArgs.len > 0) gw.print(" ", .{}) catch return error.WriteFailed;
+        gw.print("}},\n}}\n", .{}) catch return error.WriteFailed;
+        ghr_w.end() catch return error.WriteFailed;
+    }
+
+    // Remove any legacy `.shim` from a previous install of this command.
+    var legacy_shim_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&legacy_shim_buf, "{s}.shim", .{stem})) |legacy_shim| {
+        bin_dir.deleteFile(io, legacy_shim) catch {};
+    } else |_| {}
+
+    // Launcher binary name: `<stem>.exe` on Windows, `<stem>` on Unix.
+    var launcher_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const launcher_name = if (builtin.os.tag == .windows)
+        std.fmt.bufPrint(&launcher_name_buf, "{s}.exe", .{stem}) catch return error.PathTooLong
+    else
+        stem;
+
+    bin_dir.deleteFile(io, launcher_name) catch {
+        // On Windows a running launcher cannot be deleted; rename it aside.
+        if (builtin.os.tag == .windows) {
+            var old_name_buf: [Dir.max_path_bytes]u8 = undefined;
+            const old_name = std.fmt.bufPrint(&old_name_buf, "{s}.old", .{launcher_name}) catch return error.PathTooLong;
+            bin_dir.deleteFile(io, old_name) catch {};
+            bin_dir.rename(launcher_name, bin_dir, old_name, io) catch {};
+        }
+    };
+
+    // `.executable_file` is a no-op on Windows but yields the +x bit on Unix,
+    // matching `stageBareExecutable`.
+    if (bin_dir.createFile(io, launcher_name, .{ .permissions = .executable_file })) |*exe_file| {
+        defer exe_file.close(io);
+        exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
+    } else |_| {
+        // Launcher is locked (e.g. concurrently running); the .ghr file is
+        // already updated, so the existing launcher keeps working.
+    }
+
+    try w.print("  linked {s}\n", .{launcher_name});
+}
+
+/// Remove the shim launcher + `<stem>.ghr` (and any legacy `.shim`) for a wasm
+/// bin entry, but only when the `.ghr` still references `tool_path` (so we
+/// never clobber an unrelated command of the same name). Works on all
+/// platforms.
+fn cleanupWasmBinEntry(io: Io, bin_dir: Dir, wasm_rel_path: []const u8, tool_path: []const u8) void {
+    const stem = wasmStem(wasm_rel_path);
+    var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{stem}) catch return;
+
+    var owned = binGhrPointsToToolDir(io, bin_dir, ghr_name, tool_path);
+
+    // Also handle (and own via) a legacy `.shim` file pointing into tool_path.
+    var shim_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&shim_name_buf, "{s}.shim", .{stem})) |shim_name| {
+        if (shimPointsToToolDir(io, bin_dir, shim_name, tool_path)) {
+            bin_dir.deleteFile(io, shim_name) catch {};
+            owned = true;
+        }
+    } else |_| {}
+
+    if (!owned) return;
+    bin_dir.deleteFile(io, ghr_name) catch {};
+    if (builtin.os.tag == .windows) {
+        var exe_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const exe_name = std.fmt.bufPrint(&exe_name_buf, "{s}.exe", .{stem}) catch return;
+        bin_dir.deleteFile(io, exe_name) catch {};
+    } else {
+        bin_dir.deleteFile(io, stem) catch {};
+    }
+}
+
+/// Ownership check for a bin-dir `<stem>.ghr`: true when the manifest text
+/// references `tool_path` in its `target` / `targetWasm` field. Allocation-
+/// free: matches `tool_path` after applying the same ZON `\`-escaping ghr
+/// wrote, so Windows backslash paths compare correctly.
+fn binGhrPointsToToolDir(io: Io, bin_dir: Dir, ghr_name: []const u8, tool_path: []const u8) bool {
+    var content_buf: [16 * 1024]u8 = undefined;
+    const file = bin_dir.openFile(io, ghr_name, .{}) catch return false;
+    defer file.close(io);
+    const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
+    const content = content_buf[0..len];
+
+    // Build the escaped needle (`\` -> `\\`, `"` -> `\"`).
+    var needle_buf: [Dir.max_path_bytes * 2]u8 = undefined;
+    var n: usize = 0;
+    for (tool_path) |c| {
+        if (c == '\\' or c == '"') {
+            if (n >= needle_buf.len) return false;
+            needle_buf[n] = '\\';
+            n += 1;
+        }
+        if (n >= needle_buf.len) return false;
+        needle_buf[n] = c;
+        n += 1;
+    }
+    return std.mem.indexOf(u8, content, needle_buf[0..n]) != null;
+}
+
+/// Validate a downloaded `.ghr` manifest (ZON): `.version` must be present and
+/// equal to 1, and `.runtime` (default `wasmtime`) must be in the allow list.
+/// Prints a diagnostic and returns an error when invalid.
+fn validateGhrManifest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    ghr_path: []const u8,
+    err_w: *Writer,
+) !void {
+    const raw = Dir.cwd().readFileAlloc(io, ghr_path, allocator, Io.Limit.limited(64 * 1024)) catch {
+        try err_w.print("error: cannot read manifest '{s}'\n", .{ghr_path});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer allocator.free(raw);
+
+    const source = try allocator.dupeZ(u8, raw);
+    defer allocator.free(source);
+
+    const manifest = std.zon.parse.fromSliceAlloc(GhrManifest, allocator, source, null, .{
+        .ignore_unknown_fields = true,
+    }) catch {
+        try err_w.print("error: invalid `.ghr` manifest '{s}' (must be ZON with a `.version` field)\n", .{ghr_path});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer std.zon.parse.free(allocator, manifest);
+
+    if (manifest.version != 1) {
+        try err_w.print("error: unsupported `.ghr` version {d} (only version 1 is supported)\n", .{manifest.version});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    }
+
+    for (allowed_runtimes) |r| {
+        if (std.mem.eql(u8, r, manifest.runtime)) return;
+    }
+    try err_w.print("error: `.ghr` runtime '{s}' is not allowed (allowed: wasmtime, wamr)\n", .{manifest.runtime});
+    try err_w.flush();
+    return error.InstallStepFailed;
 }
 
 /// Find .app bundles recursively in a directory. Returns relative paths from the root.
@@ -884,7 +1151,9 @@ fn cleanupOldInstall(
     defer bin_dir.close(io);
     for (meta.parsed.value.bins) |exe_rel| {
         const exe_name = std.fs.path.basename(exe_rel);
-        if (builtin.os.tag == .windows) {
+        if (release_mod.isWasmAssetName(exe_rel)) {
+            cleanupWasmBinEntry(io, bin_dir, exe_rel, tool_path);
+        } else if (builtin.os.tag == .windows) {
             cleanupWindowsBinEntry(io, bin_dir, exe_name, tool_path);
         } else {
             // Verify the symlink points to our tool dir before removing
@@ -905,19 +1174,37 @@ fn cleanupOldInstall(
     }
 }
 
-/// Remove shim .exe + .shim files or legacy .cmd for a single bin entry on Windows.
+/// Remove the shim `.exe` plus its `<stem>.ghr` manifest (and any legacy
+/// `.shim` / `.cmd`) for a single native bin entry on Windows. The `.exe` is
+/// only removed when a `.ghr` or `.shim` confirms the entry belongs to
+/// `tool_path`.
 fn cleanupWindowsBinEntry(io: Io, bin_dir: Dir, exe_name: []const u8, tool_path: []const u8) void {
     const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
         exe_name[0 .. exe_name.len - 4]
     else
         exe_name;
 
-    // Remove .shim file if it points to our tool dir
+    var owned = false;
+
+    // Remove the `<stem>.ghr` manifest if its target points to our tool dir.
+    var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{stem})) |ghr_name| {
+        if (binGhrPointsToToolDir(io, bin_dir, ghr_name, tool_path)) {
+            bin_dir.deleteFile(io, ghr_name) catch {};
+            owned = true;
+        }
+    } else |_| {}
+
+    // Remove any legacy `.shim` file if it points to our tool dir.
     var shim_name_buf: [Dir.max_path_bytes]u8 = undefined;
-    const shim_name = std.fmt.bufPrint(&shim_name_buf, "{s}.shim", .{stem}) catch return;
-    if (shimPointsToToolDir(io, bin_dir, shim_name, tool_path)) {
-        bin_dir.deleteFile(io, shim_name) catch {};
-        // Remove the companion shim .exe
+    if (std.fmt.bufPrint(&shim_name_buf, "{s}.shim", .{stem})) |shim_name| {
+        if (shimPointsToToolDir(io, bin_dir, shim_name, tool_path)) {
+            bin_dir.deleteFile(io, shim_name) catch {};
+            owned = true;
+        }
+    } else |_| {}
+
+    if (owned) {
         const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe")) exe_name else blk: {
             var name_buf: [Dir.max_path_bytes]u8 = undefined;
             break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return;
@@ -925,10 +1212,11 @@ fn cleanupWindowsBinEntry(io: Io, bin_dir: Dir, exe_name: []const u8, tool_path:
         bin_dir.deleteFile(io, shim_exe_name) catch {};
     }
 
-    // Also remove legacy .cmd wrapper if present
+    // Always best-effort remove a legacy .cmd wrapper.
     var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
-    const cmd_name = std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem}) catch return;
-    bin_dir.deleteFile(io, cmd_name) catch {};
+    if (std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem})) |cmd_name| {
+        bin_dir.deleteFile(io, cmd_name) catch {};
+    } else |_| {}
 }
 
 /// Check if a .shim file's target path starts with tool_path.
@@ -972,7 +1260,9 @@ fn cleanupStaleBinEntries(
             }
         }
         if (dominated) continue;
-        if (builtin.os.tag == .windows) {
+        if (release_mod.isWasmAssetName(old_exe_rel)) {
+            cleanupWasmBinEntry(io, bin_dir, old_exe_rel, old_tool_path);
+        } else if (builtin.os.tag == .windows) {
             cleanupWindowsBinEntry(io, bin_dir, old_name, old_tool_path);
         } else {
             var link_buf: [Dir.max_path_bytes]u8 = undefined;
@@ -1030,7 +1320,10 @@ pub fn cmdUninstall(
         for (m.parsed.value.bins) |exe_rel| {
             const exe_name = std.fs.path.basename(exe_rel);
             if (bin_dir) |bd| {
-                if (builtin.os.tag == .windows) {
+                if (release_mod.isWasmAssetName(exe_rel)) {
+                    cleanupWasmBinEntry(io, bd, exe_rel, tool_path);
+                    try w.print("  unlinked {s}\n", .{wasmStem(exe_rel)});
+                } else if (builtin.os.tag == .windows) {
                     cleanupWindowsBinEntry(io, bd, exe_name, tool_path);
                     try w.print("  unlinked {s}\n", .{exe_name});
                 } else {
@@ -1432,11 +1725,52 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         try w.flush();
     }
 
+    // Whether the selected asset is a WebAssembly module. Wasm installs take a
+    // dedicated path: the `.wasm` plus its companion `<wasm>.ghr` manifest are
+    // copied verbatim into the tool dir, and a shim launcher (which loads the
+    // manifest at run time) is linked into the bin dir.
+    const is_wasm = release_mod.isWasmAssetName(asset.name);
+    const ghr_name: ?[]u8 = if (is_wasm)
+        try std.fmt.allocPrint(allocator, "{s}.ghr", .{asset.name})
+    else
+        null;
+    defer if (ghr_name) |g| allocator.free(g);
+
+    if (is_wasm) {
+        const ghr_asset = release_mod.findGhrManifestAsset(release.parsed.value.assets, asset.name) orelse {
+            try err_w.print("error: wasm asset '{s}' has no companion '{s}.ghr' manifest in this release\n", .{ asset.name, asset.name });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        const ghr_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_name.? });
+        defer allocator.free(ghr_path);
+        const ghr_dl = release_mod.assetDownload(ghr_asset, auth_header != null);
+        http.downloadToFile(allocator, io, ghr_dl.url, ghr_path, .{
+            .auth_header = auth_header,
+            .accept = ghr_dl.accept,
+            .debug_w = debug_w,
+        }) catch |err| {
+            try err_w.print("error: failed to download manifest '{s}': {t}\n", .{ ghr_asset.name, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        // Validate the manifest now so a bad one fails before we touch the
+        // installed tool dir.
+        validateGhrManifest(allocator, io, ghr_path, err_w) catch return error.InstallStepFailed;
+    }
+
     // Stage extraction
     const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging-{s}-{s}", .{
         d.cache, std.fs.path.sep, owner_lower, repo_lower,
     });
     defer allocator.free(staging_path);
+    // Best-effort removal of the cached `.ghr` once staged.
+    defer if (ghr_name) |g| {
+        var pb: [Dir.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrint(&pb, "{s}{c}{s}", .{ d.cache, std.fs.path.sep, g })) |p| {
+            Dir.deleteFileAbsolute(io, p) catch {};
+        } else |_| {}
+    };
 
     // Clean up any leftover staging dir
     deleteTreeAbsolute(io, staging_path) catch {};
@@ -1457,7 +1791,25 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     try w.print("extracting ...\n", .{});
     try w.flush();
 
-    switch (archive.detectFormat(asset.name)) {
+    if (is_wasm) {
+        // Copy the wasm module and its `.ghr` manifest verbatim into staging.
+        var cache_dir = Dir.openDirAbsolute(io, d.cache, .{}) catch |err| {
+            try err_w.print("error: failed to open cache dir '{s}': {t}\n", .{ d.cache, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer cache_dir.close(io);
+        cache_dir.copyFile(asset.name, staging_dir, asset.name, io, .{}) catch |err| {
+            try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        cache_dir.copyFile(ghr_name.?, staging_dir, ghr_name.?, io, .{}) catch |err| {
+            try err_w.print("error: failed to stage manifest '{s}': {t}\n", .{ ghr_name.?, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+    } else switch (archive.detectFormat(asset.name)) {
         .zip, .tar_gz, .tar_xz, .deb => {
             archive.extractAuto(allocator, io, staging_dir, download_path, 0) catch |err| {
                 try err_w.print(
@@ -1493,10 +1845,14 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         },
     }
 
-    // Find executables
-    const prefer_deb_shims = archive.detectFormat(asset.name) == .deb and hasDebShims(io, staging_dir);
+    // Find executables. For wasm, the single "executable" is the wasm module
+    // itself; `linkToBin` recognizes the `.wasm` extension and installs the
+    // shim launcher rather than a symlink/native shim.
+    const prefer_deb_shims = !is_wasm and archive.detectFormat(asset.name) == .deb and hasDebShims(io, staging_dir);
     var exes: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (prefer_deb_shims) {
+    if (is_wasm) {
+        try exes.append(allocator, try allocator.dupe(u8, asset.name));
+    } else if (prefer_deb_shims) {
         exes = findDebExecutables(allocator, io, staging_dir) catch |err| {
             try err_w.print(
                 "error: failed to scan staging dir '{s}' for executables: {t}\n",
@@ -1865,6 +2221,22 @@ test "cmdInstallMany short-circuits on empty spec list" {
         null,
         false,
     );
+}
+
+test "wasmStem strips the .wasm extension from the basename" {
+    try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm"));
+    try std.testing.expectEqualStrings("hello", wasmStem("sub/dir/hello.wasm"));
+    try std.testing.expectEqualStrings("a.b", wasmStem("a.b.wasm"));
+}
+
+test "writeZonEscaped escapes backslashes, quotes, and control chars" {
+    const allocator = std.testing.allocator;
+    var c = std.Io.Writer.Allocating.init(allocator);
+    defer c.deinit();
+    try writeZonEscaped(&c.writer, "C:\\a\\b \"x\"\t");
+    const got = try c.toOwnedSlice();
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings("C:\\\\a\\\\b \\\"x\\\"\\t", got);
 }
 
 test "deriveBareBinaryName strips arch-triple from stem" {
