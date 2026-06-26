@@ -17,7 +17,7 @@ ghr uninstall <name>                              Remove an installed tool
 ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
 ghr path add [--dry-run]                          Add ghr's bin dir to your user PATH
 ghr path [bin|tools|cache]                        Show ghr directories
-ghr minisign sign <file> [<file> ...] -t <comment>   Sign release artifacts with a minisign key
+ghr minisign sign <file> [<file> ...]             Sign release artifacts with a minisign key
 ghr version                                       Print version and exit
 ghr help                                          Print this help and exit
 ```
@@ -97,12 +97,13 @@ single step:
 ```
 
 Input files are bare positional arguments (each `<file>` is signed to
-`<file>.minisig`). A trusted comment (`-t`) is required and is applied to
-every input. The secret key **must** come from `MINISIGN_SECRET_KEY` —
-there is no key-file flag. If `MINISIGN_PASSWORD` is unset and the key is
-encrypted, the password is read from stdin (one line); it is never read
-from a tty. Signatures use the prehashed (`ED`) format and are
-byte-for-byte identical to `minisign -S` output. Run
+`<file>.minisig`). A trusted comment may be given with `-t` (applied to
+every input); when omitted it defaults, like minisign, to
+`timestamp:<unix>\tfile:<name>\thashed` per file. The secret key **must**
+come from `MINISIGN_SECRET_KEY` and an encrypted key's password from
+`MINISIGN_PASSWORD` — there is no key-file flag, and the password is never
+read from a tty or stdin. Signatures use the prehashed (`ED`) format and
+are byte-for-byte identical to `minisign -S` output. Run
 `ghr minisign sign help` for all options.
 
 ## License

@@ -3,10 +3,9 @@
 //!
 //! It is intentionally rigid and CI-only: the secret key MUST come from the
 //! `MINISIGN_SECRET_KEY` environment variable, and an encrypted key's
-//! password from `MINISIGN_PASSWORD` (or, failing that, stdin). The key is
-//! never read from a file flag and the password is never read from a tty.
-//! Inputs are bare positional file paths; each `<file>` is signed to
-//! `<file>.minisig`.
+//! password from `MINISIGN_PASSWORD`. Neither is read from a file flag, a
+//! tty, or stdin. Inputs are bare positional file paths; each `<file>` is
+//! signed to `<file>.minisig`.
 //!
 //! Crypto lives in `minisign.zig`; this module is just argument parsing,
 //! key/password sourcing, and sidecar writing.
@@ -92,9 +91,6 @@ fn cmdSign(
     if (inputs.items.len == 0) {
         fail(err_w, "'ghr minisign sign' requires at least one input file", .{});
     }
-    const tc = trusted_comment orelse {
-        fail(err_w, "-t <comment> is required", .{});
-    };
 
     // The secret key MUST come from the environment — no file flag.
     const env_key = environ.get("MINISIGN_SECRET_KEY") orelse {
@@ -112,7 +108,10 @@ fn cmdSign(
     defer sk.deinit();
 
     if (sk.isEncrypted()) {
-        const password = try sourcePassword(allocator, io, environ, err_w);
+        const env_pw = environ.get("MINISIGN_PASSWORD") orelse {
+            fail(err_w, "the secret key is encrypted but MINISIGN_PASSWORD is not set", .{});
+        };
+        const password = allocator.dupe(u8, env_pw) catch return error.OutOfMemory;
         defer {
             std.crypto.secureZero(u8, password);
             allocator.free(password);
@@ -126,7 +125,7 @@ fn cmdSign(
     }
 
     for (inputs.items) |input| {
-        try signOne(allocator, io, &sk, input, tc, untrusted_comment, w, err_w);
+        try signOne(allocator, io, &sk, input, trusted_comment, untrusted_comment, w, err_w);
     }
     try w.flush();
 }
@@ -136,7 +135,7 @@ fn signOne(
     io: Io,
     sk: *const minisign.SecretKey,
     input: []const u8,
-    tc: []const u8,
+    trusted_comment: ?[]const u8,
     untrusted_comment: ?[]const u8,
     w: *Writer,
     err_w: *Writer,
@@ -145,6 +144,15 @@ fn signOne(
         fail(err_w, "failed to open '{s}': {s}", .{ input, @errorName(err) });
     };
     defer file.close(io);
+
+    // Match minisign: an absent OR empty -t falls back to the default
+    // per-file trusted comment; an explicit -t applies to every input.
+    const use_default = trusted_comment == null or trusted_comment.?.len == 0;
+    const tc = if (use_default)
+        try defaultTrustedComment(allocator, io, input)
+    else
+        trusted_comment.?;
+    defer if (use_default) allocator.free(tc);
 
     const uc = untrusted_comment orelse default_untrusted_comment;
 
@@ -163,27 +171,14 @@ fn signOne(
     try w.print("signed {s} -> {s} (trusted comment: {s})\n", .{ input, out, tc });
 }
 
-/// Resolve the secret-key password: `MINISIGN_PASSWORD` env wins; otherwise
-/// read a single line from stdin. Never touches `/dev/tty`.
-fn sourcePassword(
-    allocator: std.mem.Allocator,
-    io: Io,
-    environ: *const EnvironMap,
-    err_w: *Writer,
-) ![]u8 {
-    if (environ.get("MINISIGN_PASSWORD")) |p| {
-        return allocator.dupe(u8, p) catch return error.OutOfMemory;
-    }
-
-    var stdin = File.stdin();
-    var buf: [1024]u8 = undefined;
-    var reader = stdin.reader(io, &buf);
-    const line = reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
-        error.EndOfStream => fail(err_w, "secret key is encrypted but no password was provided (set MINISIGN_PASSWORD or pipe it on stdin)", .{}),
-        else => return err,
-    };
-    const trimmed = std.mem.trimEnd(u8, line, "\r");
-    return allocator.dupe(u8, trimmed) catch return error.OutOfMemory;
+/// minisign's default trusted comment for a prehashed signature:
+/// `timestamp:<unix>\tfile:<basename>\thashed`. ghr always signs prehashed,
+/// so the `\thashed` suffix is always present (matching `minisign -S`).
+fn defaultTrustedComment(allocator: std.mem.Allocator, io: Io, input: []const u8) ![]u8 {
+    const now = Io.Clock.now(.real, io);
+    const secs: i64 = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
+    const base = std.fs.path.basename(input);
+    return std.fmt.allocPrint(allocator, "timestamp:{d}\tfile:{s}\thashed", .{ secs, base });
 }
 
 // ---------------------------------------------------------------------------
@@ -238,25 +233,26 @@ fn printSignUsage(w: *Writer) !void {
         \\ghr minisign sign - write a minisign .minisig sidecar (no external binary)
         \\
         \\USAGE:
-        \\    ghr minisign sign <file> [<file> ...] -t <comment> [-c <comment>]
+        \\    ghr minisign sign <file> [<file> ...] [-t <comment>] [-c <comment>]
         \\
         \\Each <file> is signed to <file>.minisig. Input files are given as
-        \\bare positional arguments (no -m flag). A trusted comment (-t) is
-        \\required and is applied to every input.
+        \\bare positional arguments (no -m flag). An explicit -t is applied to
+        \\every input; when omitted it defaults per-file (see below).
         \\
         \\REQUIRED ENVIRONMENT:
         \\    MINISIGN_SECRET_KEY   secret key contents (the .key file body)
         \\    MINISIGN_PASSWORD     password for the encrypted key
         \\
-        \\The secret key MUST come from MINISIGN_SECRET_KEY; there is no
-        \\key-file flag. If the key is encrypted and MINISIGN_PASSWORD is
-        \\unset, the password is read from stdin (one line) — never from a
-        \\tty, so no `expect` script is needed. MINISIGN_PASSWORD is not
-        \\required for an unencrypted key.
+        \\Both the secret key and the password MUST come from the environment
+        \\— there is no key-file flag, and the password is never read from a
+        \\tty or stdin, so no `expect` script is needed. MINISIGN_PASSWORD is
+        \\not required for an unencrypted key.
         \\
         \\OPTIONS:
-        \\    -t <text>   Trusted comment, signed (required)
-        \\    -c <text>   Untrusted comment (not signed)
+        \\    -t <text>   Trusted comment, signed. Defaults (like minisign) to
+        \\                timestamp:<unix>\tfile:<name>\thashed per input.
+        \\    -c <text>   Untrusted comment, not signed (default:
+        \\                "signature from ghr minisign").
         \\    -h, --help  Show this help
         \\
         \\Signatures use the prehashed (ED / Blake2b-512) format and are
@@ -273,4 +269,17 @@ fn printSignUsage(w: *Writer) !void {
 
 test {
     _ = @import("minisign.zig");
+}
+
+test "defaultTrustedComment: matches minisign's per-file shape" {
+    const io = std.testing.io;
+    const tc = try defaultTrustedComment(std.testing.allocator, io, "dir/sub/hello.wasm");
+    defer std.testing.allocator.free(tc);
+
+    // timestamp:<digits>\tfile:<basename>\thashed — basename only, tab-separated.
+    try std.testing.expect(std.mem.startsWith(u8, tc, "timestamp:"));
+    try std.testing.expect(std.mem.endsWith(u8, tc, "\tfile:hello.wasm\thashed"));
+    const ts = tc["timestamp:".len .. std.mem.indexOfScalar(u8, tc, '\t').?];
+    try std.testing.expect(ts.len > 0);
+    for (ts) |c| try std.testing.expect(c >= '0' and c <= '9');
 }
