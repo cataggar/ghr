@@ -243,6 +243,15 @@ fn addExecutableBit(io: Io, dir: Dir, name: []const u8) void {
     f.setPermissions(io, new_perms) catch {};
 }
 
+/// Returns true if `name` is macOS archive cruft: an AppleDouble companion
+/// file (`._*`, which mirrors a real entry's resource fork/metadata) or the
+/// `__MACOSX` directory that `zip` adds. These are never real executables.
+fn isAppleArchiveCruft(name: []const u8) bool {
+    if (std.mem.startsWith(u8, name, "._")) return true;
+    if (std.mem.eql(u8, name, "__MACOSX")) return true;
+    return false;
+}
+
 /// Returns true if the file is a shared library (not a program executable).
 fn isSharedLibrary(name: []const u8) bool {
     if (std.mem.endsWith(u8, name, ".dylib")) return true;
@@ -430,6 +439,10 @@ fn scanForExecutables(
 ) !void {
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
+        // Skip macOS archive metadata (AppleDouble `._*` companions and the
+        // `__MACOSX` directory). These are not real executables even when they
+        // carry the exec bit, and linking them clutters the bin dir (#123).
+        if (isAppleArchiveCruft(entry.name)) continue;
         const rel_name = if (prefix.len > 0)
             try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name })
         else
@@ -2479,6 +2492,31 @@ test "dedupeExecutablesByArch drops multiple foreign-arch copies" {
 
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("pkg/aarch64/tool", exes.items[0]);
+}
+
+test "findExecutables skips AppleDouble and __MACOSX cruft" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // A real executable plus macOS archive metadata that carries the exec bit.
+    const real = try tmp.dir.createFile(std.testing.io, "minisign", .{ .permissions = .executable_file });
+    real.close(std.testing.io);
+    const ad1 = try tmp.dir.createFile(std.testing.io, "._minisign", .{ .permissions = .executable_file });
+    ad1.close(std.testing.io);
+    try tmp.dir.createDirPath(std.testing.io, "__MACOSX");
+    const ad2 = try tmp.dir.createFile(std.testing.io, "__MACOSX/._minisign", .{ .permissions = .executable_file });
+    ad2.close(std.testing.io);
+
+    const allocator = std.testing.allocator;
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("minisign", exes.items[0]);
 }
 
 test "findExecutables discovers nested executables" {
