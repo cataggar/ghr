@@ -94,10 +94,13 @@ jobs:
           # commit works for SOURCE_DATE_EPOCH.
           fetch-depth: 0
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Compute SOURCE_DATE_EPOCH
         shell: bash
@@ -262,10 +265,13 @@ jobs:
           ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
           fetch-depth: 0
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Compute SOURCE_DATE_EPOCH
         shell: bash
