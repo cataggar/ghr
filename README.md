@@ -17,6 +17,7 @@ ghr uninstall <name>                              Remove an installed tool
 ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
 ghr path add [--dry-run]                          Add ghr's bin dir to your user PATH
 ghr path [bin|tools|cache]                        Show ghr directories
+ghr minisign sign <file> [<file> ...]             Sign release artifacts with a minisign key
 ghr version                                       Print version and exit
 ghr help                                          Print this help and exit
 ```
@@ -80,6 +81,30 @@ See [`actions/install`](actions/install/README.md),
 [`actions/download`](actions/download/README.md), and the
 [Caching in GitHub Actions](doc/README.md#caching-in-github-actions)
 section for details.
+
+## Signing releases
+
+`ghr minisign sign` produces a minisign `.minisig` sidecar without an
+external `minisign` binary, a key file on disk, or an `expect` script. The
+secret key and password come from the environment, so a release job is a
+single step:
+
+```yaml
+- run: ghr minisign sign hello.wasm -t "tag:${{ github.ref_name }} commit:${GITHUB_SHA}"
+  env:
+    MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+    MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
+```
+
+Input files are bare positional arguments (each `<file>` is signed to
+`<file>.minisig`). A trusted comment may be given with `-t` (applied to
+every input); when omitted it defaults, like minisign, to
+`timestamp:<unix>\tfile:<name>\thashed` per file. The secret key **must**
+come from `MINISIGN_SECRET_KEY` and an encrypted key's password from
+`MINISIGN_PASSWORD` — there is no key-file flag, and the password is never
+read from a tty or stdin. Signatures use the prehashed (`ED`) format and
+are byte-for-byte identical to `minisign -S` output. Run
+`ghr minisign sign help` for all options.
 
 ## License
 
