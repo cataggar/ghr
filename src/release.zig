@@ -648,7 +648,7 @@ fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
 /// preserves names that mention both arches (e.g. cross-arch bundles)
 /// and is a no-op on hosts whose arch isn't in the supported set
 /// (`plat_arch` empty).
-fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
+pub fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
     if (plat_arch.len == 0) return false;
     const all_arch = [_][]const u8{
         "x86_64",  "x64",   "amd64",
@@ -669,6 +669,17 @@ fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
         }
         if (is_host) continue;
         if (containsIgnoreCaseBounded(name, t)) return true;
+    }
+    return false;
+}
+
+/// Returns true if `name` contains a token for the host architecture. Used
+/// alongside `isForeignArch` to resolve duplicate-executable collisions that
+/// arise when an archive bundles the same binary for several architectures
+/// under arch-named directories (see install.zig).
+pub fn hasHostArch(name: []const u8, plat_arch: []const []const u8) bool {
+    for (plat_arch) |k| {
+        if (containsIgnoreCaseBounded(name, k)) return true;
     }
     return false;
 }
