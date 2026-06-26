@@ -341,6 +341,60 @@ fn findExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayLis
     return result;
 }
 
+/// Some archives bundle the *same* command compiled for several architectures
+/// under arch-named directories — e.g. `jedisct1/minisign@0.12` ships both
+/// `minisign-linux/x86_64/minisign` and `minisign-linux/aarch64/minisign`.
+/// `findExecutables` returns every copy, and because they share the basename
+/// `minisign`, `linkToBin` would link them in arbitrary directory-iteration
+/// order, letting the foreign-arch build win on some hosts. Exec'ing that
+/// binary fails immediately (issue #123).
+///
+/// Resolve such collisions by detecting basename groups that contain a copy
+/// whose relative path targets the host architecture, then dropping the
+/// foreign-arch copies from that group. Groups with no host-arch match, and
+/// unique basenames, are left untouched so this is a safe no-op for normal
+/// single-arch archives.
+fn dedupeExecutablesByHostArch(
+    allocator: std.mem.Allocator,
+    exes: *std.ArrayListUnmanaged([]const u8),
+) void {
+    dedupeExecutablesByArch(allocator, exes, release_mod.currentPlatformKeywords().arch);
+}
+
+fn dedupeExecutablesByArch(
+    allocator: std.mem.Allocator,
+    exes: *std.ArrayListUnmanaged([]const u8),
+    host_arch: []const []const u8,
+) void {
+    if (host_arch.len == 0 or exes.items.len < 2) return;
+
+    var i: usize = 0;
+    while (i < exes.items.len) {
+        const path = exes.items[i];
+        // Only consider dropping a copy that clearly targets a foreign arch.
+        if (!release_mod.isForeignArch(path, host_arch)) {
+            i += 1;
+            continue;
+        }
+        const base = std.fs.path.basename(path);
+        // Keep it unless a sibling with the same basename targets the host arch.
+        var host_sibling = false;
+        for (exes.items, 0..) |other, j| {
+            if (j == i) continue;
+            if (!std.mem.eql(u8, std.fs.path.basename(other), base)) continue;
+            if (release_mod.hasHostArch(other, host_arch)) {
+                host_sibling = true;
+                break;
+            }
+        }
+        if (host_sibling) {
+            allocator.free(exes.orderedRemove(i));
+            continue;
+        }
+        i += 1;
+    }
+}
+
 fn findDebExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
     var bin_dir = dir.openDir(io, "usr/bin", .{ .iterate = true }) catch return result;
@@ -1876,6 +1930,10 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         exes.deinit(allocator);
     }
 
+    // Collapse same-named binaries bundled for multiple architectures down to
+    // the host-arch copy so linking can't land on a foreign-arch build (#123).
+    dedupeExecutablesByHostArch(allocator, &exes);
+
     if (exes.items.len == 0) {
         try err_w.print("error: no executables found in archive\n", .{});
         try err_w.print("  selected asset: {s}\n", .{asset.name});
@@ -2346,6 +2404,81 @@ test "findExecutables discovers executable files" {
     // Should find the executable but not the text file
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("myapp", exes.items[0]);
+}
+
+fn makeExeList(allocator: std.mem.Allocator, paths: []const []const u8) !std.ArrayListUnmanaged([]const u8) {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (paths) |p| try list.append(allocator, try allocator.dupe(u8, p));
+    return list;
+}
+
+test "dedupeExecutablesByArch keeps host-arch copy of bundled multi-arch binary" {
+    const allocator = std.testing.allocator;
+    // Mirrors jedisct1/minisign@0.12, which ships both arches under one tarball.
+    var exes = try makeExeList(allocator, &.{
+        "minisign-linux/aarch64/minisign",
+        "minisign-linux/x86_64/minisign",
+    });
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    dedupeExecutablesByArch(allocator, &exes, &.{ "x86_64", "x64", "amd64" });
+
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("minisign-linux/x86_64/minisign", exes.items[0]);
+}
+
+test "dedupeExecutablesByArch is a no-op for single-arch archives" {
+    const allocator = std.testing.allocator;
+    var exes = try makeExeList(allocator, &.{
+        "bin/foo",
+        "bin/bar",
+    });
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    dedupeExecutablesByArch(allocator, &exes, &.{ "aarch64", "arm64" });
+
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+}
+
+test "dedupeExecutablesByArch leaves group untouched when no copy matches host" {
+    const allocator = std.testing.allocator;
+    // Host arch absent from every copy: don't drop the only builds available.
+    var exes = try makeExeList(allocator, &.{
+        "tool-x86_64",
+        "tool-aarch64",
+    });
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    dedupeExecutablesByArch(allocator, &exes, &.{ "riscv64gc", "riscv64" });
+
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+}
+
+test "dedupeExecutablesByArch drops multiple foreign-arch copies" {
+    const allocator = std.testing.allocator;
+    var exes = try makeExeList(allocator, &.{
+        "pkg/x86_64/tool",
+        "pkg/aarch64/tool",
+        "pkg/riscv64/tool",
+    });
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    dedupeExecutablesByArch(allocator, &exes, &.{ "aarch64", "arm64" });
+
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("pkg/aarch64/tool", exes.items[0]);
 }
 
 test "findExecutables discovers nested executables" {
