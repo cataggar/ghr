@@ -52,10 +52,13 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          version: 0.16.0
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Get version
         id: version
@@ -174,26 +177,25 @@ jobs:
           done
           ls -la ghr-*.sigstore.json
 
+      - name: Install ghr
+        run: pipx install ghr-bin==0.6.1
+
       - name: Sign archives with minisign (per-asset .minisig sidecars)
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y minisign expect
-          # Write the secret key to a file with 0600. The runner workspace
-          # is ephemeral; the trap removes it before the step exits.
-          umask 077
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
-          trap 'rm -f minisign.key' EXIT
           shopt -s nullglob
           for asset in ghr-*.tar.gz ghr-*.zip; do
-            # Trusted comment is printed by `ghr install` on successful
-            # verification, so encode self-identifying metadata in it.
+            # `ghr minisign sign` reads the secret key from MINISIGN_SECRET_KEY
+            # and its password from MINISIGN_PASSWORD — no key file on disk and
+            # no external minisign/expect. The trusted comment is printed by
+            # `ghr install` on successful verification, so encode
+            # self-identifying metadata in it.
             comment="timestamp:$(date +%s) file:${asset} commit:${GITHUB_SHA} tag:${GITHUB_REF_NAME}"
             echo "signing ${asset} (trusted comment: ${comment})"
-            expect scripts/sign-asset.exp "$asset" "$comment"
+            ghr minisign sign "$asset" -t "$comment"
           done
           ls -la ghr-*.minisig
 
