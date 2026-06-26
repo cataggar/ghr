@@ -237,7 +237,11 @@ runs:
           read -ra tokens <<< "$line"
           positionals+=("${tokens[@]}")
         done <<< "${SORTED_SPECS}"
-        ghr install "${flags[@]}" "${positionals[@]}"
+        # Bash 3.2 (macOS `/bin/bash`) treats `"${arr[@]}"` on an empty
+        # array as an unbound variable under `set -u`. Use the
+        # `${arr[@]+...}` guard so an empty `flags`/`positionals` expands to
+        # zero words instead of erroring.
+        ghr install ${flags[@]+"${flags[@]}"} ${positionals[@]+"${positionals[@]}"}
 
     - name: Sanity check (ghr list)
       shell: bash
