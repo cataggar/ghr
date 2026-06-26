@@ -5,6 +5,7 @@ const install = @import("install.zig");
 const download = @import("download.zig");
 const ensurepath = @import("ensurepath.zig");
 const validate = @import("validate.zig");
+const minisign_cmd = @import("minisign_cmd.zig");
 const release_mod = @import("release.zig");
 const link = @import("link.zig");
 
@@ -168,6 +169,8 @@ pub fn main(init: std.process.Init) !void {
         try runLinkCmd(allocator, io, environ, &args, &stdout.interface, &stderr.interface, .unlink);
     } else if (eql(cmd_str, "validate")) {
         try validate.cmdValidate(allocator, io, &args, &stdout.interface, &stderr.interface);
+    } else if (eql(cmd_str, "minisign")) {
+        try minisign_cmd.cmdMinisign(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else {
         try stderr.interface.print("error: unknown command '{s}'\n\n", .{cmd_str});
         try printUsage(&stderr.interface);
@@ -683,6 +686,7 @@ fn printUsage(w: *Writer) !void {
         \\    path add [--dry-run]                 Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
         \\    validate <SUBCOMMAND>                Run validations against published artifacts
+        \\    minisign <SUBCOMMAND>                Sign release artifacts with a minisign key
         \\    version                              Print version and exit
         \\    help                                 Print this help and exit
         \\
@@ -715,4 +719,5 @@ test {
     _ = @import("download.zig");
     _ = @import("validate.zig");
     _ = @import("link.zig");
+    _ = @import("minisign_cmd.zig");
 }

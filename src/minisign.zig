@@ -1,4 +1,11 @@
-//! Native minisign verification (issue #65).
+//! Native minisign verification and signing.
+//!
+//! Signing (`SecretKey`, `signArtifact`) is the inverse of the
+//! verification path: it parses a v2 `.key` secret key (optionally
+//! scrypt-encrypted), Blake2b-512 prehashes the artifact, produces the
+//! `ED` artifact signature plus the trusted-comment global signature, and
+//! serialises a 4-line `.minisig` sidecar. Like verification it uses only
+//! `std.crypto` (Ed25519, Blake2b, scrypt) — no new C deps.
 //!
 //! Coverage:
 //!   * Parse a minisign v2 public key — single-token base64 of
@@ -24,6 +31,8 @@ const File = Io.File;
 
 const Ed25519 = std.crypto.sign.Ed25519;
 const Blake2b512 = std.crypto.hash.blake2.Blake2b512;
+const Blake2b256 = std.crypto.hash.blake2.Blake2b256;
+const scrypt = std.crypto.pwhash.scrypt;
 
 // ---------------------------------------------------------------------------
 // Wire format constants.
@@ -46,6 +55,24 @@ const global_sig_decoded_len = Ed25519.Signature.encoded_length;
 
 const untrusted_prefix = "untrusted comment:";
 const trusted_prefix = "trusted comment:";
+
+/// Secret-key signature algorithm tag (`Ed`). The on-disk secret key is a
+/// raw Ed25519 key; the artifact signature it produces is always the `ED`
+/// (Blake2b-512 prehashed) variant.
+pub const sk_sig_alg: [2]u8 = .{ 'E', 'd' };
+/// KDF tag for an scrypt-encrypted secret key.
+pub const kdf_scrypt: [2]u8 = .{ 'S', 'c' };
+/// KDF tag for an unencrypted secret key (two zero bytes).
+pub const kdf_none: [2]u8 = .{ 0, 0 };
+/// Checksum tag (`B2` = Blake2b-256 over `sig_alg || key_id || secret_key`).
+pub const chk_blake2b: [2]u8 = .{ 'B', '2' };
+
+/// Decoded length of a v2 secret key:
+/// `<sig_alg:2><kdf_alg:2><chk_alg:2><salt:32><opslimit:8><memlimit:8>`
+/// `<key_id:8><secret_key:64><checksum:32>` = 158 bytes.
+const sk_decoded_len = 2 + 2 + 2 + 32 + 8 + 8 + 8 + 64 + 32;
+/// The 104 encrypted bytes (`key_id || secret_key || checksum`).
+const sk_encrypted_len = 8 + 64 + 32;
 
 // ---------------------------------------------------------------------------
 // Parsed structures.
@@ -87,6 +114,13 @@ pub const VerifyError = error{
     MinisignKeyIdMismatch,
     MinisignSignatureMismatch,
     MinisignGlobalSigMismatch,
+};
+
+pub const SignError = error{
+    MinisignSecretKeyParseError,
+    MinisignUnsupportedAlgorithm,
+    MinisignUnsupportedKdf,
+    MinisignWrongPassword,
 };
 
 // ---------------------------------------------------------------------------
@@ -333,6 +367,197 @@ pub fn verifyGlobal(pk: PublicKey, sig: Signature) !void {
     verifier.update(&sig.sig);
     verifier.update(sig.trusted_comment);
     verifier.verify() catch return VerifyError.MinisignGlobalSigMismatch;
+}
+
+// ---------------------------------------------------------------------------
+// Signing.
+// ---------------------------------------------------------------------------
+
+/// A parsed minisign v2 secret key. When `kdf_alg` is `Sc` the `key_id`,
+/// `secret_key` and `checksum` fields are still scrypt-encrypted until
+/// `decrypt` succeeds; `decrypted` tracks that state. `signArtifact`
+/// asserts the key has been decrypted.
+pub const SecretKey = struct {
+    sig_alg: [2]u8,
+    kdf_alg: [2]u8,
+    chk_alg: [2]u8,
+    kdf_salt: [32]u8,
+    kdf_opslimit: u64,
+    kdf_memlimit: u64,
+    key_id: KeyId,
+    /// 64-byte Ed25519 secret key (`seed:32 || pubkey:32`).
+    secret_key: [64]u8,
+    checksum: [32]u8,
+    decrypted: bool,
+
+    /// True when the key material is scrypt-encrypted and a password is
+    /// required before signing.
+    pub fn isEncrypted(self: SecretKey) bool {
+        return !std.mem.eql(u8, &self.kdf_alg, &kdf_none);
+    }
+
+    /// Wipe the secret bytes. Safe to call on an encrypted or decrypted key.
+    pub fn deinit(self: *SecretKey) void {
+        std.crypto.secureZero(u8, &self.secret_key);
+        std.crypto.secureZero(u8, &self.checksum);
+    }
+
+    /// Derive the public key from a decrypted secret key.
+    pub fn publicKey(self: SecretKey) PublicKey {
+        return .{
+            .algo = algo_pure,
+            .key_id = self.key_id,
+            .key = self.secret_key[32..64].*,
+        };
+    }
+
+    /// Decrypt the key material in place using `password` (scrypt KDF),
+    /// verifying the Blake2b-256 checksum. A checksum mismatch is reported
+    /// as `MinisignWrongPassword`. No-op (and always succeeds) for an
+    /// unencrypted key.
+    pub fn decrypt(self: *SecretKey, allocator: std.mem.Allocator, password: []const u8) !void {
+        if (!self.isEncrypted()) {
+            self.decrypted = true;
+            return;
+        }
+        if (!std.mem.eql(u8, &self.kdf_alg, &kdf_scrypt)) return SignError.MinisignUnsupportedKdf;
+
+        var stream: [sk_encrypted_len]u8 = undefined;
+        defer std.crypto.secureZero(u8, &stream);
+        const params = scrypt.Params.fromLimits(self.kdf_opslimit, @intCast(self.kdf_memlimit));
+        try scrypt.kdf(allocator, &stream, password, &self.kdf_salt, params);
+
+        var key_id = self.key_id;
+        var secret_key = self.secret_key;
+        var checksum = self.checksum;
+        defer std.crypto.secureZero(u8, &secret_key);
+        for (&key_id, stream[0..8]) |*b, k| b.* ^= k;
+        for (&secret_key, stream[8..72]) |*b, k| b.* ^= k;
+        for (&checksum, stream[72..104]) |*b, k| b.* ^= k;
+
+        var computed: [32]u8 = undefined;
+        var h = Blake2b256.init(.{});
+        h.update(&self.sig_alg);
+        h.update(&key_id);
+        h.update(&secret_key);
+        h.final(&computed);
+        if (!std.crypto.timing_safe.eql([32]u8, computed, checksum)) {
+            return SignError.MinisignWrongPassword;
+        }
+
+        self.key_id = key_id;
+        self.secret_key = secret_key;
+        self.checksum = checksum;
+        self.decrypted = true;
+    }
+
+    /// Sign `file` and return an allocated 4-line `.minisig` document
+    /// (caller owns the returned slice). Always emits the `ED`
+    /// Blake2b-512 prehashed variant, streaming the artifact from disk in
+    /// 64 KiB chunks. `trusted_comment` is covered by the trailing global
+    /// signature; `untrusted_comment` is not. Signatures are deterministic
+    /// (no random nonce), matching minisign's default output.
+    pub fn signArtifact(
+        self: *const SecretKey,
+        allocator: std.mem.Allocator,
+        io: Io,
+        file: File,
+        trusted_comment: []const u8,
+        untrusted_comment: []const u8,
+    ) ![]u8 {
+        std.debug.assert(self.decrypted);
+
+        var read_buf: [64 * 1024]u8 = undefined;
+        var fr = file.reader(io, &read_buf);
+        var hasher = Blake2b512.init(.{});
+        var chunk: [64 * 1024]u8 = undefined;
+        while (true) {
+            const n = try fr.interface.readSliceShort(&chunk);
+            if (n == 0) break;
+            hasher.update(chunk[0..n]);
+            if (n < chunk.len) break;
+        }
+        var digest: [Blake2b512.digest_length]u8 = undefined;
+        hasher.final(&digest);
+
+        const ed_sk = try Ed25519.SecretKey.fromBytes(self.secret_key);
+        const kp = try Ed25519.KeyPair.fromSecretKey(ed_sk);
+
+        // Artifact signature over the prehash.
+        const art_sig = (try kp.sign(&digest, null)).toBytes();
+
+        // Global signature over `art_sig || trusted_comment`.
+        const gbuf = try allocator.alloc(u8, art_sig.len + trusted_comment.len);
+        defer allocator.free(gbuf);
+        @memcpy(gbuf[0..art_sig.len], &art_sig);
+        @memcpy(gbuf[art_sig.len..], trusted_comment);
+        const global_sig = (try kp.sign(gbuf, null)).toBytes();
+
+        // Signature line raw bytes: `<algo:2><key_id:8><sig:64>`.
+        var sig_raw: [sig_decoded_len]u8 = undefined;
+        sig_raw[0] = algo_prehashed[0];
+        sig_raw[1] = algo_prehashed[1];
+        @memcpy(sig_raw[2..10], &self.key_id);
+        @memcpy(sig_raw[10..], &art_sig);
+
+        const enc = std.base64.standard.Encoder;
+        var sig_b64: [enc.calcSize(sig_decoded_len)]u8 = undefined;
+        _ = enc.encode(&sig_b64, &sig_raw);
+        var gsig_b64: [enc.calcSize(global_sig_decoded_len)]u8 = undefined;
+        _ = enc.encode(&gsig_b64, &global_sig);
+
+        return std.fmt.allocPrint(
+            allocator,
+            "{s} {s}\n{s}\n{s} {s}\n{s}\n",
+            .{ untrusted_prefix, untrusted_comment, sig_b64, trusted_prefix, trusted_comment, gsig_b64 },
+        );
+    }
+};
+
+/// Parse a v2 minisign secret key. Accepts either the single base64 token
+/// (line 2 of a `.key` file) or the whole 2-line file (a leading
+/// `untrusted comment:` line is tolerated and skipped). Returns
+/// `MinisignSecretKeyParseError` on malformed input and
+/// `MinisignUnsupportedAlgorithm` for a non-`Ed`/non-`B2` key.
+pub fn parseSecretKey(input: []const u8) SignError!SecretKey {
+    const trimmed = trimAsciiSpace(input);
+    if (trimmed.len == 0) return SignError.MinisignSecretKeyParseError;
+
+    var token = trimmed;
+    if (std.mem.startsWith(u8, token, untrusted_prefix)) {
+        const nl = std.mem.indexOfScalar(u8, token, '\n') orelse
+            return SignError.MinisignSecretKeyParseError;
+        token = trimAsciiSpace(token[nl + 1 ..]);
+    }
+    for (token) |c| switch (c) {
+        ' ', '\t', '\r', '\n' => return SignError.MinisignSecretKeyParseError,
+        else => {},
+    };
+
+    var raw: [sk_decoded_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &raw);
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(token) catch
+        return SignError.MinisignSecretKeyParseError;
+    if (decoded_len != raw.len) return SignError.MinisignSecretKeyParseError;
+    decoder.decode(&raw, token) catch return SignError.MinisignSecretKeyParseError;
+
+    var sk: SecretKey = .{
+        .sig_alg = .{ raw[0], raw[1] },
+        .kdf_alg = .{ raw[2], raw[3] },
+        .chk_alg = .{ raw[4], raw[5] },
+        .kdf_salt = raw[6..38].*,
+        .kdf_opslimit = std.mem.readInt(u64, raw[38..46], .little),
+        .kdf_memlimit = std.mem.readInt(u64, raw[46..54], .little),
+        .key_id = raw[54..62].*,
+        .secret_key = raw[62..126].*,
+        .checksum = raw[126..158].*,
+        .decrypted = false,
+    };
+    if (!std.mem.eql(u8, &sk.sig_alg, &sk_sig_alg)) return SignError.MinisignUnsupportedAlgorithm;
+    if (!std.mem.eql(u8, &sk.chk_alg, &chk_blake2b)) return SignError.MinisignUnsupportedAlgorithm;
+    sk.decrypted = !sk.isEncrypted();
+    return sk;
 }
 
 // ---------------------------------------------------------------------------
@@ -608,4 +833,164 @@ test "verifyArtifact + verifyGlobal: synthetic Ed (pure) round-trip" {
     var f = try Dir.openFileAbsolute(io, path, .{});
     defer f.close(io);
     try verifyArtifact(io, f, pk, sig);
+}
+
+// ---------------------------------------------------------------------------
+// Signing round-trip tests.
+//
+// `signArtifact` is validated two ways:
+//   * Byte-for-byte against the upstream `minisign 0.12` CLI: the encrypted
+//     secret key, public key, artifact and reference `.minisig` below were
+//     all produced by `minisign` (password "testpass"). Because Ed25519
+//     signatures here are deterministic, our output must match bit-for-bit.
+//   * Round-trip through ghr's own (independently upstream-validated)
+//     verifier, using a fast programmatically-built *unencrypted* key so
+//     most coverage avoids the deliberately expensive scrypt KDF.
+// ---------------------------------------------------------------------------
+
+const sign_seckey = @embedFile("minisign/testdata/sign_seckey.key");
+const sign_pubkey = @embedFile("minisign/testdata/sign_pubkey.pub");
+const sign_artifact = @embedFile("minisign/testdata/sign_artifact.txt");
+const sign_reference_minisig = @embedFile("minisign/testdata/sign_artifact.txt.minisig");
+const sign_password = "testpass";
+
+const enc_std = std.base64.standard.Encoder;
+const sk_b64_len: usize = enc_std.calcSize(sk_decoded_len);
+
+// Build an unencrypted v2 secret key (base64 text) from a deterministic
+// Ed25519 keypair, returning both the serialized key and the matching
+// public key. Exercises the on-disk layout without invoking scrypt.
+fn buildUnencryptedSecretKey(out_b64: *[sk_b64_len]u8) struct { text: []const u8, pk: PublicKey } {
+    var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
+    @memset(&seed, 0x37);
+    const kp = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
+    const sk_bytes = kp.secret_key.toBytes();
+    const key_id: KeyId = .{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02 };
+
+    var raw: [sk_decoded_len]u8 = undefined;
+    @memcpy(raw[0..2], &sk_sig_alg);
+    @memcpy(raw[2..4], &kdf_none);
+    @memcpy(raw[4..6], &chk_blake2b);
+    @memset(raw[6..38], 0); // salt (unused when unencrypted)
+    std.mem.writeInt(u64, raw[38..46], 0, .little);
+    std.mem.writeInt(u64, raw[46..54], 0, .little);
+    @memcpy(raw[54..62], &key_id);
+    @memcpy(raw[62..126], &sk_bytes);
+
+    var chk: [32]u8 = undefined;
+    var h = Blake2b256.init(.{});
+    h.update(&sk_sig_alg);
+    h.update(&key_id);
+    h.update(&sk_bytes);
+    h.final(&chk);
+    @memcpy(raw[126..158], &chk);
+
+    const text = enc_std.encode(out_b64, &raw);
+    return .{
+        .text = text,
+        .pk = .{ .algo = algo_pure, .key_id = key_id, .key = kp.public_key.toBytes() },
+    };
+}
+
+test "parseSecretKey + signArtifact: unencrypted round-trip and key derivation" {
+    const io = std.testing.io;
+    var b64: [sk_b64_len]u8 = undefined;
+    const built = buildUnencryptedSecretKey(&b64);
+
+    var sk = try parseSecretKey(built.text);
+    defer sk.deinit();
+    try testing.expect(!sk.isEncrypted());
+    try sk.decrypt(testing.allocator, ""); // no-op for an unencrypted key.
+    try testing.expect(sk.decrypted);
+
+    const derived = sk.publicKey();
+    try testing.expectEqualSlices(u8, &built.pk.key_id, &derived.key_id);
+    try testing.expectEqualSlices(u8, &built.pk.key, &derived.key);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try tmp.dir.createFile(io, "p.bin", .{});
+        try f.writeStreamingAll(io, "ghr unencrypted-key round-trip payload\n");
+        f.close(io);
+    }
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const path = try realPathOf(io, tmp.dir, "p.bin", &path_buf);
+
+    const sidecar = blk: {
+        var f = try Dir.openFileAbsolute(io, path, .{});
+        defer f.close(io);
+        break :blk try sk.signArtifact(testing.allocator, io, f, "timestamp:1700000000\tfile:p.bin\thashed", "ghr test");
+    };
+    defer testing.allocator.free(sidecar);
+
+    const sig = try parseSignature(sidecar);
+    try testing.expectEqualSlices(u8, &algo_prehashed, &sig.algo);
+    try verifyKeyId(built.pk, sig);
+
+    var f = try Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    try verifyArtifact(io, f, built.pk, sig);
+    try verifyGlobal(built.pk, sig);
+}
+
+test "parseSecretKey: rejects malformed input" {
+    try testing.expectError(SignError.MinisignSecretKeyParseError, parseSecretKey(""));
+    try testing.expectError(SignError.MinisignSecretKeyParseError, parseSecretKey("not base64"));
+    try testing.expectError(SignError.MinisignSecretKeyParseError, parseSecretKey("AAAA"));
+}
+
+// The following two tests run scrypt against minisign's fixed (deliberately
+// expensive) KDF parameters, so they are slow in Debug builds — that cost is
+// inherent to decrypting a real encrypted minisign key.
+
+test "decrypt: wrong password is rejected" {
+    var sk = try parseSecretKey(sign_seckey);
+    defer sk.deinit();
+    try testing.expect(sk.isEncrypted());
+    try testing.expectEqualSlices(u8, &kdf_scrypt, &sk.kdf_alg);
+    try testing.expectError(SignError.MinisignWrongPassword, sk.decrypt(testing.allocator, "not-the-password"));
+}
+
+test "signArtifact: reproduces the reference minisign signature byte-for-byte" {
+    const io = std.testing.io;
+    var sk = try parseSecretKey(sign_seckey);
+    defer sk.deinit();
+    try sk.decrypt(testing.allocator, sign_password);
+
+    // Decrypted key must derive the published public key.
+    const pk = try parsePublicKey(sign_pubkey);
+    const derived = sk.publicKey();
+    try testing.expectEqualSlices(u8, &pk.key_id, &derived.key_id);
+    try testing.expectEqualSlices(u8, &pk.key, &derived.key);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try tmp.dir.createFile(io, "art.txt", .{});
+        try f.writeStreamingAll(io, sign_artifact);
+        f.close(io);
+    }
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const path = try realPathOf(io, tmp.dir, "art.txt", &path_buf);
+    var f = try Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+
+    // Same trusted/untrusted comments the reference used → deterministic
+    // Ed25519 signatures must match the reference `.minisig` bit-for-bit.
+    const ref = try parseSignature(sign_reference_minisig);
+    const sidecar = try sk.signArtifact(
+        testing.allocator,
+        io,
+        f,
+        ref.trusted_comment,
+        "signature from minisign secret key",
+    );
+    defer testing.allocator.free(sidecar);
+
+    try testing.expectEqualStrings(sign_reference_minisig, sidecar);
+
+    const mine = try parseSignature(sidecar);
+    try verifyKeyId(pk, mine);
+    try verifyGlobal(pk, mine);
 }
