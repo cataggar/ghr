@@ -1,0 +1,9 @@
+# Embedded test fixtures and trust anchors are pulled in via `@embedFile` and
+# compared byte-for-byte (e.g. the minisign sign reference signature), so their
+# bytes must be identical on every platform. Pin them to LF so a Windows
+# checkout with `core.autocrlf=true` can't rewrite them to CRLF and corrupt the
+# embedded data.
+src/minisign/testdata/**    text eol=lf
+src/sigstore/testdata/**    text eol=lf
+src/authenticode/trust/**   text eol=lf
+src/sigstore/trust/**       text eol=lf
