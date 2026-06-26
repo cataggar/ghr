@@ -17,7 +17,7 @@ ghr uninstall <name>                              Remove an installed tool
 ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
 ghr path add [--dry-run]                          Add ghr's bin dir to your user PATH
 ghr path [bin|tools|cache]                        Show ghr directories
-ghr minisign sign -m <file> [-m <file> ...]       Sign release artifacts with a minisign key
+ghr minisign sign <file> [<file> ...] -t <comment>   Sign release artifacts with a minisign key
 ghr version                                       Print version and exit
 ghr help                                          Print this help and exit
 ```
@@ -86,21 +86,24 @@ section for details.
 
 `ghr minisign sign` produces a minisign `.minisig` sidecar without an
 external `minisign` binary, a key file on disk, or an `expect` script. The
-secret key and password are read from the environment, so a release job is
-a single step:
+secret key and password come from the environment, so a release job is a
+single step:
 
 ```yaml
-- run: ghr minisign sign -m hello.wasm -t "tag:${{ github.ref_name }} commit:${GITHUB_SHA}"
+- run: ghr minisign sign hello.wasm -t "tag:${{ github.ref_name }} commit:${GITHUB_SHA}"
   env:
     MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
     MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
 ```
 
-If `MINISIGN_PASSWORD` is unset and the key is encrypted, the password is
-read from stdin (one line); it is never read from a tty. Pass `-s <file>`
-to read the secret key from a file instead of the environment. Signatures
-use the prehashed (`ED`) format and are byte-for-byte identical to
-`minisign -S` output. Run `ghr minisign sign help` for all options.
+Input files are bare positional arguments (each `<file>` is signed to
+`<file>.minisig`). A trusted comment (`-t`) is required and is applied to
+every input. The secret key **must** come from `MINISIGN_SECRET_KEY` —
+there is no key-file flag. If `MINISIGN_PASSWORD` is unset and the key is
+encrypted, the password is read from stdin (one line); it is never read
+from a tty. Signatures use the prehashed (`ED`) format and are
+byte-for-byte identical to `minisign -S` output. Run
+`ghr minisign sign help` for all options.
 
 ## License
 

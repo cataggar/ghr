@@ -1,11 +1,12 @@
 //! `ghr minisign sign` — produce a minisign `.minisig` sidecar without an
 //! external `minisign` binary, an `expect` script, or a key file on disk.
 //!
-//! It is CI-first: the secret key and its password are read from
-//! environment variables (`MINISIGN_SECRET_KEY` / `MINISIGN_PASSWORD`) by
-//! default, so a release workflow collapses to a single `run:` step. The
-//! password may also be piped on stdin; it is never read from `/dev/tty`,
-//! so no pseudo-terminal trick is needed.
+//! It is intentionally rigid and CI-only: the secret key MUST come from the
+//! `MINISIGN_SECRET_KEY` environment variable, and an encrypted key's
+//! password from `MINISIGN_PASSWORD` (or, failing that, stdin). The key is
+//! never read from a file flag and the password is never read from a tty.
+//! Inputs are bare positional file paths; each `<file>` is signed to
+//! `<file>.minisig`.
 //!
 //! Crypto lives in `minisign.zig`; this module is just argument parsing,
 //! key/password sourcing, and sidecar writing.
@@ -20,7 +21,6 @@ const Writer = Io.Writer;
 const EnvironMap = std.process.Environ.Map;
 
 const default_untrusted_comment = "signature from ghr minisign";
-const max_secret_key_bytes = 4 * 1024;
 
 /// Entry point for `ghr minisign <subcommand> ...`.
 pub fn cmdMinisign(
@@ -70,8 +70,6 @@ fn cmdSign(
     var inputs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer inputs.deinit(allocator);
 
-    var secret_key_path: ?[]const u8 = null;
-    var output_path: ?[]const u8 = null;
     var trusted_comment: ?[]const u8 = null;
     var untrusted_comment: ?[]const u8 = null;
 
@@ -79,53 +77,37 @@ fn cmdSign(
         if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try printSignUsage(w);
             return;
-        } else if (eqOpt(arg, "-m", "--input")) {
-            inputs.append(allocator, nextValue(args, err_w, arg)) catch return error.OutOfMemory;
-        } else if (eqOpt(arg, "-s", "--secret-key")) {
-            secret_key_path = nextValue(args, err_w, arg);
-        } else if (eqOpt(arg, "-x", "--output")) {
-            output_path = nextValue(args, err_w, arg);
-        } else if (eqOpt(arg, "-t", "--trusted-comment")) {
+        } else if (std.mem.eql(u8, arg, "-t")) {
             trusted_comment = nextValue(args, err_w, arg);
-        } else if (eqOpt(arg, "-c", "--untrusted-comment")) {
+        } else if (std.mem.eql(u8, arg, "-c")) {
             untrusted_comment = nextValue(args, err_w, arg);
-        } else if (std.mem.startsWith(u8, arg, "-")) {
+        } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             fail(err_w, "unknown option '{s}' for 'ghr minisign sign'", .{arg});
         } else {
-            // Bare positional: treat as an input file for convenience.
+            // Inputs are bare positional file paths.
             inputs.append(allocator, arg) catch return error.OutOfMemory;
         }
     }
 
     if (inputs.items.len == 0) {
-        fail(err_w, "'ghr minisign sign' requires at least one input (-m <file>)", .{});
+        fail(err_w, "'ghr minisign sign' requires at least one input file", .{});
     }
-    if (output_path != null and inputs.items.len > 1) {
-        fail(err_w, "-x/--output cannot be combined with multiple inputs", .{});
-    }
-    if (trusted_comment != null and inputs.items.len > 1) {
-        fail(err_w, "-t/--trusted-comment cannot be combined with multiple inputs", .{});
-    }
-
-    // Source the secret key: -s file wins, else MINISIGN_SECRET_KEY env.
-    const sk_bytes = blk: {
-        if (secret_key_path) |p| {
-            break :blk readWholeFile(allocator, io, p, max_secret_key_bytes) catch |err| {
-                fail(err_w, "failed to read secret key '{s}': {s}", .{ p, @errorName(err) });
-            };
-        }
-        if (environ.get("MINISIGN_SECRET_KEY")) |env_key| {
-            break :blk allocator.dupe(u8, env_key) catch return error.OutOfMemory;
-        }
-        fail(err_w, "no secret key: pass -s <file> or set MINISIGN_SECRET_KEY", .{});
+    const tc = trusted_comment orelse {
+        fail(err_w, "-t <comment> is required", .{});
     };
+
+    // The secret key MUST come from the environment — no file flag.
+    const env_key = environ.get("MINISIGN_SECRET_KEY") orelse {
+        fail(err_w, "MINISIGN_SECRET_KEY is not set (the secret key must come from the environment)", .{});
+    };
+    const sk_bytes = allocator.dupe(u8, env_key) catch return error.OutOfMemory;
     defer {
         std.crypto.secureZero(u8, sk_bytes);
         allocator.free(sk_bytes);
     }
 
     var sk = minisign.parseSecretKey(sk_bytes) catch |err| {
-        fail(err_w, "invalid secret key: {s}", .{@errorName(err)});
+        fail(err_w, "invalid MINISIGN_SECRET_KEY: {s}", .{@errorName(err)});
     };
     defer sk.deinit();
 
@@ -144,7 +126,7 @@ fn cmdSign(
     }
 
     for (inputs.items) |input| {
-        try signOne(allocator, io, &sk, input, output_path, trusted_comment, untrusted_comment, w, err_w);
+        try signOne(allocator, io, &sk, input, tc, untrusted_comment, w, err_w);
     }
     try w.flush();
 }
@@ -154,8 +136,7 @@ fn signOne(
     io: Io,
     sk: *const minisign.SecretKey,
     input: []const u8,
-    output_path: ?[]const u8,
-    trusted_comment: ?[]const u8,
+    tc: []const u8,
     untrusted_comment: ?[]const u8,
     w: *Writer,
     err_w: *Writer,
@@ -165,10 +146,6 @@ fn signOne(
     };
     defer file.close(io);
 
-    const tc = trusted_comment orelse try defaultTrustedComment(allocator, io, input);
-    const owns_tc = trusted_comment == null;
-    defer if (owns_tc) allocator.free(tc);
-
     const uc = untrusted_comment orelse default_untrusted_comment;
 
     const sidecar = sk.signArtifact(allocator, io, file, tc, uc) catch |err| {
@@ -176,24 +153,14 @@ fn signOne(
     };
     defer allocator.free(sidecar);
 
-    const out = output_path orelse try std.fmt.allocPrint(allocator, "{s}.minisig", .{input});
-    const owns_out = output_path == null;
-    defer if (owns_out) allocator.free(out);
+    const out = try std.fmt.allocPrint(allocator, "{s}.minisig", .{input});
+    defer allocator.free(out);
 
     writeWholeFile(io, out, sidecar) catch |err| {
         fail(err_w, "failed to write '{s}': {s}", .{ out, @errorName(err) });
     };
 
     try w.print("signed {s} -> {s} (trusted comment: {s})\n", .{ input, out, tc });
-}
-
-/// minisign's default trusted comment for a prehashed signature:
-/// `timestamp:<unix>\tfile:<basename>\thashed`.
-fn defaultTrustedComment(allocator: std.mem.Allocator, io: Io, input: []const u8) ![]u8 {
-    const now = Io.Clock.now(.real, io);
-    const secs: i64 = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
-    const base = std.fs.path.basename(input);
-    return std.fmt.allocPrint(allocator, "timestamp:{d}\tfile:{s}\thashed", .{ secs, base });
 }
 
 /// Resolve the secret-key password: `MINISIGN_PASSWORD` env wins; otherwise
@@ -228,12 +195,6 @@ fn openFile(io: Io, path: []const u8) !File {
     return Dir.cwd().openFile(io, path, .{});
 }
 
-fn readWholeFile(allocator: std.mem.Allocator, io: Io, path: []const u8, limit: usize) ![]u8 {
-    // Dir.readFileAlloc opens with size-known reader semantics; on POSIX an
-    // absolute sub_path resolves correctly via openat regardless of dir.
-    return Dir.cwd().readFileAlloc(io, path, allocator, Io.Limit.limited(limit));
-}
-
 fn writeWholeFile(io: Io, path: []const u8, bytes: []const u8) !void {
     var file = if (std.fs.path.isAbsolute(path))
         try Dir.createFileAbsolute(io, path, .{})
@@ -246,10 +207,6 @@ fn writeWholeFile(io: Io, path: []const u8, bytes: []const u8) !void {
 // ---------------------------------------------------------------------------
 // Argument helpers.
 // ---------------------------------------------------------------------------
-
-fn eqOpt(arg: []const u8, short: []const u8, long: []const u8) bool {
-    return std.mem.eql(u8, arg, short) or std.mem.eql(u8, arg, long);
-}
 
 fn nextValue(args: *std.process.Args.Iterator, err_w: *Writer, flag: []const u8) []const u8 {
     return args.next() orelse fail(err_w, "option '{s}' requires a value", .{flag});
@@ -270,7 +227,8 @@ pub fn printUsage(w: *Writer) !void {
         \\    sign     Sign one or more files, writing <file>.minisig sidecars
         \\    help     Show this help
         \\
-        \\Run 'ghr minisign sign help' for signing options.
+        \\Run 'ghr minisign sign help' for signing usage and the required
+        \\MINISIGN_SECRET_KEY / MINISIGN_PASSWORD environment variables.
         \\
     , .{});
 }
@@ -280,35 +238,35 @@ fn printSignUsage(w: *Writer) !void {
         \\ghr minisign sign - write a minisign .minisig sidecar (no external binary)
         \\
         \\USAGE:
-        \\    ghr minisign sign -m <file> [-m <file> ...] [OPTIONS]
+        \\    ghr minisign sign <file> [<file> ...] -t <comment> [-c <comment>]
         \\
-        \\The secret key and password are read from the environment by
-        \\default, so CI never needs a key file or an `expect` script:
+        \\Each <file> is signed to <file>.minisig. Input files are given as
+        \\bare positional arguments (no -m flag). A trusted comment (-t) is
+        \\required and is applied to every input.
         \\
-        \\    MINISIGN_SECRET_KEY   secret key (file contents or base64 line)
-        \\    MINISIGN_PASSWORD     password for an encrypted key
+        \\REQUIRED ENVIRONMENT:
+        \\    MINISIGN_SECRET_KEY   secret key contents (the .key file body)
+        \\    MINISIGN_PASSWORD     password for the encrypted key
         \\
-        \\If MINISIGN_PASSWORD is unset and the key is encrypted, the
-        \\password is read from stdin (one line). It is never read from a tty.
+        \\The secret key MUST come from MINISIGN_SECRET_KEY; there is no
+        \\key-file flag. If the key is encrypted and MINISIGN_PASSWORD is
+        \\unset, the password is read from stdin (one line) — never from a
+        \\tty, so no `expect` script is needed. MINISIGN_PASSWORD is not
+        \\required for an unencrypted key.
         \\
         \\OPTIONS:
-        \\    -m, --input <file>             File to sign (repeatable)
-        \\    -s, --secret-key <file>        Secret key file (overrides env)
-        \\    -x, --output <file>            Sidecar path (default <file>.minisig;
-        \\                                   single input only)
-        \\    -t, --trusted-comment <text>   Trusted comment (signed); default
-        \\                                   timestamp:<unix>\tfile:<name>\thashed
-        \\    -c, --untrusted-comment <text> Untrusted comment (not signed)
-        \\    -h, --help                     Show this help
+        \\    -t <text>   Trusted comment, signed (required)
+        \\    -c <text>   Untrusted comment (not signed)
+        \\    -h, --help  Show this help
         \\
         \\Signatures use the prehashed (ED / Blake2b-512) format and are
         \\deterministic, matching `minisign -S` output.
         \\
         \\EXAMPLE (GitHub Actions):
-        \\    - run: ghr minisign sign -m hello.wasm -t "tag:${{ github.ref_name }}"
+        \\    - run: ghr minisign sign hello.wasm -t "tag:${{{{ github.ref_name }}}}"
         \\      env:
-        \\        MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-        \\        MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
+        \\        MINISIGN_SECRET_KEY: ${{{{ secrets.MINISIGN_SECRET_KEY }}}}
+        \\        MINISIGN_PASSWORD:   ${{{{ secrets.MINISIGN_PASSWORD }}}}
         \\
     , .{});
 }
