@@ -11,7 +11,10 @@
 ///
 /// For backward compatibility the shim also still reads a legacy `<stem>.shim`
 /// text file (a single-line native target path) when no `.ghr` manifest is
-/// present. New installs only write `.ghr`.
+/// present. New installs normally write only `.ghr`; the one exception is a
+/// Windows self-update where the running shim exe is locked and cannot be
+/// replaced — ghr then also writes a `.shim` fallback so the still-running
+/// (possibly older, `.shim`-only) shim keeps resolving the new target.
 ///
 /// This is the same general technique used by npm and Scoop on Windows, with
 /// the wasm-launcher behavior layered on so a `.wasm` is runnable as a

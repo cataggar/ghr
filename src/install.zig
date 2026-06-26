@@ -584,16 +584,16 @@ fn linkToBin(
             exe_name;
 
         // Write the `<stem>.ghr` manifest naming the native target. The shim
-        // reads this at run time; it replaces the legacy `.shim` file.
+        // reads this at run time; for a current shim it supersedes the legacy
+        // `.shim` file (which is reconciled further below).
         var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
         const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{stem}) catch return error.PathTooLong;
         try writeNativeGhr(io, bin_dir, ghr_name, src_path);
 
-        // Remove any legacy `.shim` / `.cmd` left by previous installs.
-        var legacy_shim_buf: [Dir.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrint(&legacy_shim_buf, "{s}.shim", .{stem})) |p| {
-            bin_dir.deleteFile(io, p) catch {};
-        } else |_| {}
+        // Remove any legacy `.cmd` wrapper from very old installs; the shim
+        // exe + `.ghr` manifest supersede it unconditionally. The legacy
+        // `.shim` is reconciled below, once we know whether the current shim
+        // exe was actually installed.
         var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
         if (std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem})) |p| {
             bin_dir.deleteFile(io, p) catch {};
@@ -613,13 +613,30 @@ fn linkToBin(
             bin_dir.deleteFile(io, old_name) catch {};
             bin_dir.rename(shim_exe_name, bin_dir, old_name, io) catch {};
         };
-        if (bin_dir.createFile(io, shim_exe_name, .{})) |*exe_file| {
+        const shim_replaced = if (bin_dir.createFile(io, shim_exe_name, .{})) |*exe_file| blk: {
             defer exe_file.close(io);
             exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
-        } else |_| {
-            // The shim exe is locked (self-update). The .ghr file has already
-            // been updated with the new target path, so the existing shim exe
-            // will work correctly on the next invocation. Skip replacing it.
+            break :blk true;
+        } else |_| false;
+
+        // Reconcile the legacy `.shim` file now that we know whether the
+        // current shim exe was installed.
+        var legacy_shim_buf: [Dir.max_path_bytes]u8 = undefined;
+        const legacy_shim = std.fmt.bufPrint(&legacy_shim_buf, "{s}.shim", .{stem}) catch return error.PathTooLong;
+        if (shim_replaced) {
+            // The freshly written shim reads the `.ghr` manifest; drop any
+            // stale `.shim` from an older install.
+            bin_dir.deleteFile(io, legacy_shim) catch {};
+        } else {
+            // Self-update on Windows: the running shim exe is locked, so we
+            // could not install the current `.ghr`-aware shim. The shim that
+            // is still running may predate the `.ghr` format and only
+            // understand a legacy `.shim` file, so write that fallback
+            // pointing at the new target. A current shim prefers the `.ghr`
+            // manifest and ignores `.shim` when one is present, so this is
+            // safe for both old and new shims and prevents a broken command
+            // (`shim: cannot read <stem>.shim`) after a self-update.
+            writeLegacyShim(io, bin_dir, legacy_shim, src_path) catch {};
         }
     } else {
         // Unix: symlink
@@ -684,6 +701,22 @@ fn writeNativeGhr(io: Io, bin_dir: Dir, ghr_name: []const u8, target_abs: []cons
     gw.print(".{{\n    .version = 1,\n    .target = \"", .{}) catch return error.WriteFailed;
     writeZonEscaped(gw, target_abs) catch return error.WriteFailed;
     gw.print("\",\n}}\n", .{}) catch return error.WriteFailed;
+    fw.end() catch return error.WriteFailed;
+}
+
+/// Write a legacy `<stem>.shim` file: a single line holding the absolute
+/// native target path. Only used as a self-update fallback on Windows when the
+/// shim exe is locked and cannot be replaced, so an older `.shim`-only shim
+/// that is still running keeps resolving the new target. Current shims prefer
+/// the `.ghr` manifest and ignore this file whenever one is present.
+fn writeLegacyShim(io: Io, bin_dir: Dir, shim_name: []const u8, target_abs: []const u8) !void {
+    bin_dir.deleteFile(io, shim_name) catch {};
+    var shim_file = bin_dir.createFile(io, shim_name, .{}) catch return error.CreateFailed;
+    defer shim_file.close(io);
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    var fw = shim_file.writer(io, &buf);
+    const sw = &fw.interface;
+    sw.print("{s}\n", .{target_abs}) catch return error.WriteFailed;
     fw.end() catch return error.WriteFailed;
 }
 
@@ -2929,6 +2962,36 @@ test "shimPointsToToolDir validates path boundaries" {
             "c:\\tools\\OWNER\\repo",
         ));
     }
+}
+
+test "writeLegacyShim writes a single-line target readable by shimPointsToToolDir" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target = "C:\\tools\\owner\\repo\\bin\\tool.exe";
+    try writeLegacyShim(std.testing.io, tmp.dir, "tool.shim", target);
+
+    // Contents are exactly the target followed by a trailing newline.
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "tool.shim", allocator, Io.Limit.limited(4096));
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings(target ++ "\n", body);
+
+    // The fallback is recognized as owning its tool dir, so a legacy
+    // `.shim`-only shim resolves it after a self-update.
+    try std.testing.expect(shimPointsToToolDir(
+        std.testing.io,
+        tmp.dir,
+        "tool.shim",
+        "C:\\tools\\owner\\repo",
+    ));
+
+    // Overwrites any pre-existing `.shim` rather than appending.
+    const target2 = "C:\\tools\\owner\\repo\\bin\\v2\\tool.exe";
+    try writeLegacyShim(std.testing.io, tmp.dir, "tool.shim", target2);
+    const body2 = try tmp.dir.readFileAlloc(std.testing.io, "tool.shim", allocator, Io.Limit.limited(4096));
+    defer allocator.free(body2);
+    try std.testing.expectEqualStrings(target2 ++ "\n", body2);
 }
 
 test "ensureDirWithParents creates leaf and one missing parent" {
