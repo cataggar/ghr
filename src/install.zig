@@ -1377,6 +1377,54 @@ fn cleanupStaleBinEntries(
     }
 }
 
+/// Unlink every bin in `bins` that this unit (`unit_path`) owns. Handles
+/// wasm shim launchers, Windows shim exes, and Unix symlinks. Shared by the
+/// repo-unit and per-module uninstall paths.
+fn unlinkUnitBins(
+    io: Io,
+    bin_dir: Dir,
+    bins: []const []const u8,
+    unit_path: []const u8,
+    w: *Writer,
+) !void {
+    for (bins) |exe_rel| {
+        const exe_name = std.fs.path.basename(exe_rel);
+        if (release_mod.isWasmAssetName(exe_rel)) {
+            cleanupWasmBinEntry(io, bin_dir, exe_rel, unit_path);
+            try w.print("  unlinked {s}\n", .{wasmStem(exe_rel)});
+        } else if (builtin.os.tag == .windows) {
+            cleanupWindowsBinEntry(io, bin_dir, exe_name, unit_path);
+            try w.print("  unlinked {s}\n", .{exe_name});
+        } else {
+            var link_buf: [Dir.max_path_bytes]u8 = undefined;
+            const len = bin_dir.readLink(io, exe_name, &link_buf) catch continue;
+            const link_target = link_buf[0..len];
+            if (std.mem.startsWith(u8, link_target, unit_path) and
+                (link_target.len == unit_path.len or link_target[unit_path.len] == '/'))
+            {
+                bin_dir.deleteFile(io, exe_name) catch continue;
+                try w.print("  unlinked {s}\n", .{exe_name});
+            }
+        }
+    }
+}
+
+/// Parse a `ghr uninstall` argument into a repo spec plus an optional wasm
+/// module stem. `owner/repo` → whole repo; `owner/repo/<stem>` → one module.
+const UninstallTarget = struct {
+    repo_spec: []const u8,
+    module_stem: ?[]const u8,
+};
+
+fn parseUninstallSpec(spec_str: []const u8) UninstallTarget {
+    if (std.mem.indexOfScalar(u8, spec_str, '/')) |first| {
+        if (std.mem.indexOfScalarPos(u8, spec_str, first + 1, '/')) |second| {
+            return .{ .repo_spec = spec_str[0..second], .module_stem = spec_str[second + 1 ..] };
+        }
+    }
+    return .{ .repo_spec = spec_str, .module_stem = null };
+}
+
 pub fn cmdUninstall(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1385,12 +1433,27 @@ pub fn cmdUninstall(
     w: *Writer,
     err_w: *Writer,
 ) !void {
-    const owned = release_mod.parseRepoSpecOwned(allocator, spec_str) catch {
-        try err_w.print("error: invalid spec '{s}', expected owner/repo\n", .{spec_str});
+    // An optional trailing `/<stem>` selects a single wasm module unit
+    // (`<tools>/<owner>/<repo>/<stem>/`); otherwise the whole repo — its
+    // repo-level install plus every wasm module under it — is removed.
+    const target = parseUninstallSpec(spec_str);
+    const module_stem = target.module_stem;
+    const repo_spec_str = target.repo_spec;
+
+    const owned = release_mod.parseRepoSpecOwned(allocator, repo_spec_str) catch {
+        try err_w.print("error: invalid spec '{s}', expected owner/repo or owner/repo/<wasm-stem>\n", .{spec_str});
         try err_w.flush();
         std.process.exit(1);
     };
     defer owned.deinit();
+
+    if (module_stem) |stem| {
+        if (stem.len == 0 or std.mem.indexOfScalar(u8, stem, '/') != null) {
+            try err_w.print("error: invalid spec '{s}', expected owner/repo/<wasm-stem>\n", .{spec_str});
+            try err_w.flush();
+            std.process.exit(1);
+        }
+    }
 
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
@@ -1405,46 +1468,77 @@ pub fn cmdUninstall(
     };
     defer allocator.free(tool_path);
 
-    // Read metadata to know what to clean up
+    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch null;
+    defer if (bin_dir) |*bd| bd.close(io);
+
+    // --- Single wasm module unit ---------------------------------------
+    if (module_stem) |stem| {
+        const module_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, stem });
+        defer allocator.free(module_path);
+
+        const mmeta = readMetadata(allocator, io, module_path) orelse {
+            try err_w.print("error: {s}/{s}/{s} is not installed\n", .{ owned.owner, owned.repo, stem });
+            try err_w.flush();
+            std.process.exit(1);
+        };
+        defer {
+            mmeta.parsed.deinit();
+            allocator.free(mmeta.body);
+        }
+
+        if (bin_dir) |bd| {
+            try unlinkUnitBins(io, bd, mmeta.parsed.value.bins, module_path, w);
+        }
+
+        deleteTreeAbsolute(io, module_path) catch {
+            try err_w.print("error: failed to remove {s}\n", .{module_path});
+            try err_w.flush();
+            std.process.exit(1);
+        };
+
+        // Best-effort: drop the now-empty repo dir (only succeeds when no
+        // repo-level install or sibling modules remain).
+        Dir.deleteDirAbsolute(io, tool_path) catch {};
+
+        try w.print("uninstalled {s}/{s}/{s}\n", .{ owned.owner, owned.repo, stem });
+        return;
+    }
+
+    // --- Whole repo: repo-level unit + every wasm module under it -------
     const meta = readMetadata(allocator, io, tool_path);
     defer if (meta) |m| {
         m.parsed.deinit();
         allocator.free(m.body);
     };
 
-    // Remove bin symlinks
-    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch null;
-    defer if (bin_dir) |*bd| bd.close(io);
-
     if (meta) |m| {
-        for (m.parsed.value.bins) |exe_rel| {
-            const exe_name = std.fs.path.basename(exe_rel);
-            if (bin_dir) |bd| {
-                if (release_mod.isWasmAssetName(exe_rel)) {
-                    cleanupWasmBinEntry(io, bd, exe_rel, tool_path);
-                    try w.print("  unlinked {s}\n", .{wasmStem(exe_rel)});
-                } else if (builtin.os.tag == .windows) {
-                    cleanupWindowsBinEntry(io, bd, exe_name, tool_path);
-                    try w.print("  unlinked {s}\n", .{exe_name});
-                } else {
-                    var link_buf: [Dir.max_path_bytes]u8 = undefined;
-                    const len = bd.readLink(io, exe_name, &link_buf) catch continue;
-                    const link_target = link_buf[0..len];
-                    if (std.mem.startsWith(u8, link_target, tool_path) and
-                        (link_target.len == tool_path.len or link_target[tool_path.len] == '/'))
-                    {
-                        bd.deleteFile(io, exe_name) catch continue;
-                        try w.print("  unlinked {s}\n", .{exe_name});
-                    }
-                }
-            }
+        if (bin_dir) |bd| {
+            try unlinkUnitBins(io, bd, m.parsed.value.bins, tool_path, w);
         }
-
-        // Remove app bundle copies (macOS)
         if (comptime builtin.os.tag.isDarwin()) {
             uninstallAppBundles(allocator, io, environ, m.parsed.value.apps, tool_path, w);
         }
     }
+
+    // Unlink bins for each wasm module unit under the repo.
+    if (Dir.openDirAbsolute(io, tool_path, .{ .iterate = true })) |*repo_dir| {
+        defer repo_dir.close(io);
+        var it = repo_dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            if (std.mem.endsWith(u8, entry.name, ".old")) continue;
+            const module_path = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, entry.name }) catch continue;
+            defer allocator.free(module_path);
+            const mmeta = readMetadata(allocator, io, module_path) orelse continue;
+            defer {
+                mmeta.parsed.deinit();
+                allocator.free(mmeta.body);
+            }
+            if (bin_dir) |bd| {
+                unlinkUnitBins(io, bd, mmeta.parsed.value.bins, module_path, w) catch {};
+            }
+        }
+    } else |_| {}
 
     // Delete the tool directory
     deleteTreeAbsolute(io, tool_path) catch {
@@ -1485,6 +1579,438 @@ pub const InstallContext = struct {
     /// any spec whose `SpecWithKey.key` is null.
     minisign_pubkey_b64: ?[]const u8,
 };
+
+/// Move any wasm-module unit subdirs (child dirs containing their own
+/// `ghr.json`) out of `repo_path` into `staging_path`, so a repo-level
+/// (archive) reinstall that replaces `repo_path` preserves independently
+/// installed wasm modules. The staging dir is later renamed onto `repo_path`,
+/// so the modules end up back at their original absolute paths and their shim
+/// targets stay valid. Best-effort: names that collide with staged archive
+/// content are left in place.
+fn preserveWasmModuleUnits(
+    allocator: std.mem.Allocator,
+    io: Io,
+    repo_path: []const u8,
+    staging_path: []const u8,
+) void {
+    var rd = Dir.openDirAbsolute(io, repo_path, .{ .iterate = true }) catch return;
+    defer rd.close(io);
+
+    var names: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (names.items) |n| allocator.free(n);
+        names.deinit(allocator);
+    }
+    var it = rd.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        var child = rd.openDir(io, entry.name, .{}) catch continue;
+        const is_unit = blk: {
+            var f = child.openFile(io, "ghr.json", .{}) catch break :blk false;
+            f.close(io);
+            break :blk true;
+        };
+        child.close(io);
+        if (!is_unit) continue;
+        const dup = allocator.dupe(u8, entry.name) catch continue;
+        names.append(allocator, dup) catch {
+            allocator.free(dup);
+            continue;
+        };
+    }
+    for (names.items) |name| {
+        var sb: [Dir.max_path_bytes]u8 = undefined;
+        var db: [Dir.max_path_bytes]u8 = undefined;
+        const src = std.fmt.bufPrint(&sb, "{s}{c}{s}", .{ repo_path, std.fs.path.sep, name }) catch continue;
+        const dst = std.fmt.bufPrint(&db, "{s}{c}{s}", .{ staging_path, std.fs.path.sep, name }) catch continue;
+        Dir.renameAbsolute(src, dst, io) catch {};
+    }
+}
+
+/// Result of `verifyDownloadedAsset`: the metadata label recorded in
+/// `ghr.json` and the minisign key the install actually verified against.
+const VerifyResult = struct {
+    label: []const u8,
+    minisign_key: ?[]const u8,
+};
+
+/// Run the full verification pipeline (checksum / minisign / authenticode /
+/// sigstore) over an asset already downloaded to `download_path` and report
+/// the strongest outcome. Shared by the archive and per-module wasm install
+/// paths. On any verification failure the diagnostic is printed, the cached
+/// download is removed, and `error.InstallStepFailed` is returned.
+fn verifyDownloadedAsset(
+    ctx: *const InstallContext,
+    assets: []const release_mod.Asset,
+    asset_name: []const u8,
+    download_path: []const u8,
+    minisign_pubkey_b64: ?[]const u8,
+    debug_w: ?*Writer,
+) !VerifyResult {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const d = ctx.dirs;
+    const auth_header = ctx.auth_header;
+    const gates = ctx.gates;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+
+    // Verification (issue #50 + issue #65). Runs after the asset is on
+    // disk, before we extract or move anything. Checksum (Phase 1),
+    // minisign (issue #65, requires a key — inline or `--minisign`), and
+    // sigstore bundle (Phase 2) are independent — all run when material
+    // is published, unless the matching skip flag suppresses one. Outcome
+    // precedence for the metadata label: sigstore > minisign > authenticode > checksum.
+    var verified_label: []const u8 = "none";
+    // Pubkey the install actually verified against (sticky across the
+    // other verifiers' outcomes). Recorded in `ghr.json` and surfaced by
+    // `ghr list` so users can copy it back into future installs.
+    var recorded_minisign_key: ?[]const u8 = null;
+    if (gates.skip_verify) {
+        verified_label = "skipped";
+        try w.print("note: verification skipped (--skip-verify)\n", .{});
+    } else {
+        const sha_outcome: release_mod.VerifyOutcome = if (gates.skip_checksum) blk: {
+            try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
+            break :blk .no_verification;
+        } else blk: {
+            // Verify GitHub's built-in asset digest (inline in the release
+            // JSON, no extra network request). Independently, if the
+            // release also publishes a `.sha256` / `SHA256SUMS` sidecar,
+            // validate that too — a published sidecar is never silently
+            // ignored. Both must pass; the sidecar drives the recorded
+            // label when present.
+            const gh_outcome = release_mod.verifyDownloadedAssetGithubDigest(
+                io,
+                assets,
+                asset_name,
+                download_path,
+                debug_w,
+                w,
+                err_w,
+            ) catch |verr| {
+                Dir.deleteFileAbsolute(io, download_path) catch {};
+                switch (verr) {
+                    error.ChecksumMismatch => return error.InstallStepFailed,
+                    else => {
+                        try err_w.print("error: checksum verification failed: {}\n", .{verr});
+                        try err_w.flush();
+                        return error.InstallStepFailed;
+                    },
+                }
+            };
+            const sidecar_outcome = verifyDownloadedAssetSha256(
+                allocator,
+                io,
+                d.cache,
+                assets,
+                asset_name,
+                download_path,
+                debug_w,
+                auth_header,
+                w,
+                err_w,
+            ) catch |verr| {
+                switch (verr) {
+                    error.ChecksumMismatch,
+                    error.ChecksumDownloadFailed,
+                    error.ChecksumEntryMissing,
+                    => {
+                        Dir.deleteFileAbsolute(io, download_path) catch {};
+                        return error.InstallStepFailed;
+                    },
+                    else => {
+                        try err_w.print("error: checksum verification failed: {}\n", .{verr});
+                        try err_w.flush();
+                        Dir.deleteFileAbsolute(io, download_path) catch {};
+                        return error.InstallStepFailed;
+                    },
+                }
+            };
+            break :blk if (sidecar_outcome == .sha256_verified) sidecar_outcome else gh_outcome;
+        };
+        if (sha_outcome == .sha256_verified) verified_label = "checksum";
+        if (sha_outcome == .github_digest_verified) verified_label = "github-digest";
+
+        const mini_outcome: release_mod.VerifyOutcome = if (gates.skip_minisign) blk: {
+            if (minisign_pubkey_b64 != null) {
+                try w.print("note: minisign verification skipped (--skip-minisign)\n", .{});
+            }
+            break :blk .no_verification;
+        } else release_mod.verifyDownloadedAssetMinisign(
+            allocator,
+            io,
+            d.cache,
+            assets,
+            asset_name,
+            download_path,
+            debug_w,
+            auth_header,
+            minisign_pubkey_b64,
+            w,
+            err_w,
+        ) catch {
+            // Diagnostic was already printed by the verifier.
+            Dir.deleteFileAbsolute(io, download_path) catch {};
+            return error.InstallStepFailed;
+        };
+        if (mini_outcome == .minisign_verified) {
+            verified_label = "minisign";
+            recorded_minisign_key = minisign_pubkey_b64;
+        }
+
+        const ac_outcome: release_mod.VerifyOutcome = if (gates.skip_authenticode) blk: {
+            try w.print("note: authenticode verification skipped (--skip-authenticode)\n", .{});
+            break :blk .no_verification;
+        } else release_mod.verifyDownloadedAssetAuthenticode(
+            allocator,
+            io,
+            download_path,
+            debug_w,
+            w,
+            err_w,
+        ) catch |verr| {
+            try err_w.print("error: authenticode verification failed: {s}\n", .{@errorName(verr)});
+            try err_w.flush();
+            Dir.deleteFileAbsolute(io, download_path) catch {};
+            return error.InstallStepFailed;
+        };
+        if (ac_outcome == .authenticode_verified) verified_label = "authenticode";
+
+        const sig_outcome: release_mod.VerifyOutcome = if (gates.skip_sigstore) blk: {
+            try w.print("note: sigstore verification skipped (--skip-sigstore)\n", .{});
+            break :blk .no_verification;
+        } else verifyDownloadedAssetSigstore(
+            allocator,
+            io,
+            d.cache,
+            assets,
+            asset_name,
+            download_path,
+            debug_w,
+            auth_header,
+            w,
+            err_w,
+        ) catch |verr| {
+            try err_w.print("error: sigstore verification failed: {s}\n", .{@errorName(verr)});
+            try err_w.flush();
+            Dir.deleteFileAbsolute(io, download_path) catch {};
+            return error.InstallStepFailed;
+        };
+        if (sig_outcome == .sigstore_verified) verified_label = "sigstore";
+
+        if (sha_outcome == .no_verification and
+            mini_outcome == .no_verification and
+            ac_outcome == .no_verification and
+            sig_outcome == .no_verification)
+        {
+            try w.print("note: download is unverified (no checksum, minisign, sigstore, or authenticode)\n", .{});
+        }
+        try w.flush();
+    }
+    return .{ .label = verified_label, .minisign_key = recorded_minisign_key };
+}
+
+/// Install one wasm module as its own unit at `<tools>/<owner>/<repo>/<stem>/`.
+///
+/// Unlike an archive install (whose unit is the whole repo), each wasm module
+/// is independent: it has its own `ghr.json`/tag and links a single shim named
+/// after the module stem. Installing one module never touches the repo-level
+/// install or sibling modules, so different releases of the same repo (e.g. a
+/// `wabt` archive and `petstore` wasm components) coexist. Returns the wasm
+/// stem (the linked command name) on success.
+fn installWasmModuleUnit(
+    ctx: *const InstallContext,
+    tag_name: []const u8,
+    assets: []const release_mod.Asset,
+    asset: release_mod.Asset,
+    owner_lower: []const u8,
+    repo_lower: []const u8,
+    minisign_pubkey_b64: ?[]const u8,
+) ![]const u8 {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const d = ctx.dirs;
+    const auth_header = ctx.auth_header;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+    const debug = ctx.debug;
+    const gates = ctx.gates;
+
+    const debug_w: ?*Writer = if (debug) err_w else null;
+    const stem = wasmStem(asset.name);
+
+    // Pre-flight verification (fail before downloading when a `.minisig`
+    // sidecar is published but no key was supplied).
+    release_mod.preflightVerification(
+        assets,
+        asset.name,
+        gates,
+        minisign_pubkey_b64,
+        err_w,
+    ) catch return error.InstallStepFailed;
+
+    try w.print("downloading {s} ...\n", .{asset.name});
+    try w.flush();
+
+    ensureDirAbsoluteRecursive(io, d.cache);
+
+    const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        d.cache, std.fs.path.sep, asset.name,
+    });
+    defer allocator.free(download_path);
+
+    const asset_dl = release_mod.assetDownload(asset, auth_header != null);
+    debugLog(debug_w, "debug: url: {s}\n", .{asset_dl.url});
+    http.downloadToFile(allocator, io, asset_dl.url, download_path, .{
+        .auth_header = auth_header,
+        .accept = asset_dl.accept,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: download failed: {}\n", .{err});
+        try err_w.print("  url: {s}\n", .{asset_dl.url});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer Dir.deleteFileAbsolute(io, download_path) catch {};
+
+    const vr = try verifyDownloadedAsset(ctx, assets, asset.name, download_path, minisign_pubkey_b64, debug_w);
+
+    // Download + validate the companion `<wasm>.ghr` manifest.
+    const ghr_name = try std.fmt.allocPrint(allocator, "{s}.ghr", .{asset.name});
+    defer allocator.free(ghr_name);
+    const ghr_asset = release_mod.findGhrManifestAsset(assets, asset.name) orelse {
+        try err_w.print("error: wasm asset '{s}' has no companion '{s}.ghr' manifest in this release\n", .{ asset.name, asset.name });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    const ghr_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_name });
+    defer allocator.free(ghr_path);
+    defer Dir.deleteFileAbsolute(io, ghr_path) catch {};
+    const ghr_dl = release_mod.assetDownload(ghr_asset, auth_header != null);
+    http.downloadToFile(allocator, io, ghr_dl.url, ghr_path, .{
+        .auth_header = auth_header,
+        .accept = ghr_dl.accept,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: failed to download manifest '{s}': {t}\n", .{ ghr_asset.name, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    validateGhrManifest(allocator, io, ghr_path, err_w) catch return error.InstallStepFailed;
+
+    // Stage the wasm + manifest into a per-module staging dir.
+    const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging-{s}-{s}-{s}", .{
+        d.cache, std.fs.path.sep, owner_lower, repo_lower, stem,
+    });
+    defer allocator.free(staging_path);
+    deleteTreeAbsolute(io, staging_path) catch {};
+    Dir.createDirAbsolute(io, staging_path, .default_dir) catch |err| {
+        try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    errdefer deleteTreeAbsolute(io, staging_path) catch {};
+    {
+        var staging_dir = Dir.openDirAbsolute(io, staging_path, .{ .iterate = true }) catch |err| {
+            try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ staging_path, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer staging_dir.close(io);
+        var cache_dir = Dir.openDirAbsolute(io, d.cache, .{}) catch |err| {
+            try err_w.print("error: failed to open cache dir '{s}': {t}\n", .{ d.cache, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer cache_dir.close(io);
+        cache_dir.copyFile(asset.name, staging_dir, asset.name, io, .{}) catch |err| {
+            try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        cache_dir.copyFile(ghr_name, staging_dir, ghr_name, io, .{}) catch |err| {
+            try err_w.print("error: failed to stage manifest '{s}': {t}\n", .{ ghr_name, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+    }
+
+    // Ensure the repo dir exists, then atomically swap in the module dir at
+    // `<tools>/<owner>/<repo>/<stem>` without disturbing siblings.
+    const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
+        d.tools, std.fs.path.sep, owner_lower, std.fs.path.sep, repo_lower,
+    });
+    defer allocator.free(repo_path);
+    const module_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ repo_path, std.fs.path.sep, stem });
+    defer allocator.free(module_path);
+
+    ensureDirAbsoluteRecursive(io, repo_path);
+
+    // Save old module metadata (for stale bin cleanup) before replacing it.
+    const old_meta = readMetadata(allocator, io, module_path);
+    defer if (old_meta) |m| {
+        m.parsed.deinit();
+        allocator.free(m.body);
+    };
+
+    const module_exists = blk: {
+        var dc = Dir.openDirAbsolute(io, module_path, .{}) catch break :blk false;
+        dc.close(io);
+        break :blk true;
+    };
+    if (module_exists) {
+        deleteTreeAbsolute(io, module_path) catch {
+            if (comptime builtin.os.tag == .windows) {
+                var tombstone_buf: [Dir.max_path_bytes]u8 = undefined;
+                if (std.fmt.bufPrint(&tombstone_buf, "{s}.old", .{module_path})) |tombstone| {
+                    deleteTreeAbsolute(io, tombstone) catch {};
+                    Dir.renameAbsolute(module_path, tombstone, io) catch {};
+                } else |_| {}
+            }
+        };
+    }
+
+    Dir.renameAbsolute(staging_path, module_path, io) catch |err| {
+        try err_w.print(
+            "error: failed to move staging directory '{s}' to module directory '{s}': {t}\n",
+            .{ staging_path, module_path, err },
+        );
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+
+    var module_dir = Dir.openDirAbsolute(io, module_path, .{}) catch |err| {
+        try err_w.print("error: failed to open module directory '{s}': {t}\n", .{ module_path, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer module_dir.close(io);
+
+    writeMetadata(allocator, io, module_dir, tag_name, asset.name, &.{asset.name}, &.{}, vr.label, vr.minisign_key) catch |err| {
+        try err_w.print("warning: failed to write metadata: {}\n", .{err});
+    };
+
+    ensureDirAbsoluteRecursive(io, d.bin);
+    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
+        try err_w.print("error: failed to open bin directory '{s}': {t}\n", .{ d.bin, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer bin_dir.close(io);
+
+    try w.print("linking executables:\n", .{});
+    linkToBin(allocator, io, module_path, bin_dir, asset.name, w) catch |err| {
+        try err_w.print("warning: failed to link {s}: {}\n", .{ asset.name, err });
+    };
+
+    // Clean up stale bin entries from a previous install of this module.
+    if (old_meta) |m| {
+        cleanupStaleBinEntries(io, bin_dir, m.parsed.value.bins, &.{asset.name}, module_path);
+    }
+
+    return stem;
+}
 
 /// Install a single spec using the shared `InstallContext`.
 ///
@@ -1640,6 +2166,32 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     // When several wasm modules are installed together this is the first.
     const primary_name = primary_assets.items[0].name;
 
+    // Wasm modules install as independent per-module units under
+    // `<tools>/<owner>/<repo>/<stem>/`, each with its own `ghr.json`/tag, so
+    // a `wabt` archive release and `petstore` wasm components from the same
+    // repo coexist instead of clobbering one shared repo dir. The selected
+    // assets are homogeneous (all wasm or a single non-wasm), so inspecting
+    // the first is sufficient.
+    if (release_mod.isWasmAssetName(primary_name)) {
+        for (primary_assets.items) |asset| {
+            const stem = installWasmModuleUnit(
+                ctx,
+                tag_name,
+                release.parsed.value.assets,
+                asset,
+                owner_lower,
+                repo_lower,
+                minisign_pubkey_b64,
+            ) catch |err| switch (err) {
+                error.InstallStepFailed => return error.InstallStepFailed,
+                else => return err,
+            };
+            try w.print("installed {s}/{s}/{s}@{s}\n", .{ spec.owner, spec.repo, stem, tag_name });
+        }
+        try w.flush();
+        return;
+    }
+
     // Staging directory, shared across every primary asset.
     const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging-{s}-{s}", .{
         d.cache, std.fs.path.sep, owner_lower, repo_lower,
@@ -1728,225 +2280,15 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
             }
         }
 
-        // Verification (issue #50 + issue #65). Runs after the asset is on
-        // disk, before we extract or move anything. Checksum (Phase 1),
-        // minisign (issue #65, requires a key — inline or `--minisign`), and
-        // sigstore bundle (Phase 2) are independent — all run when material
-        // is published, unless the matching skip flag suppresses one. Outcome
-        // precedence for the metadata label: sigstore > minisign > authenticode > checksum.
-        verified_label = "none";
-        // Pubkey the install actually verified against (sticky across the
-        // other verifiers' outcomes). Recorded in `ghr.json` and surfaced by
-        // `ghr list` so users can copy it back into future installs.
-        recorded_minisign_key = null;
-        if (gates.skip_verify) {
-            verified_label = "skipped";
-            try w.print("note: verification skipped (--skip-verify)\n", .{});
-        } else {
-            const sha_outcome: release_mod.VerifyOutcome = if (gates.skip_checksum) blk: {
-                try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
-                break :blk .no_verification;
-            } else blk: {
-                // Verify GitHub's built-in asset digest (inline in the release
-                // JSON, no extra network request). Independently, if the
-                // release also publishes a `.sha256` / `SHA256SUMS` sidecar,
-                // validate that too — a published sidecar is never silently
-                // ignored. Both must pass; the sidecar drives the recorded
-                // label when present.
-                const gh_outcome = release_mod.verifyDownloadedAssetGithubDigest(
-                    io,
-                    release.parsed.value.assets,
-                    asset.name,
-                    download_path,
-                    debug_w,
-                    w,
-                    err_w,
-                ) catch |verr| {
-                    Dir.deleteFileAbsolute(io, download_path) catch {};
-                    switch (verr) {
-                        error.ChecksumMismatch => return error.InstallStepFailed,
-                        else => {
-                            try err_w.print("error: checksum verification failed: {}\n", .{verr});
-                            try err_w.flush();
-                            return error.InstallStepFailed;
-                        },
-                    }
-                };
-                const sidecar_outcome = verifyDownloadedAssetSha256(
-                    allocator,
-                    io,
-                    d.cache,
-                    release.parsed.value.assets,
-                    asset.name,
-                    download_path,
-                    debug_w,
-                    auth_header,
-                    w,
-                    err_w,
-                ) catch |verr| {
-                    switch (verr) {
-                        error.ChecksumMismatch,
-                        error.ChecksumDownloadFailed,
-                        error.ChecksumEntryMissing,
-                        => {
-                            Dir.deleteFileAbsolute(io, download_path) catch {};
-                            return error.InstallStepFailed;
-                        },
-                        else => {
-                            try err_w.print("error: checksum verification failed: {}\n", .{verr});
-                            try err_w.flush();
-                            Dir.deleteFileAbsolute(io, download_path) catch {};
-                            return error.InstallStepFailed;
-                        },
-                    }
-                };
-                break :blk if (sidecar_outcome == .sha256_verified) sidecar_outcome else gh_outcome;
-            };
-            if (sha_outcome == .sha256_verified) verified_label = "checksum";
-            if (sha_outcome == .github_digest_verified) verified_label = "github-digest";
-
-            const mini_outcome: release_mod.VerifyOutcome = if (gates.skip_minisign) blk: {
-                if (minisign_pubkey_b64 != null) {
-                    try w.print("note: minisign verification skipped (--skip-minisign)\n", .{});
-                }
-                break :blk .no_verification;
-            } else release_mod.verifyDownloadedAssetMinisign(
-                allocator,
-                io,
-                d.cache,
-                release.parsed.value.assets,
-                asset.name,
-                download_path,
-                debug_w,
-                auth_header,
-                minisign_pubkey_b64,
-                w,
-                err_w,
-            ) catch {
-                // Diagnostic was already printed by the verifier.
-                Dir.deleteFileAbsolute(io, download_path) catch {};
-                return error.InstallStepFailed;
-            };
-            if (mini_outcome == .minisign_verified) {
-                verified_label = "minisign";
-                recorded_minisign_key = minisign_pubkey_b64;
-            }
-
-            const ac_outcome: release_mod.VerifyOutcome = if (gates.skip_authenticode) blk: {
-                try w.print("note: authenticode verification skipped (--skip-authenticode)\n", .{});
-                break :blk .no_verification;
-            } else release_mod.verifyDownloadedAssetAuthenticode(
-                allocator,
-                io,
-                download_path,
-                debug_w,
-                w,
-                err_w,
-            ) catch |verr| {
-                try err_w.print("error: authenticode verification failed: {s}\n", .{@errorName(verr)});
-                try err_w.flush();
-                Dir.deleteFileAbsolute(io, download_path) catch {};
-                return error.InstallStepFailed;
-            };
-            if (ac_outcome == .authenticode_verified) verified_label = "authenticode";
-
-            const sig_outcome: release_mod.VerifyOutcome = if (gates.skip_sigstore) blk: {
-                try w.print("note: sigstore verification skipped (--skip-sigstore)\n", .{});
-                break :blk .no_verification;
-            } else verifyDownloadedAssetSigstore(
-                allocator,
-                io,
-                d.cache,
-                release.parsed.value.assets,
-                asset.name,
-                download_path,
-                debug_w,
-                auth_header,
-                w,
-                err_w,
-            ) catch |verr| {
-                try err_w.print("error: sigstore verification failed: {s}\n", .{@errorName(verr)});
-                try err_w.flush();
-                Dir.deleteFileAbsolute(io, download_path) catch {};
-                return error.InstallStepFailed;
-            };
-            if (sig_outcome == .sigstore_verified) verified_label = "sigstore";
-
-            if (sha_outcome == .no_verification and
-                mini_outcome == .no_verification and
-                ac_outcome == .no_verification and
-                sig_outcome == .no_verification)
-            {
-                try w.print("note: download is unverified (no checksum, minisign, sigstore, or authenticode)\n", .{});
-            }
-            try w.flush();
-        }
-
-        // Whether the selected asset is a WebAssembly module. Wasm installs take a
-        // dedicated path: the `.wasm` plus its companion `<wasm>.ghr` manifest are
-        // copied verbatim into the tool dir, and a shim launcher (which loads the
-        // manifest at run time) is linked into the bin dir.
-        const is_wasm = release_mod.isWasmAssetName(asset.name);
-        const ghr_name: ?[]u8 = if (is_wasm)
-            try std.fmt.allocPrint(allocator, "{s}.ghr", .{asset.name})
-        else
-            null;
-        defer if (ghr_name) |g| allocator.free(g);
-
-        if (is_wasm) {
-            const ghr_asset = release_mod.findGhrManifestAsset(release.parsed.value.assets, asset.name) orelse {
-                try err_w.print("error: wasm asset '{s}' has no companion '{s}.ghr' manifest in this release\n", .{ asset.name, asset.name });
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-            const ghr_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_name.? });
-            defer allocator.free(ghr_path);
-            const ghr_dl = release_mod.assetDownload(ghr_asset, auth_header != null);
-            http.downloadToFile(allocator, io, ghr_dl.url, ghr_path, .{
-                .auth_header = auth_header,
-                .accept = ghr_dl.accept,
-                .debug_w = debug_w,
-            }) catch |err| {
-                try err_w.print("error: failed to download manifest '{s}': {t}\n", .{ ghr_asset.name, err });
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-            // Validate the manifest now so a bad one fails before we touch the
-            // installed tool dir.
-            validateGhrManifest(allocator, io, ghr_path, err_w) catch return error.InstallStepFailed;
-        }
-
-        // Best-effort removal of the cached `.ghr` once staged.
-        defer if (ghr_name) |g| {
-            var pb: [Dir.max_path_bytes]u8 = undefined;
-            if (std.fmt.bufPrint(&pb, "{s}{c}{s}", .{ d.cache, std.fs.path.sep, g })) |p| {
-                Dir.deleteFileAbsolute(io, p) catch {};
-            } else |_| {}
-        };
+        const vr = try verifyDownloadedAsset(ctx, release.parsed.value.assets, asset.name, download_path, minisign_pubkey_b64, debug_w);
+        verified_label = vr.label;
+        recorded_minisign_key = vr.minisign_key;
 
         // Extract
         try w.print("extracting ...\n", .{});
         try w.flush();
 
-        if (is_wasm) {
-            // Copy the wasm module and its `.ghr` manifest verbatim into staging.
-            var cache_dir = Dir.openDirAbsolute(io, d.cache, .{}) catch |err| {
-                try err_w.print("error: failed to open cache dir '{s}': {t}\n", .{ d.cache, err });
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-            defer cache_dir.close(io);
-            cache_dir.copyFile(asset.name, staging_dir, asset.name, io, .{}) catch |err| {
-                try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-            cache_dir.copyFile(ghr_name.?, staging_dir, ghr_name.?, io, .{}) catch |err| {
-                try err_w.print("error: failed to stage manifest '{s}': {t}\n", .{ ghr_name.?, err });
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-        } else switch (archive.detectFormat(asset.name)) {
+        switch (archive.detectFormat(asset.name)) {
             .zip, .tar_gz, .tar_xz, .deb => {
                 archive.extractAuto(allocator, io, staging_dir, download_path, 0) catch |err| {
                     try err_w.print(
@@ -1985,10 +2327,8 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         // Find executables. For wasm, the single "executable" is the wasm module
         // itself; `linkToBin` recognizes the `.wasm` extension and installs the
         // shim launcher rather than a symlink/native shim.
-        const prefer_deb_shims = !is_wasm and archive.detectFormat(asset.name) == .deb and hasDebShims(io, staging_dir);
-        if (is_wasm) {
-            try exes.append(allocator, try allocator.dupe(u8, asset.name));
-        } else if (prefer_deb_shims) {
+        const prefer_deb_shims = archive.detectFormat(asset.name) == .deb and hasDebShims(io, staging_dir);
+        if (prefer_deb_shims) {
             exes = findDebExecutables(allocator, io, staging_dir) catch |err| {
                 try err_w.print(
                     "error: failed to scan staging dir '{s}' for executables: {t}\n",
@@ -2111,6 +2451,9 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         break :blk true;
     };
     if (tool_dir_exists) {
+        // Preserve independently-installed wasm module units under this repo
+        // so replacing the repo-level (archive) install doesn't delete them.
+        preserveWasmModuleUnits(allocator, io, tool_path, staging_path);
         deleteTreeAbsolute(io, tool_path) catch {
             if (comptime builtin.os.tag == .windows) {
                 var tombstone_buf: [Dir.max_path_bytes]u8 = undefined;
@@ -3276,6 +3619,72 @@ test "resolveInstalledToolPath: tools_dir missing returns null" {
     const nonexistent = try std.fmt.bufPrint(&nonexistent_buf, "{s}{c}nope", .{ base, std.fs.path.sep });
 
     try std.testing.expect(try resolveInstalledToolPath(allocator, tio, nonexistent, "owner", "repo") == null);
+}
+
+test "parseUninstallSpec: repo only" {
+    const t = parseUninstallSpec("cataggar/wabt");
+    try std.testing.expectEqualStrings("cataggar/wabt", t.repo_spec);
+    try std.testing.expect(t.module_stem == null);
+}
+
+test "parseUninstallSpec: repo with module stem" {
+    const t = parseUninstallSpec("cataggar/wabt/petstore-test");
+    try std.testing.expectEqualStrings("cataggar/wabt", t.repo_spec);
+    try std.testing.expectEqualStrings("petstore-test", t.module_stem.?);
+}
+
+test "parseUninstallSpec: bare name (no slash)" {
+    const t = parseUninstallSpec("wabt");
+    try std.testing.expectEqualStrings("wabt", t.repo_spec);
+    try std.testing.expect(t.module_stem == null);
+}
+
+test "preserveWasmModuleUnits moves module subdirs but leaves repo-level content" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    // Repo dir with a repo-level ghr.json, an archive content subdir (no
+    // ghr.json), and two wasm module units (each with a ghr.json).
+    try tmp.dir.createDirPath(tio, "repo");
+    try tmp.dir.createDirPath(tio, "repo/archive-content");
+    try tmp.dir.createDirPath(tio, "repo/petstore");
+    try tmp.dir.createDirPath(tio, "repo/petstore-test");
+    try tmp.dir.createDirPath(tio, "staging");
+    {
+        var f = try tmp.dir.createFile(tio, "repo/ghr.json", .{});
+        f.close(tio);
+    }
+    {
+        var f = try tmp.dir.createFile(tio, "repo/petstore/ghr.json", .{});
+        f.close(tio);
+    }
+    {
+        var f = try tmp.dir.createFile(tio, "repo/petstore-test/ghr.json", .{});
+        f.close(tio);
+    }
+
+    const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ base, std.fs.path.sep });
+    defer allocator.free(repo_path);
+    const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging", .{ base, std.fs.path.sep });
+    defer allocator.free(staging_path);
+
+    preserveWasmModuleUnits(allocator, tio, repo_path, staging_path);
+
+    // Modules relocated into staging.
+    try std.testing.expect(tmp.dir.access(tio, "staging/petstore/ghr.json", .{}) != error.FileNotFound);
+    try std.testing.expect(tmp.dir.access(tio, "staging/petstore-test/ghr.json", .{}) != error.FileNotFound);
+    // Removed from the repo dir.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(tio, "repo/petstore", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(tio, "repo/petstore-test", .{}));
+    // Repo-level manifest and archive content left untouched.
+    try std.testing.expect(tmp.dir.access(tio, "repo/ghr.json", .{}) != error.FileNotFound);
+    try std.testing.expect(tmp.dir.access(tio, "repo/archive-content", .{}) != error.FileNotFound);
 }
 
 test "caseRenameDir: leaf-case-only rename uses temp dance" {

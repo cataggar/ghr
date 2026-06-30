@@ -476,9 +476,15 @@ fn printUninstallUsage(w: *Writer) !void {
         \\
         \\USAGE:
         \\    ghr uninstall <owner/repo>
+        \\    ghr uninstall <owner/repo/wasm-stem>
         \\
         \\Removes the installed tool's binaries from ghr's bin directory and
         \\its tool storage directory.
+        \\
+        \\A wasm release installs each module as its own unit; pass
+        \\<owner/repo/wasm-stem> to remove a single module, or <owner/repo>
+        \\to remove the whole repo (its archive install plus every wasm
+        \\module under it).
         \\
         \\Run 'ghr uninstall help' to show this help.
         \\
@@ -511,11 +517,43 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
         while (try repo_iter.next(io)) |repo_entry| {
             if (repo_entry.kind != .directory) continue;
             if (std.mem.endsWith(u8, repo_entry.name, ".old")) continue; // skip tombstones
-            const meta = readToolMeta(allocator, io, owner_dir, repo_entry.name);
-            defer if (meta) |m| m.deinit(allocator);
-            const line = try formatToolLine(allocator, entry.name, repo_entry.name, meta);
-            errdefer allocator.free(line);
-            try lines.append(allocator, line);
+
+            // Repo-level (archive / bare binary) install: `<owner>/<repo>/ghr.json`.
+            const repo_meta = readToolMeta(allocator, io, owner_dir, repo_entry.name);
+            defer if (repo_meta) |m| m.deinit(allocator);
+            if (repo_meta != null) {
+                const line = try formatToolLine(allocator, entry.name, repo_entry.name, repo_meta);
+                errdefer allocator.free(line);
+                try lines.append(allocator, line);
+            }
+
+            // Descend into per-module wasm units: `<owner>/<repo>/<stem>/ghr.json`.
+            var module_count: usize = 0;
+            if (owner_dir.openDir(io, repo_entry.name, .{ .iterate = true })) |*repo_dir| {
+                defer repo_dir.close(io);
+                var mod_iter = repo_dir.iterate();
+                while (try mod_iter.next(io)) |mod_entry| {
+                    if (mod_entry.kind != .directory) continue;
+                    if (std.mem.endsWith(u8, mod_entry.name, ".old")) continue;
+                    const mod_meta = readToolMeta(allocator, io, repo_dir.*, mod_entry.name);
+                    defer if (mod_meta) |m| m.deinit(allocator);
+                    if (mod_meta == null) continue;
+                    const combined = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_entry.name, mod_entry.name });
+                    defer allocator.free(combined);
+                    const line = try formatToolLine(allocator, entry.name, combined, mod_meta);
+                    errdefer allocator.free(line);
+                    try lines.append(allocator, line);
+                    module_count += 1;
+                }
+            } else |_| {}
+
+            // Preserve the old fallback: a repo dir with neither a repo-level
+            // manifest nor any module units still lists as a bare entry.
+            if (repo_meta == null and module_count == 0) {
+                const line = try formatToolLine(allocator, entry.name, repo_entry.name, null);
+                errdefer allocator.free(line);
+                try lines.append(allocator, line);
+            }
         }
     }
 
