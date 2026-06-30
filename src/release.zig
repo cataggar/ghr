@@ -1663,10 +1663,34 @@ pub const AssetMatch = union(enum) {
     ambiguous: []const Asset,
 };
 
+/// Returns true if `name` is a verification/metadata sidecar (signature,
+/// checksum, manifest, certificate, etc.) that accompanies a primary asset
+/// rather than being a downloadable artifact itself. Used to exclude such
+/// companions from substring name matching so that, e.g., `petstore-test`
+/// resolves to `petstore-test.wasm` and not its `.ghr` / `.minisig` /
+/// `.sigstore` siblings.
+pub fn isSidecarAsset(name: []const u8) bool {
+    const sidecar_suffixes = [_][]const u8{
+        ".ghr",        ".minisig",    ".sig",        ".asc",
+        ".pem",        ".pub",        ".gpg",        ".cert",
+        ".crt",        ".bundle",     ".sigstore",   ".sigstore.json",
+        ".sha256",     ".sha256sum",  ".sha256sums", ".sha512",
+        ".sha512sum",  ".sha512sums", ".md5",        ".md5sum",
+        ".md5sums",    ".sha1",       ".sha1sum",
+    };
+    for (sidecar_suffixes) |s| {
+        if (std.ascii.endsWithIgnoreCase(name, s)) return true;
+    }
+    return false;
+}
+
 /// Find a single asset by `name` using a two-stage match:
-///   1. Case-sensitive exact name match — one match wins.
-///   2. Otherwise case-insensitive substring match — one match wins,
-///      multiple → `.ambiguous`, zero → `.none`.
+///   1. Case-sensitive exact name match — one match wins (sidecars included,
+///      so a fully-qualified sidecar name still resolves).
+///   2. Otherwise case-insensitive substring match over non-sidecar assets
+///      only — one match wins, multiple → `.ambiguous`, zero → `.none`.
+///      Verification/metadata sidecars (`.ghr`, `.minisig`, `.sigstore`, …)
+///      are skipped so they never make an otherwise-unique match ambiguous.
 pub fn findAssetByName(
     allocator: std.mem.Allocator,
     assets: []const Asset,
@@ -1679,6 +1703,7 @@ pub fn findAssetByName(
     var matches: std.ArrayListUnmanaged(Asset) = .empty;
     errdefer matches.deinit(allocator);
     for (assets) |a| {
+        if (isSidecarAsset(a.name)) continue;
         if (containsIgnoreCase(a.name, name)) try matches.append(allocator, a);
     }
     if (matches.items.len == 0) {
@@ -2750,6 +2775,42 @@ test "findAssetByName none when nothing matches" {
         .{ .name = "tool-linux-amd64.tar.gz", .browser_download_url = "" },
     };
     try std.testing.expectEqual(AssetMatch.none, try findAssetByName(a, &assets, "macos"));
+}
+
+test "findAssetByName ignores sidecars so primary asset is unique" {
+    const a = std.testing.allocator;
+    const assets = [_]Asset{
+        .{ .name = "petstore-test.wasm", .browser_download_url = "" },
+        .{ .name = "petstore-test.wasm.ghr", .browser_download_url = "" },
+        .{ .name = "petstore-test.wasm.minisig", .browser_download_url = "" },
+        .{ .name = "petstore-test.wasm.sigstore.json", .browser_download_url = "" },
+        .{ .name = "petstore-test.wasm.sha256", .browser_download_url = "" },
+    };
+    switch (try findAssetByName(a, &assets, "petstore-test")) {
+        .one => |asset| try std.testing.expectEqualStrings("petstore-test.wasm", asset.name),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "findAssetByName exact sidecar name still resolves" {
+    const a = std.testing.allocator;
+    const assets = [_]Asset{
+        .{ .name = "petstore-test.wasm", .browser_download_url = "" },
+        .{ .name = "petstore-test.wasm.ghr", .browser_download_url = "" },
+    };
+    switch (try findAssetByName(a, &assets, "petstore-test.wasm.ghr")) {
+        .one => |asset| try std.testing.expectEqualStrings("petstore-test.wasm.ghr", asset.name),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "isSidecarAsset classifies sidecars and primaries" {
+    try std.testing.expect(isSidecarAsset("petstore-test.wasm.ghr"));
+    try std.testing.expect(isSidecarAsset("petstore-test.wasm.minisig"));
+    try std.testing.expect(isSidecarAsset("tool.tar.gz.sigstore.json"));
+    try std.testing.expect(isSidecarAsset("tool.tar.gz.sha256"));
+    try std.testing.expect(!isSidecarAsset("petstore-test.wasm"));
+    try std.testing.expect(!isSidecarAsset("tool-linux-amd64.tar.gz"));
 }
 
 test "verifyDownloadedAssetMinisign fails closed when no sidecar is published" {
