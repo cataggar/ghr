@@ -569,6 +569,25 @@ pub fn findGhrManifestAsset(assets: []const Asset, wasm_name: []const u8) ?Asset
     return null;
 }
 
+/// Collect every wasm module that ships a companion `<wasm>.ghr` manifest.
+/// A bare `ghr install owner/repo` (no file filter) installs all of these so
+/// a release shipping several wasm tools (e.g. `petstore` and
+/// `petstore-test`) brings in every one. The returned slice preserves the
+/// asset order and is allocator-owned — the caller must free it.
+pub fn wasmModulesWithManifest(
+    allocator: std.mem.Allocator,
+    assets: []const Asset,
+) ![]const Asset {
+    var list: std.ArrayListUnmanaged(Asset) = .empty;
+    errdefer list.deinit(allocator);
+    for (assets) |a| {
+        if (isWasmAssetName(a.name) and findGhrManifestAsset(assets, a.name) != null) {
+            try list.append(allocator, a);
+        }
+    }
+    return list.toOwnedSlice(allocator);
+}
+
 /// Markers in asset names that indicate non-primary variants (libraries,
 /// source tarballs, minimal/debug builds, plugins, distro-specific static
 /// bundles) which should be deprioritized when a plain binary archive is
@@ -2216,6 +2235,35 @@ test "isWasmAssetName and findGhrManifestAsset" {
     const found = findGhrManifestAsset(&assets, "hello.wasm") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("hello.wasm.ghr", found.name);
     try std.testing.expect(findGhrManifestAsset(&assets, "missing.wasm") == null);
+}
+
+test "wasmModulesWithManifest returns every wasm that ships a .ghr" {
+    const a = std.testing.allocator;
+    const assets = [_]Asset{
+        .{ .name = "petstore.wasm", .browser_download_url = "u1" },
+        .{ .name = "petstore.wasm.ghr", .browser_download_url = "u2" },
+        .{ .name = "petstore.wasm.minisig", .browser_download_url = "u3" },
+        .{ .name = "petstore-test.wasm", .browser_download_url = "u4" },
+        .{ .name = "petstore-test.wasm.ghr", .browser_download_url = "u5" },
+        // A wasm without a companion manifest is skipped.
+        .{ .name = "orphan.wasm", .browser_download_url = "u6" },
+    };
+    const mods = try wasmModulesWithManifest(a, &assets);
+    defer a.free(mods);
+    try std.testing.expectEqual(@as(usize, 2), mods.len);
+    try std.testing.expectEqualStrings("petstore.wasm", mods[0].name);
+    try std.testing.expectEqualStrings("petstore-test.wasm", mods[1].name);
+}
+
+test "wasmModulesWithManifest empty when no wasm modules" {
+    const a = std.testing.allocator;
+    const assets = [_]Asset{
+        .{ .name = "tool-linux-amd64.tar.gz", .browser_download_url = "" },
+        .{ .name = "tool-linux-amd64.tar.gz.sha256", .browser_download_url = "" },
+    };
+    const mods = try wasmModulesWithManifest(a, &assets);
+    defer a.free(mods);
+    try std.testing.expectEqual(@as(usize, 0), mods.len);
 }
 
 test "findBestAsset selects the lone wasm module over its sidecars" {
