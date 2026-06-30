@@ -1504,48 +1504,89 @@ pub fn cmdUninstall(
         return;
     }
 
-    // --- Whole repo: repo-level unit + every wasm module under it -------
+    // --- Whole repo: repo-level (archive) unit only -------------------
+    // Wasm modules under the repo are independent units and are NOT removed
+    // here; use `ghr uninstall <owner/repo/stem>` to remove one.
     const meta = readMetadata(allocator, io, tool_path);
     defer if (meta) |m| {
         m.parsed.deinit();
         allocator.free(m.body);
     };
 
-    if (meta) |m| {
-        if (bin_dir) |bd| {
-            try unlinkUnitBins(io, bd, m.parsed.value.bins, tool_path, w);
-        }
-        if (comptime builtin.os.tag.isDarwin()) {
-            uninstallAppBundles(allocator, io, environ, m.parsed.value.apps, tool_path, w);
-        }
-    }
-
-    // Unlink bins for each wasm module unit under the repo.
-    if (Dir.openDirAbsolute(io, tool_path, .{ .iterate = true })) |*repo_dir| {
-        defer repo_dir.close(io);
-        var it = repo_dir.iterate();
+    // Detect whether any wasm module units live under the repo so we can
+    // give a helpful message and preserve them while deleting.
+    var has_modules = false;
+    if (Dir.openDirAbsolute(io, tool_path, .{ .iterate = true })) |*rd| {
+        defer rd.close(io);
+        var it = rd.iterate();
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .directory) continue;
             if (std.mem.endsWith(u8, entry.name, ".old")) continue;
-            const module_path = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, entry.name }) catch continue;
-            defer allocator.free(module_path);
-            const mmeta = readMetadata(allocator, io, module_path) orelse continue;
-            defer {
-                mmeta.parsed.deinit();
-                allocator.free(mmeta.body);
-            }
-            if (bin_dir) |bd| {
-                unlinkUnitBins(io, bd, mmeta.parsed.value.bins, module_path, w) catch {};
+            const mp = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, entry.name }) catch continue;
+            defer allocator.free(mp);
+            if (dirHasGhrJson(io, mp)) {
+                has_modules = true;
+                break;
             }
         }
     } else |_| {}
 
-    // Delete the tool directory
-    deleteTreeAbsolute(io, tool_path) catch {
-        try err_w.print("error: failed to remove {s}\n", .{tool_path});
+    const m = meta orelse {
+        if (has_modules) {
+            try err_w.print("error: {s}/{s} has no repo-level install; it only has wasm modules\n", .{ owned.owner, owned.repo });
+            try err_w.print("  remove a module with: ghr uninstall {s}/{s}/<wasm-stem>\n", .{ owned.owner, owned.repo });
+        } else {
+            try err_w.print("error: {s}/{s} is not installed\n", .{ owned.owner, owned.repo });
+        }
         try err_w.flush();
         std.process.exit(1);
     };
+
+    if (bin_dir) |bd| {
+        try unlinkUnitBins(io, bd, m.parsed.value.bins, tool_path, w);
+    }
+    if (comptime builtin.os.tag.isDarwin()) {
+        uninstallAppBundles(allocator, io, environ, m.parsed.value.apps, tool_path, w);
+    }
+
+    // Remove repo-level content (the manifest + extracted archive files),
+    // preserving wasm module subdirs (child dirs with their own `ghr.json`).
+    const Entry = struct { name: []u8, is_dir: bool };
+    var to_delete: std.ArrayListUnmanaged(Entry) = .empty;
+    defer {
+        for (to_delete.items) |e| allocator.free(e.name);
+        to_delete.deinit(allocator);
+    }
+    if (Dir.openDirAbsolute(io, tool_path, .{ .iterate = true })) |*rd| {
+        defer rd.close(io);
+        var it = rd.iterate();
+        while (it.next(io) catch null) |entry| {
+            const is_dir = entry.kind == .directory;
+            if (is_dir and !std.mem.endsWith(u8, entry.name, ".old")) {
+                const mp = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, entry.name }) catch continue;
+                defer allocator.free(mp);
+                if (dirHasGhrJson(io, mp)) continue; // preserve module unit
+            }
+            const dup = allocator.dupe(u8, entry.name) catch continue;
+            to_delete.append(allocator, .{ .name = dup, .is_dir = is_dir }) catch {
+                allocator.free(dup);
+                continue;
+            };
+        }
+    } else |_| {}
+
+    for (to_delete.items) |e| {
+        var pb: [Dir.max_path_bytes]u8 = undefined;
+        const p = std.fmt.bufPrint(&pb, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, e.name }) catch continue;
+        if (e.is_dir) {
+            deleteTreeAbsolute(io, p) catch {};
+        } else {
+            Dir.deleteFileAbsolute(io, p) catch {};
+        }
+    }
+
+    // Drop the repo dir only when nothing (no preserved module) remains.
+    Dir.deleteDirAbsolute(io, tool_path) catch {};
 
     try w.print("uninstalled {s}/{s}\n", .{ owned.owner, owned.repo });
 }
@@ -1579,6 +1620,16 @@ pub const InstallContext = struct {
     /// any spec whose `SpecWithKey.key` is null.
     minisign_pubkey_b64: ?[]const u8,
 };
+
+/// True when `abs_dir` is a directory containing a `ghr.json` — i.e. an
+/// installed unit (a wasm module dir, or the repo dir of an archive install).
+fn dirHasGhrJson(io: Io, abs_dir: []const u8) bool {
+    var dir = Dir.openDirAbsolute(io, abs_dir, .{}) catch return false;
+    defer dir.close(io);
+    var f = dir.openFile(io, "ghr.json", .{}) catch return false;
+    f.close(io);
+    return true;
+}
 
 /// Move any wasm-module unit subdirs (child dirs containing their own
 /// `ghr.json`) out of `repo_path` into `staging_path`, so a repo-level

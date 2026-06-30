@@ -481,10 +481,10 @@ fn printUninstallUsage(w: *Writer) !void {
         \\Removes the installed tool's binaries from ghr's bin directory and
         \\its tool storage directory.
         \\
-        \\A wasm release installs each module as its own unit; pass
-        \\<owner/repo/wasm-stem> to remove a single module, or <owner/repo>
-        \\to remove the whole repo (its archive install plus every wasm
-        \\module under it).
+        \\A wasm release installs each module as its own unit. Pass
+        \\<owner/repo/wasm-stem> to remove a single module. Plain
+        \\<owner/repo> removes only the repo-level (archive) install and
+        \\leaves any wasm modules in place.
         \\
         \\Run 'ghr uninstall help' to show this help.
         \\
