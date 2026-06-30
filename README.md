@@ -1,3 +1,7 @@
+<img src="https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg" alt="ghr logo">
+
+<sub>Logo by the talented Talia Blasquez, [Instagram: @my_artistic_sidetrip](https://www.instagram.com/my_artistic_sidetrip/). Licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).</sub>
+
 # ghr
 
 A toolkit for GitHub releases.
