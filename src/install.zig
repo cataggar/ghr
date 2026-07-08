@@ -270,11 +270,33 @@ fn isLibraryDir(name: []const u8) bool {
     return false;
 }
 
+/// Returns the length of `tok` if `haystack` starts with it (case-insensitive)
+/// and `tok` is immediately followed by a separator, a `.`, or the end of
+/// the string (so `"arm"` doesn't spuriously match inside `"armv7"`).
+fn matchLeadingToken(haystack: []const u8, tok: []const u8) ?usize {
+    if (haystack.len < tok.len) return null;
+    if (!std.ascii.eqlIgnoreCase(haystack[0..tok.len], tok)) return null;
+    if (haystack.len > tok.len) {
+        const nc = haystack[tok.len];
+        if (nc != '-' and nc != '_' and nc != '.') return null;
+    }
+    return tok.len;
+}
+
+const bare_binary_archs = [_][]const u8{
+    "x86_64",  "x64",   "amd64",
+    "aarch64", "arm64", "armv7l",
+    "armv7",   "armv6", "x86",
+    "i686",    "i386",  "ppc64le",
+    "ppc64",   "s390x", "riscv64",
+};
+
 /// For bare-binary assets whose name follows the `<name>-<arch>-<triple>...`
-/// convention (e.g. `wash-aarch64-unknown-linux-musl`), extract `<name>` so
-/// the resulting link in `~/.ghr/bin/` is the natural command the user
-/// expects to run. Falls back to `repo` if the pattern doesn't match (e.g.
-/// `cosign-linux-amd64`, where the arch is not directly after the stem).
+/// convention (e.g. `wash-aarch64-unknown-linux-musl`) or the
+/// `<name>-<os>-<arch>` convention (e.g. `mer-macos-aarch64`,
+/// `cosign-linux-amd64`), extract `<name>` so the resulting link in
+/// `~/.ghr/bin/` is the natural command the user expects to run. Falls back
+/// to `repo` if neither pattern matches.
 fn deriveBareBinaryName(
     allocator: std.mem.Allocator,
     asset_name: []const u8,
@@ -297,24 +319,35 @@ fn deriveBareBinaryName(
         if (si > 0 and si + 1 < name.len) {
             const stem = name[0..si];
             const after = name[si + 1 ..];
-            const archs = [_][]const u8{
-                "x86_64",  "x64",   "amd64",
-                "aarch64", "arm64", "armv7l",
-                "armv7",   "armv6", "x86",
-                "i686",    "i386",  "ppc64le",
-                "ppc64",   "s390x", "riscv64",
+
+            for (bare_binary_archs) |a| {
+                if (matchLeadingToken(after, a) != null) {
+                    if (is_windows) {
+                        return std.fmt.allocPrint(allocator, "{s}.exe", .{stem});
+                    }
+                    return allocator.dupe(u8, stem);
+                }
+            }
+
+            // Try the `<name>-<os>-<arch>` ordering: the token right after
+            // the stem is an OS name, and an arch token follows it.
+            const oses = [_][]const u8{
+                "linux",   "darwin", "macos",   "windows",
+                "win",     "freebsd", "netbsd", "openbsd",
+                "android", "ios",
             };
-            for (archs) |a| {
-                if (after.len < a.len) continue;
-                if (!std.ascii.eqlIgnoreCase(after[0..a.len], a)) continue;
-                if (after.len > a.len) {
-                    const nc = after[a.len];
-                    if (nc != '-' and nc != '_' and nc != '.') continue;
+            for (oses) |o| {
+                const os_len = matchLeadingToken(after, o) orelse continue;
+                if (os_len >= after.len) continue; // nothing follows the OS token
+                const rest = after[os_len + 1 ..];
+                for (bare_binary_archs) |a| {
+                    if (matchLeadingToken(rest, a) != null) {
+                        if (is_windows) {
+                            return std.fmt.allocPrint(allocator, "{s}.exe", .{stem});
+                        }
+                        return allocator.dupe(u8, stem);
+                    }
                 }
-                if (is_windows) {
-                    return std.fmt.allocPrint(allocator, "{s}.exe", .{stem});
-                }
-                return allocator.dupe(u8, stem);
             }
         }
     }
@@ -2784,7 +2817,7 @@ test "deriveBareBinaryName strips arch-triple from stem" {
         try std.testing.expectEqualStrings("wash.exe", n);
     }
     {
-        // arch is not directly after stem -> fall back to repo.
+        // `<name>-<os>-<arch>` ordering, stem happens to equal repo.
         const n = try deriveBareBinaryName(a, "cosign-linux-amd64", "cosign", false);
         defer a.free(n);
         try std.testing.expectEqualStrings("cosign", n);
@@ -2795,10 +2828,28 @@ test "deriveBareBinaryName strips arch-triple from stem" {
         try std.testing.expectEqualStrings("cosign.exe", n);
     }
     {
+        // `<name>-<os>-<arch>` ordering where stem differs from repo
+        // (e.g. justrach/merjs ships a binary literally named `mer`).
+        const n = try deriveBareBinaryName(a, "mer-macos-aarch64", "merjs", false);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("mer", n);
+    }
+    {
+        const n = try deriveBareBinaryName(a, "mer-windows-x86_64.exe", "merjs", true);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("mer.exe", n);
+    }
+    {
         // Underscore separator.
         const n = try deriveBareBinaryName(a, "foo_aarch64-unknown-linux-gnu", "repo", false);
         defer a.free(n);
         try std.testing.expectEqualStrings("foo", n);
+    }
+    {
+        // Neither pattern matches -> fall back to repo.
+        const n = try deriveBareBinaryName(a, "foo-bar-baz", "repo", false);
+        defer a.free(n);
+        try std.testing.expectEqualStrings("repo", n);
     }
     {
         // No separator at all -> fall back.
