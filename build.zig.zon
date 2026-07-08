@@ -1,6 +1,6 @@
 .{
     .name = .ghr,
-    .version = "0.6.4",
+    .version = "0.6.5",
     .fingerprint = 0xa1f6f50846da9442,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
