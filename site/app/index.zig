@@ -24,7 +24,7 @@ fn page() h.Node {
             h.div(.{ .class = "hero-actions" }, .{
                 h.a(.{ .href = "https://github.com/cataggar/ghr", .class = "btn btn-primary" }, "View on GitHub"),
                 h.a(.{ .href = "https://github.com/cataggar/ghr#install", .class = "btn btn-secondary" }, "Install ghr"),
-                h.a(.{ .href = "/blog", .class = "btn btn-secondary" }, "Read the blog"),
+                h.a(.{ .href = layout.base_path ++ "/blog", .class = "btn btn-secondary" }, "Read the blog"),
             }),
         }),
 
@@ -51,9 +51,9 @@ fn page() h.Node {
         h.section(.{}, .{
             h.div(.{ .class = "section-title" }, "From the blog"),
             h.div(.{ .class = "post-list" }, .{
-                postCard("blog/ghr-toolkit", "ghr: a toolkit for GitHub releases", "Why ghr exists, how installs are verified with GitHub's checksum, minisign, and sigstore, and what it looks like to install ghr with ghr itself."),
-                postCard("blog/installable-wasm-apps", "Installable WebAssembly apps", "Teaching ghr to install WASI 0.3 WebAssembly components straight from a GitHub release — a 3 KB app that runs unmodified on Windows, Linux, and macOS."),
-                postCard("blog/wasi-petstore", "Installable WASI 0.3 Pet Store example", "A two-component WebAssembly example — a web component and a storage component talking over a component-model interface — installed with a single ghr command."),
+                postCard("https://cataggar.medium.com/ghr-a-toolkit-for-github-releases-60bc489cf3aa", "ghr: a toolkit for GitHub releases", "Why ghr exists, how installs are verified with GitHub's checksum, minisign, and sigstore, and what it looks like to install ghr with ghr itself."),
+                postCard("https://cataggar.medium.com/installable-webassembly-apps-a9c44038a7d9", "Installable WebAssembly apps", "Teaching ghr to install WASI 0.3 WebAssembly components straight from a GitHub release — a 3 KB app that runs unmodified on Windows, Linux, and macOS."),
+                postCard("https://cataggar.medium.com/installable-wasi-0-3-pet-store-example-beb0e04101a6", "Installable WASI 0.3 Pet Store example", "A two-component WebAssembly example — a web component and a storage component talking over a component-model interface — installed with a single ghr command."),
             }),
         }),
     });
@@ -66,10 +66,10 @@ fn feature(title: []const u8, desc: []const u8) h.Node {
     });
 }
 
-fn postCard(href: []const u8, title: []const u8, desc: []const u8) h.Node {
+fn postCard(medium_url: []const u8, title: []const u8, desc: []const u8) h.Node {
     return h.article(.{ .class = "post-card" }, .{
         h.h3(.{}, title),
         h.p(.{}, desc),
-        h.a(.{ .href = "/" ++ href, .class = "read-more" }, "Read more \u{2192}"),
+        h.a(.{ .href = medium_url, .class = "read-more", .target = "_blank", .rel = "noopener" }, "Read more \u{2192}"),
     });
 }

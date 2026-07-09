@@ -33,7 +33,7 @@ fn post(slug: []const u8, title: []const u8, desc: []const u8, medium_url: []con
         h.h3(.{}, title),
         h.p(.{}, desc),
         h.div(.{ .style = "display:flex;gap:16px;margin-top:10px;" }, .{
-            h.a(.{ .href = "/blog/" ++ slug, .class = "read-more" }, "Read on ghr.dev \u{2192}"),
+            h.a(.{ .href = layout.base_path ++ "/blog/" ++ slug, .class = "read-more" }, "Read on ghr.dev \u{2192}"),
             h.a(.{ .href = medium_url, .class = "read-more", .target = "_blank", .rel = "noopener" }, "Original on Medium \u{2197}"),
         }),
     });
