@@ -1,0 +1,24 @@
+.{
+    .name = .ghr_site,
+    .version = "0.1.0",
+    .fingerprint = 0xb3fb5661653208ed,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Pinned to cataggar/merjs@windows, which carries the native-Windows
+        // fix (std.c pthread/clock_gettime shims -> std.Io equivalents) that
+        // upstream justrach/merjs lacks as of fe5b35c. Native Linux still hits
+        // an unrelated std.Io.Evented/io_uring stdlib bug in Zig 0.16.0, so
+        // this site's CI workflow builds on windows-latest.
+        .merjs = .{
+            .url = "git+https://github.com/cataggar/merjs.git?ref=windows#79bc8361ef4139f63f0f8791f82aaf089fb691c7",
+            .hash = "merjs-0.2.5-qL9LkvvEYAACfI7Lev4EEDBuviJSterDKtdv_AgpRtEj",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "app",
+        "public",
+    },
+}
