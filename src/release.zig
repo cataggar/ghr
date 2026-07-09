@@ -846,6 +846,7 @@ pub fn isInstallableAssetName(name: []const u8) bool {
 // ---------------------------------------------------------------------------
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha512 = std.crypto.hash.sha2.Sha512;
 
 /// Outcome of running the verification step for a downloaded asset.
 pub const VerifyOutcome = enum {
@@ -885,13 +886,18 @@ fn hexNibble(c: u8) ?u8 {
     };
 }
 
-/// Returns true if `s` is exactly 64 ASCII hex characters.
-fn isHex64(s: []const u8) bool {
-    if (s.len != 64) return false;
+/// Returns true if `s` is exactly `len` ASCII hex characters.
+fn isHexOfLen(s: []const u8, len: usize) bool {
+    if (s.len != len) return false;
     for (s) |c| {
         if (hexNibble(c) == null) return false;
     }
     return true;
+}
+
+/// Returns true if `s` is exactly 64 ASCII hex characters.
+fn isHex64(s: []const u8) bool {
+    return isHexOfLen(s, 64);
 }
 
 /// Lowercase ASCII-hex equality. Both sides must already be 64 chars.
@@ -912,17 +918,83 @@ fn sha256ToHex(digest: [32]u8, out: *[64]u8) void {
     }
 }
 
-const Sha256Entry = struct {
-    hex: []const u8,
-    name: []const u8,
+/// Format a 64-byte digest as 128 lowercase hex characters into `out`.
+fn sha512ToHex(digest: [64]u8, out: *[128]u8) void {
+    const hex = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 0x0f];
+    }
+}
+
+/// Hash algorithm used by an aggregate/sidecar checksum-file entry.
+const ChecksumAlgo = enum {
+    sha256,
+    sha512,
+
+    fn label(self: ChecksumAlgo) []const u8 {
+        return switch (self) {
+            .sha256 => "sha256",
+            .sha512 => "sha512",
+        };
+    }
+
+    fn hexLen(self: ChecksumAlgo) usize {
+        return switch (self) {
+            .sha256 => 64,
+            .sha512 => 128,
+        };
+    }
 };
 
-/// Parse a single line from a SHA256 checksum file. Supports:
+const ChecksumEntry = struct {
+    hex: []const u8,
+    name: []const u8,
+    algo: ChecksumAlgo,
+};
+
+/// Parse a `SHA256 (<name>) = <hex>` / `SHA512 (<name>) = <hex>` BSD-shasum
+/// line for the given `prefix`/`algo`. Returns null if `line` doesn't start
+/// with `prefix` or the hex doesn't match `algo`'s expected width.
+fn parseBsdChecksumLine(line: []const u8, prefix: []const u8, algo: ChecksumAlgo) ?ChecksumEntry {
+    if (line.len <= prefix.len or !std.mem.startsWith(u8, line, prefix)) return null;
+    const rest = line[prefix.len..];
+    const close = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
+    const name = rest[0..close];
+    const after = rest[close + 1 ..];
+    if (after.len < 4 or !std.mem.startsWith(u8, after, " = ")) return null;
+    const hex = after[3..];
+    if (!isHexOfLen(hex, algo.hexLen())) return null;
+    return .{ .hex = hex, .name = stripDotSlash(name), .algo = algo };
+}
+
+/// Parse a GNU coreutils `<hex>  <name>` / `<hex> *<name>` line for the
+/// given `algo`. Returns null if `line` doesn't start with a hex digest of
+/// `algo`'s expected width followed by a space/tab.
+fn parseGnuChecksumLine(line: []const u8, algo: ChecksumAlgo) ?ChecksumEntry {
+    const hex_len = algo.hexLen();
+    if (line.len < hex_len + 1 + 1) return null;
+    const hex = line[0..hex_len];
+    if (!isHexOfLen(hex, hex_len)) return null;
+    if (line[hex_len] != ' ' and line[hex_len] != '\t') return null;
+    var name_start: usize = hex_len + 1;
+    while (name_start < line.len and (line[name_start] == ' ' or line[name_start] == '\t')) {
+        name_start += 1;
+    }
+    if (name_start < line.len and line[name_start] == '*') name_start += 1;
+    if (name_start >= line.len) return null;
+    return .{ .hex = hex, .name = stripDotSlash(line[name_start..]), .algo = algo };
+}
+
+/// Parse a single line from an aggregate checksum file. Supports SHA-256
+/// (64-hex) and SHA-512 (128-hex) entries in either form:
 ///   GNU coreutils: `<hex>  <name>` or `<hex> *<name>` (binary-mode marker)
-///   BSD shasum:    `SHA256 (<name>) = <hex>`
+///   BSD shasum:    `SHA256 (<name>) = <hex>` / `SHA512 (<name>) = <hex>`
 /// Strips a leading `./` from the filename. Returns null for blank lines,
-/// `#` comment lines, or anything we can't recognize.
-fn parseSha256Line(raw: []const u8) ?Sha256Entry {
+/// `#` comment lines, or anything we can't recognize. The wider SHA-512
+/// width is tried before SHA-256 so a 128-hex GNU line isn't mistaken for a
+/// truncated SHA-256 one.
+fn parseChecksumLine(raw: []const u8) ?ChecksumEntry {
     var line = raw;
     while (line.len > 0 and (line[line.len - 1] == '\r' or line[line.len - 1] == '\n' or
         line[line.len - 1] == ' ' or line[line.len - 1] == '\t'))
@@ -933,30 +1005,13 @@ fn parseSha256Line(raw: []const u8) ?Sha256Entry {
     if (line.len == 0) return null;
     if (line[0] == '#') return null;
 
-    const bsd_prefix = "SHA256 (";
-    if (line.len > bsd_prefix.len and std.mem.startsWith(u8, line, bsd_prefix)) {
-        const rest = line[bsd_prefix.len..];
-        const close = std.mem.indexOfScalar(u8, rest, ')') orelse return null;
-        const name = rest[0..close];
-        const after = rest[close + 1 ..];
-        if (after.len < 4) return null;
-        if (!std.mem.startsWith(u8, after, " = ")) return null;
-        const hex = after[3..];
-        if (!isHex64(hex)) return null;
-        return .{ .hex = hex, .name = stripDotSlash(name) };
-    }
+    if (parseBsdChecksumLine(line, "SHA256 (", .sha256)) |e| return e;
+    if (parseBsdChecksumLine(line, "SHA512 (", .sha512)) |e| return e;
 
-    if (line.len < 64 + 1 + 1) return null;
-    const hex = line[0..64];
-    if (!isHex64(hex)) return null;
-    if (line[64] != ' ' and line[64] != '\t') return null;
-    var name_start: usize = 65;
-    while (name_start < line.len and (line[name_start] == ' ' or line[name_start] == '\t')) {
-        name_start += 1;
-    }
-    if (name_start < line.len and line[name_start] == '*') name_start += 1;
-    if (name_start >= line.len) return null;
-    return .{ .hex = hex, .name = stripDotSlash(line[name_start..]) };
+    if (parseGnuChecksumLine(line, .sha512)) |e| return e;
+    if (parseGnuChecksumLine(line, .sha256)) |e| return e;
+
+    return null;
 }
 
 fn stripDotSlash(name: []const u8) []const u8 {
@@ -973,18 +1028,19 @@ fn checksumNameMatches(entry_name: []const u8, target: []const u8) bool {
     return std.ascii.eqlIgnoreCase(basename, target);
 }
 
-/// Search a SHA256 checksum-file body for the entry matching `target_name`
-/// and return its 64-char hex hash. Returns null if no entry matches.
+/// Search an aggregate checksum-file body for the entry matching
+/// `target_name` and return it (hex digest, name, and detected algorithm).
+/// Returns null if no entry matches.
 ///
 /// Recognised formats:
-///   - GNU coreutils: `<hex>  <name>` or `<hex> *<name>`
-///   - BSD shasum:    `SHA256 (<name>) = <hex>`
+///   - GNU coreutils: `<hex>  <name>` or `<hex> *<name>` (SHA-256 or SHA-512)
+///   - BSD shasum:    `SHA256 (<name>) = <hex>` / `SHA512 (<name>) = <hex>`
 ///   - Windows `certutil -hashfile <name> SHA256`, which BurntSushi/ripgrep
 ///     and friends publish as Windows `.sha256` sidecars:
 ///         SHA256 hash of <name>:
 ///         <hex>
 ///         CertUtil: -hashfile command completed successfully.
-fn lookupSha256(content: []const u8, target_name: []const u8) ?[]const u8 {
+fn lookupChecksum(content: []const u8, target_name: []const u8) ?ChecksumEntry {
     const certutil_prefix = "SHA256 hash of ";
     var pending_certutil_name: ?[]const u8 = null;
     var it = std.mem.splitScalar(u8, content, '\n');
@@ -1011,26 +1067,27 @@ fn lookupSha256(content: []const u8, target_name: []const u8) ?[]const u8 {
         // header. Any other non-empty line terminates the certutil block.
         if (pending_certutil_name) |name| {
             if (line.len == 64 and isHex64(line)) {
-                if (checksumNameMatches(name, target_name)) return line;
+                if (checksumNameMatches(name, target_name)) {
+                    return .{ .hex = line, .name = name, .algo = .sha256 };
+                }
                 pending_certutil_name = null;
                 continue;
             }
             if (line.len > 0) pending_certutil_name = null;
         }
 
-        const entry = parseSha256Line(line) orelse continue;
-        if (checksumNameMatches(entry.name, target_name)) return entry.hex;
+        const entry = parseChecksumLine(line) orelse continue;
+        if (checksumNameMatches(entry.name, target_name)) return entry;
     }
     return null;
 }
 
-/// Returns true if `name` looks like a SHA256 checksum file rather than a
-/// signature, key, or unrelated checksum (sha512/md5).
-fn isSha256ChecksumFile(name: []const u8) bool {
+/// Returns true if `name` looks like a checksum file (SHA-256 or SHA-512)
+/// rather than a signature, key, or unrelated checksum (md5/sha1).
+fn isChecksumFile(name: []const u8) bool {
     const reject_suffixes = [_][]const u8{
-        ".sig",    ".asc",       ".pem",        ".pub", ".gpg",    ".minisig",
-        ".sha512", ".sha512sum", ".sha512sums", ".md5", ".md5sum", ".md5sums",
-        ".sha1",   ".sha1sum",
+        ".sig", ".asc",    ".pem",     ".pub",  ".gpg",     ".minisig",
+        ".md5", ".md5sum", ".md5sums", ".sha1", ".sha1sum",
     };
     for (reject_suffixes) |s| {
         if (std.ascii.endsWithIgnoreCase(name, s)) return false;
@@ -1040,34 +1097,56 @@ fn isSha256ChecksumFile(name: []const u8) bool {
     if (std.ascii.endsWithIgnoreCase(name, ".sha256sums")) return true;
     if (std.ascii.endsWithIgnoreCase(name, ".sha256sum.txt")) return true;
     if (std.ascii.endsWithIgnoreCase(name, ".sha256sums.txt")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha512")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha512sum")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha512sums")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha512sum.txt")) return true;
+    if (std.ascii.endsWithIgnoreCase(name, ".sha512sums.txt")) return true;
     if (containsIgnoreCase(name, "checksum")) return true;
     if (containsIgnoreCase(name, "sha256sums")) return true;
+    if (containsIgnoreCase(name, "sha512sums")) return true;
     if (std.ascii.eqlIgnoreCase(name, "SHA256SUMS")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "SHA512SUMS")) return true;
     return false;
 }
 
-/// Locate the best SHA256 checksum asset for `asset_name` in the release's
-/// asset list. Prefers a sidecar (`<asset>.sha256`) when present, otherwise
-/// falls back to an aggregate checksum file. Returns null when none is
-/// available.
-fn findChecksumAsset(assets: []const Asset, asset_name: []const u8) ?Asset {
+/// Locate the sidecar checksum asset for `asset_name` whose name is
+/// `<asset_name>` plus `suffix_a` (e.g. `.sha256`) or `suffix_b` (e.g.
+/// `.sha256sum`). Returns null when no matching sidecar is published.
+fn findSidecarChecksumAsset(
+    assets: []const Asset,
+    asset_name: []const u8,
+    suffix_a: []const u8,
+    suffix_b: []const u8,
+) ?Asset {
     for (assets) |a| {
         if (std.mem.eql(u8, a.name, asset_name)) continue;
-        if (std.ascii.endsWithIgnoreCase(a.name, ".sha256") or
-            std.ascii.endsWithIgnoreCase(a.name, ".sha256sum"))
+        if (std.ascii.endsWithIgnoreCase(a.name, suffix_a) or
+            std.ascii.endsWithIgnoreCase(a.name, suffix_b))
         {
             const dot = std.mem.lastIndexOfScalar(u8, a.name, '.').?;
             const stem = a.name[0..dot];
-            const final_stem = if (std.ascii.endsWithIgnoreCase(stem, ".sha256"))
-                stem[0 .. stem.len - ".sha256".len]
+            const final_stem = if (std.ascii.endsWithIgnoreCase(stem, suffix_a))
+                stem[0 .. stem.len - suffix_a.len]
             else
                 stem;
             if (std.ascii.eqlIgnoreCase(final_stem, asset_name)) return a;
         }
     }
+    return null;
+}
+
+/// Locate the best checksum asset for `asset_name` in the release's asset
+/// list. Prefers a `<asset>.sha256`/`.sha256sum` sidecar, then a
+/// `<asset>.sha512`/`.sha512sum` sidecar, then falls back to an aggregate
+/// checksum file (`checksums.txt`, `SHA256SUMS`, `SHA512SUMS`, ...).
+/// Returns null when none is available.
+fn findChecksumAsset(assets: []const Asset, asset_name: []const u8) ?Asset {
+    if (findSidecarChecksumAsset(assets, asset_name, ".sha256", ".sha256sum")) |a| return a;
+    if (findSidecarChecksumAsset(assets, asset_name, ".sha512", ".sha512sum")) |a| return a;
     for (assets) |a| {
         if (std.mem.eql(u8, a.name, asset_name)) continue;
-        if (isSha256ChecksumFile(a.name)) return a;
+        if (isChecksumFile(a.name)) return a;
     }
     return null;
 }
@@ -1091,9 +1170,30 @@ fn computeFileSha256(io: Io, path: []const u8) ![32]u8 {
     return digest;
 }
 
-/// Run Phase 1 verification on `download_path`. On `mismatch` this function
-/// prints the diagnostic and returns `error.ChecksumMismatch`; the caller is
-/// responsible for deleting the cached file and exiting.
+/// Stream the file at `path` through SHA-512 and return the 64-byte digest.
+fn computeFileSha512(io: Io, path: []const u8) ![64]u8 {
+    var file = try Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var read_buf: [64 * 1024]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    var hasher = Sha512.init(.{});
+    var chunk: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try file_reader.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        hasher.update(chunk[0..n]);
+        if (n < chunk.len) break;
+    }
+    var digest: [64]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+/// Run Phase 1 verification on `download_path` against a published sidecar
+/// or aggregate checksum file, whether it uses SHA-256 or SHA-512. On
+/// `mismatch` this function prints the diagnostic and returns
+/// `error.ChecksumMismatch`; the caller is responsible for deleting the
+/// cached file and exiting.
 pub fn verifyDownloadedAssetSha256(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1136,30 +1236,44 @@ pub fn verifyDownloadedAssetSha256(
     };
     defer allocator.free(checksum_bytes);
 
-    const expected_hex = lookupSha256(checksum_bytes, asset_name) orelse {
+    const expected = lookupChecksum(checksum_bytes, asset_name) orelse {
         try err_w.print("error: checksum file '{s}' has no entry for '{s}'\n", .{ checksum_asset.name, asset_name });
         try err_w.flush();
         return error.ChecksumEntryMissing;
     };
 
-    const digest = computeFileSha256(io, download_path) catch |err| {
-        try err_w.print("error: failed to hash '{s}': {}\n", .{ download_path, err });
-        try err_w.flush();
-        return err;
+    var actual_hex_buf: [128]u8 = undefined;
+    const actual_hex: []const u8 = switch (expected.algo) {
+        .sha256 => blk: {
+            const digest = computeFileSha256(io, download_path) catch |err| {
+                try err_w.print("error: failed to hash '{s}': {}\n", .{ download_path, err });
+                try err_w.flush();
+                return err;
+            };
+            sha256ToHex(digest, actual_hex_buf[0..64]);
+            break :blk actual_hex_buf[0..64];
+        },
+        .sha512 => blk: {
+            const digest = computeFileSha512(io, download_path) catch |err| {
+                try err_w.print("error: failed to hash '{s}': {}\n", .{ download_path, err });
+                try err_w.flush();
+                return err;
+            };
+            sha512ToHex(digest, actual_hex_buf[0..128]);
+            break :blk actual_hex_buf[0..128];
+        },
     };
-    var actual_hex: [64]u8 = undefined;
-    sha256ToHex(digest, &actual_hex);
 
-    if (!hexEqIgnoreCase(expected_hex, &actual_hex)) {
+    if (!hexEqIgnoreCase(expected.hex, actual_hex)) {
         try err_w.print(
-            "error: SHA256 mismatch for {s}\n  expected: {s}\n  actual:   {s}\n  source:   {s}\n",
-            .{ asset_name, expected_hex, &actual_hex, checksum_asset.name },
+            "error: {s} mismatch for {s}\n  expected: {s}\n  actual:   {s}\n  source:   {s}\n",
+            .{ expected.algo.label(), asset_name, expected.hex, actual_hex, checksum_asset.name },
         );
         try err_w.flush();
         return error.ChecksumMismatch;
     }
 
-    try w.print("verified sha256 {s}... ({s})\n", .{ actual_hex[0..12], checksum_asset.name });
+    try w.print("verified {s} {s}... ({s})\n", .{ expected.algo.label(), actual_hex[0..12], checksum_asset.name });
     try w.flush();
     return .sha256_verified;
 }
@@ -1690,12 +1804,12 @@ pub const AssetMatch = union(enum) {
 /// `.sigstore` siblings.
 pub fn isSidecarAsset(name: []const u8) bool {
     const sidecar_suffixes = [_][]const u8{
-        ".ghr",        ".minisig",    ".sig",        ".asc",
-        ".pem",        ".pub",        ".gpg",        ".cert",
-        ".crt",        ".bundle",     ".sigstore",   ".sigstore.json",
-        ".sha256",     ".sha256sum",  ".sha256sums", ".sha512",
-        ".sha512sum",  ".sha512sums", ".md5",        ".md5sum",
-        ".md5sums",    ".sha1",       ".sha1sum",
+        ".ghr",       ".minisig",    ".sig",        ".asc",
+        ".pem",       ".pub",        ".gpg",        ".cert",
+        ".crt",       ".bundle",     ".sigstore",   ".sigstore.json",
+        ".sha256",    ".sha256sum",  ".sha256sums", ".sha512",
+        ".sha512sum", ".sha512sums", ".md5",        ".md5sum",
+        ".md5sums",   ".sha1",       ".sha1sum",
     };
     for (sidecar_suffixes) |s| {
         if (std.ascii.endsWithIgnoreCase(name, s)) return true;
@@ -2592,54 +2706,89 @@ test "isHex64 accepts and rejects" {
     try std.testing.expect(!isHex64("g" ++ ("0" ** 63)));
 }
 
-test "parseSha256Line GNU two-space form" {
+test "parseChecksumLine GNU two-space form" {
     const line = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  app.tar.gz";
-    const e = parseSha256Line(line) orelse return error.TestUnexpectedNull;
+    const e = parseChecksumLine(line) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", e.hex);
     try std.testing.expectEqualStrings("app.tar.gz", e.name);
+    try std.testing.expectEqual(ChecksumAlgo.sha256, e.algo);
 }
 
-test "parseSha256Line GNU binary-mode asterisk" {
+test "parseChecksumLine GNU binary-mode asterisk" {
     const line = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff *bin.exe";
-    const e = parseSha256Line(line) orelse return error.TestUnexpectedNull;
+    const e = parseChecksumLine(line) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("bin.exe", e.name);
+    try std.testing.expectEqual(ChecksumAlgo.sha256, e.algo);
 }
 
-test "parseSha256Line strips leading ./" {
+test "parseChecksumLine strips leading ./" {
     const line = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff  ./foo";
-    const e = parseSha256Line(line) orelse return error.TestUnexpectedNull;
+    const e = parseChecksumLine(line) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("foo", e.name);
 }
 
-test "parseSha256Line BSD form" {
+test "parseChecksumLine BSD form" {
     const line = "SHA256 (app.tar.gz) = abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    const e = parseSha256Line(line) orelse return error.TestUnexpectedNull;
+    const e = parseChecksumLine(line) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("app.tar.gz", e.name);
     try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", e.hex);
+    try std.testing.expectEqual(ChecksumAlgo.sha256, e.algo);
 }
 
-test "parseSha256Line skips comments and blanks" {
-    try std.testing.expect(parseSha256Line("") == null);
-    try std.testing.expect(parseSha256Line("   \r\n") == null);
-    try std.testing.expect(parseSha256Line("# header line") == null);
-    try std.testing.expect(parseSha256Line("not a real line") == null);
-    try std.testing.expect(parseSha256Line("dead  short") == null);
+test "parseChecksumLine GNU sha512 two-space form" {
+    // Real width Caddy publishes in `caddy_<ver>_checksums.txt`: 128-hex
+    // SHA-512, not SHA-256, despite the generic "checksums.txt" filename.
+    const line = ("ab" ** 64) ++ "  caddy_2.11.4_linux_arm64.tar.gz";
+    const e = parseChecksumLine(line) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("ab" ** 64, e.hex);
+    try std.testing.expectEqualStrings("caddy_2.11.4_linux_arm64.tar.gz", e.name);
+    try std.testing.expectEqual(ChecksumAlgo.sha512, e.algo);
 }
 
-test "lookupSha256 finds entry across formats" {
+test "parseChecksumLine BSD sha512 form" {
+    const line = "SHA512 (app.tar.gz) = " ++ ("cd" ** 64);
+    const e = parseChecksumLine(line) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("app.tar.gz", e.name);
+    try std.testing.expectEqualStrings("cd" ** 64, e.hex);
+    try std.testing.expectEqual(ChecksumAlgo.sha512, e.algo);
+}
+
+test "parseChecksumLine skips comments and blanks" {
+    try std.testing.expect(parseChecksumLine("") == null);
+    try std.testing.expect(parseChecksumLine("   \r\n") == null);
+    try std.testing.expect(parseChecksumLine("# header line") == null);
+    try std.testing.expect(parseChecksumLine("not a real line") == null);
+    try std.testing.expect(parseChecksumLine("dead  short") == null);
+}
+
+test "lookupChecksum finds entry across formats" {
     const body =
         "# generated by something\n" ++
         "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  other.bin\n" ++
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  app.tar.gz\n" ++
         "SHA256 (alt.zip) = 1111111111111111111111111111111111111111111111111111111111111111\n";
-    const got = lookupSha256(body, "app.tar.gz") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", got);
-    const got2 = lookupSha256(body, "alt.zip") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("1111111111111111111111111111111111111111111111111111111111111111", got2);
-    try std.testing.expect(lookupSha256(body, "missing") == null);
+    const got = lookupChecksum(body, "app.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", got.hex);
+    try std.testing.expectEqual(ChecksumAlgo.sha256, got.algo);
+    const got2 = lookupChecksum(body, "alt.zip") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("1111111111111111111111111111111111111111111111111111111111111111", got2.hex);
+    try std.testing.expect(lookupChecksum(body, "missing") == null);
 }
 
-test "lookupSha256 parses certutil format (Windows .sha256 sidecars)" {
+test "lookupChecksum resolves sha512 entries in a caddy-shaped checksums.txt" {
+    // Trimmed shape of the real caddy_2.11.4_checksums.txt (128-hex SHA-512
+    // entries, no algorithm hint in the aggregate filename).
+    const body =
+        ("11" ** 64) ++ "  caddy_2.11.4_linux_amd64.tar.gz\n" ++
+        ("22" ** 64) ++ "  caddy_2.11.4_linux_arm64.tar.gz\n" ++
+        ("33" ** 64) ++ "  caddy_2.11.4_windows_amd64.zip\n";
+    const got = lookupChecksum(body, "caddy_2.11.4_linux_arm64.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("22" ** 64, got.hex);
+    try std.testing.expectEqual(ChecksumAlgo.sha512, got.algo);
+    try std.testing.expect(lookupChecksum(body, "caddy_2.11.4_freebsd_amd64.tar.gz") == null);
+}
+
+test "lookupChecksum parses certutil format (Windows .sha256 sidecars)" {
     // Verbatim shape of `certutil -hashfile <name> SHA256` output, which
     // BurntSushi/ripgrep publishes as its Windows `.sha256` sidecars (CRLF
     // line endings, three lines: header, bare digest, trailing status).
@@ -2647,25 +2796,25 @@ test "lookupSha256 parses certutil format (Windows .sha256 sidecars)" {
         "SHA256 hash of ripgrep-14.1.1-x86_64-pc-windows-gnu.zip:\r\n" ++
         "01469c43c3fffdb4baff80469a75a7bf1dc3d0bf4ef63cda72a22f885f27465a\r\n" ++
         "CertUtil: -hashfile command completed successfully.\r\n";
-    const got = lookupSha256(body, "ripgrep-14.1.1-x86_64-pc-windows-gnu.zip") orelse
+    const got = lookupChecksum(body, "ripgrep-14.1.1-x86_64-pc-windows-gnu.zip") orelse
         return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings(
         "01469c43c3fffdb4baff80469a75a7bf1dc3d0bf4ef63cda72a22f885f27465a",
-        got,
+        got.hex,
     );
-    try std.testing.expect(lookupSha256(body, "wrong-name.zip") == null);
+    try std.testing.expect(lookupChecksum(body, "wrong-name.zip") == null);
 }
 
-test "lookupSha256 mixes certutil and gnu entries in one file" {
+test "lookupChecksum mixes certutil and gnu entries in one file" {
     const body =
         "SHA256 hash of asset-a.zip:\r\n" ++
         ("a" ** 64) ++ "\r\n" ++
         "CertUtil: -hashfile command completed successfully.\r\n" ++
         ("b" ** 64) ++ "  asset-b.zip\n";
-    const a = lookupSha256(body, "asset-a.zip") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("a" ** 64, a);
-    const b = lookupSha256(body, "asset-b.zip") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("b" ** 64, b);
+    const a = lookupChecksum(body, "asset-a.zip") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("a" ** 64, a.hex);
+    const b = lookupChecksum(body, "asset-b.zip") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("b" ** 64, b.hex);
 }
 
 test "checksumNameMatches strips path and ignores case" {
@@ -2674,16 +2823,18 @@ test "checksumNameMatches strips path and ignores case" {
     try std.testing.expect(!checksumNameMatches("bar.tgz", "foo.tgz"));
 }
 
-test "isSha256ChecksumFile accepts sha256 forms, rejects sigs and sha512" {
-    try std.testing.expect(isSha256ChecksumFile("app.tar.gz.sha256"));
-    try std.testing.expect(isSha256ChecksumFile("checksums.txt"));
-    try std.testing.expect(isSha256ChecksumFile("SHA256SUMS"));
-    try std.testing.expect(isSha256ChecksumFile("project_checksums_v1.0.txt"));
-    try std.testing.expect(!isSha256ChecksumFile("app.tar.gz"));
-    try std.testing.expect(!isSha256ChecksumFile("app.tar.gz.sig"));
-    try std.testing.expect(!isSha256ChecksumFile("app.tar.gz.sha512"));
-    try std.testing.expect(!isSha256ChecksumFile("checksums.txt.sig"));
-    try std.testing.expect(!isSha256ChecksumFile("release.pub"));
+test "isChecksumFile accepts sha256 and sha512 forms, rejects sigs and md5" {
+    try std.testing.expect(isChecksumFile("app.tar.gz.sha256"));
+    try std.testing.expect(isChecksumFile("checksums.txt"));
+    try std.testing.expect(isChecksumFile("SHA256SUMS"));
+    try std.testing.expect(isChecksumFile("project_checksums_v1.0.txt"));
+    try std.testing.expect(isChecksumFile("app.tar.gz.sha512"));
+    try std.testing.expect(isChecksumFile("SHA512SUMS"));
+    try std.testing.expect(!isChecksumFile("app.tar.gz"));
+    try std.testing.expect(!isChecksumFile("app.tar.gz.sig"));
+    try std.testing.expect(!isChecksumFile("app.tar.gz.md5"));
+    try std.testing.expect(!isChecksumFile("checksums.txt.sig"));
+    try std.testing.expect(!isChecksumFile("release.pub"));
 }
 
 test "findChecksumAsset prefers sidecar over aggregate" {
@@ -2705,13 +2856,24 @@ test "findChecksumAsset falls back to aggregate" {
     try std.testing.expectEqualStrings("SHA256SUMS", got.name);
 }
 
-test "findChecksumAsset returns null when only sha512 is present" {
+test "findChecksumAsset prefers sha256 sidecar over sha512 sidecar" {
+    const assets = [_]Asset{
+        .{ .name = "app-linux.tar.gz", .browser_download_url = "" },
+        .{ .name = "app-linux.tar.gz.sha512", .browser_download_url = "" },
+        .{ .name = "app-linux.tar.gz.sha256", .browser_download_url = "" },
+    };
+    const got = findChecksumAsset(&assets, "app-linux.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("app-linux.tar.gz.sha256", got.name);
+}
+
+test "findChecksumAsset finds a sha512-only sidecar" {
     const assets = [_]Asset{
         .{ .name = "app-linux.tar.gz", .browser_download_url = "" },
         .{ .name = "app-linux.tar.gz.sha512", .browser_download_url = "" },
         .{ .name = "release.sig", .browser_download_url = "" },
     };
-    try std.testing.expect(findChecksumAsset(&assets, "app-linux.tar.gz") == null);
+    const got = findChecksumAsset(&assets, "app-linux.tar.gz") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("app-linux.tar.gz.sha512", got.name);
 }
 
 test "lookupAssetDigest extracts the GitHub sha256 digest" {
@@ -2763,6 +2925,37 @@ test "computeFileSha256 streams a synthetic file" {
     var expected: [32]u8 = undefined;
     Sha256.hash(payload, &expected, .{});
     try std.testing.expectEqualSlices(u8, &expected, &digest);
+}
+
+test "computeFileSha512 streams a synthetic file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const payload = "the quick brown fox jumps over the lazy dog\n";
+    var f = try tmp.dir.createFile(std.testing.io, "blob", .{});
+    try f.writeStreamingAll(std.testing.io, payload);
+    f.close(std.testing.io);
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(std.testing.io, "blob", &path_buf);
+    const full_path = path_buf[0..n];
+
+    const digest = try computeFileSha512(std.testing.io, full_path);
+    var expected: [64]u8 = undefined;
+    Sha512.hash(payload, &expected, .{});
+    try std.testing.expectEqualSlices(u8, &expected, &digest);
+}
+
+test "sha512ToHex formats a known digest" {
+    var expected: [64]u8 = undefined;
+    Sha512.hash("abc", &expected, .{});
+    var hex: [128]u8 = undefined;
+    sha512ToHex(expected, &hex);
+    try std.testing.expectEqualStrings(
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a" ++
+            "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        &hex,
+    );
 }
 
 test "hexEqIgnoreCase mixed case" {

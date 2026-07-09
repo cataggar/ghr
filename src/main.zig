@@ -451,7 +451,7 @@ fn printInstallUsage(w: *Writer) !void {
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
         \\    --skip-verify           Skip every verification step (checksum, minisign, sigstore, authenticode)
-        \\    --skip-checksum         Skip checksum verification (GitHub asset digest + .sha256 sidecar)
+        \\    --skip-checksum         Skip checksum verification (GitHub asset digest + .sha256/.sha512 sidecar)
         \\    --skip-minisign         Skip just the minisign verification step
         \\    --skip-sigstore         Skip just the sigstore-bundle verification step
         \\    --skip-authenticode     Skip just the Authenticode (Windows PE) verification step

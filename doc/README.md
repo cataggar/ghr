@@ -76,7 +76,7 @@ OPTIONS:
         --sha256 <hex>         Verify download against SHA-256 digest (single-spec only)
         --minisign <pubkey>    Default minisign key, applied to specs without an inline key
         --skip-verify          Umbrella: skip every verification step (checksum, minisign, sigstore, authenticode)
-        --skip-checksum        Skip checksum verification (GitHub asset digest + .sha256 sidecar)
+        --skip-checksum        Skip checksum verification (GitHub asset digest + .sha256/.sha512 sidecar)
         --skip-minisign        Skip just the minisign verification step
         --skip-sigstore        Skip just the sigstore-bundle verification step
         --skip-authenticode    Skip just the Authenticode (Windows PE) verification step
@@ -422,13 +422,17 @@ publishes:
   arrived with the release metadata. Its trust root is GitHub itself (the
   same as a CI-generated sidecar): it attests integrity, not independent
   provenance. Assets uploaded before the rollout carry no digest.
-- **Checksum files** — sidecar `<asset>.sha256` files and aggregate
-  `*checksums*` / `SHA256SUMS` files are both supported, in GNU and BSD
-  formats. When a release publishes one it is **always validated** (in
-  addition to the GitHub digest, never as a silent substitute); both must
-  match. The sidecar download is the only case that costs an extra
-  request, so releases that rely solely on the built-in digest verify for
-  free.
+- **Checksum files** — sidecar `<asset>.sha256` / `<asset>.sha512` files
+  and aggregate `*checksums*` / `SHA256SUMS` / `SHA512SUMS` files are all
+  supported, in GNU and BSD formats, and may use SHA-256 (64-hex) or
+  SHA-512 (128-hex) digests — the entry's hex width picks the algorithm
+  per asset, so a single aggregate file can even mix both (e.g. some
+  projects publish 128-hex SHA-512 in a file simply named
+  `checksums.txt`). When a release publishes one it is **always
+  validated** (in addition to the GitHub digest, never as a silent
+  substitute); both must match. The sidecar download is the only case
+  that costs an extra request, so releases that rely solely on the
+  built-in digest verify for free.
 - **Sigstore bundles** — `<asset>.sigstore.json` (cosign bundle v0.3) is
   verified entirely natively in Zig. The X.509 chain is walked from the
   bundle's leaf cert to embedded production Fulcio roots, the artifact's
