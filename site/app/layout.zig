@@ -75,8 +75,8 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
         \\    .layout-wide { max-width:1080px; }
         \\    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
-        \\    .site-logo-link { display:inline-block; }
-        \\    .site-logo { display:block; width:100%; max-width:520px; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
+        \\    .site-logo-link { display:block; width:100%; }
+        \\    .site-logo { display:block; width:100%; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
         \\    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
         \\    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
         \\    .nav a:hover { color:var(--text); }
