@@ -76,7 +76,7 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\    .layout-wide { max-width:1080px; }
         \\    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
         \\    .site-logo-link { display:inline-block; }
-        \\    .site-logo { display:block; width:100%; max-width:360px; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
+        \\    .site-logo { display:block; width:100%; max-width:520px; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
         \\    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
         \\    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
         \\    .nav a:hover { color:var(--text); }
@@ -133,12 +133,12 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
 
     w.writeAll("</head>\n<body>\n<div class=\"layout\">\n  <header class=\"layout-header\">\n") catch return body;
     w.print(
-        \\    <a href="/" class="site-logo-link"><img src="{s}" alt="ghr logo" class="site-logo"></a>
         \\    <nav class="nav">
         \\      <a href="/blog">Blog</a>
         \\      <a href="https://github.com/cataggar/ghr">GitHub</a>
         \\      <a href="https://github.com/cataggar/ghr#install">Install</a>
         \\    </nav>
+        \\    <a href="/" class="site-logo-link"><img src="{s}" alt="ghr logo" class="site-logo"></a>
         \\
     , .{logo_url}) catch return body;
     w.writeAll("  </header>\n") catch return body;
