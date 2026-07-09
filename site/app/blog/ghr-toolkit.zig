@@ -1,5 +1,6 @@
 const mer = @import("mer");
 const h = mer.h;
+const layout = @import("app/layout");
 
 pub const prerender = true;
 
@@ -16,7 +17,7 @@ pub fn render(req: mer.Request) mer.Response {
 
 fn page() h.Node {
     return h.article(.{ .class = "prose" }, .{
-        h.a(.{ .href = "/blog", .class = "back-link" }, "\u{2190} Back to blog"),
+        h.a(.{ .href = layout.base_path ++ "/blog", .class = "back-link" }, "\u{2190} Back to blog"),
         h.h1(.{}, "ghr: a toolkit for GitHub releases"),
         h.p(.{ .style = "color:var(--muted);" }, .{
             h.text("Originally published on "),

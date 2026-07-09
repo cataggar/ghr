@@ -14,6 +14,14 @@ const mercss = mer.mercss;
 
 pub const logo_url = "https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg";
 
+/// GitHub Pages serves this project site at https://cataggar.github.io/ghr/
+/// (a subpath), not the domain root — an absolute link like href="/blog"
+/// would resolve to https://cataggar.github.io/blog (wrong host path, 404).
+/// Every internal link/asset path in the site is prefixed with this so it
+/// resolves under the actual deployed subpath. Update this (and nothing
+/// else) if the site ever moves to a custom domain served from "/".
+pub const base_path = "/ghr";
+
 /// Small rounded pill, e.g. the "MIT licensed" / version badges.
 pub const Badge = mercss.Component(.{
     .display = "inline-flex",
@@ -48,10 +56,11 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\  <link rel="preconnect" href="https://fonts.googleapis.com">
         \\  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
         \\  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-        \\  <link rel="icon" href="/favicon.ico" sizes="any">
-        \\  <link rel="icon" href="/favicon-32x32.png" type="image/png" sizes="32x32">
         \\
     ) catch return body;
+
+    w.print("  <link rel=\"icon\" href=\"{s}/favicon.ico\" sizes=\"any\">\n", .{base_path}) catch return body;
+    w.print("  <link rel=\"icon\" href=\"{s}/favicon-32x32.png\" type=\"image/png\" sizes=\"32x32\">\n", .{base_path}) catch return body;
 
     w.print("  <title>{s} \u{2014} ghr</title>\n", .{title}) catch return body;
     w.print("  <meta name=\"description\" content=\"{s}\">\n", .{desc}) catch return body;
@@ -136,13 +145,13 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
     w.writeAll("</head>\n<body>\n<div class=\"layout\">\n  <header class=\"layout-header\">\n") catch return body;
     w.print(
         \\    <nav class="nav">
-        \\      <a href="/blog">Blog</a>
+        \\      <a href="{s}/blog">Blog</a>
         \\      <a href="https://github.com/cataggar/ghr">GitHub</a>
         \\      <a href="https://github.com/cataggar/ghr#install">Install</a>
         \\    </nav>
-        \\    <a href="/" class="site-logo-link"><img src="{s}" alt="ghr logo" class="site-logo"></a>
+        \\    <a href="{s}/" class="site-logo-link"><img src="{s}" alt="ghr logo" class="site-logo"></a>
         \\
-    , .{logo_url}) catch return body;
+    , .{ base_path, base_path, logo_url }) catch return body;
     w.writeAll("  </header>\n") catch return body;
 
     _ = path;
