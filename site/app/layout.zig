@@ -74,11 +74,10 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\    h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
         \\    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
         \\    .layout-wide { max-width:1080px; }
-        \\    .layout-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:48px; flex-wrap:wrap; gap:12px; }
-        \\    .wordmark { font-family:'DM Serif Display',Georgia,serif; font-size:20px; display:flex; align-items:center; gap:8px; }
-        \\    .wordmark span { color:var(--red); }
-        \\    .wordmark img { width:28px; height:28px; object-fit:contain; border-radius:6px; }
-        \\    .nav { display:flex; gap:20px; flex-wrap:wrap; }
+        \\    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
+        \\    .site-logo-link { display:inline-block; }
+        \\    .site-logo { display:block; width:100%; max-width:360px; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
+        \\    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
         \\    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
         \\    .nav a:hover { color:var(--text); }
         \\    .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
@@ -134,7 +133,7 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
 
     w.writeAll("</head>\n<body>\n<div class=\"layout\">\n  <header class=\"layout-header\">\n") catch return body;
     w.print(
-        \\    <a href="/" class="wordmark"><img src="{s}" alt="ghr logo"> ghr<span>.</span></a>
+        \\    <a href="/" class="site-logo-link"><img src="{s}" alt="ghr logo" class="site-logo"></a>
         \\    <nav class="nav">
         \\      <a href="/blog">Blog</a>
         \\      <a href="https://github.com/cataggar/ghr">GitHub</a>
