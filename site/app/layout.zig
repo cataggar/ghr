@@ -151,7 +151,7 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
     w.writeAll(
         \\
         \\  <footer class="layout-footer">
-        \\    Built with <a href="https://github.com/cataggar/merjs">mer</a> &middot; Zig 0.16 &middot;
+        \\    Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.16 &middot;
         \\    <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
         \\    <span class="attribution">Logo by
         \\      <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
