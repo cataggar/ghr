@@ -153,8 +153,8 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\  <footer class="layout-footer">
         \\    Built with <a href="https://github.com/cataggar/merjs">mer</a> &middot; Zig 0.16 &middot;
         \\    <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
-        \\    <span class="attribution">Logo by Talia Blasquez (
-        \\      <a href="https://www.instagram.com/my_artistic_sidetrip/">@my_artistic_sidetrip</a>),
+        \\    <span class="attribution">Logo by
+        \\      <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
         \\      licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
         \\    </span>
         \\  </footer>
