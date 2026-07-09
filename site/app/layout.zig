@@ -50,7 +50,6 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
         \\  <link rel="icon" href="/favicon.ico" sizes="any">
         \\  <link rel="icon" href="/favicon-32x32.png" type="image/png" sizes="32x32">
-        \\  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
         \\
     ) catch return body;
 
