@@ -18,12 +18,10 @@ concurrency:
 jobs:
   build:
     name: Build site
-    # merjs (the `mer` framework the site is built with) currently fails to
-    # compile on native Linux due to an unrelated std.Io.Evented/io_uring
-    # stdlib bug in Zig 0.16.0. windows-latest is unaffected, so the site is
-    # built there for now; the dist/ output is a plain static site and
-    # works the same regardless of which OS produced it.
-    runs-on: windows-latest
+    # Fixed on cataggar/merjs@main: runtime.zig no longer uses
+    # std.Io.Evented/io_uring (a Zig 0.16.0 stdlib bug on Linux), so this
+    # builds on ubuntu again, matching the repo's other CI jobs.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
