@@ -376,10 +376,62 @@ fn stageBareExecutable(
     try dest.writeStreamingAll(io, content);
 }
 
-/// Scan directory recursively for executable files and return their relative paths.
+fn deinitPathList(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayListUnmanaged([]const u8),
+) void {
+    for (paths.items) |path| allocator.free(path);
+    paths.deinit(allocator);
+    paths.* = .empty;
+}
+
+/// Scan directories breadth-first and return executable files from the
+/// shallowest level that contains any. Release archives commonly have one
+/// wrapper directory around their commands; stopping at that wrapper's level
+/// keeps executable-looking firmware and other data in deeper directories off
+/// PATH while preserving nested-only archive layouts.
 fn findExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
-    try scanForExecutables(allocator, io, dir, &result, "");
+    errdefer deinitPathList(allocator, &result);
+
+    var current: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitPathList(allocator, &current);
+    const root_path = try allocator.dupe(u8, "");
+    current.append(allocator, root_path) catch |err| {
+        allocator.free(root_path);
+        return err;
+    };
+
+    while (current.items.len > 0) {
+        var next: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer deinitPathList(allocator, &next);
+
+        for (current.items) |prefix| {
+            var opened: ?Dir = null;
+            if (prefix.len > 0) {
+                opened = dir.openDir(io, prefix, .{ .iterate = true }) catch continue;
+            }
+            defer if (opened) |*d| d.close(io);
+
+            try scanExecutableLevel(
+                allocator,
+                io,
+                opened orelse dir,
+                &result,
+                &next,
+                prefix,
+            );
+        }
+
+        if (result.items.len > 0) {
+            deinitPathList(allocator, &next);
+            return result;
+        }
+
+        deinitPathList(allocator, &current);
+        current = next;
+    }
+
     return result;
 }
 
@@ -463,11 +515,14 @@ fn hasDebShims(io: Io, dir: Dir) bool {
     return false;
 }
 
-fn scanForExecutables(
+/// Scan one breadth-first level. Executable files and recognized app bundles
+/// are collected in `result`; ordinary subdirectories are queued in `next`.
+fn scanExecutableLevel(
     allocator: std.mem.Allocator,
     io: Io,
     dir: Dir,
     result: *std.ArrayListUnmanaged([]const u8),
+    next: *std.ArrayListUnmanaged([]const u8),
     prefix: []const u8,
 ) !void {
     var iter = dir.iterate();
@@ -483,20 +538,21 @@ fn scanForExecutables(
 
         if (entry.kind == .directory) {
             if (isMacAppBundle(io, dir, entry.name)) {
-                // Only scan Contents/MacOS/ inside .app bundles
-                try scanAppBundle(allocator, io, dir, entry.name, result, rel_name);
+                // Treat the bundle as a candidate at this level while only
+                // inspecting its Contents/MacOS directory for launchers.
+                scanAppBundle(allocator, io, dir, entry.name, result, rel_name) catch |err| {
+                    allocator.free(rel_name);
+                    return err;
+                };
                 allocator.free(rel_name);
             } else if (isLibraryDir(entry.name)) {
                 // Skip directories that contain shared libraries, not executables
                 allocator.free(rel_name);
             } else {
-                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch {
+                next.append(allocator, rel_name) catch |err| {
                     allocator.free(rel_name);
-                    continue;
+                    return err;
                 };
-                defer sub.close(io);
-                try scanForExecutables(allocator, io, sub, result, rel_name);
-                allocator.free(rel_name);
             }
         } else if (entry.kind == .file) {
             if (isSharedLibrary(entry.name)) {
@@ -521,7 +577,10 @@ fn scanForExecutables(
                 break :blk true;
             };
             if (is_exe) {
-                try result.append(allocator, rel_name);
+                result.append(allocator, rel_name) catch |err| {
+                    allocator.free(rel_name);
+                    return err;
+                };
             } else {
                 allocator.free(rel_name);
             }
@@ -3049,6 +3108,83 @@ test "findExecutables discovers nested executables" {
 
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("bin/tool", exes.items[0]);
+}
+
+test "findExecutables stops at shallowest executable level" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "qemu-linux-arm64/share");
+
+    const command = try tmp.dir.createFile(
+        std.testing.io,
+        "qemu-linux-arm64/qemu-img",
+        .{ .permissions = .executable_file },
+    );
+    command.close(std.testing.io);
+
+    // QEMU firmware can be a valid foreign-architecture ELF image without an
+    // executable bit, which makes the ZIP mode-recovery heuristic match it.
+    var elf_firmware = try tmp.dir.createFile(
+        std.testing.io,
+        "qemu-linux-arm64/share/openbios-ppc",
+        .{},
+    );
+    try elf_firmware.writeStreamingAll(std.testing.io, "\x7fELFfirmware");
+    elf_firmware.close(std.testing.io);
+
+    // A few upstream firmware blobs also incorrectly carry executable mode.
+    const mode_firmware = try tmp.dir.createFile(
+        std.testing.io,
+        "qemu-linux-arm64/share/qboot.rom",
+        .{ .permissions = .executable_file },
+    );
+    mode_firmware.close(std.testing.io);
+
+    const allocator = std.testing.allocator;
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
+    defer deinitPathList(allocator, &exes);
+
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("qemu-linux-arm64/qemu-img", exes.items[0]);
+
+    // Deeper executable-looking data was never considered or chmod'd.
+    const stat = try tmp.dir.statFile(std.testing.io, "qemu-linux-arm64/share/openbios-ppc", .{});
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        @as(u32, @intFromEnum(stat.permissions)) & 0o111,
+    );
+}
+
+test "findExecutables keeps all candidates at the shallowest level" {
+    if (comptime !File.Permissions.has_executable_bit) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "minisign-linux/aarch64");
+    try tmp.dir.createDirPath(std.testing.io, "minisign-linux/x86_64");
+    const arm = try tmp.dir.createFile(
+        std.testing.io,
+        "minisign-linux/aarch64/minisign",
+        .{ .permissions = .executable_file },
+    );
+    arm.close(std.testing.io);
+    const x86 = try tmp.dir.createFile(
+        std.testing.io,
+        "minisign-linux/x86_64/minisign",
+        .{ .permissions = .executable_file },
+    );
+    x86.close(std.testing.io);
+
+    const allocator = std.testing.allocator;
+    var exes = try findExecutables(allocator, std.testing.io, tmp.dir);
+    defer deinitPathList(allocator, &exes);
+
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+    dedupeExecutablesByArch(allocator, &exes, &.{ "aarch64", "arm64" });
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("minisign-linux/aarch64/minisign", exes.items[0]);
 }
 
 test "findExecutables returns empty for no executables" {

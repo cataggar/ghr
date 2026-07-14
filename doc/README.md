@@ -58,6 +58,11 @@ ghr path tools
 ghr path bin
 ```
 
+For archive assets, `ghr install` exposes executable candidates from the
+shallowest directory level containing any executables. It searches deeper only
+when no shallower candidates exist, so nested-only package layouts still work
+without putting executable-looking firmware or data files on `PATH`.
+
 ## Download
 
 `ghr download` fetches a release asset using the same discovery logic as
