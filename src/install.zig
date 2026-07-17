@@ -78,12 +78,125 @@ pub fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) void {
     };
 }
 
-/// Prepare a staging directory below `cache_path`. Stale staging contents are
-/// removed best-effort, matching the install cleanup behavior.
-fn prepareStagingDir(io: Io, cache_path: []const u8, staging_path: []const u8) !void {
-    ensureDirAbsoluteRecursive(io, cache_path);
-    deleteTreeAbsolute(io, staging_path) catch {};
-    try Dir.createDirAbsolute(io, staging_path, .default_dir);
+/// Build a hidden, deterministic staging path beside an install path.
+fn stagingSiblingPath(allocator: std.mem.Allocator, parent: []const u8, leaf: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}{c}.{s}.staging", .{ parent, std.fs.path.sep, leaf });
+}
+
+/// Build the tombstone path used while replacing an install path.
+fn backupSiblingPath(allocator: std.mem.Allocator, parent: []const u8, leaf: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}{c}.{s}.old", .{ parent, std.fs.path.sep, leaf });
+}
+
+/// Build the visible tombstone path used by ghr 0.6.8 and earlier.
+fn legacyBackupPath(allocator: std.mem.Allocator, final_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}.old", .{final_path});
+}
+
+fn directoryExists(io: Io, abs_path: []const u8) !bool {
+    var dir = Dir.openDirAbsolute(io, abs_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        error.NotDir => return error.InstallPathNotDirectory,
+        else => return err,
+    };
+    dir.close(io);
+    return true;
+}
+
+fn deleteTreeIfExists(io: Io, abs_path: []const u8) !void {
+    deleteTreeAbsolute(io, abs_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+/// Prepare a destination-local staging directory. Its parent is created before
+/// stale staging contents are removed, so a fresh tools hierarchy works even
+/// when the cache and tools roots are on different filesystems.
+fn prepareStagingDir(io: Io, staging_parent: []const u8, staging_path: []const u8) !void {
+    ensureDirAbsoluteRecursive(io, staging_parent);
+    var parent = try Dir.openDirAbsolute(io, staging_parent, .{});
+    defer parent.close(io);
+
+    try deleteTreeIfExists(io, staging_path);
+    try parent.createDir(io, std.fs.path.basename(staging_path), .default_dir);
+}
+
+/// A stale backup with no live directory means the previous transaction
+/// stopped after moving the live installation aside. Restore it before
+/// inspecting or preserving the live install. When both are present, the
+/// backup belongs to an already committed transaction and can be removed.
+fn recoverStaleBackup(io: Io, final_path: []const u8, backup_path: []const u8) !void {
+    if (!try directoryExists(io, backup_path)) return;
+    if (try directoryExists(io, final_path)) {
+        try deleteTreeIfExists(io, backup_path);
+    } else {
+        try Dir.renameAbsolute(backup_path, final_path, io);
+    }
+}
+
+/// Recover the current hidden backup first, then migrate or clean the legacy
+/// visible backup. This makes a current interrupted transaction win if both
+/// backup forms are present.
+fn recoverInstallBackups(
+    io: Io,
+    final_path: []const u8,
+    backup_path: []const u8,
+    legacy_backup_path: []const u8,
+) !void {
+    try recoverStaleBackup(io, final_path, backup_path);
+    try recoverStaleBackup(io, final_path, legacy_backup_path);
+}
+
+const RenameDirFn = *const fn (Io, []const u8, []const u8) anyerror!void;
+
+fn renameDirectory(io: Io, old_path: []const u8, new_path: []const u8) anyerror!void {
+    try Dir.renameAbsolute(old_path, new_path, io);
+}
+
+const ReplaceResult = union(enum) {
+    committed,
+    backup_retained: anyerror,
+};
+
+fn replaceStagedDirWithRename(
+    io: Io,
+    staging_path: []const u8,
+    final_path: []const u8,
+    backup_path: []const u8,
+    rename_dir: RenameDirFn,
+) !ReplaceResult {
+    try recoverStaleBackup(io, final_path, backup_path);
+    if (!try directoryExists(io, staging_path)) return error.StagingDirectoryNotFound;
+
+    if (try directoryExists(io, final_path)) {
+        try rename_dir(io, final_path, backup_path);
+        rename_dir(io, staging_path, final_path) catch |err| {
+            rename_dir(io, backup_path, final_path) catch return error.InstallRollbackFailed;
+            return err;
+        };
+        deleteTreeIfExists(io, backup_path) catch |err| return .{ .backup_retained = err };
+    } else {
+        try rename_dir(io, staging_path, final_path);
+    }
+    return .committed;
+}
+
+/// Commit a completed staging tree without deleting the previous live tree
+/// first. The two rename operations are always between siblings, avoiding
+/// cross-device EXDEV failures and permitting rollback if the commit fails.
+fn replaceStagedDir(
+    io: Io,
+    staging_path: []const u8,
+    final_path: []const u8,
+    backup_path: []const u8,
+) !ReplaceResult {
+    return replaceStagedDirWithRename(io, staging_path, final_path, backup_path, renameDirectory);
+}
+
+fn isInstallTransactionDir(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".old") or
+        (std.mem.startsWith(u8, name, ".") and std.mem.endsWith(u8, name, ".staging"));
 }
 
 /// ASCII case-insensitive equality. Cheap and allocation-free.
@@ -1236,7 +1349,7 @@ fn copyDirRecursive(io: Io, src_dir: Dir, dest_dir: Dir) !void {
             .sym_link => {
                 var buf: [Dir.max_path_bytes]u8 = undefined;
                 const len = try src_dir.readLink(io, entry.name, &buf);
-                dest_dir.symLink(io, buf[0..len], entry.name, .{}) catch {};
+                try dest_dir.symLink(io, buf[0..len], entry.name, .{});
             },
             else => {},
         }
@@ -1621,7 +1734,7 @@ pub fn cmdUninstall(
         var it = rd.iterate();
         while (it.next(io) catch null) |entry| {
             if (entry.kind != .directory) continue;
-            if (std.mem.endsWith(u8, entry.name, ".old")) continue;
+            if (isInstallTransactionDir(entry.name)) continue;
             const mp = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, entry.name }) catch continue;
             defer allocator.free(mp);
             if (dirHasGhrJson(io, mp)) {
@@ -1662,7 +1775,7 @@ pub fn cmdUninstall(
         var it = rd.iterate();
         while (it.next(io) catch null) |entry| {
             const is_dir = entry.kind == .directory;
-            if (is_dir and !std.mem.endsWith(u8, entry.name, ".old")) {
+            if (is_dir and !isInstallTransactionDir(entry.name)) {
                 const mp = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, entry.name }) catch continue;
                 defer allocator.free(mp);
                 if (dirHasGhrJson(io, mp)) continue; // preserve module unit
@@ -1731,50 +1844,51 @@ fn dirHasGhrJson(io: Io, abs_dir: []const u8) bool {
     return true;
 }
 
-/// Move any wasm-module unit subdirs (child dirs containing their own
-/// `ghr.json`) out of `repo_path` into `staging_path`, so a repo-level
-/// (archive) reinstall that replaces `repo_path` preserves independently
-/// installed wasm modules. The staging dir is later renamed onto `repo_path`,
-/// so the modules end up back at their original absolute paths and their shim
-/// targets stay valid. Best-effort: names that collide with staged archive
-/// content are left in place.
+/// Copy wasm-module unit subdirs (child dirs containing their own `ghr.json`)
+/// from `repo_path` into `staging_path`. The source remains live until the
+/// completed staging tree is committed, so a failed archive replacement never
+/// removes independently installed modules. A collision with archive content
+/// is an explicit failure rather than silently dropping the module.
 fn preserveWasmModuleUnits(
-    allocator: std.mem.Allocator,
     io: Io,
     repo_path: []const u8,
     staging_path: []const u8,
-) void {
-    var rd = Dir.openDirAbsolute(io, repo_path, .{ .iterate = true }) catch return;
+) !void {
+    var rd = try Dir.openDirAbsolute(io, repo_path, .{ .iterate = true });
     defer rd.close(io);
 
-    var names: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (names.items) |n| allocator.free(n);
-        names.deinit(allocator);
-    }
     var it = rd.iterate();
-    while (it.next(io) catch null) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        var child = rd.openDir(io, entry.name, .{}) catch continue;
-        const is_unit = blk: {
-            var f = child.openFile(io, "ghr.json", .{}) catch break :blk false;
-            f.close(io);
-            break :blk true;
-        };
-        child.close(io);
-        if (!is_unit) continue;
-        const dup = allocator.dupe(u8, entry.name) catch continue;
-        names.append(allocator, dup) catch {
-            allocator.free(dup);
-            continue;
-        };
-    }
-    for (names.items) |name| {
-        var sb: [Dir.max_path_bytes]u8 = undefined;
-        var db: [Dir.max_path_bytes]u8 = undefined;
-        const src = std.fmt.bufPrint(&sb, "{s}{c}{s}", .{ repo_path, std.fs.path.sep, name }) catch continue;
-        const dst = std.fmt.bufPrint(&db, "{s}{c}{s}", .{ staging_path, std.fs.path.sep, name }) catch continue;
-        Dir.renameAbsolute(src, dst, io) catch {};
+        if (isInstallTransactionDir(entry.name)) continue;
+
+        {
+            var source = try rd.openDir(io, entry.name, .{ .iterate = true });
+            defer source.close(io);
+            const is_unit = blk: {
+                var manifest = source.openFile(io, "ghr.json", .{}) catch break :blk false;
+                manifest.close(io);
+                break :blk true;
+            };
+            if (!is_unit) continue;
+
+            var db: [Dir.max_path_bytes]u8 = undefined;
+            const dst = try std.fmt.bufPrint(&db, "{s}{c}{s}", .{ staging_path, std.fs.path.sep, entry.name });
+
+            const destination_exists = directoryExists(io, dst) catch |err| {
+                if (err == error.InstallPathNotDirectory) return error.WasmModulePreservationCollision;
+                return err;
+            };
+            if (destination_exists) {
+                return error.WasmModulePreservationCollision;
+            }
+            try Dir.createDirAbsolute(io, dst, .default_dir);
+            errdefer deleteTreeAbsolute(io, dst) catch {};
+
+            var destination = try Dir.openDirAbsolute(io, dst, .{});
+            defer destination.close(io);
+            try copyDirRecursive(io, source, destination);
+        }
     }
 }
 
@@ -2050,17 +2164,28 @@ fn installWasmModuleUnit(
     };
     validateGhrManifest(allocator, io, ghr_path, err_w) catch return error.InstallStepFailed;
 
-    // Stage the wasm + manifest into a per-module staging dir.
-    const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging-{s}-{s}-{s}", .{
-        d.cache, std.fs.path.sep, owner_lower, repo_lower, stem,
+    // Stage the wasm + manifest beside the destination module, not in cache.
+    // This keeps the final rename on the tools filesystem even when the cache
+    // and data roots are separate mounts.
+    const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
+        d.tools, std.fs.path.sep, owner_lower, std.fs.path.sep, repo_lower,
     });
+    defer allocator.free(repo_path);
+    const module_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ repo_path, std.fs.path.sep, stem });
+    defer allocator.free(module_path);
+    const staging_path = try stagingSiblingPath(allocator, repo_path, stem);
     defer allocator.free(staging_path);
-    prepareStagingDir(io, d.cache, staging_path) catch |err| {
+    const backup_path = try backupSiblingPath(allocator, repo_path, stem);
+    defer allocator.free(backup_path);
+    const legacy_backup_path = try legacyBackupPath(allocator, module_path);
+    defer allocator.free(legacy_backup_path);
+
+    prepareStagingDir(io, repo_path, staging_path) catch |err| {
         try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
         try err_w.flush();
         return error.InstallStepFailed;
     };
-    errdefer deleteTreeAbsolute(io, staging_path) catch {};
+    errdefer deleteTreeIfExists(io, staging_path) catch {};
     {
         var staging_dir = Dir.openDirAbsolute(io, staging_path, .{ .iterate = true }) catch |err| {
             try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ staging_path, err });
@@ -2084,18 +2209,18 @@ fn installWasmModuleUnit(
             try err_w.flush();
             return error.InstallStepFailed;
         };
+        writeMetadata(allocator, io, staging_dir, tag_name, asset.name, &.{asset.name}, &.{}, vr.label, vr.minisign_key) catch |err| {
+            try err_w.print("error: failed to write module metadata: {t}\n", .{err});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
     }
 
-    // Ensure the repo dir exists, then atomically swap in the module dir at
-    // `<tools>/<owner>/<repo>/<stem>` without disturbing siblings.
-    const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
-        d.tools, std.fs.path.sep, owner_lower, std.fs.path.sep, repo_lower,
-    });
-    defer allocator.free(repo_path);
-    const module_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ repo_path, std.fs.path.sep, stem });
-    defer allocator.free(module_path);
-
-    ensureDirAbsoluteRecursive(io, repo_path);
+    recoverInstallBackups(io, module_path, backup_path, legacy_backup_path) catch |err| {
+        try err_w.print("error: failed to recover previous module install '{s}': {t}\n", .{ module_path, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
 
     // Save old module metadata (for stale bin cleanup) before replacing it.
     const old_meta = readMetadata(allocator, io, module_path);
@@ -2104,42 +2229,23 @@ fn installWasmModuleUnit(
         allocator.free(m.body);
     };
 
-    const module_exists = blk: {
-        var dc = Dir.openDirAbsolute(io, module_path, .{}) catch break :blk false;
-        dc.close(io);
-        break :blk true;
-    };
-    if (module_exists) {
-        deleteTreeAbsolute(io, module_path) catch {
-            if (comptime builtin.os.tag == .windows) {
-                var tombstone_buf: [Dir.max_path_bytes]u8 = undefined;
-                if (std.fmt.bufPrint(&tombstone_buf, "{s}.old", .{module_path})) |tombstone| {
-                    deleteTreeAbsolute(io, tombstone) catch {};
-                    Dir.renameAbsolute(module_path, tombstone, io) catch {};
-                } else |_| {}
-            }
-        };
-    }
-
-    Dir.renameAbsolute(staging_path, module_path, io) catch |err| {
+    const module_replace = replaceStagedDir(io, staging_path, module_path, backup_path) catch |err| {
         try err_w.print(
-            "error: failed to move staging directory '{s}' to module directory '{s}': {t}\n",
-            .{ staging_path, module_path, err },
+            "error: failed to replace module directory '{s}' with staging directory '{s}': {t}\n",
+            .{ module_path, staging_path, err },
         );
         try err_w.flush();
         return error.InstallStepFailed;
     };
-
-    var module_dir = Dir.openDirAbsolute(io, module_path, .{}) catch |err| {
-        try err_w.print("error: failed to open module directory '{s}': {t}\n", .{ module_path, err });
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    defer module_dir.close(io);
-
-    writeMetadata(allocator, io, module_dir, tag_name, asset.name, &.{asset.name}, &.{}, vr.label, vr.minisign_key) catch |err| {
-        try err_w.print("warning: failed to write metadata: {}\n", .{err});
-    };
+    switch (module_replace) {
+        .committed => {},
+        .backup_retained => |err| {
+            try err_w.print(
+                "warning: installed module '{s}', but retained backup '{s}' ({t})\n",
+                .{ module_path, backup_path, err },
+            );
+        },
+    }
 
     ensureDirAbsoluteRecursive(io, d.bin);
     var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
@@ -2342,16 +2448,29 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         return;
     }
 
-    // Staging directory, shared across every primary asset.
-    const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging-{s}-{s}", .{
-        d.cache, std.fs.path.sep, owner_lower, repo_lower,
+    // Stage archive content beside the destination repo, not in cache. This
+    // makes the final replacement a same-filesystem sibling rename.
+    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        d.tools, std.fs.path.sep, owner_lower,
     });
+    defer allocator.free(owner_path);
+    const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        owner_path, std.fs.path.sep, repo_lower,
+    });
+    defer allocator.free(tool_path);
+    const staging_path = try stagingSiblingPath(allocator, owner_path, repo_lower);
     defer allocator.free(staging_path);
-    prepareStagingDir(io, d.cache, staging_path) catch |err| {
+    const backup_path = try backupSiblingPath(allocator, owner_path, repo_lower);
+    defer allocator.free(backup_path);
+    const legacy_backup_path = try legacyBackupPath(allocator, tool_path);
+    defer allocator.free(legacy_backup_path);
+
+    prepareStagingDir(io, owner_path, staging_path) catch |err| {
         try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
         try err_w.flush();
         return error.InstallStepFailed;
     };
+    errdefer deleteTreeIfExists(io, staging_path) catch {};
     var staging_dir = Dir.openDirAbsolute(io, staging_path, .{ .iterate = true }) catch |err| {
         try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ staging_path, err });
         try err_w.flush();
@@ -2371,6 +2490,10 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     // (recorded here) reflects them all.
     var verified_label: []const u8 = "none";
     var recorded_minisign_key: ?[]const u8 = null;
+
+    // Downloaded release assets remain in cache even though extraction now
+    // stages beside the destination install.
+    ensureDirAbsoluteRecursive(io, d.cache);
 
     for (primary_assets.items) |asset| {
         // Pre-flight verification check: if a `.minisig` sidecar exists but
@@ -2527,11 +2650,13 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         apps.deinit(allocator);
     }
 
-    // Move staging to final tool dir
-    const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
-        d.tools, std.fs.path.sep, owner_lower, std.fs.path.sep, repo_lower,
-    });
-    defer allocator.free(tool_path);
+    const bins_slice = exes.items;
+    const apps_slice = apps.items;
+    writeMetadata(allocator, io, staging_dir, tag_name, primary_name, bins_slice, apps_slice, verified_label, recorded_minisign_key) catch |err| {
+        try err_w.print("error: failed to write tool metadata: {t}\n", .{err});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
 
     // Opportunistic case-migration: a pre-migration install of the same
     // repo may live at a mixed-case path (e.g. `<tools>/AzureAD/foo`).
@@ -2570,13 +2695,11 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         }
     }
 
-    // Clean up tombstone from a previous self-update (Windows)
-    if (comptime builtin.os.tag == .windows) {
-        var tb: [Dir.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrint(&tb, "{s}.old", .{tool_path})) |t| {
-            deleteTreeAbsolute(io, t) catch {};
-        } else |_| {}
-    }
+    recoverInstallBackups(io, tool_path, backup_path, legacy_backup_path) catch |err| {
+        try err_w.print("error: failed to recover previous tool install '{s}': {t}\n", .{ tool_path, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
 
     // Save old metadata before touching anything (for stale bin cleanup after install)
     const old_meta = readMetadata(allocator, io, tool_path);
@@ -2585,80 +2708,33 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         allocator.free(m.body);
     };
 
-    // Remove old tool directory. On Windows, running executables can be renamed
-    // but not deleted, so fall back to renaming the old dir as a tombstone.
-    // Pre-check existence so the Windows fallback only runs when there is
-    // actually something to move out of the way — without this, a first
-    // install on Windows surfaces deleteTreeAbsolute's PathNotFound as a
-    // misleading "files may be locked" error from the rename fallback.
-    const tool_dir_exists = blk: {
-        var d_check = Dir.openDirAbsolute(io, tool_path, .{}) catch break :blk false;
-        d_check.close(io);
-        break :blk true;
-    };
-    if (tool_dir_exists) {
+    if (try directoryExists(io, tool_path)) {
         // Preserve independently-installed wasm module units under this repo
         // so replacing the repo-level (archive) install doesn't delete them.
-        preserveWasmModuleUnits(allocator, io, tool_path, staging_path);
-        deleteTreeAbsolute(io, tool_path) catch {
-            if (comptime builtin.os.tag == .windows) {
-                var tombstone_buf: [Dir.max_path_bytes]u8 = undefined;
-                const tombstone = std.fmt.bufPrint(&tombstone_buf, "{s}.old", .{tool_path}) catch {
-                    try err_w.print("error: tool path too long\n", .{});
-                    try err_w.flush();
-                    return error.InstallStepFailed;
-                };
-                deleteTreeAbsolute(io, tombstone) catch {};
-                Dir.renameAbsolute(tool_path, tombstone, io) catch {
-                    try err_w.print("error: cannot replace tool directory (files may be locked by a running process)\n", .{});
-                    try err_w.flush();
-                    return error.InstallStepFailed;
-                };
-            }
+        preserveWasmModuleUnits(io, tool_path, staging_path) catch |err| {
+            try err_w.print("error: failed to preserve wasm modules while replacing '{s}': {t}\n", .{ tool_path, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
         };
     }
 
-    // Ensure tools and owner dirs exist (create full path)
-    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
-        d.tools, std.fs.path.sep, owner_lower,
-    });
-    defer allocator.free(owner_path);
-    // Ensure the tools directory and all of its ancestors exist. On a fresh
-    // install on Linux this may need to create `~/.local`, `~/.local/share`,
-    // `~/.local/share/ghr`, and `~/.local/share/ghr/tools`; on Windows it
-    // creates `%APPDATA%\ghr\data\tools` and its parents. The previous
-    // 2-ancestor bound was insufficient for the tools layout and caused
-    // a misleading `FileNotFound` on `renameAbsolute` below.
-    ensureDirAbsoluteRecursive(io, d.tools);
-    Dir.createDirAbsolute(io, owner_path, .default_dir) catch {};
-
-    // Rename staging to final
-    Dir.renameAbsolute(staging_path, tool_path, io) catch |err| {
+    const tool_replace = replaceStagedDir(io, staging_path, tool_path, backup_path) catch |err| {
         try err_w.print(
-            "error: failed to move staging directory '{s}' to tool directory '{s}': {t}\n",
-            .{ staging_path, tool_path, err },
+            "error: failed to replace tool directory '{s}' with staging directory '{s}': {t}\n",
+            .{ tool_path, staging_path, err },
         );
         try err_w.flush();
         return error.InstallStepFailed;
     };
-
-    // Re-open the tool dir for metadata and linking
-    var tool_dir = Dir.openDirAbsolute(io, tool_path, .{}) catch |err| {
-        try err_w.print(
-            "error: failed to open tool directory '{s}': {t}\n",
-            .{ tool_path, err },
-        );
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    defer tool_dir.close(io);
-
-    // Write metadata
-    const bins_slice = exes.items;
-    const apps_slice = apps.items;
-    writeMetadata(allocator, io, tool_dir, tag_name, primary_name, bins_slice, apps_slice, verified_label, recorded_minisign_key) catch |err| {
-        try err_w.print("warning: failed to write metadata: {}\n", .{err});
-    };
+    switch (tool_replace) {
+        .committed => {},
+        .backup_retained => |err| {
+            try err_w.print(
+                "warning: installed tool '{s}', but retained backup '{s}' ({t})\n",
+                .{ tool_path, backup_path, err },
+            );
+        },
+    }
 
     // Create bin dir and link executables. The bin directory normally lives
     // under `~/.local/bin`; on a fresh install neither `.local` nor `.local/bin`
@@ -3744,8 +3820,29 @@ test "ensureDirAbsoluteRecursive tolerates already-existing path" {
     try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
 }
 
-test "prepareStagingDir creates missing cache root and staging leaf" {
+test "ensureDirAbsoluteRecursive restores a missing download cache hierarchy" {
     const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+    var cache_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}{c}cache{c}ghr", .{
+        base,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "cache", .{}));
+    ensureDirAbsoluteRecursive(tio, cache_path);
+    try std.testing.expect((try tmp.dir.statFile(tio, "cache/ghr", .{})).kind == .directory);
+}
+
+test "prepareStagingDir uses the destination parent instead of cache" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -3757,15 +3854,217 @@ test "prepareStagingDir creates missing cache root and staging leaf" {
     const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}{c}cache{c}ghr", .{
         base, std.fs.path.sep, std.fs.path.sep,
     });
-    var staging_buf: [Dir.max_path_bytes]u8 = undefined;
-    const staging_path = try std.fmt.bufPrint(&staging_buf, "{s}{c}staging-owner-repo", .{
-        cache_path, std.fs.path.sep,
+    var owner_buf: [Dir.max_path_bytes]u8 = undefined;
+    const owner_path = try std.fmt.bufPrint(&owner_buf, "{s}{c}tools{c}owner", .{
+        base, std.fs.path.sep, std.fs.path.sep,
     });
+    const staging_path = try stagingSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(staging_path);
 
-    try prepareStagingDir(tio, cache_path, staging_path);
+    try prepareStagingDir(tio, owner_path, staging_path);
 
-    try std.testing.expect((try tmp.dir.statFile(tio, "cache/ghr", .{})).kind == .directory);
-    try std.testing.expect((try tmp.dir.statFile(tio, "cache/ghr/staging-owner-repo", .{})).kind == .directory);
+    try std.testing.expect((try tmp.dir.statFile(tio, "tools/owner/.repo.staging", .{})).kind == .directory);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "cache", .{}));
+    try std.testing.expect(std.mem.startsWith(u8, staging_path, owner_path));
+    try std.testing.expect(!std.mem.startsWith(u8, staging_path, cache_path));
+}
+
+test "replaceStagedDir installs a fresh staging tree" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "owner/.repo.staging");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/.repo.staging/marker", .data = "new" });
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    defer allocator.free(owner_path);
+    const final_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    defer allocator.free(final_path);
+    const staging_path = try stagingSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(staging_path);
+    const backup_path = try backupSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(backup_path);
+
+    _ = try replaceStagedDir(tio, staging_path, final_path, backup_path);
+
+    const marker = try tmp.dir.readFileAlloc(tio, "owner/repo/marker", allocator, Io.Limit.limited(16));
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("new", marker);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "owner/.repo.staging", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "owner/.repo.old", .{}));
+}
+
+test "replaceStagedDir removes backup after replacing an existing install" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "owner/repo");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/repo/marker", .data = "old" });
+    try tmp.dir.createDirPath(tio, "owner/.repo.staging");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/.repo.staging/marker", .data = "new" });
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    defer allocator.free(owner_path);
+    const final_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    defer allocator.free(final_path);
+    const staging_path = try stagingSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(staging_path);
+    const backup_path = try backupSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(backup_path);
+
+    _ = try replaceStagedDir(tio, staging_path, final_path, backup_path);
+
+    const marker = try tmp.dir.readFileAlloc(tio, "owner/repo/marker", allocator, Io.Limit.limited(16));
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("new", marker);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "owner/.repo.old", .{}));
+}
+
+test "recoverStaleBackup restores a missing live install" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "owner/.repo.old");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/.repo.old/marker", .data = "old" });
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    defer allocator.free(owner_path);
+    const final_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    defer allocator.free(final_path);
+    const backup_path = try backupSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(backup_path);
+
+    try recoverStaleBackup(tio, final_path, backup_path);
+
+    const marker = try tmp.dir.readFileAlloc(tio, "owner/repo/marker", allocator, Io.Limit.limited(16));
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("old", marker);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "owner/.repo.old", .{}));
+}
+
+test "recoverInstallBackups restores a legacy wasm module tombstone" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "owner/repo/stem.old");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/repo/stem.old/marker", .data = "legacy" });
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+    const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}owner{c}repo", .{
+        base,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+    defer allocator.free(repo_path);
+    const module_path = try std.fmt.allocPrint(allocator, "{s}{c}stem", .{ repo_path, std.fs.path.sep });
+    defer allocator.free(module_path);
+    const backup_path = try backupSiblingPath(allocator, repo_path, "stem");
+    defer allocator.free(backup_path);
+    const legacy_backup_path = try legacyBackupPath(allocator, module_path);
+    defer allocator.free(legacy_backup_path);
+
+    try recoverInstallBackups(tio, module_path, backup_path, legacy_backup_path);
+
+    const marker = try tmp.dir.readFileAlloc(tio, "owner/repo/stem/marker", allocator, Io.Limit.limited(16));
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("legacy", marker);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "owner/repo/stem.old", .{}));
+}
+
+test "recoverInstallBackups removes a stale legacy archive tombstone" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "owner/repo");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/repo/marker", .data = "live" });
+    try tmp.dir.createDirPath(tio, "owner/repo.old");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/repo.old/marker", .data = "legacy" });
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    defer allocator.free(owner_path);
+    const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    defer allocator.free(tool_path);
+    const backup_path = try backupSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(backup_path);
+    const legacy_backup_path = try legacyBackupPath(allocator, tool_path);
+    defer allocator.free(legacy_backup_path);
+
+    try recoverInstallBackups(tio, tool_path, backup_path, legacy_backup_path);
+
+    const marker = try tmp.dir.readFileAlloc(tio, "owner/repo/marker", allocator, Io.Limit.limited(16));
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("live", marker);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "owner/repo.old", .{}));
+}
+
+test "replaceStagedDir restores the live install when committing staging fails" {
+    const tio = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "owner/repo");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/repo/marker", .data = "old" });
+    try tmp.dir.createDirPath(tio, "owner/.repo.staging");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "owner/.repo.staging/marker", .data = "new" });
+
+    const TestRename = struct {
+        var calls: usize = 0;
+
+        fn run(io: Io, old_path: []const u8, new_path: []const u8) anyerror!void {
+            calls += 1;
+            if (calls == 2) return error.TestRenameFailure;
+            try Dir.renameAbsolute(old_path, new_path, io);
+        }
+    };
+    TestRename.calls = 0;
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    defer allocator.free(owner_path);
+    const final_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    defer allocator.free(final_path);
+    const staging_path = try stagingSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(staging_path);
+    const backup_path = try backupSiblingPath(allocator, owner_path, "repo");
+    defer allocator.free(backup_path);
+
+    try std.testing.expectError(
+        error.TestRenameFailure,
+        replaceStagedDirWithRename(tio, staging_path, final_path, backup_path, TestRename.run),
+    );
+
+    const marker = try tmp.dir.readFileAlloc(tio, "owner/repo/marker", allocator, Io.Limit.limited(16));
+    defer allocator.free(marker);
+    try std.testing.expectEqualStrings("old", marker);
+    try std.testing.expect((try tmp.dir.statFile(tio, "owner/.repo.staging", .{})).kind == .directory);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "owner/.repo.old", .{}));
 }
 
 test "resolveInstalledToolPath: exact lowercase match" {
@@ -3904,7 +4203,7 @@ test "parseUninstallSpec: bare name (no slash)" {
     try std.testing.expect(t.module_stem == null);
 }
 
-test "preserveWasmModuleUnits moves module subdirs but leaves repo-level content" {
+test "preserveWasmModuleUnits copies modules without mutating the live install" {
     const tio = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3933,20 +4232,24 @@ test "preserveWasmModuleUnits moves module subdirs but leaves repo-level content
         var f = try tmp.dir.createFile(tio, "repo/petstore-test/ghr.json", .{});
         f.close(tio);
     }
+    try tmp.dir.writeFile(tio, .{ .sub_path = "repo/petstore/module.wasm", .data = "wasm" });
 
     const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ base, std.fs.path.sep });
     defer allocator.free(repo_path);
     const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging", .{ base, std.fs.path.sep });
     defer allocator.free(staging_path);
 
-    preserveWasmModuleUnits(allocator, tio, repo_path, staging_path);
+    try preserveWasmModuleUnits(tio, repo_path, staging_path);
 
-    // Modules relocated into staging.
+    // Modules are copied into the completed staging tree.
     try std.testing.expect(tmp.dir.access(tio, "staging/petstore/ghr.json", .{}) != error.FileNotFound);
     try std.testing.expect(tmp.dir.access(tio, "staging/petstore-test/ghr.json", .{}) != error.FileNotFound);
-    // Removed from the repo dir.
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(tio, "repo/petstore", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(tio, "repo/petstore-test", .{}));
+    const copied = try tmp.dir.readFileAlloc(tio, "staging/petstore/module.wasm", allocator, Io.Limit.limited(16));
+    defer allocator.free(copied);
+    try std.testing.expectEqualStrings("wasm", copied);
+    // The original module paths remain live until the staging tree commits.
+    try std.testing.expect(tmp.dir.access(tio, "repo/petstore", .{}) != error.FileNotFound);
+    try std.testing.expect(tmp.dir.access(tio, "repo/petstore-test", .{}) != error.FileNotFound);
     // Repo-level manifest and archive content left untouched.
     try std.testing.expect(tmp.dir.access(tio, "repo/ghr.json", .{}) != error.FileNotFound);
     try std.testing.expect(tmp.dir.access(tio, "repo/archive-content", .{}) != error.FileNotFound);
