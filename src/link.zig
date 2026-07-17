@@ -567,8 +567,8 @@ const InstalledListing = struct {
     /// are installed inside it).
     present: bool,
     /// `<owner>/<repo>` slugs of installed tools, sorted alphabetically.
-    /// `.old` tombstone directories are filtered out so they don't
-    /// pollute user-facing output.
+    /// Transaction directories are filtered out so they don't pollute
+    /// user-facing output.
     slugs: []const []const u8,
 };
 
@@ -590,14 +590,16 @@ fn listInstalledSlugs(
     var it = tools.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        if (std.mem.endsWith(u8, entry.name, ".old")) continue;
+        if (std.mem.endsWith(u8, entry.name, ".old") or
+            (std.mem.startsWith(u8, entry.name, ".") and std.mem.endsWith(u8, entry.name, ".staging"))) continue;
         const owner_name = entry.name;
         var owner_dir = tools.openDir(io, owner_name, .{ .iterate = true }) catch continue;
         defer owner_dir.close(io);
         var it2 = owner_dir.iterate();
         while (try it2.next(io)) |sub| {
             if (sub.kind != .directory) continue;
-            if (std.mem.endsWith(u8, sub.name, ".old")) continue;
+            if (std.mem.endsWith(u8, sub.name, ".old") or
+                (std.mem.startsWith(u8, sub.name, ".") and std.mem.endsWith(u8, sub.name, ".staging"))) continue;
             const slug = try std.fmt.allocPrint(arena, "{s}/{s}", .{ owner_name, sub.name });
             try out.append(arena, slug);
         }
@@ -2084,7 +2086,7 @@ test "listInstalledSlugs: empty dir reports present with no slugs" {
     try std.testing.expectEqual(@as(usize, 0), result.slugs.len);
 }
 
-test "listInstalledSlugs: lists owner/repo slugs sorted and skips tombstones" {
+test "listInstalledSlugs: lists owner/repo slugs and skips transaction dirs" {
     const tio = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2093,6 +2095,7 @@ test "listInstalledSlugs: lists owner/repo slugs sorted and skips tombstones" {
     try tmp.dir.createDirPath(tio, "azuread/microsoft-authentication-cli");
     try tmp.dir.createDirPath(tio, "cataggar/ghr");
     try tmp.dir.createDirPath(tio, "cataggar/ghr.old"); // tombstone
+    try tmp.dir.createDirPath(tio, "cataggar/.ghr.staging");
     try tmp.dir.createDirPath(tio, "ctaggart/zig");
     try tmp.dir.createDirPath(tio, "lonely-owner"); // owner with no repos
 
@@ -2158,7 +2161,6 @@ test "writeNotInstalledError: distinguishes missing tools dir from empty" {
     try writeNotInstalledError(allocator, tio, &out2.writer, base, "x", "y");
     try std.testing.expect(std.mem.indexOf(u8, out2.written(), "Windows tools dir exists but is empty") != null);
 }
-
 
 test "isValidBareExeName: accepts plain names and .exe suffix" {
     try std.testing.expect(isValidBareExeName("git"));

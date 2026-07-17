@@ -510,13 +510,15 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
-        if (std.mem.endsWith(u8, entry.name, ".old")) continue; // skip tombstones
+        if (std.mem.endsWith(u8, entry.name, ".old") or
+            (std.mem.startsWith(u8, entry.name, ".") and std.mem.endsWith(u8, entry.name, ".staging"))) continue;
         var owner_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer owner_dir.close(io);
         var repo_iter = owner_dir.iterate();
         while (try repo_iter.next(io)) |repo_entry| {
             if (repo_entry.kind != .directory) continue;
-            if (std.mem.endsWith(u8, repo_entry.name, ".old")) continue; // skip tombstones
+            if (std.mem.endsWith(u8, repo_entry.name, ".old") or
+                (std.mem.startsWith(u8, repo_entry.name, ".") and std.mem.endsWith(u8, repo_entry.name, ".staging"))) continue;
 
             // Repo-level (archive / bare binary) install: `<owner>/<repo>/ghr.json`.
             const repo_meta = readToolMeta(allocator, io, owner_dir, repo_entry.name);
@@ -534,7 +536,8 @@ fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map
                 var mod_iter = repo_dir.iterate();
                 while (try mod_iter.next(io)) |mod_entry| {
                     if (mod_entry.kind != .directory) continue;
-                    if (std.mem.endsWith(u8, mod_entry.name, ".old")) continue;
+                    if (std.mem.endsWith(u8, mod_entry.name, ".old") or
+                        (std.mem.startsWith(u8, mod_entry.name, ".") and std.mem.endsWith(u8, mod_entry.name, ".staging"))) continue;
                     const mod_meta = readToolMeta(allocator, io, repo_dir.*, mod_entry.name);
                     defer if (mod_meta) |m| m.deinit(allocator);
                     if (mod_meta == null) continue;
