@@ -78,6 +78,14 @@ pub fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) void {
     };
 }
 
+/// Prepare a staging directory below `cache_path`. Stale staging contents are
+/// removed best-effort, matching the install cleanup behavior.
+fn prepareStagingDir(io: Io, cache_path: []const u8, staging_path: []const u8) !void {
+    ensureDirAbsoluteRecursive(io, cache_path);
+    deleteTreeAbsolute(io, staging_path) catch {};
+    try Dir.createDirAbsolute(io, staging_path, .default_dir);
+}
+
 /// ASCII case-insensitive equality. Cheap and allocation-free.
 fn eqlIgnoreAsciiCase(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
@@ -332,7 +340,7 @@ fn deriveBareBinaryName(
             // Try the `<name>-<os>-<arch>` ordering: the token right after
             // the stem is an OS name, and an arch token follows it.
             const oses = [_][]const u8{
-                "linux",   "darwin", "macos",   "windows",
+                "linux",   "darwin",  "macos",  "windows",
                 "win",     "freebsd", "netbsd", "openbsd",
                 "android", "ios",
             };
@@ -2047,8 +2055,7 @@ fn installWasmModuleUnit(
         d.cache, std.fs.path.sep, owner_lower, repo_lower, stem,
     });
     defer allocator.free(staging_path);
-    deleteTreeAbsolute(io, staging_path) catch {};
-    Dir.createDirAbsolute(io, staging_path, .default_dir) catch |err| {
+    prepareStagingDir(io, d.cache, staging_path) catch |err| {
         try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
         try err_w.flush();
         return error.InstallStepFailed;
@@ -2340,8 +2347,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         d.cache, std.fs.path.sep, owner_lower, repo_lower,
     });
     defer allocator.free(staging_path);
-    deleteTreeAbsolute(io, staging_path) catch {};
-    Dir.createDirAbsolute(io, staging_path, .default_dir) catch |err| {
+    prepareStagingDir(io, d.cache, staging_path) catch |err| {
         try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
         try err_w.flush();
         return error.InstallStepFailed;
@@ -2381,9 +2387,6 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
         try w.print("downloading {s} ...\n", .{asset.name});
         try w.flush();
-
-        // Ensure cache directory tree exists
-        ensureDirAbsoluteRecursive(io, d.cache);
 
         // Download to cache file
         const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
@@ -3739,6 +3742,30 @@ test "ensureDirAbsoluteRecursive tolerates already-existing path" {
     ensureDirAbsoluteRecursive(tio, leaf);
 
     try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
+}
+
+test "prepareStagingDir creates missing cache root and staging leaf" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var cache_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cache_path = try std.fmt.bufPrint(&cache_buf, "{s}{c}cache{c}ghr", .{
+        base, std.fs.path.sep, std.fs.path.sep,
+    });
+    var staging_buf: [Dir.max_path_bytes]u8 = undefined;
+    const staging_path = try std.fmt.bufPrint(&staging_buf, "{s}{c}staging-owner-repo", .{
+        cache_path, std.fs.path.sep,
+    });
+
+    try prepareStagingDir(tio, cache_path, staging_path);
+
+    try std.testing.expect((try tmp.dir.statFile(tio, "cache/ghr", .{})).kind == .directory);
+    try std.testing.expect((try tmp.dir.statFile(tio, "cache/ghr/staging-owner-repo", .{})).kind == .directory);
 }
 
 test "resolveInstalledToolPath: exact lowercase match" {
