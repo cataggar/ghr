@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info");
-    const version_str = b.option([]const u8, "version", "Override version string") orelse "0.1.0-dev";
+    const version_str = b.option([]const u8, "version", "Override version string") orelse "0.6.8";
 
     const exe_options = b.addOptions();
     exe_options.addOption([]const u8, "version", version_str);
