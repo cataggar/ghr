@@ -1893,7 +1893,7 @@ pub fn verifyDownloadedAssetAuthenticode(
     defer allocator.free(bytes);
     try fr2.interface.readSliceAll(bytes);
 
-    var trust = try authenticode.buildTrustBundle(allocator, Io.Clock.now(.real, io).toSeconds());
+    var trust = try authenticode.buildTrustBundle(allocator);
     defer trust.deinit(allocator);
 
     const now = Io.Clock.now(.real, io).toSeconds();
