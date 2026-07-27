@@ -44,6 +44,12 @@ jobs:
           PACKAGE_IDENTIFIER: cataggar.ghr
           MANIFEST_PATH: manifests/c/cataggar/ghr
         run: |
+          # GitHub runs this with `bash -e`. Every check below reports its
+          # own failure through `fail`, and several commands are expected to
+          # return non-zero (an absent response header makes `header` exit 1),
+          # so `-e` must be turned off explicitly — `set` below would not
+          # otherwise clear a flag passed on the command line.
+          set +e
           set -uo pipefail
 
           rotate="Rotate it in Settings > Environments > winget > Secrets. It must be a classic PAT with 'public_repo' (or 'repo') scope on an account that can fork microsoft/winget-pkgs."
@@ -68,8 +74,10 @@ jobs:
               "https://api.github.com$1"
           }
 
+          # Absent headers are normal (fine-grained PATs report no scopes),
+          # so never propagate grep's no-match status to the caller.
           header() {
-            tr -d '\r' < "$hdr" | grep -i "^$1:" | tail -n1 | cut -d: -f2- | sed 's/^ *//'
+            tr -d '\r' < "$hdr" | grep -i "^$1:" | tail -n1 | cut -d: -f2- | sed 's/^ *//' || true
           }
 
           # 1. Is the token itself still usable?
@@ -81,7 +89,7 @@ jobs:
             *) fail "GET /user returned HTTP $status, expected 200. $rotate" ;;
           esac
 
-          login="$(grep -o '"login"[[:space:]]*:[[:space:]]*"[^"]*"' "$body" | head -n1 | cut -d'"' -f4)"
+          login="$(grep -o '"login"[[:space:]]*:[[:space:]]*"[^"]*"' "$body" | head -n1 | cut -d'"' -f4 || true)"
           scopes="$(header x-oauth-scopes)"
           expiry="$(header github-authentication-token-expiration)"
 
