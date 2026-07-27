@@ -2025,6 +2025,13 @@ test "walkZipPes recovers PE entries from a fabricated archive" {
     try std.testing.expectEqualStrings("tiny.exe", results.items[0].name);
     try std.testing.expectEqualSlices(u8, pe_data, results.items[0].bytes);
 }
+/// Verify that `leaf_der` chains to a root in `trust`, drawing candidate
+/// intermediates from `intermediates_raw` and enforcing every certificate's
+/// validity window against `verify_at`.
+///
+/// Returns the parsed **leaf**, not the last certificate walked. The leaf is
+/// what identifies the signer; returning anything further up the chain
+/// misattributes the signature to a CA.
 ///
 /// Re-uses the std.crypto.Certificate.verify primitive, which
 /// performs the per-step signature verification.
@@ -2045,8 +2052,12 @@ pub fn verifyChain(
         try pool.append(.{ .buffer = cert_der, .index = 0 });
     }
 
-    var subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
+    const subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
     var subject = der.parseCertificate(subject_cert) catch return error.InvalidSignature;
+    // The walk below reassigns `subject` as it climbs toward the root, so
+    // capture the leaf now — it is what the caller asked us to verify and
+    // what identifies the signer.
+    const leaf = subject;
 
     var depth: u8 = 0;
     while (depth < 8) : (depth += 1) {
@@ -2060,25 +2071,21 @@ pub fn verifyChain(
             // Confirm root is valid at the same clock.
             if (verify_at < issuer.validity.not_before) return error.InvalidSignature;
             if (verify_at > issuer.validity.not_after) return error.InvalidSignature;
-            return der.parseCertificate(subject_cert) catch error.InvalidSignature;
+            return leaf;
         }
 
         // 2. Try to find issuer among the in-bundle intermediates.
         var matched: ?Certificate.Parsed = null;
-        var matched_cert: ?Certificate = null;
         for (pool.items) |c| {
-            const cc = c;
-            const p = der.parseCertificate(cc) catch continue;
+            const p = der.parseCertificate(c) catch continue;
             if (std.mem.eql(u8, p.subject(), issuer_name)) {
                 matched = p;
-                matched_cert = cc;
                 break;
             }
         }
         const issuer = matched orelse return error.InvalidSignature;
         try subject.verify(issuer, verify_at);
         subject = issuer;
-        subject_cert = matched_cert.?;
     }
     return error.InvalidSignature;
 }
@@ -2372,4 +2379,36 @@ test "parseSignedData walks a real Authenticode signature" {
 
     // The unsignedAttrs carry the RFC 3161 timestamp token.
     try std.testing.expect(signed_data.signer.unsigned_attrs_raw.len > 0);
+}
+
+test "verifyChain returns the signer leaf, not an intermediate" {
+    const allocator = std.testing.allocator;
+    // 2025-10-16T23:57:02Z — the genTime of the fixture's RFC 3161
+    // countersignature. The signer leaf is a Microsoft short-lived EOC
+    // certificate valid only 2025-10-16..2025-10-19, so the chain is
+    // verifiable at this instant and at no useful wall-clock time.
+    const verify_at: i64 = 1760659022;
+
+    var trust = try buildTrustBundle(allocator, verify_at);
+    defer trust.deinit(allocator);
+
+    const signed_data = try parseSignedData(test_pkcs7_der);
+    const leaf_der = (try findSignerCertDer(signed_data)) orelse
+        return error.TestSignerCertNotFound;
+
+    const leaf = try verifyChain(
+        allocator,
+        leaf_der,
+        signed_data.certificates_raw,
+        trust,
+        verify_at,
+    );
+
+    // The chain is leaf -> "Microsoft ID Verified CS EOC CA 02" ->
+    // "Microsoft ID Verified Code Signing PCA 2021" -> trusted root.
+    // Returning the last certificate walked would report the PCA here and
+    // credit a GitHub-signed binary to Microsoft.
+    try std.testing.expectEqualStrings("GitHub, Inc.", try extractSubjectCn(leaf));
+    try std.testing.expectEqualStrings("GitHub, Inc.", try extractOrganization(leaf));
+    try std.testing.expectEqualSlices(u8, leaf_der, leaf.certificate.buffer);
 }
