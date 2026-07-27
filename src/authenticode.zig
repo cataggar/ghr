@@ -1377,8 +1377,11 @@ pub fn parseTstInfo(bytes: []const u8) TstError!TstInfo {
 ///      `signer.unsigned_attrs_raw`.
 ///   2. Delegate detached CMS, TSTInfo, imprint, and TSA-chain
 ///      verification to `rfc3161.verifyDetached`.
-///   3. Select `.wall_clock` so the refactor preserves Authenticode's
-///      existing TSA certificate validity policy.
+///   3. Select `.gen_time` so the TSA chain is validated at the instant
+///      the token was issued. Validating it against the wall clock would
+///      make every timestamped signature unverifiable once the TSA's own
+///      certificate expires — precisely the failure timestamping exists
+///      to prevent, and typically within about a year.
 pub fn verifyTimestamp(
     allocator: std.mem.Allocator,
     signer: SignerInfo,
@@ -1394,7 +1397,7 @@ pub fn verifyTimestamp(
         signer.signature,
         tsa_trust,
         now,
-        .wall_clock,
+        .gen_time,
     );
 }
 
@@ -1553,10 +1556,12 @@ pub const VerifyPeError = error{
 /// `signer_trust` and `tsa_trust` are bundles of trusted Authenticode
 /// and TSA roots respectively (typically populated via
 /// `buildEmbeddedTrustBundle` plus any caller-supplied additions).
-/// `now` is the wall-clock used to enforce the TSA cert's own
-/// validity window; the TSA's `genTime` is then used as the clock
-/// for the signer chain so the signature remains valid past the
-/// signer cert's notAfter.
+///
+/// Certificate validity is enforced at the signing time established by
+/// the RFC 3161 countersignature, never against the wall clock: an
+/// artifact signed while its certificates were valid stays verifiable
+/// after they expire. `now` is threaded through to `rfc3161` but is not
+/// used as a validity clock for any certificate.
 pub fn verifyPe(
     allocator: std.mem.Allocator,
     pe_bytes: []const u8,
@@ -1834,15 +1839,32 @@ const embedded_roots = [_][]const u8{
 /// Authenticode trust roots. Caller owns the returned bundle and
 /// must call `bundle.deinit(allocator)`.
 ///
-/// `now_sec` is used by `parseCert` to skip already-expired roots;
-/// passing the current wall-clock time is fine since all 15 embedded
-/// roots are valid through 2029 or later.
-pub fn buildTrustBundle(allocator: std.mem.Allocator, now_sec: i64) !Certificate.Bundle {
+/// The bundle is deliberately not filtered by any clock. See
+/// `no_wall_clock_filter`.
+pub fn buildTrustBundle(allocator: std.mem.Allocator) !Certificate.Bundle {
     var bundle: Certificate.Bundle = .empty;
     errdefer bundle.deinit(allocator);
-    for (embedded_roots) |pem| try addPemCertsToBundle(&bundle, allocator, pem, now_sec);
+    for (embedded_roots) |pem| try addPemCertsToBundle(&bundle, allocator, pem);
     return bundle;
 }
+
+/// `std`'s `Bundle.parseCert` silently drops any certificate whose
+/// `notAfter` precedes the time it is handed, and a dropped root is
+/// indistinguishable from one that was never embedded — the chain walk
+/// simply fails to find an issuer.
+///
+/// Pass 0 so no root is ever filtered out. An artifact signed while a
+/// root was valid must stay verifiable after that root expires, which
+/// is the same principle that puts the signer and TSA chains on the
+/// timestamp's `genTime`. Root validity is still enforced, at signing
+/// time, by `verifyChain`.
+///
+/// The check in `parseCert` is one-sided — it compares against
+/// `notAfter` only — so 0 disables it without suppressing any other
+/// validation. Trust in these roots comes from being compiled into the
+/// binary; removing one is a code change, not something a `notAfter`
+/// date expresses.
+const no_wall_clock_filter: i64 = 0;
 
 /// Add every PEM-encoded `CERTIFICATE` block in `pem_bytes` to `cb`.
 /// Mirrors `sigstore.zig`'s helper; kept local to avoid the
@@ -1851,7 +1873,6 @@ fn addPemCertsToBundle(
     cb: *Certificate.Bundle,
     gpa: std.mem.Allocator,
     pem_bytes: []const u8,
-    now_sec: i64,
 ) !void {
     const begin_marker = "-----BEGIN CERTIFICATE-----";
     const end_marker = "-----END CERTIFICATE-----";
@@ -1875,7 +1896,7 @@ fn addPemCertsToBundle(
         decoder.decode(cb.bytes.allocatedSlice()[decoded_start..], stripped) catch
             return error.TrustBundleBuildFailed;
         cb.bytes.items.len += decoded_len;
-        try cb.parseCert(gpa, decoded_start, now_sec);
+        try cb.parseCert(gpa, decoded_start, no_wall_clock_filter);
     }
 }
 
@@ -1893,12 +1914,47 @@ fn stripPemWhitespace(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
 
 test "buildTrustBundle parses all embedded Authenticode roots" {
     const allocator = std.testing.allocator;
-    const now: i64 = 1746878400; // 2025-05-10, inside every root's validity window
-    var bundle = try buildTrustBundle(allocator, now);
+    var bundle = try buildTrustBundle(allocator);
     defer bundle.deinit(allocator);
     try std.testing.expect(bundle.bytes.items.len > 0);
     // 15 embedded roots; map_size grows by 1 per parsed cert.
     try std.testing.expectEqual(@as(usize, embedded_roots.len), bundle.map.count());
+}
+
+test "trust bundle construction does not filter certificates by the wall clock" {
+    const allocator = std.testing.allocator;
+
+    // The fixture's signer leaf is a Microsoft short-lived EOC certificate
+    // valid only 2025-10-16..2025-10-19, so it is long expired at any real
+    // run date. No embedded root is expired yet — the earliest, GlobalSign
+    // R3, runs to 2029-03-18 — so an already-expired certificate is needed
+    // to observe the filter at all.
+    const signed_data = try parseSignedData(test_pkcs7_der);
+    const expired_der = (try findSignerCertDer(signed_data)) orelse
+        return error.TestSignerCertNotFound;
+    const parsed = try der.parseCertificate(.{ .buffer = expired_der, .index = 0 });
+    // 2026-01-01, comfortably past the fixture's 2025-10-19 notAfter.
+    try std.testing.expect(parsed.validity.not_after < 1767225600);
+
+    // Added with the sentinel: retained despite being expired.
+    {
+        var bundle: Certificate.Bundle = .empty;
+        defer bundle.deinit(allocator);
+        try bundle.bytes.appendSlice(allocator, expired_der);
+        try bundle.parseCert(allocator, 0, no_wall_clock_filter);
+        try std.testing.expectEqual(@as(usize, 1), bundle.map.count());
+    }
+
+    // Added with a wall clock past its notAfter: silently dropped. This is
+    // the behaviour the sentinel exists to avoid; if someone reintroduces a
+    // wall-clock argument, the assertion above starts failing here.
+    {
+        var bundle: Certificate.Bundle = .empty;
+        defer bundle.deinit(allocator);
+        try bundle.bytes.appendSlice(allocator, expired_der);
+        try bundle.parseCert(allocator, 0, @as(i64, @intCast(parsed.validity.not_after)) + 1);
+        try std.testing.expectEqual(@as(usize, 0), bundle.map.count());
+    }
 }
 
 fn decompressDeflateToBuf(compressed: []const u8, out: []u8) !void {
@@ -2295,7 +2351,7 @@ test "malformed certificate chains are rejected without panicking" {
     const allocator = std.testing.allocator;
     const now: i64 = 1735689600; // 2025-01-01
 
-    var trust = try buildTrustBundle(allocator, now);
+    var trust = try buildTrustBundle(allocator);
     defer trust.deinit(allocator);
 
     for ([_][]const u8{
@@ -2389,7 +2445,7 @@ test "verifyChain returns the signer leaf, not an intermediate" {
     // verifiable at this instant and at no useful wall-clock time.
     const verify_at: i64 = 1760659022;
 
-    var trust = try buildTrustBundle(allocator, verify_at);
+    var trust = try buildTrustBundle(allocator);
     defer trust.deinit(allocator);
 
     const signed_data = try parseSignedData(test_pkcs7_der);
@@ -2411,4 +2467,30 @@ test "verifyChain returns the signer leaf, not an intermediate" {
     try std.testing.expectEqualStrings("GitHub, Inc.", try extractSubjectCn(leaf));
     try std.testing.expectEqualStrings("GitHub, Inc.", try extractOrganization(leaf));
     try std.testing.expectEqualSlices(u8, leaf_der, leaf.certificate.buffer);
+}
+
+test "RFC 3161 countersignature verifies at genTime after the TSA certificate expired" {
+    const allocator = std.testing.allocator;
+
+    var trust = try buildTrustBundle(allocator);
+    defer trust.deinit(allocator);
+
+    const signed_data = try parseSignedData(test_pkcs7_der);
+
+    // The fixture's TSA leaf, "Microsoft Public RSA Time Stamping Authority",
+    // expired 2025-11-19. Hand verifyTimestamp a wall clock well past that
+    // date: it must still succeed, because the timestamp authority's chain is
+    // checked at the token's own genTime rather than at the moment ghr runs.
+    // Under wall-clock validation this call fails with CertificateExpired.
+    const now_past_tsa_expiry: i64 = 1785110400; // 2026-07-27
+
+    const gen_time = try verifyTimestamp(
+        allocator,
+        signed_data.signer,
+        trust,
+        now_past_tsa_expiry,
+    );
+
+    // 2025-10-16T23:57:02Z, the instant git-lfs 3.7.1 was countersigned.
+    try std.testing.expectEqual(@as(i64, 1760659022), gen_time);
 }

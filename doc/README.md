@@ -574,7 +574,11 @@ publishes:
      `szOID_RFC3161_counterSign`), verify the TimeStampToken's own
      SignerInfo signature, walk the TSA cert chain to a trusted TSA
      root, and bind `TSTInfo.messageImprint` to `sha256(signer
-     signature)`.
+     signature)`. The TSA chain is validated at the token's own
+     `genTime`, the same clock used for the signer chain — timestamp
+     authorities rotate their certificates too, and an archived
+     signature does not stop being correctly timestamped when the TSA's
+     cert expires.
   5. Walk the X.509 chain from the signer cert through the
      intermediates carried in the SignedData's `certificates` SET to
      one of the 15 embedded trust roots (Microsoft Identity
@@ -583,7 +587,9 @@ publishes:
      Assurance EV / Assured ID G3, GlobalSign Root CA R3 / R6 / Code
      Signing R45, USERTrust RSA / ECC, Entrust Root G2 / EC1). The
      TSA's `genTime` is used as the validity clock so signatures
-     remain trustworthy past the signer cert's `notAfter`.
+     remain trustworthy past the signer cert's `notAfter`. The wall
+     clock plays no part in certificate validity anywhere in this
+     path, including the construction of the trust root set itself.
 
   Authenticode is fail-closed when a PE inside the asset carries a
   signature that doesn't verify, and fail-open when no PE carries any
