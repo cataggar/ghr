@@ -28,6 +28,7 @@
 //!     digest function.
 
 const std = @import("std");
+const rfc3161 = @import("rfc3161.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -146,7 +147,7 @@ pub fn parsePe(bytes: []const u8) ParseError!PeImage {
     if (num_rva_sizes_off + 4 > bytes.len) return error.TruncatedOptionalHeader;
     const num_rva_and_sizes = std.mem.readInt(
         u32,
-        bytes[num_rva_sizes_off .. num_rva_sizes_off + 4][0..2 + 2],
+        bytes[num_rva_sizes_off .. num_rva_sizes_off + 4][0 .. 2 + 2],
         .little,
     );
     if (num_rva_and_sizes <= data_directory_security_index) {
@@ -1078,7 +1079,10 @@ const EcdsaP384Sha384 = std.crypto.sign.ecdsa.Ecdsa(
 pub const VerifyError = error{
     InvalidSignature,
     SignerCertNotFound,
+    SignerCertMismatch,
     BundleSignerMismatch,
+    InvalidTsaExtendedKeyUsage,
+    InvalidDerElement,
     UnsupportedSignerKeyType,
     InvalidCertificateChoice,
     OutOfMemory,
@@ -1294,7 +1298,11 @@ pub fn findSignerCertDer(signed_data: SignedData) VerifyError!?[]const u8 {
 
 pub const TstError = error{
     InvalidTstInfo,
+    InvalidTimestampResponse,
+    TimestampStatusNotGranted,
+    MissingTimestampToken,
     UnsupportedTstInfoVersion,
+    TimestampContentDigestMismatch,
     TstInfoMessageImprintMismatch,
     InvalidGeneralizedTime,
 } || Pkcs7Error;
@@ -1367,14 +1375,10 @@ pub fn parseTstInfo(bytes: []const u8) TstError!TstInfo {
 ///
 ///   1. Locate the `id-aa-signatureTimeStampToken` attribute in
 ///      `signer.unsigned_attrs_raw`.
-///   2. Parse the TimeStampToken as a PKCS#7 SignedData over a
-///      TSTInfo (`parseTimestampToken`).
-///   3. Verify the TSA SignerInfo's signature over its own
-///      signedAttrs using the TSA's leaf cert.
-///   4. Walk the TSA cert chain to a trusted TSA root in
-///      `tsa_trust`, using the wall-clock `now` as the clock.
-///   5. Verify TSTInfo.messageImprint.hashedMessage equals the hash
-///      (per `imprint_alg`) of `signer.signature`.
+///   2. Delegate detached CMS, TSTInfo, imprint, and TSA-chain
+///      verification to `rfc3161.verifyDetached`.
+///   3. Select `.wall_clock` so the refactor preserves Authenticode's
+///      existing TSA certificate validity policy.
 pub fn verifyTimestamp(
     allocator: std.mem.Allocator,
     signer: SignerInfo,
@@ -1384,42 +1388,14 @@ pub fn verifyTimestamp(
     const token_bytes = (try findUnsignedAttr(signer, &oid.timestamp_token)) orelse
         (try findUnsignedAttr(signer, &oid.ms_timestamp_token)) orelse
         return error.MissingSignedAttrs; // re-purposed: caller treats as fail-closed
-    const token = try parseTimestampToken(token_bytes);
-
-    // Step 3: verify the TSA's own signer signature over its
-    // signedAttrs (re-emitted as SET OF), using the TSA leaf cert
-    // bundled inside this TimeStampToken.
-    try verifySignerSignature(allocator, token);
-
-    // Step 4: walk the TSA cert chain to one of the embedded TSA
-    // roots. Use wall-clock `now` here since the TSA cert itself
-    // does have a validity window we want to enforce against the
-    // moment of verification.
-    const tsa_leaf = (try findSignerCertDer(token)) orelse
-        return error.SignerCertNotFound;
-    _ = try verifyChain(allocator, tsa_leaf, token.certificates_raw, tsa_trust, now);
-
-    // Step 5: bind the TSTInfo's messageImprint to sha256(signer.signature).
-    const tst = try parseTstInfo(token.spc_indirect_data);
-    var imprint_calc: [64]u8 = undefined; // big enough for sha-512
-    const imprint_calc_slice = switch (tst.imprint_alg) {
-        .sha256 => blk: {
-            std.crypto.hash.sha2.Sha256.hash(signer.signature, imprint_calc[0..32], .{});
-            break :blk imprint_calc[0..32];
-        },
-        .sha384 => blk: {
-            std.crypto.hash.sha2.Sha384.hash(signer.signature, imprint_calc[0..48], .{});
-            break :blk imprint_calc[0..48];
-        },
-        .sha512 => blk: {
-            std.crypto.hash.sha2.Sha512.hash(signer.signature, imprint_calc[0..64], .{});
-            break :blk imprint_calc[0..64];
-        },
-    };
-    if (!std.mem.eql(u8, tst.imprint, imprint_calc_slice))
-        return error.TstInfoMessageImprintMismatch;
-
-    return tst.gen_time;
+    return rfc3161.verifyDetached(
+        allocator,
+        token_bytes,
+        signer.signature,
+        tsa_trust,
+        now,
+        .wall_clock,
+    );
 }
 
 /// Parse an ASN.1 GeneralizedTime ("YYYYMMDDHHMMSSZ" — RFC 5280 form)
