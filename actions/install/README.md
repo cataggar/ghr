@@ -35,10 +35,11 @@ invalidates the cache cleanly.
 | `tools`             | _(required)_             | Newline-separated entries. Each entry is `owner/repo[@tag]` (or `owner/repo/file[@tag]`), optionally followed by a single whitespace-separated minisign pubkey. Empty lines and lines starting with `#` are ignored. |
 | `cache`             | `true`                   | Cache the installed tools across runs. |
 | `minisign`          | _(empty)_                | Default base64 minisign public key applied to every `tools:` line that does **not** include its own inline key. When set, ghr requires a `.minisig` sidecar (fail-closed). Inline per-spec keys override this default for that one spec. |
-| `skip-verify`       | `false`                  | Umbrella: skip every verification step (checksum, minisign, sigstore, authenticode). |
+| `skip-verify`       | `false`                  | Umbrella: skip every verification step (checksum, minisign, sigstore, GitHub attestation, authenticode). |
 | `skip-checksum`     | `false`                  | Skip just the checksum-sidecar verification step. |
 | `skip-minisign`     | `false`                  | Skip just the minisign verification step. Bypasses the fail-closed "sidecar published but no key" behavior. |
-| `skip-sigstore`     | `false`                  | Skip just the sigstore-bundle verification step. |
+| `skip-sigstore`     | `false`                  | Skip just the `.sigstore.json` sidecar published as a release asset. Does not affect GitHub's attestation service. |
+| `skip-attestation`  | `false`                  | Skip just GitHub artifact attestation verification, which is looked up by digest rather than published as a release asset. |
 | `skip-authenticode` | `false`                  | Skip just the Authenticode (Windows PE) verification step. |
 | `keep-going`        | `false`                  | Continue past per-spec failures; exit non-zero with a summary if any spec failed. |
 | `ghr-version`       | _(derived from action ref)_ | Override the `ghr-bin` version installed. Default: derived from the action's git ref (e.g. `@v0.3.0` → `ghr-bin==0.3.0`). Pass `latest` to install the latest from PyPI. |
@@ -101,6 +102,33 @@ unavailable in a given release, while keeping the others active.
     tools: BurntSushi/ripgrep@14.1.1
     skip-checksum: 'true'   # checksum-sidecar bypass; minisign + sigstore still apply
 ```
+
+### Two independent Sigstore forms
+
+`skip-sigstore` and `skip-attestation` are not interchangeable. A release can
+carry either, both, or neither, and each is verified on its own:
+
+- **`.sigstore.json` sidecar** — a file the release publishes alongside the
+  asset. Controlled by `skip-sigstore`.
+- **GitHub artifact attestation** — not a release asset at all. `ghr` looks it
+  up from GitHub's attestation API using the downloaded file's SHA-256 digest.
+  Controlled by `skip-attestation`.
+
+Attestation lookups go through the GitHub API, so an unauthenticated runner
+can hit rate limits. Pass a token, which on GitHub-hosted runners you already
+have:
+
+```yaml
+- uses: cataggar/ghr/actions/install@v1
+  with:
+    tools: cli/cli@v2.96.0
+  env:
+    GH_TOKEN: ${{ github.token }}
+```
+
+A lookup that fails for any reason other than "no attestation exists" is
+fatal, so a rate limit or an expired token cannot be mistaken for an
+unattested artifact. Set `skip-attestation: 'true'` to opt out deliberately.
 
 ### Continue past per-spec failures
 

@@ -80,10 +80,11 @@ OPTIONS:
         --strip-components <N> Strip N leading path components when extracting
         --sha256 <hex>         Verify download against SHA-256 digest (single-spec only)
         --minisign <pubkey>    Default minisign key, applied to specs without an inline key
-        --skip-verify          Umbrella: skip every verification step (checksum, minisign, sigstore, authenticode)
+        --skip-verify          Skip every verification step (checksum, minisign, sigstore, attestation, authenticode)
         --skip-checksum        Skip checksum verification (GitHub asset digest + .sha256/.sha512 sidecar)
         --skip-minisign        Skip just the minisign verification step
-        --skip-sigstore        Skip just the sigstore-bundle verification step
+        --skip-sigstore        Skip just the published .sigstore.json sidecar verification step
+        --skip-attestation     Skip just the GitHub-native artifact attestation verification step
         --skip-authenticode    Skip just the Authenticode (Windows PE) verification step
         --keep-archive         Keep archive on disk after extraction
         --keep-going           For multi-spec, continue past per-spec failures
@@ -118,7 +119,8 @@ GitHub asset API endpoint rather than the public download URL, so
 private and SSO-protected enterprise releases work as long as the
 token is authorized for the organization.
 Downloads are auto-verified against any sigstore bundle or checksum
-sidecar published with the release; pass `--minisign <pubkey>` to
+sidecar published with the release, and against any GitHub artifact
+attestation covering the downloaded digest; pass `--minisign <pubkey>` to
 also require a minisign signature (or attach an inline key to a
 spec), `--skip-<step>` to bypass one verifier individually, or
 `--skip-verify` to bypass all checks. Exit codes: `0` success, `1`
@@ -281,7 +283,8 @@ Hand-rolled equivalent:
 The same multi-spec rules apply: `-o` and `--sha256` are rejected when
 more than one spec is supplied — `--extract <dir>` is the multi-spec
 equivalent of `-o`, and verification falls back to whatever GitHub asset
-digest, sigstore, or sha256 sidecars the release publishes.
+digest, sigstore, or sha256 sidecars the release publishes, plus any
+GitHub artifact attestation covering the downloaded digest.
 
 ## Directories
 
@@ -438,8 +441,11 @@ publishes:
   substitute); both must match. The sidecar download is the only case
   that costs an extra request, so releases that rely solely on the
   built-in digest verify for free.
-- **Sigstore bundles** — `<asset>.sigstore.json` (cosign bundle v0.3) is
-  verified entirely natively in Zig. The X.509 chain is walked from the
+- **Sigstore bundles** — `<asset>.sigstore.json` (cosign bundle v0.3),
+  published as a release asset, is verified entirely natively in Zig.
+  This is a separate mechanism from GitHub artifact attestations below;
+  a release may publish either, both, or neither, and each is verified
+  independently of the other. The X.509 chain is walked from the
   bundle's leaf cert to embedded production Fulcio roots, the artifact's
   ECDSA-P256/SHA-256 signature is checked against the leaf, and Rekor's
   signed entry timestamp is verified against the embedded Rekor public
@@ -474,6 +480,60 @@ publishes:
   of the payload; the Rekor `dsse / 0.0.1` body is checked to bind back
   to the bundle's envelope (`payloadHash` equals sha256 of the payload;
   signature + verifier cert equal the bundle's).
+- **GitHub artifact attestations** — unlike every other method here,
+  these are **not published as release assets**, so there is nothing to
+  spot in a release's file list. After downloading, ghr asks GitHub's
+  [attestation API](https://docs.github.com/en/rest/repos/attestations)
+  for any attestation matching the file's SHA-256, and verifies it with
+  the same native Zig Sigstore stack described above. This is what
+  `gh attestation verify` checks, and it covers the many releases built
+  by [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance)
+  that publish no sidecar at all.
+
+  Two trust models are handled, and the bundle itself selects which:
+
+  - **Public repositories** are signed by the public Sigstore instance
+    (`O=sigstore.dev, CN=sigstore-intermediate`) and logged in Rekor. A
+    verified Rekor signed entry timestamp is **required**, and its
+    `integratedTime` is the certificate-validity clock. An inclusion
+    proof, when present, is replayed against the signed checkpoint.
+  - **Private repositories** are signed by GitHub's own Fulcio
+    (`O=GitHub, Inc., CN=Fulcio Intermediate l2`) and are not in a public
+    log. In place of Rekor the bundle carries a full RFC 3161
+    `TimeStampResp` from GitHub's TSA, whose `genTime` becomes the clock.
+    The TSA chain is pinned to GitHub's embedded trust root, so a
+    timestamp token cannot carry its own signer.
+
+  The attestation must be a [SLSA Provenance v1](https://slsa.dev/provenance/v1)
+  statement whose subject digest matches the download, and whose signing
+  certificate names the repository the asset came from. The predicate type
+  is checked against the *signed* statement rather than trusting the API's
+  `predicate_type` filter, which is an unsigned request parameter that also
+  admits older provenance versions. This is the same predicate
+  `gh attestation verify` enforces by default, so an attestation ghr accepts
+  here is one `gh` accepts too. Subject *names*
+  are deliberately not matched — the local filename is chosen by the
+  downloader, so it carries no meaning here. Repository identity is bound
+  by the certificate's rename-stable numeric repository id as well as its
+  URI, so a repository that was renamed or transferred after signing still
+  verifies rather than failing as an impostor.
+
+  Lookups are **fail-closed**: only two responses count as "no attestation
+  exists" — a `404` (the repository has never produced one) and a success
+  carrying an empty list (it uses attestations, but not for this digest).
+  Both fall back to the other verifiers. Anything else — a rate limit, an
+  expired token, a network error, a `500` — aborts the operation, so a
+  transport failure can never be silently reported as an unattested
+  artifact.
+
+  Because each lookup is a GitHub API call, **unauthenticated use can hit
+  API rate limits**. Set `GH_TOKEN` or `GITHUB_TOKEN` (private
+  repositories additionally need the `attestations:read` permission), or
+  opt out explicitly with `--skip-attestation`.
+
+  A missing attestation is not a policy failure. ghr reports what a
+  release actually published; it does not require provenance to exist. If
+  you need "this artifact MUST be attested", enforce that separately.
 - **Minisign signatures** — `<asset>.minisig` sidecars
   ([minisign v2](https://jedisct1.github.io/minisign/)) are verified when
   the caller supplies a public key — either via `--minisign <base64-pubkey>`
@@ -533,16 +593,25 @@ publishes:
 
 On any verification failure the operation is aborted and the cached
 download is deleted. If no checksum, minisign sidecar, sigstore bundle,
-or Authenticode signature is published the download proceeds with a
-`note:` line so you know it was unverified.
+GitHub attestation, or Authenticode signature is published the download
+proceeds with a `note:` line so you know it was unverified.
 
 Pass `--skip-verify` to bypass every check at once. To bypass only one
 step (e.g. when its sidecar is broken in a particular release while the
 others still apply), use the narrower flags: `--skip-checksum`,
-`--skip-minisign`, `--skip-sigstore`, `--skip-authenticode`. For
+`--skip-minisign`, `--skip-sigstore`, `--skip-attestation`,
+`--skip-authenticode`.
+
+Note that `--skip-sigstore` and `--skip-attestation` are **not**
+interchangeable even though both verify Sigstore material:
+`--skip-sigstore` covers only a `.sigstore.json` sidecar published as a
+release asset, while `--skip-attestation` covers only GitHub's
+attestation service. Skipping one leaves the other active. For
 `install`, the strongest result is recorded in each tool's `ghr.json`
 metadata as `"verified"`:
 
+- `"github-attestation"` — a GitHub artifact attestation for the file's
+  digest verified under the SLSA v1 + repository-identity policy.
 - `"sigstore"` — sigstore bundle verified (also implies the bundle's
   declared SHA256 matches the file).
 - `"minisign"` — minisign sidecar verified by the caller-supplied
@@ -558,9 +627,9 @@ metadata as `"verified"`:
 
 When more than one verifier succeeds (e.g. checksum *and* sigstore, or
 checksum *and* Authenticode) the strongest one is recorded — precedence
-is sigstore > minisign > authenticode > checksum. All successful
-verifiers still print their own diagnostic line, so the full set is
-visible at install time.
+is github-attestation > sigstore > minisign > authenticode > checksum.
+All successful verifiers still print their own diagnostic line, so the
+full set is visible at install time.
 
 When the install actually verifies the asset with a minisign key
 (inline per-spec or `--minisign`), the key itself is also recorded in
@@ -568,11 +637,21 @@ When the install actually verifies the asset with a minisign key
 line so the full output is directly pasteable as `ghr install <line>`
 on the next upgrade.
 
-The trust roots embedded in ghr come from two sources:
+The trust roots embedded in ghr come from three sources:
 [`sigstore/root-signing`](https://github.com/sigstore/root-signing)
-for the sigstore + Rekor anchor, and a Mozilla CCADB snapshot plus
-direct issuing-CA fetches for the Authenticode + RFC 3161 roots
-(documented per-root in [`src/authenticode/trust/README.md`](../src/authenticode/trust/README.md)).
+for the sigstore + Rekor anchor, GitHub's own TUF trust root for the
+GitHub Fulcio and TSA anchors used by artifact attestations, and a
+Mozilla CCADB snapshot plus direct issuing-CA fetches for the
+Authenticode + RFC 3161 roots (documented per-root in
+[`src/authenticode/trust/README.md`](../src/authenticode/trust/README.md)).
+
+Because these are embedded rather than fetched, GitHub rotating its
+attestation signing material requires a new ghr release. In restricted
+networks, attestation verification needs `api.github.com` and the
+GitHub-hosted bundle URLs to be reachable, or `--skip-attestation`.
+
+GitHub artifact attestation support is tracked in
+[#165](https://github.com/cataggar/ghr/issues/165).
 Rotating them requires a new ghr release.
 
 ## Reproducible builds

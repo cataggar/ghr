@@ -66,6 +66,29 @@ pub const VerifyGates = struct {
     skip_sigstore: bool = false,
     skip_attestation: bool = false,
     skip_authenticode: bool = false,
+
+    pub const Verifier = enum {
+        checksum,
+        minisign,
+        sigstore,
+        attestation,
+        authenticode,
+    };
+
+    /// Whether a given verifier is disabled, by its own flag or by the
+    /// umbrella. Callers use this rather than reading a field directly so
+    /// that each site is correct on its own instead of depending on a
+    /// `skip_verify` check somewhere further up.
+    pub fn shouldSkip(self: VerifyGates, verifier: Verifier) bool {
+        if (self.skip_verify) return true;
+        return switch (verifier) {
+            .checksum => self.skip_checksum,
+            .minisign => self.skip_minisign,
+            .sigstore => self.skip_sigstore,
+            .attestation => self.skip_attestation,
+            .authenticode => self.skip_authenticode,
+        };
+    }
 };
 
 /// CLI positional classifier outcome for one bare argument.
@@ -1676,7 +1699,11 @@ pub fn verifyDownloadedAssetAttestation(
     defer allocator.free(owner_uri);
 
     const policy: sigstore.VerificationPolicy = .{
-        .expected_predicate_type = null,
+        // The API request carries `?predicate_type=provenance`, but that is
+        // an unsigned server-side filter that also admits older provenance
+        // versions. Pin the signed `predicateType` locally instead, to the
+        // same value `gh attestation verify` enforces by default.
+        .expected_predicate_type = "https://slsa.dev/provenance/v1",
         .expected_repository_uri = repository_uri,
         .expected_owner_uri = owner_uri,
         // The attestation names the artifact by digest, and the local
@@ -1742,6 +1769,10 @@ pub fn verifyDownloadedAssetAttestation(
             digest_hex[0..12],
             if (last_err) |e| @errorName(e) else "unknown",
         },
+    );
+    try err_w.print(
+        "note: pass --skip-attestation to bypass GitHub-native attestation verification\n",
+        .{},
     );
     try err_w.flush();
     return error.AttestationVerificationFailed;
@@ -2259,7 +2290,7 @@ pub fn preflightVerification(
     minisign_pubkey_b64: ?[]const u8,
     err_w: *Writer,
 ) !void {
-    if (gates.skip_verify or gates.skip_minisign) return;
+    if (gates.shouldSkip(.minisign)) return;
 
     var views_buf: [256]minisign.AssetView = undefined;
     if (assets.len > views_buf.len) {
@@ -2338,7 +2369,7 @@ pub fn verifyAssetOnDisk(
         return .skipped;
     }
 
-    const sha_outcome: VerifyOutcome = if (gates.skip_checksum) blk: {
+    const sha_outcome: VerifyOutcome = if (gates.shouldSkip(.checksum)) blk: {
         try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
         break :blk .no_verification;
     } else blk: {
@@ -2390,7 +2421,7 @@ pub fn verifyAssetOnDisk(
         err_w,
     );
 
-    const sig_outcome: VerifyOutcome = if (gates.skip_sigstore) blk: {
+    const sig_outcome: VerifyOutcome = if (gates.shouldSkip(.sigstore)) blk: {
         try w.print("note: sigstore verification skipped (--skip-sigstore)\n", .{});
         break :blk .no_verification;
     } else try verifyDownloadedAssetSigstore(
@@ -2406,7 +2437,7 @@ pub fn verifyAssetOnDisk(
         err_w,
     );
 
-    const ac_outcome: VerifyOutcome = if (gates.skip_authenticode) blk: {
+    const ac_outcome: VerifyOutcome = if (gates.shouldSkip(.authenticode)) blk: {
         try w.print("note: authenticode verification skipped (--skip-authenticode)\n", .{});
         break :blk .no_verification;
     } else try verifyDownloadedAssetAuthenticode(
@@ -2420,7 +2451,7 @@ pub fn verifyAssetOnDisk(
 
     // Runs even when the sidecar above succeeded: the two forms are
     // independent, and a release can publish both.
-    const att_outcome: VerifyOutcome = if (gates.skip_attestation) blk: {
+    const att_outcome: VerifyOutcome = if (gates.shouldSkip(.attestation)) blk: {
         try w.print("note: github attestation verification skipped (--skip-attestation)\n", .{});
         break :blk .no_verification;
     } else try verifyDownloadedAssetAttestation(

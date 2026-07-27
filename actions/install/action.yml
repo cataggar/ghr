@@ -36,7 +36,7 @@ inputs:
   skip-verify:
     description: >-
       Umbrella flag: skip every verification step (checksum, minisign,
-      sigstore, authenticode). Default: false.
+      sigstore, GitHub attestation, authenticode). Default: false.
     required: false
     default: 'false'
   skip-checksum:
@@ -53,7 +53,17 @@ inputs:
     default: 'false'
   skip-sigstore:
     description: >-
-      Skip just the sigstore-bundle verification step. Default: false.
+      Skip just the verification of a `.sigstore.json` sidecar published as a
+      release asset. Does not affect GitHub's attestation service; use
+      `skip-attestation` for that. Default: false.
+    required: false
+    default: 'false'
+  skip-attestation:
+    description: >-
+      Skip just the GitHub artifact attestation verification step.
+      Attestations are looked up from GitHub's attestation API by the
+      downloaded file's digest rather than published as release assets, so
+      this is independent of `skip-sigstore`. Default: false.
     required: false
     default: 'false'
   skip-authenticode:
@@ -222,6 +232,7 @@ runs:
         SKIP_CHECKSUM: ${{ inputs.skip-checksum }}
         SKIP_MINISIGN: ${{ inputs.skip-minisign }}
         SKIP_SIGSTORE: ${{ inputs.skip-sigstore }}
+        SKIP_ATTESTATION: ${{ inputs.skip-attestation }}
         SKIP_AUTHENTICODE: ${{ inputs.skip-authenticode }}
         KEEP_GOING: ${{ inputs.keep-going }}
       run: |
@@ -232,6 +243,7 @@ runs:
         if [[ "${SKIP_CHECKSUM}" == "true" ]]; then flags+=(--skip-checksum); fi
         if [[ "${SKIP_MINISIGN}" == "true" ]]; then flags+=(--skip-minisign); fi
         if [[ "${SKIP_SIGSTORE}" == "true" ]]; then flags+=(--skip-sigstore); fi
+        if [[ "${SKIP_ATTESTATION}" == "true" ]]; then flags+=(--skip-attestation); fi
         if [[ "${SKIP_AUTHENTICODE}" == "true" ]]; then flags+=(--skip-authenticode); fi
         if [[ -n "${MINISIGN}" ]]; then flags+=(--minisign "${MINISIGN}"); fi
         # SORTED_SPECS is newline-separated `spec` or `spec key` lines.

@@ -36,6 +36,27 @@ pub const Candidate = struct {
     repository_id: ?u64 = null,
 };
 
+/// Maps an HTTP status to either success or a distinguishable failure.
+///
+/// `404` is separated from every other error so the API caller can treat it
+/// as "this repository has no attestations" rather than a lookup failure:
+/// GitHub returns `404` for a repository that has never produced an
+/// attestation, and `200` with an empty list for one that has but not for
+/// the requested digest. Everything else — including `401`, `403`, `429`,
+/// and `5xx` — stays an error, so a rate limit or an expired token can
+/// never be mistaken for an unattested artifact.
+fn classifyStatus(status: std.http.Status) !void {
+    if (status == .not_found) return error.HttpNotFound;
+    if (status != .ok) return error.UnexpectedHttpStatus;
+}
+
+/// The second absence signal: a successful response whose list is empty.
+/// The repository does use attestations, but published none for this digest,
+/// so the caller must fall back to the other verifiers rather than fail.
+fn isAbsent(response: ApiResponse) bool {
+    return response.attestations.len == 0;
+}
+
 pub const BundleSet = struct {
     allocator: std.mem.Allocator,
     items: []Candidate,
@@ -97,7 +118,7 @@ pub fn lookup(
     }) catch return error.MalformedApiResponse;
     defer parsed.deinit();
 
-    if (parsed.value.attestations.len == 0) return .none;
+    if (isAbsent(parsed.value)) return .none;
     if (parsed.value.attestations.len > max_candidates) {
         return error.TooManyAttestations;
     }
@@ -304,13 +325,7 @@ fn fetchOnce(
             ),
         };
     }
-    // Distinguished from other statuses so the API caller can treat it as
-    // "this repository has no attestations" rather than a lookup failure.
-    // GitHub returns 404 for a repository that has never produced an
-    // attestation, and 200 with an empty list for one that has but not for
-    // the requested digest.
-    if (response.head.status == .not_found) return error.HttpNotFound;
-    if (response.head.status != .ok) return error.UnexpectedHttpStatus;
+    try classifyStatus(response.head.status);
 
     const body_limit = if (response.head.content_encoding == .identity)
         options.identity_limit
@@ -646,4 +661,70 @@ test "resolves redirects before enforcing HTTPS" {
         error.InsecureBundleUrl,
         validateHttpsUrl(downgrade),
     );
+}
+
+test "only 404 and an empty list mean the artifact has no attestation" {
+    // Absence, which must fall back to the other verifiers.
+    try std.testing.expectError(error.HttpNotFound, classifyStatus(.not_found));
+    try std.testing.expectEqual({}, try classifyStatus(.ok));
+
+    // Everything else must fail closed. A rate limit or a token problem
+    // says nothing about whether an attestation exists, so treating any of
+    // these as absence would silently downgrade a verified install.
+    for ([_]std.http.Status{
+        .unauthorized,
+        .forbidden,
+        .too_many_requests,
+        .internal_server_error,
+        .bad_gateway,
+        .service_unavailable,
+        .no_content,
+        .accepted,
+    }) |status| {
+        try std.testing.expectError(error.UnexpectedHttpStatus, classifyStatus(status));
+    }
+}
+
+test "an empty attestation list is absence, not a malformed response" {
+    const allocator = std.testing.allocator;
+    // The second absence signal: the repository does use attestations, but
+    // published none for this digest. `lookup` must report `.none` here so
+    // the caller falls back instead of aborting the download.
+    var empty = try std.json.parseFromSlice(
+        ApiResponse,
+        allocator,
+        "{\"attestations\":[]}",
+        .{ .ignore_unknown_fields = true },
+    );
+    defer empty.deinit();
+    try std.testing.expect(isAbsent(empty.value));
+
+    // A response that does carry a candidate must not be read as absence,
+    // or a real attestation would be silently ignored.
+    var present = try std.json.parseFromSlice(
+        ApiResponse,
+        allocator,
+        \\{"attestations":[{"bundle_url":"https://example.test/a.json.sn"}]}
+    ,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer present.deinit();
+    try std.testing.expect(!isAbsent(present.value));
+}
+
+test "candidates carry the repository id GitHub filed them under" {
+    const allocator = std.testing.allocator;
+    // The id is what survives a rename, so it must reach the verifier
+    // rather than being dropped during parsing.
+    const body =
+        \\{"attestations":[{"repository_id":212613049,"bundle_url":"https://example.test/a.json.sn"},{"bundle_url":"https://example.test/b.json.sn"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(ApiResponse, allocator, body, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 212613049), parsed.value.attestations[0].repository_id);
+    // A response that omits the id must still parse; the verifier then
+    // simply has no id to match and falls back to the URI alone.
+    try std.testing.expectEqual(@as(?u64, null), parsed.value.attestations[1].repository_id);
 }
