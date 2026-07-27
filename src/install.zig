@@ -1939,7 +1939,7 @@ fn verifyDownloadedAsset(
         verified_label = "skipped";
         try w.print("note: verification skipped (--skip-verify)\n", .{});
     } else {
-        const sha_outcome: release_mod.VerifyOutcome = if (gates.skip_checksum) blk: {
+        const sha_outcome: release_mod.VerifyOutcome = if (gates.shouldSkip(.checksum)) blk: {
             try w.print("note: checksum verification skipped (--skip-checksum)\n", .{});
             break :blk .no_verification;
         } else blk: {
@@ -2025,7 +2025,7 @@ fn verifyDownloadedAsset(
             recorded_minisign_key = minisign_pubkey_b64;
         }
 
-        const ac_outcome: release_mod.VerifyOutcome = if (gates.skip_authenticode) blk: {
+        const ac_outcome: release_mod.VerifyOutcome = if (gates.shouldSkip(.authenticode)) blk: {
             try w.print("note: authenticode verification skipped (--skip-authenticode)\n", .{});
             break :blk .no_verification;
         } else release_mod.verifyDownloadedAssetAuthenticode(
@@ -2042,7 +2042,7 @@ fn verifyDownloadedAsset(
             return error.InstallStepFailed;
         };
 
-        const sig_outcome: release_mod.VerifyOutcome = if (gates.skip_sigstore) blk: {
+        const sig_outcome: release_mod.VerifyOutcome = if (gates.shouldSkip(.sigstore)) blk: {
             try w.print("note: sigstore verification skipped (--skip-sigstore)\n", .{});
             break :blk .no_verification;
         } else verifyDownloadedAssetSigstore(
@@ -2065,7 +2065,7 @@ fn verifyDownloadedAsset(
 
         // Runs even when the sidecar above succeeded: the two forms are
         // independent, and a release can publish both.
-        const att_outcome: release_mod.VerifyOutcome = if (gates.skip_attestation) blk: {
+        const att_outcome: release_mod.VerifyOutcome = if (gates.shouldSkip(.attestation)) blk: {
             try w.print("note: github attestation verification skipped (--skip-attestation)\n", .{});
             break :blk .no_verification;
         } else release_mod.verifyDownloadedAssetAttestation(
@@ -4345,4 +4345,44 @@ test "caseRenameDir: cross-parent rename uses plain rename" {
     try caseRenameDir(tio, old_abs, new_abs);
     try std.testing.expect((try tmp.dir.statFile(tio, "new/repo", .{})).kind == .directory);
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "Old/repo", .{}));
+}
+
+test "writeMetadata round-trips the github-attestation outcome" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bins = [_][]const u8{"tool"};
+    const apps = [_][]const u8{};
+    // The label must survive a write/read cycle unchanged, since `ghr list`
+    // and upgrade decisions read it back verbatim.
+    const label = release_mod.outcomeLabel(.github_attestation_verified).?;
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1.2.3", "tool-linux.tar.xz", &bins, &apps, label, "");
+
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(Metadata, allocator, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("github-attestation", parsed.value.verified);
+}
+
+test "an attestation outranks every other verifier in recorded metadata" {
+    // Both pipelines share one ranking, so an install that also verified a
+    // checksum or a sidecar still records the strongest result.
+    try std.testing.expectEqualStrings(
+        "github-attestation",
+        release_mod.outcomeLabel(release_mod.strongestOutcome(&.{
+            .sha256_verified,
+            .github_attestation_verified,
+        })).?,
+    );
+    try std.testing.expectEqualStrings(
+        "github-attestation",
+        release_mod.outcomeLabel(release_mod.strongestOutcome(&.{
+            .github_attestation_verified,
+            .sigstore_verified,
+            .authenticode_verified,
+        })).?,
+    );
 }

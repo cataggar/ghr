@@ -781,6 +781,85 @@ change, but the silence should be made consistent here.
   zig build test
   ```
 
+### Implementation Status
+
+- [x] `skip-attestation` input, `SKIP_ATTESTATION` forwarding, and
+  independent flag append added to both composite Actions; `skip-verify`
+  descriptions updated.
+- [x] Both Action READMEs document the new input and explain why
+  `skip-sigstore` and `skip-attestation` are not interchangeable, including
+  the token guidance for API rate limits.
+- [x] `README.md` and `doc/README.md` document the feature: digest lookup,
+  public vs private trust models, SLSA v1 policy, repository identity,
+  authentication requirements, fail-closed transport, both narrow skip flags,
+  the updated umbrella, `"github-attestation"` metadata and precedence, that
+  attestations are not visible release assets, that sidecars are verified
+  independently, and that absence is not a policy failure. Links `#165`.
+- [x] Embedded help text in `doc/README.md` re-synced with the real
+  `ghr download help` output.
+- [x] Tests added for the two absence signals and their status
+  classification, non-absence statuses failing closed, candidate
+  `repository_id` parsing, skip-gate independence, the `skip_verify`
+  umbrella, exit-code classification, and the `"github-attestation"`
+  metadata round-trip and precedence.
+
+Review also caught that the plan's "SLSA predicate enforcement" was not
+actually implemented: the policy passed `expected_predicate_type = null`, so
+the only thing constraining the predicate was the `?predicate_type=provenance`
+query parameter — an unsigned server-side filter that also admits older
+provenance versions. The signed `predicateType` is now pinned locally to
+`https://slsa.dev/provenance/v1`, the same value `gh attestation verify`
+enforces by default. Re-verified live against every attestation reachable in
+testing.
+
+Two consequences of pinning the predicate, both accepted deliberately:
+
+- The attestation path is now DSSE-only by policy as well as by trust domain.
+  A `hashedrekord` bundle fails `PredicateTypeMismatch`, which is unreachable
+  in practice since the attestation API stores DSSE envelopes only.
+- A repository whose only attestation is SLSA provenance **v0.2** now fails
+  closed rather than falling back. `actions/attest-build-provenance` has
+  emitted v1 since GA, so this is confined to very early-beta attestations,
+  and it matches what `gh attestation verify` does by default. The failure is
+  recoverable via the `--skip-attestation` hint now printed on that path.
+
+Three small refactors fell out of making the plan's assertions testable:
+
+- The download exit-code mapping was an inline `switch`, so the
+  transport-versus-verification distinction could not be asserted. It is now
+  `verifyExitCode` / `isClassifiedVerifyError`, and the duplicate mapping in
+  the standalone attestation branch was folded into the same function.
+- Each verifier read its own `skip_*` field and relied on a distant
+  `skip_verify` early return for the umbrella. `VerifyGates.shouldSkip` now
+  expresses both, so every site is umbrella-correct on its own.
+- The HTTP status check and the empty-list check inside `lookup` were inline
+  in its network path, so neither absence signal could be asserted without a
+  live server. They are now `classifyStatus` and `isAbsent`.
+
+### Manual Verification
+
+- [x] `ghr download cataggar/ghr@v0.6.9 --skip-minisign` verifies **both**
+  forms on the same asset, confirming they are genuinely independent:
+
+  ```
+  verified sigstore: sha256 c0fe7b6b6d44... (rekor t=..., log 2191588318)
+  verified github attestation: sha256 c0fe7b6b6d44... (rekor t=..., log 2191590204)
+  ```
+
+- [x] `--skip-sigstore` leaves the native attestation verifying.
+- [x] `--skip-attestation` leaves the sidecar verifying.
+- [x] `--skip-verify` runs neither.
+- [x] A public repository with no attestations
+  (`BurntSushi/ripgrep@14.1.1`) still falls back to its checksum sidecar.
+- [x] An invalid token fails closed: exit `2`, the partial download deleted,
+  and a diagnostic naming both `--skip-attestation` and the
+  `attestations:read` permission. `--skip-attestation` then succeeds.
+- [ ] Live private-repository verification was not exercised; it needs a
+  private repository that publishes attestations. The private trust path
+  (GitHub Fulcio + RFC 3161 `genTime` clock, no Rekor) is covered
+  deterministically by the `GitHub private provenance verifies through
+  RFC3161 policy` fixture test instead.
+
 ## Testing Strategy
 
 ### Unit Tests

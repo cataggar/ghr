@@ -18,6 +18,52 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const sha256_hex_len = Sha256.digest_length * 2;
 
 /// Exit codes used by `cmdDownload`.
+/// Errors whose exit code is a deliberate classification rather than a
+/// catch-all. Anything outside this set is unexpected enough to warrant
+/// printing the raw error before failing.
+fn isClassifiedVerifyError(err: anyerror) bool {
+    return switch (err) {
+        error.ChecksumMismatch,
+        error.ChecksumDownloadFailed,
+        error.ChecksumEntryMissing,
+        error.MinisignSidecarMissing,
+        error.MinisignSidecarPresentButNoKey,
+        error.MinisignKeyIdMismatch,
+        error.MinisignSignatureMismatch,
+        error.MinisignGlobalSigMismatch,
+        error.MinisignDownloadFailed,
+        error.AttestationVerificationFailed,
+        error.AttestationLookupFailed,
+        => true,
+        else => false,
+    };
+}
+
+/// Separates "the artifact failed a check it was subject to" from "we could
+/// not complete the check". The distinction matters for attestations: a
+/// lookup that never reached the API says nothing about the artifact, while
+/// a signature that failed to verify says a great deal.
+fn verifyExitCode(err: anyerror) u8 {
+    return switch (err) {
+        error.ChecksumMismatch,
+        error.ChecksumDownloadFailed,
+        error.ChecksumEntryMissing,
+        error.MinisignSidecarMissing,
+        error.MinisignSidecarPresentButNoKey,
+        error.MinisignKeyIdMismatch,
+        error.MinisignSignatureMismatch,
+        error.MinisignGlobalSigMismatch,
+        // Cryptographic, identity, and subject-binding failures on an
+        // attestation that *does* exist are verification failures, not
+        // transport problems.
+        error.AttestationVerificationFailed,
+        => exit_sha256_mismatch,
+        // Could not reach or read the attestation API, so we never learned
+        // whether an attestation exists.
+        else => exit_http_error,
+    };
+}
+
 pub const exit_arg_error: u8 = 1;
 pub const exit_io_error: u8 = 1;
 pub const exit_http_error: u8 = 2;
@@ -409,31 +455,11 @@ fn downloadOne(
             err_w,
         ) catch |verr| {
             Dir.deleteFileAbsolute(io, part_path) catch {};
-            switch (verr) {
-                error.ChecksumMismatch,
-                error.ChecksumDownloadFailed,
-                error.ChecksumEntryMissing,
-                error.MinisignSidecarMissing,
-                error.MinisignSidecarPresentButNoKey,
-                error.MinisignKeyIdMismatch,
-                error.MinisignSignatureMismatch,
-                error.MinisignGlobalSigMismatch,
-                // Cryptographic, identity, and subject-binding failures on
-                // an attestation that *does* exist are verification
-                // failures, not transport problems.
-                error.AttestationVerificationFailed,
-                => return step.fail(exit_sha256_mismatch),
-                error.MinisignDownloadFailed,
-                // Could not reach or read the attestation API, so we never
-                // learned whether one exists.
-                error.AttestationLookupFailed,
-                => return step.fail(exit_http_error),
-                else => {
-                    try err_w.print("error: verification failed: {}\n", .{verr});
-                    try err_w.flush();
-                    return step.fail(exit_http_error);
-                },
+            if (!isClassifiedVerifyError(verr)) {
+                try err_w.print("error: verification failed: {}\n", .{verr});
+                try err_w.flush();
             }
+            return step.fail(verifyExitCode(verr));
         };
         _ = outcome;
     } else if (target.repository) |repo| {
@@ -459,10 +485,7 @@ fn downloadOne(
                 err_w,
             ) catch |verr| {
                 Dir.deleteFileAbsolute(io, part_path) catch {};
-                switch (verr) {
-                    error.AttestationVerificationFailed => return step.fail(exit_sha256_mismatch),
-                    else => return step.fail(exit_http_error),
-                }
+                return step.fail(verifyExitCode(verr));
             };
             if (outcome == .no_verification) {
                 try w.print("note: download is unverified (no release context for this URL)\n", .{});
@@ -1002,9 +1025,10 @@ fn printDownloadUsage(w: *Writer) !void {
         \\Picks the asset that 'ghr install' would install (first form), or the
         \\named asset (second form, exact match preferred, otherwise unique
         \\substring). Downloads are auto-verified against any sigstore bundle
-        \\or checksum sidecar published with the release. Pass a minisign key
-        \\(inline or `--minisign`) to also require minisign signature
-        \\verification against a `<asset>.minisig` sidecar.
+        \\or checksum sidecar published with the release, and against any
+        \\GitHub artifact attestation covering the downloaded digest. Pass a
+        \\minisign key (inline or `--minisign`) to also require minisign
+        \\signature verification against a `<asset>.minisig` sidecar.
         \\
         \\Multi-spec invocations share a single HTTP client + auth context.
         \\
@@ -1171,4 +1195,66 @@ test "validateMultiTargetOptions rejects --sha256 with multi-target" {
     try opts.targets.append(std.testing.allocator, .{ .spec = "other/repo@2.0" });
 
     try std.testing.expectError(error.ConflictingFlag, validateMultiTargetOptions(&opts, &err_w.writer));
+}
+
+test "skip gates stay independent of each other" {
+    // The two Sigstore-derived verifiers are separate mechanisms, so
+    // silencing one must never silence the other.
+    var sigstore_only: Options = .{ .skip_sigstore = true };
+    const g1 = sigstore_only.gates();
+    try std.testing.expect(g1.skip_sigstore);
+    try std.testing.expect(!g1.skip_attestation);
+
+    var attestation_only: Options = .{ .skip_attestation = true };
+    const g2 = attestation_only.gates();
+    try std.testing.expect(g2.skip_attestation);
+    try std.testing.expect(!g2.skip_sigstore);
+
+    // Neither narrow flag may leak into an unrelated verifier.
+    try std.testing.expect(!g1.skip_checksum);
+    try std.testing.expect(!g1.skip_minisign);
+    try std.testing.expect(!g1.skip_authenticode);
+    try std.testing.expect(!g2.skip_checksum);
+    try std.testing.expect(!g2.skip_minisign);
+    try std.testing.expect(!g2.skip_authenticode);
+}
+
+test "skip-verify is the umbrella over every verifier" {
+    var opts: Options = .{ .skip_verify = true };
+    const gates = opts.gates();
+    try std.testing.expect(gates.skip_verify);
+    try std.testing.expect(gates.shouldSkip(.sigstore));
+    try std.testing.expect(gates.shouldSkip(.attestation));
+    try std.testing.expect(gates.shouldSkip(.checksum));
+    try std.testing.expect(gates.shouldSkip(.minisign));
+    try std.testing.expect(gates.shouldSkip(.authenticode));
+}
+
+test "verification failures and lookup failures get different exit codes" {
+    // An attestation that exists but does not verify is a statement about
+    // the artifact.
+    try std.testing.expectEqual(
+        exit_sha256_mismatch,
+        verifyExitCode(error.AttestationVerificationFailed),
+    );
+    // An attestation we could not fetch is a statement about the network.
+    try std.testing.expectEqual(
+        exit_http_error,
+        verifyExitCode(error.AttestationLookupFailed),
+    );
+    try std.testing.expectEqual(
+        exit_sha256_mismatch,
+        verifyExitCode(error.ChecksumMismatch),
+    );
+    try std.testing.expectEqual(
+        exit_http_error,
+        verifyExitCode(error.MinisignDownloadFailed),
+    );
+
+    // Both attestation outcomes are deliberately classified, so neither
+    // falls through to the raw-error diagnostic.
+    try std.testing.expect(isClassifiedVerifyError(error.AttestationVerificationFailed));
+    try std.testing.expect(isClassifiedVerifyError(error.AttestationLookupFailed));
+    try std.testing.expect(!isClassifiedVerifyError(error.OutOfMemory));
+    try std.testing.expectEqual(exit_http_error, verifyExitCode(error.OutOfMemory));
 }
