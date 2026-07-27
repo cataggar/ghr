@@ -1500,6 +1500,10 @@ pub const Identity = struct {
     runner_environment: ?[]const u8 = null,
     source_repository_uri: ?[]const u8 = null,
     source_repository_owner_uri: ?[]const u8 = null,
+    /// Numeric repository id (OID .1.15). Unlike the URI above this
+    /// survives a rename or transfer, so it is the only identity in the
+    /// certificate that can still be matched after one.
+    source_repository_id: ?[]const u8 = null,
     build_config_uri: ?[]const u8 = null,
     /// Legacy repository extension (`owner/repo`) used as a fallback when
     /// the URI-form source repository extension is absent.
@@ -1587,6 +1591,7 @@ pub fn extractIdentity(leaf_der: []const u8) !Identity {
                 9 => id.build_signer_uri = parseDerUtf8String(value_bytes) orelse continue,
                 11 => id.runner_environment = parseDerUtf8String(value_bytes) orelse continue,
                 12 => id.source_repository_uri = parseDerUtf8String(value_bytes) orelse continue,
+                15 => id.source_repository_id = parseDerUtf8String(value_bytes) orelse continue,
                 16 => id.source_repository_owner_uri = parseDerUtf8String(value_bytes) orelse continue,
                 18 => id.build_config_uri = parseDerUtf8String(value_bytes) orelse continue,
                 else => {},
@@ -1624,6 +1629,14 @@ pub const VerificationPolicy = struct {
     expected_oidc_issuer: ?[]const u8 = null,
     expected_repository_uri: ?[]const u8 = null,
     expected_owner_uri: ?[]const u8 = null,
+    /// Numeric repository id the attestation is filed under, when the
+    /// caller knows it. A certificate's `source_repository_uri` is frozen
+    /// at signing time and cannot follow a later rename or transfer, so a
+    /// renamed repository would otherwise fail `expected_repository_uri`
+    /// even though the attestation is genuinely its own. Matching the
+    /// rename-stable numeric id accepts that case without weakening the
+    /// check: the id must still match exactly.
+    expected_repository_id: ?[]const u8 = null,
     expected_build_config_prefix: ?[]const u8 = null,
     subject_binding: SubjectBinding = .name_and_digest,
 };
@@ -1649,13 +1662,21 @@ fn enforcePolicy(
             return error.OidcIssuerMismatch;
     }
 
+    var repository_matched_by_id = false;
     if (policy.expected_repository_uri) |expected| {
-        if (!matchesRepository(identity, expected))
-            return error.SourceRepositoryMismatch;
+        switch (matchesRepository(identity, expected, policy.expected_repository_id)) {
+            .no => return error.SourceRepositoryMismatch,
+            .by_uri => {},
+            .by_id => repository_matched_by_id = true,
+        }
     }
 
     if (policy.expected_owner_uri) |expected| {
-        if (!matchesOwner(identity, expected))
+        // A numeric-id match already pins the exact repository, and a
+        // transfer moves it to a different owner without changing that id.
+        // Checking the owner URI in that case would reject the very
+        // attestation the id just proved genuine.
+        if (!repository_matched_by_id and !matchesOwner(identity, expected))
             return error.SourceRepositoryOwnerMismatch;
     }
 
@@ -1667,14 +1688,36 @@ fn enforcePolicy(
     }
 }
 
-fn matchesRepository(identity: Identity, expected_uri: []const u8) bool {
+const RepositoryMatch = enum { no, by_uri, by_id };
+
+fn matchesRepository(
+    identity: Identity,
+    expected_uri: []const u8,
+    expected_id: ?[]const u8,
+) RepositoryMatch {
     if (identity.source_repository_uri) |actual| {
-        return std.ascii.eqlIgnoreCase(actual, expected_uri);
+        if (std.ascii.eqlIgnoreCase(actual, expected_uri)) return .by_uri;
+        // The names differ. Accept only if both sides carry the same
+        // rename-stable numeric id, which means this really is the same
+        // repository under a name it has since changed.
+        if (idsMatch(identity.source_repository_id, expected_id)) return .by_id;
+        return .no;
     }
-    const legacy = identity.legacy_repository orelse return false;
+    const legacy = identity.legacy_repository orelse return .no;
     const github_prefix = "https://github.com/";
-    if (!asciiStartsWithIgnoreCase(expected_uri, github_prefix)) return false;
-    return std.ascii.eqlIgnoreCase(legacy, expected_uri[github_prefix.len..]);
+    if (!asciiStartsWithIgnoreCase(expected_uri, github_prefix)) return .no;
+    if (!std.ascii.eqlIgnoreCase(legacy, expected_uri[github_prefix.len..])) return .no;
+    return .by_uri;
+}
+
+/// True when both ids are present and equal. A missing id on either side
+/// is never a match, so this can only ever accept an attestation, never
+/// substitute for a check that would otherwise have run.
+fn idsMatch(actual: ?[]const u8, expected: ?[]const u8) bool {
+    const a = actual orelse return false;
+    const e = expected orelse return false;
+    if (a.len == 0 or e.len == 0) return false;
+    return std.mem.eql(u8, a, e);
 }
 
 fn matchesOwner(identity: Identity, expected_uri: []const u8) bool {
@@ -2489,6 +2532,7 @@ test "extractIdentity exposes GitHub repository policy extensions" {
         "https://github.com/wasmCloud",
         id.source_repository_owner_uri.?,
     );
+    try std.testing.expectEqualStrings("304403692", id.source_repository_id.?);
     try std.testing.expectEqualStrings(
         "https://github.com/wasmCloud/wasmCloud/.github/workflows/release-tag.yml@refs/heads/main",
         id.build_config_uri.?,
@@ -2545,6 +2589,78 @@ test "GitHub policy enforces predicate and repository identity" {
     try std.testing.expectError(
         error.BuildConfigMismatch,
         enforcePolicy(bundle.payload, id, wrong_build_config),
+    );
+}
+
+test "renamed repository verifies through its rename-stable numeric id" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_wash_bundle_json);
+    defer bundle.deinit();
+
+    const id = try extractIdentity(bundle.leaf_der);
+    // What a lookup looks like after the repository was renamed and
+    // transferred: GitHub answers under the new name, but the certificate
+    // still carries the name it had when it was signed.
+    const renamed: VerificationPolicy = .{
+        .expected_repository_uri = "https://github.com/newowner/renamed",
+        .expected_owner_uri = "https://github.com/newowner",
+        .expected_repository_id = "304403692",
+        .subject_binding = .digest_only,
+    };
+    try enforcePolicy(bundle.payload, id, renamed);
+
+    // A different repository's id must not be accepted under a name that
+    // does not match either.
+    var wrong_id = renamed;
+    wrong_id.expected_repository_id = "999999999";
+    try std.testing.expectError(
+        error.SourceRepositoryMismatch,
+        enforcePolicy(bundle.payload, id, wrong_id),
+    );
+
+    // Without an id the mismatched name is still fatal, so the id is the
+    // only thing that can widen the check.
+    var no_id = renamed;
+    no_id.expected_repository_id = null;
+    try std.testing.expectError(
+        error.SourceRepositoryMismatch,
+        enforcePolicy(bundle.payload, id, no_id),
+    );
+
+    // An empty id is not a wildcard.
+    var empty_id = renamed;
+    empty_id.expected_repository_id = "";
+    try std.testing.expectError(
+        error.SourceRepositoryMismatch,
+        enforcePolicy(bundle.payload, id, empty_id),
+    );
+}
+
+test "matching repository id does not let a wrong name pass by prefix" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_wash_bundle_json);
+    defer bundle.deinit();
+
+    const id = try extractIdentity(bundle.leaf_der);
+    // The id is compared exactly, not as a prefix or substring.
+    const policy: VerificationPolicy = .{
+        .expected_repository_uri = "https://github.com/other/repo",
+        .expected_owner_uri = "https://github.com/other",
+        .subject_binding = .digest_only,
+    };
+
+    var truncated = policy;
+    truncated.expected_repository_id = "30440369";
+    try std.testing.expectError(
+        error.SourceRepositoryMismatch,
+        enforcePolicy(bundle.payload, id, truncated),
+    );
+
+    var extended = policy;
+    extended.expected_repository_id = "3044036920";
+    try std.testing.expectError(
+        error.SourceRepositoryMismatch,
+        enforcePolicy(bundle.payload, id, extended),
     );
 }
 

@@ -4,6 +4,7 @@ const http = @import("http.zig");
 const archive = @import("archive.zig");
 const auth = @import("auth.zig");
 const release_mod = @import("release.zig");
+const attestation = @import("attestation.zig");
 const Dirs = @import("dirs.zig").Dirs;
 
 const Io = std.Io;
@@ -46,8 +47,13 @@ pub const Options = struct {
     /// Skip just the minisign-sidecar verification step. Bypasses the
     /// fail-closed "sidecar present but no key" diagnostic.
     skip_minisign: bool = false,
-    /// Skip just the sigstore-bundle verification step.
+    /// Skip just the sigstore-bundle verification step. Applies only to a
+    /// `.sigstore.json` sidecar published alongside the release asset.
     skip_sigstore: bool = false,
+    /// Skip just the GitHub-native artifact attestation lookup and
+    /// verification. Independent of `skip_sigstore`: an asset can carry
+    /// both forms, and each is verified on its own.
+    skip_attestation: bool = false,
     /// Skip just the Authenticode (Windows PE) verification step.
     skip_authenticode: bool = false,
     /// Raw base64 minisign public key (single token). Default applied to
@@ -72,6 +78,7 @@ pub const Options = struct {
             .skip_checksum = self.skip_checksum,
             .skip_minisign = self.skip_minisign,
             .skip_sigstore = self.skip_sigstore,
+            .skip_attestation = self.skip_attestation,
             .skip_authenticode = self.skip_authenticode,
         };
     }
@@ -93,6 +100,11 @@ const ResolvedTarget = struct {
     release: ?release_mod.ParsedRelease,
     /// Asset name within `release.parsed.value.assets`, when release is set.
     asset_name: ?[]const u8,
+    /// Owner/repo the asset came from, used to look up GitHub-native
+    /// attestations. Set for repository and file specs, and for release
+    /// URLs we could decode; null for arbitrary URLs, which have no
+    /// repository to query.
+    repository: ?attestation.Repository = null,
     /// Allocated buffer for parseGitHubReleaseUrl results (URL form only).
     url_decoded: ?release_mod.ParsedReleaseUrl,
 
@@ -392,6 +404,7 @@ fn downloadOne(
             per_spec_auth_header,
             gates,
             effective_minisign_pubkey,
+            target.repository,
             w,
             err_w,
         ) catch |verr| {
@@ -405,8 +418,15 @@ fn downloadOne(
                 error.MinisignKeyIdMismatch,
                 error.MinisignSignatureMismatch,
                 error.MinisignGlobalSigMismatch,
+                // Cryptographic, identity, and subject-binding failures on
+                // an attestation that *does* exist are verification
+                // failures, not transport problems.
+                error.AttestationVerificationFailed,
                 => return step.fail(exit_sha256_mismatch),
                 error.MinisignDownloadFailed,
+                // Could not reach or read the attestation API, so we never
+                // learned whether one exists.
+                error.AttestationLookupFailed,
                 => return step.fail(exit_http_error),
                 else => {
                     try err_w.print("error: verification failed: {}\n", .{verr});
@@ -416,6 +436,39 @@ fn downloadOne(
             }
         };
         _ = outcome;
+    } else if (target.repository) |repo| {
+        // No release context (a bare release URL whose API lookup failed),
+        // so only the digest-keyed attestation stage can run. Without this
+        // the artifact would be kept with no verification at all and no
+        // diagnostic.
+        if (gates.skip_verify) {
+            try w.print("note: verification skipped (--skip-verify)\n", .{});
+            try w.flush();
+        } else if (gates.skip_attestation) {
+            try w.print("note: github attestation verification skipped (--skip-attestation)\n", .{});
+            try w.flush();
+        } else {
+            const outcome = release_mod.verifyDownloadedAssetAttestation(
+                allocator,
+                io,
+                repo,
+                part_path,
+                debug_w,
+                per_spec_auth_header,
+                w,
+                err_w,
+            ) catch |verr| {
+                Dir.deleteFileAbsolute(io, part_path) catch {};
+                switch (verr) {
+                    error.AttestationVerificationFailed => return step.fail(exit_sha256_mismatch),
+                    else => return step.fail(exit_http_error),
+                }
+            };
+            if (outcome == .no_verification) {
+                try w.print("note: download is unverified (no release context for this URL)\n", .{});
+                try w.flush();
+            }
+        }
     }
 
     // 6) Atomic rename into place.
@@ -513,6 +566,10 @@ fn resolveTarget(
                     .release = null,
                     .asset_name = null,
                     .url_decoded = null,
+                    // Not a release-download URL, but if it points at a
+                    // repository we can still verify by digest instead of
+                    // downloading with no verification at all.
+                    .repository = release_mod.repositoryFromGitHubUrl(u),
                 };
             }
             const gh = gh_opt.?;
@@ -543,17 +600,25 @@ fn resolveTarget(
                     .release = rel,
                     .asset_name = gh.file,
                     .url_decoded = gh,
+                    // Prefer the canonical name from the release body (it
+                    // borrows from `rel`); fall back to the URL's slug,
+                    // which borrows from `gh`, retained in `url_decoded`.
+                    .repository = release_mod.canonicalRepository(rel.parsed.value) orelse
+                        .{ .owner = gh.owner, .repo = gh.repo },
                 };
             }
-            // Couldn't fetch release context; download anyway, no verify.
-            var gh_mut = gh;
-            gh_mut.deinit(allocator);
+            // Couldn't fetch release context, so checksum/minisign/sigstore
+            // have nothing to work from. Attestations are looked up by
+            // digest against the repository itself, so they still apply —
+            // retain the decoded owner/repo and let that stage run rather
+            // than silently downloading an unverified artifact.
             return .{
                 .download_url = u,
                 .default_filename = null,
                 .release = null,
                 .asset_name = null,
-                .url_decoded = null,
+                .url_decoded = gh,
+                .repository = .{ .owner = gh.owner, .repo = gh.repo },
             };
         },
         .repo_spec => |rs| {
@@ -575,6 +640,8 @@ fn resolveTarget(
                 .release = rel,
                 .asset_name = asset.name,
                 .url_decoded = null,
+                .repository = release_mod.canonicalRepository(rel.parsed.value) orelse
+                    .{ .owner = rs.owner, .repo = rs.repo },
             };
         },
         .file_spec => |fs| {
@@ -596,6 +663,8 @@ fn resolveTarget(
                         .release = rel,
                         .asset_name = asset.name,
                         .url_decoded = null,
+                        .repository = release_mod.canonicalRepository(rel.parsed.value) orelse
+                            .{ .owner = fs.owner, .repo = fs.repo },
                     };
                 },
                 .none => {
@@ -815,6 +884,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
             opts.skip_minisign = true;
         } else if (eql(arg, "--skip-sigstore")) {
             opts.skip_sigstore = true;
+        } else if (eql(arg, "--skip-attestation")) {
+            opts.skip_attestation = true;
         } else if (eql(arg, "--skip-authenticode")) {
             opts.skip_authenticode = true;
         } else if (eql(arg, "--minisign")) {
@@ -943,10 +1014,11 @@ fn printDownloadUsage(w: *Writer) !void {
         \\        --strip-components <N> Strip N leading path components when extracting
         \\        --sha256 <hex>         Verify download against literal SHA-256 digest (single-spec only)
         \\        --minisign <pubkey>    Default minisign key, applied to specs without an inline key
-        \\        --skip-verify          Skip every verification step (checksum, minisign, sigstore, authenticode)
+        \\        --skip-verify          Skip every verification step (checksum, minisign, sigstore, attestation, authenticode)
         \\        --skip-checksum        Skip checksum verification (GitHub asset digest + .sha256/.sha512 sidecar)
         \\        --skip-minisign        Skip just the minisign verification step
-        \\        --skip-sigstore        Skip just the sigstore-bundle verification step
+        \\        --skip-sigstore        Skip just the published .sigstore.json sidecar verification step
+        \\        --skip-attestation     Skip just the GitHub-native artifact attestation verification step
         \\        --skip-authenticode    Skip just the Authenticode (Windows PE) verification step
         \\        --keep-archive         Keep archive on disk after extraction
         \\        --keep-going           For multi-spec, continue past per-spec failures

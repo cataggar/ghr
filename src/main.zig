@@ -65,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
         var skip_checksum = false;
         var skip_minisign = false;
         var skip_sigstore = false;
+        var skip_attestation = false;
         var skip_authenticode = false;
         var keep_going = false;
         var minisign_pubkey: ?[]const u8 = null;
@@ -83,6 +84,8 @@ pub fn main(init: std.process.Init) !void {
                 skip_minisign = true;
             } else if (eql(arg, "--skip-sigstore")) {
                 skip_sigstore = true;
+            } else if (eql(arg, "--skip-attestation")) {
+                skip_attestation = true;
             } else if (eql(arg, "--skip-authenticode")) {
                 skip_authenticode = true;
             } else if (eql(arg, "--keep-going")) {
@@ -135,6 +138,7 @@ pub fn main(init: std.process.Init) !void {
             .skip_checksum = skip_checksum,
             .skip_minisign = skip_minisign,
             .skip_sigstore = skip_sigstore,
+            .skip_attestation = skip_attestation,
             .skip_authenticode = skip_authenticode,
         };
         try install.cmdInstallMany(
@@ -450,10 +454,11 @@ fn printInstallUsage(w: *Writer) !void {
         \\OPTIONS:
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
-        \\    --skip-verify           Skip every verification step (checksum, minisign, sigstore, authenticode)
+        \\    --skip-verify           Skip every verification step (checksum, minisign, sigstore, attestation, authenticode)
         \\    --skip-checksum         Skip checksum verification (GitHub asset digest + .sha256/.sha512 sidecar)
         \\    --skip-minisign         Skip just the minisign verification step
-        \\    --skip-sigstore         Skip just the sigstore-bundle verification step
+        \\    --skip-sigstore         Skip just the published .sigstore.json sidecar verification step
+        \\    --skip-attestation      Skip just the GitHub-native artifact attestation verification step
         \\    --skip-authenticode     Skip just the Authenticode (Windows PE) verification step
         \\    --minisign <pubkey>     Default minisign key, applied to specs without an inline key;
         \\                            <pubkey> is a base64 minisign public key string
@@ -738,7 +743,8 @@ fn printUsage(w: *Writer) !void {
         \\OPTIONS:
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
-        \\    --skip-verify           Skip sigstore + SHA256 + minisign verification
+        \\    --skip-verify           Skip every verification step: checksum, minisign,
+        \\                            sigstore sidecar, GitHub attestation, authenticode
         \\    --minisign <pubkey>     Require minisign signature (install/download only);
         \\                            <pubkey> is a base64 minisign public key string
         \\    --keep-going            For multi-spec install/download, continue past

@@ -5,6 +5,7 @@ const http = @import("http.zig");
 const archive = @import("archive.zig");
 const auth = @import("auth.zig");
 const release_mod = @import("release.zig");
+const attestation = @import("attestation.zig");
 const version = @import("build_options").version;
 
 const Io = std.Io;
@@ -1910,6 +1911,7 @@ fn verifyDownloadedAsset(
     asset_name: []const u8,
     download_path: []const u8,
     minisign_pubkey_b64: ?[]const u8,
+    repository: ?attestation.Repository,
     debug_w: ?*Writer,
 ) !VerifyResult {
     const allocator = ctx.allocator;
@@ -1922,10 +1924,12 @@ fn verifyDownloadedAsset(
 
     // Verification (issue #50 + issue #65). Runs after the asset is on
     // disk, before we extract or move anything. Checksum (Phase 1),
-    // minisign (issue #65, requires a key — inline or `--minisign`), and
-    // sigstore bundle (Phase 2) are independent — all run when material
-    // is published, unless the matching skip flag suppresses one. Outcome
-    // precedence for the metadata label: sigstore > minisign > authenticode > checksum.
+    // minisign (issue #65, requires a key — inline or `--minisign`),
+    // sigstore sidecar (Phase 2), and GitHub-native attestation
+    // (issue #165) are independent — all run when material is published,
+    // unless the matching skip flag suppresses one. The recorded label is
+    // the strongest successful outcome, ranked by `release_mod`:
+    // github-attestation > sigstore > minisign > authenticode > checksum.
     var verified_label: []const u8 = "none";
     // Pubkey the install actually verified against (sticky across the
     // other verifiers' outcomes). Recorded in `ghr.json` and surfaced by
@@ -1994,8 +1998,6 @@ fn verifyDownloadedAsset(
             };
             break :blk if (sidecar_outcome == .sha256_verified) sidecar_outcome else gh_outcome;
         };
-        if (sha_outcome == .sha256_verified) verified_label = "checksum";
-        if (sha_outcome == .github_digest_verified) verified_label = "github-digest";
 
         const mini_outcome: release_mod.VerifyOutcome = if (gates.skip_minisign) blk: {
             if (minisign_pubkey_b64 != null) {
@@ -2020,7 +2022,6 @@ fn verifyDownloadedAsset(
             return error.InstallStepFailed;
         };
         if (mini_outcome == .minisign_verified) {
-            verified_label = "minisign";
             recorded_minisign_key = minisign_pubkey_b64;
         }
 
@@ -2040,7 +2041,6 @@ fn verifyDownloadedAsset(
             Dir.deleteFileAbsolute(io, download_path) catch {};
             return error.InstallStepFailed;
         };
-        if (ac_outcome == .authenticode_verified) verified_label = "authenticode";
 
         const sig_outcome: release_mod.VerifyOutcome = if (gates.skip_sigstore) blk: {
             try w.print("note: sigstore verification skipped (--skip-sigstore)\n", .{});
@@ -2062,14 +2062,39 @@ fn verifyDownloadedAsset(
             Dir.deleteFileAbsolute(io, download_path) catch {};
             return error.InstallStepFailed;
         };
-        if (sig_outcome == .sigstore_verified) verified_label = "sigstore";
 
-        if (sha_outcome == .no_verification and
-            mini_outcome == .no_verification and
-            ac_outcome == .no_verification and
-            sig_outcome == .no_verification)
-        {
-            try w.print("note: download is unverified (no checksum, minisign, sigstore, or authenticode)\n", .{});
+        // Runs even when the sidecar above succeeded: the two forms are
+        // independent, and a release can publish both.
+        const att_outcome: release_mod.VerifyOutcome = if (gates.skip_attestation) blk: {
+            try w.print("note: github attestation verification skipped (--skip-attestation)\n", .{});
+            break :blk .no_verification;
+        } else release_mod.verifyDownloadedAssetAttestation(
+            allocator,
+            io,
+            repository,
+            download_path,
+            debug_w,
+            auth_header,
+            w,
+            err_w,
+        ) catch {
+            // Diagnostic and remediation hint already printed by the
+            // verifier.
+            Dir.deleteFileAbsolute(io, download_path) catch {};
+            return error.InstallStepFailed;
+        };
+
+        const best = release_mod.strongestOutcome(&.{
+            att_outcome,
+            sig_outcome,
+            mini_outcome,
+            ac_outcome,
+            sha_outcome,
+        });
+        if (release_mod.outcomeLabel(best)) |label| {
+            verified_label = label;
+        } else {
+            try w.print("note: download is unverified (no checksum, minisign, sigstore, attestation, or authenticode)\n", .{});
         }
         try w.flush();
     }
@@ -2092,6 +2117,7 @@ fn installWasmModuleUnit(
     owner_lower: []const u8,
     repo_lower: []const u8,
     minisign_pubkey_b64: ?[]const u8,
+    repository: ?attestation.Repository,
 ) ![]const u8 {
     const allocator = ctx.allocator;
     const io = ctx.io;
@@ -2139,7 +2165,7 @@ fn installWasmModuleUnit(
     };
     defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
-    const vr = try verifyDownloadedAsset(ctx, assets, asset.name, download_path, minisign_pubkey_b64, debug_w);
+    const vr = try verifyDownloadedAsset(ctx, assets, asset.name, download_path, minisign_pubkey_b64, repository, debug_w);
 
     // Download + validate the companion `<wasm>.ghr` manifest.
     const ghr_name = try std.fmt.allocPrint(allocator, "{s}.ghr", .{asset.name});
@@ -2438,6 +2464,8 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
                 owner_lower,
                 repo_lower,
                 minisign_pubkey_b64,
+                release_mod.canonicalRepository(release.parsed.value) orelse
+                    .{ .owner = spec.owner, .repo = spec.repo },
             ) catch |err| switch (err) {
                 error.InstallStepFailed => return error.InstallStepFailed,
                 else => return err,
@@ -2549,7 +2577,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
             }
         }
 
-        const vr = try verifyDownloadedAsset(ctx, release.parsed.value.assets, asset.name, download_path, minisign_pubkey_b64, debug_w);
+        const vr = try verifyDownloadedAsset(ctx, release.parsed.value.assets, asset.name, download_path, minisign_pubkey_b64, release_mod.canonicalRepository(release.parsed.value) orelse .{ .owner = spec.owner, .repo = spec.repo }, debug_w);
         verified_label = vr.label;
         recorded_minisign_key = vr.minisign_key;
 

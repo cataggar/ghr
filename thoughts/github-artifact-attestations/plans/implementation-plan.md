@@ -575,6 +575,95 @@ metadata result.
 - Existing minisign/Authenticode precedence matches the documented order in
   both pipelines after the shared ranking change.
 
+### Implementation Status
+
+- [x] `VerifyGates.skip_attestation` and `.github_attestation_verified` added.
+- [x] Shared `outcomeRank` / `strongestOutcome` / `outcomeLabel` helpers added
+  in `release.zig` and used by both pipelines. This corrected a real
+  inconsistency: `install.zig` assigned its label by sequential overwrite, so
+  Authenticode outranked minisign there but not in `download.zig`.
+- [x] `verifyDownloadedAssetAttestation` added, running even when the sidecar
+  succeeds.
+- [x] Repository context threaded through `ResolvedTarget` (repo specs, file
+  specs, and decoded release URLs) and through both install paths, including
+  `installWasmModuleUnit`.
+- [x] `--skip-attestation` parsed for both `ghr install` and `ghr download`;
+  help text updated in all three places, including the umbrella `--skip-verify`
+  description.
+- [x] Exit codes mapped: lookup/transport failures to `2`, verification
+  failures to `3`.
+
+#### Deviation from the plan: two absence signals, not one
+
+The plan assumed absence was signalled only by a successful empty response.
+Probing the live API showed there are two, and treating the first as an error
+broke every repository that has never published an attestation:
+
+- `404` — the repository has never produced an attestation
+  (`BurntSushi/ripgrep`).
+- `200` with `{"attestations":[]}` — the repository does use attestations, but
+  not for this digest (`cli/cli` queried with an unknown digest).
+
+`attestation.lookup` now maps both to `.none`. A 404 is safe to treat as
+absence here because reaching that call already required successfully
+downloading a release asset from the same repository, so it reflects an
+absence of attestations rather than an access-control redaction. All other
+statuses remain hard failures.
+
+#### Deviation from the plan: repository identity must be rename-stable
+
+Review found that matching only the certificate's `source_repository_uri`
+breaks after a repository is renamed or transferred. GitHub keys attestation
+storage by the repository's *numeric* id, so the API keeps returning the
+pre-rename attestations, but the Fulcio leaf's URI is frozen at signing time
+and still names the old owner/repo. The canonical name resolves to the *new*
+name, so every candidate failed `SourceRepositoryMismatch`, surfacing as exit
+`3` and deleting a perfectly good artifact with a security-looking message.
+
+The verifier now also binds on the rename-stable numeric id:
+
+- `sigstore.Identity` extracts Fulcio OID `1.3.6.1.4.1.57264.1.15`
+  ("Source Repository Identifier").
+- `attestation.BundleSet` carries each candidate's `repository_id` from the
+  API response instead of discarding it.
+- `VerificationPolicy.expected_repository_id` is set per candidate, and a URI
+  mismatch is accepted only when both ids are present, non-empty, and exactly
+  equal.
+- A match by id also satisfies the owner check, since the id already pins the
+  exact repository and a transfer changes the owner without changing the id.
+
+This does not weaken the policy. The id comes from a TLS-authenticated API
+response for the repository actually being verified and must equal the id
+inside the Fulcio-signed certificate, so it cannot be attacker-chosen. A
+missing or empty id on either side never matches, so the id can only ever
+accept an attestation that a rename would otherwise have wrongly rejected.
+
+### Manual Verification
+
+- [x] `ghr download cli/cli/gh_2.96.0_macOS_arm64.zip` verifies the native
+  attestation and prints source, workflow, issuer, and inclusion:
+
+  ```
+  verified github attestation: sha256 f23a0c37d963... (rekor t=..., log 2049189324)
+    source:   https://github.com/cli/cli
+    workflow: https://github.com/cli/cli/.github/workflows/deployment.yml@refs/heads/trunk
+    issuer:   https://token.actions.githubusercontent.com
+    inclusion: tree size 1927285185 + checkpoint
+  ```
+
+- [x] `ghr install cli/cli` records `"verified":"github-attestation"` in
+  `ghr.json`.
+- [x] `--skip-attestation` and `--skip-verify` suppress the stage;
+  `--skip-sigstore` does **not**.
+- [x] `BurntSushi/ripgrep` (no attestations) falls back to checksum
+  verification with no diagnostic.
+- [x] A release-download permalink (`.../releases/latest/download/...`) is
+  verified rather than silently skipped.
+- [x] A bad `GH_TOKEN` on a release URL fails closed with exit `2` instead of
+  reporting success.
+- [x] `github/hub@v2.14.2` (renamed to `mislav/hub`) resolves, downloads, and
+  exits `0`.
+
 ---
 
 ## Phase 4: Actions, Documentation, Fixtures, and End-to-End Coverage
@@ -583,6 +672,12 @@ metadata result.
 
 Expose the feature consistently across every user-facing surface and add
 fixture-driven regression coverage.
+
+Carried over from Phase 3 review: a download from a non-`github.com` URL has
+no repository context, so no verification is even attempted, yet it exits `0`
+with no diagnostic at all. Every other path prints an "unverified" note. This
+is pre-existing rather than a Phase 3 regression, so it was left out of that
+change, but the silence should be made consistent here.
 
 ### Changes Required
 

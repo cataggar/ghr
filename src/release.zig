@@ -15,6 +15,7 @@ const http = @import("http.zig");
 const sigstore = @import("sigstore.zig");
 const minisign = @import("minisign.zig");
 const authenticode = @import("authenticode.zig");
+const attestation = @import("attestation.zig");
 const version = @import("build_options").version;
 
 const Io = std.Io;
@@ -50,13 +51,20 @@ pub const SpecWithKey = struct {
 };
 
 /// Bundle of per-invocation verification skip flags. `skip_verify` is the
-/// umbrella (disables every check); the four narrow flags suppress one
-/// path apiece.
+/// umbrella (disables every check); the narrow flags suppress one path
+/// apiece.
+///
+/// `skip_sigstore` and `skip_attestation` are deliberately separate. The
+/// former suppresses only the release-published `.sigstore.json` sidecar;
+/// the latter suppresses only the GitHub-native attestation looked up
+/// through the API. A release can publish both, and each is verified
+/// independently.
 pub const VerifyGates = struct {
     skip_verify: bool = false,
     skip_checksum: bool = false,
     skip_minisign: bool = false,
     skip_sigstore: bool = false,
+    skip_attestation: bool = false,
     skip_authenticode: bool = false,
 };
 
@@ -350,7 +358,68 @@ pub fn assetDownload(asset: Asset, have_auth: bool) AssetDownload {
 pub const Release = struct {
     tag_name: []const u8,
     assets: []const Asset,
+    /// Canonical release URL, e.g.
+    /// `https://github.com/mislav/hub/releases/tag/v2.14.2`. GitHub answers
+    /// the API for a *renamed or transferred* repository under its current
+    /// name, so this is the only place in the response that reveals the
+    /// identity attestations are actually filed under. Optional because
+    /// older captured fixtures omit it.
+    html_url: ?[]const u8 = null,
 };
+
+/// Owner/repo from any `https://github.com/{owner}/{repo}/...` URL.
+///
+/// Deliberately looser than `parseGitHubReleaseUrl`, which only accepts the
+/// `/releases/download/{tag}/{file}` shape. The permalink form GitHub
+/// recommends in READMEs — `/releases/latest/download/{file}` — does not
+/// match that shape, but the repository is still right there in the URL and
+/// attestations are keyed by digest, so the attestation stage can still run.
+///
+/// Returns null for non-github.com URLs and anything without two path
+/// segments. Slices borrow from `url`.
+pub fn repositoryFromGitHubUrl(url: []const u8) ?attestation.Repository {
+    const prefix = "https://github.com/";
+    if (!std.mem.startsWith(u8, url, prefix)) return null;
+    var rest = url[prefix.len..];
+
+    const owner_end = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const owner = rest[0..owner_end];
+    rest = rest[owner_end + 1 ..];
+
+    var repo_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    // Tolerate a bare `owner/repo?x=y` or `owner/repo#frag`.
+    if (std.mem.indexOfAny(u8, rest[0..repo_end], "?#")) |cut| repo_end = cut;
+    const repo = rest[0..repo_end];
+
+    if (owner.len == 0 or repo.len == 0) return null;
+    return .{ .owner = owner, .repo = repo };
+}
+
+/// Canonical `owner/repo` for a release, parsed from its `html_url`.
+///
+/// The slug the user typed can be stale: `github/hub` still resolves, but
+/// GitHub files its releases — and its attestations — under `mislav/hub`.
+/// Attestation lookup and repository policy must both use the canonical
+/// name, or a renamed repository fails a check it should pass.
+///
+/// Returns null when `html_url` is absent or not a github.com release URL,
+/// leaving the caller to fall back to the requested slug.
+pub fn canonicalRepository(release: Release) ?attestation.Repository {
+    const url = release.html_url orelse return null;
+    const prefix = "https://github.com/";
+    if (!std.mem.startsWith(u8, url, prefix)) return null;
+    var rest = url[prefix.len..];
+
+    const owner_end = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const owner = rest[0..owner_end];
+    rest = rest[owner_end + 1 ..];
+
+    const repo_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const repo = rest[0..repo_end];
+
+    if (owner.len == 0 or repo.len == 0) return null;
+    return .{ .owner = owner, .repo = repo };
+}
 
 /// URL-encode a tag for use in the GitHub API path.
 /// Handles '+' -> '%2B' and other special characters.
@@ -870,11 +939,59 @@ pub const VerifyOutcome = enum {
     /// SET) succeeded. This implies SHA256 verification too — the bundle's
     /// `messageDigest` is checked against the cached file.
     sigstore_verified,
+    /// A GitHub-native artifact attestation was found through the API for
+    /// the downloaded file's SHA-256 and verified against GitHub's trust
+    /// material and repository policy. Ranked above `sigstore_verified`
+    /// because the digest is bound by GitHub rather than by a sidecar the
+    /// release author uploaded alongside the asset.
+    github_attestation_verified,
     /// No verification material was published for this release.
     no_verification,
     /// User passed --skip-verify.
     skipped,
 };
+
+/// Strength ordering used to pick which successful verification to report
+/// and record. Both the download and install pipelines rank through this
+/// helper so the documented precedence
+/// (`github-attestation > sigstore > minisign > authenticode > checksum`)
+/// holds identically in each, rather than emerging from the order in
+/// which verifiers happen to run.
+pub fn outcomeRank(outcome: VerifyOutcome) u8 {
+    return switch (outcome) {
+        .github_attestation_verified => 6,
+        .sigstore_verified => 5,
+        .minisign_verified => 4,
+        .authenticode_verified => 3,
+        .sha256_verified => 2,
+        .github_digest_verified => 1,
+        .no_verification, .skipped => 0,
+    };
+}
+
+/// Strongest of `outcomes`, or `.no_verification` when none succeeded.
+pub fn strongestOutcome(outcomes: []const VerifyOutcome) VerifyOutcome {
+    var best: VerifyOutcome = .no_verification;
+    for (outcomes) |outcome| {
+        if (outcomeRank(outcome) > outcomeRank(best)) best = outcome;
+    }
+    return best;
+}
+
+/// Stable identifier recorded in `ghr.json` for a successful outcome, or
+/// null when nothing verified.
+pub fn outcomeLabel(outcome: VerifyOutcome) ?[]const u8 {
+    return switch (outcome) {
+        .github_attestation_verified => "github-attestation",
+        .sigstore_verified => "sigstore",
+        .minisign_verified => "minisign",
+        .authenticode_verified => "authenticode",
+        .sha256_verified => "checksum",
+        .github_digest_verified => "github-digest",
+        .no_verification => null,
+        .skipped => "skipped",
+    };
+}
 
 /// Decode a single ASCII hex character into 0..15. Returns null on invalid input.
 fn hexNibble(c: u8) ?u8 {
@@ -1459,6 +1576,238 @@ pub fn verifyDownloadedAssetSigstore(
     return .sigstore_verified;
 }
 
+/// Verify a GitHub-native artifact attestation for `download_path`.
+///
+/// Unlike the sidecar verifier above, nothing about this stage is
+/// published as a release asset. GitHub records the attestation against
+/// the artifact's SHA-256 at build time, and we look it up by hashing
+/// what we actually downloaded. That makes it independent of the release
+/// author: a tampered asset simply has no attestation for its digest.
+///
+/// Fail-closed rules, in order of subtlety:
+///
+///   * A *successful* API response listing no attestations returns
+///     `.no_verification`, preserving every existing fallback. Most
+///     releases have no attestations and must keep working.
+///   * Any API, auth, rate-limit, or bundle transport failure is an
+///     error. We cannot distinguish "no attestation exists" from "we
+///     were prevented from seeing it", so we refuse to treat the latter
+///     as the former.
+///   * If candidates exist but none verify, that is an error even though
+///     a sidecar or checksum may have passed. An attestation that fails
+///     to verify is evidence of a problem, not an absence of evidence.
+///
+/// Multiple candidates are expected: the same digest can be attested by
+/// several workflow runs. Any one of them verifying under policy is
+/// enough.
+pub fn verifyDownloadedAssetAttestation(
+    allocator: std.mem.Allocator,
+    io: Io,
+    repository: ?attestation.Repository,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    auth_header: ?[]const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
+    // Attestations are keyed by owner/repo. A bare-URL download with no
+    // release context has nothing to query against.
+    const repo = repository orelse {
+        debugLog(debug_w, "debug: attestation: no repository context; skipping lookup\n", .{});
+        return .no_verification;
+    };
+
+    const digest = try computeFileSha256(io, download_path);
+    var digest_hex: [64]u8 = undefined;
+    sha256ToHex(digest, &digest_hex);
+
+    debugLog(debug_w, "debug: attestation lookup: {s}/{s} sha256:{s}\n", .{
+        repo.owner, repo.repo, digest_hex[0..],
+    });
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const result = attestation.lookup(
+        &client,
+        allocator,
+        repo,
+        &digest_hex,
+        auth_header,
+    ) catch |err| {
+        try err_w.print(
+            "error: GitHub attestation lookup failed for '{s}/{s}': {s}\n",
+            .{ repo.owner, repo.repo, @errorName(err) },
+        );
+        try err_w.print(
+            "note: pass --skip-attestation to bypass GitHub-native attestation verification\n",
+            .{},
+        );
+        try err_w.print(
+            "note: private repositories require a token with the 'attestations:read' permission\n",
+            .{},
+        );
+        try err_w.flush();
+        return error.AttestationLookupFailed;
+    };
+    defer result.deinit();
+
+    const bundles = switch (result) {
+        .none => {
+            debugLog(debug_w, "debug: attestation: none published for this digest\n", .{});
+            return .no_verification;
+        },
+        .found => |set| set.items,
+    };
+
+    debugLog(debug_w, "debug: attestation: {d} candidate(s)\n", .{bundles.len});
+
+    const repository_uri = try std.fmt.allocPrint(
+        allocator,
+        "https://github.com/{s}/{s}",
+        .{ repo.owner, repo.repo },
+    );
+    defer allocator.free(repository_uri);
+    const owner_uri = try std.fmt.allocPrint(
+        allocator,
+        "https://github.com/{s}",
+        .{repo.owner},
+    );
+    defer allocator.free(owner_uri);
+
+    const policy: sigstore.VerificationPolicy = .{
+        .expected_predicate_type = null,
+        .expected_repository_uri = repository_uri,
+        .expected_owner_uri = owner_uri,
+        // The attestation names the artifact by digest, and the local
+        // filename is chosen by the downloader, so name matching would be
+        // meaningless here.
+        .subject_binding = .digest_only,
+    };
+
+    const rekor = sigstore.embeddedRekorKey(allocator) catch |err| {
+        try err_w.print("error: failed to load embedded Rekor key: {s}\n", .{@errorName(err)});
+        try err_w.flush();
+        return err;
+    };
+
+    var last_err: ?anyerror = null;
+    for (bundles, 0..) |candidate, i| {
+        // GitHub files attestations under the repository's numeric id, so
+        // this is still correct after a rename or transfer even though the
+        // certificate's repository URI is not.
+        var id_buf: [20]u8 = undefined;
+        const candidate_policy: sigstore.VerificationPolicy = blk: {
+            var p = policy;
+            if (candidate.repository_id) |id| {
+                p.expected_repository_id = std.fmt.bufPrint(&id_buf, "{d}", .{id}) catch null;
+            }
+            break :blk p;
+        };
+
+        var bundle = sigstore.parseBundle(allocator, candidate.json) catch |err| {
+            debugLog(debug_w, "debug: attestation candidate {d}: parse failed: {s}\n", .{ i, @errorName(err) });
+            last_err = err;
+            continue;
+        };
+        defer bundle.deinit();
+
+        var file = try Dir.openFileAbsolute(io, download_path, .{});
+        defer file.close(io);
+
+        const identity = sigstore.verifyBundleWithPolicy(
+            allocator,
+            io,
+            bundle,
+            rekor,
+            file,
+            "",
+            candidate_policy,
+        ) catch |err| {
+            debugLog(debug_w, "debug: attestation candidate {d}: {s}\n", .{ i, @errorName(err) });
+            last_err = err;
+            continue;
+        };
+
+        try printAttestationIdentity(w, identity, digest_hex[0..12], bundle);
+        return .github_attestation_verified;
+    }
+
+    try err_w.print(
+        "error: {d} GitHub attestation(s) published for '{s}/{s}' sha256 {s}..., none verified: {s}\n",
+        .{
+            bundles.len,
+            repo.owner,
+            repo.repo,
+            digest_hex[0..12],
+            if (last_err) |e| @errorName(e) else "unknown",
+        },
+    );
+    try err_w.flush();
+    return error.AttestationVerificationFailed;
+}
+
+/// Print the human-readable summary for a verified native attestation.
+fn printAttestationIdentity(
+    w: *Writer,
+    identity: sigstore.VerifiedIdentity,
+    digest_prefix: []const u8,
+    bundle: sigstore.Bundle,
+) !void {
+    var time_buf: [20]u8 = undefined;
+    const time_iso = authenticode.formatUnixTimeIso(identity.integrated_time, &time_buf);
+
+    switch (identity.observation) {
+        .rekor => {
+            if (bundle.rekor) |observation| {
+                try w.print(
+                    "verified github attestation: sha256 {s}... (rekor t={s}, log {d})\n",
+                    .{ digest_prefix, time_iso, observation.log_index },
+                );
+            } else {
+                try w.print(
+                    "verified github attestation: sha256 {s}... (rekor t={s})\n",
+                    .{ digest_prefix, time_iso },
+                );
+            }
+        },
+        .rfc3161 => try w.print(
+            "verified github attestation: sha256 {s}... (rfc3161 t={s})\n",
+            .{ digest_prefix, time_iso },
+        ),
+    }
+
+    if (identity.identity.source_repository_uri) |uri| {
+        try w.print("  source:   {s}\n", .{uri});
+    } else if (identity.identity.legacy_repository) |repo| {
+        try w.print("  source:   {s}\n", .{repo});
+    }
+    if (identity.identity.build_config_uri) |uri| {
+        try w.print("  workflow: {s}\n", .{uri});
+    }
+    // Only worth showing when the signing workflow differs from the
+    // workflow the repository ran — i.e. a reusable workflow signed it.
+    if (identity.identity.build_signer_uri) |signer| {
+        const same = if (identity.identity.build_config_uri) |cfg|
+            std.mem.eql(u8, cfg, signer)
+        else
+            false;
+        if (!same) try w.print("  signer:   {s}\n", .{signer});
+    }
+    if (identity.identity.oidc_issuer) |issuer| {
+        try w.print("  issuer:   {s}\n", .{issuer});
+    }
+    if (identity.inclusion_verified) {
+        const cp_note: []const u8 = if (identity.checkpoint_verified) " + checkpoint" else "";
+        if (bundle.rekor) |observation| {
+            if (observation.inclusion) |inc| {
+                try w.print("  inclusion: tree size {d}{s}\n", .{ inc.tree_size, cp_note });
+            }
+        }
+    }
+    try w.flush();
+}
+
 /// Run Authenticode verification on `download_path`. Auto-detects the
 /// file shape:
 ///
@@ -1979,6 +2328,7 @@ pub fn verifyAssetOnDisk(
     auth_header: ?[]const u8,
     gates: VerifyGates,
     minisign_pubkey_b64: ?[]const u8,
+    repository: ?attestation.Repository,
     w: *Writer,
     err_w: *Writer,
 ) !VerifyOutcome {
@@ -2068,13 +2418,32 @@ pub fn verifyAssetOnDisk(
         err_w,
     );
 
-    if (sig_outcome == .sigstore_verified) return .sigstore_verified;
-    if (mini_outcome == .minisign_verified) return .minisign_verified;
-    if (ac_outcome == .authenticode_verified) return .authenticode_verified;
-    if (sha_outcome == .sha256_verified) return .sha256_verified;
-    if (sha_outcome == .github_digest_verified) return .github_digest_verified;
+    // Runs even when the sidecar above succeeded: the two forms are
+    // independent, and a release can publish both.
+    const att_outcome: VerifyOutcome = if (gates.skip_attestation) blk: {
+        try w.print("note: github attestation verification skipped (--skip-attestation)\n", .{});
+        break :blk .no_verification;
+    } else try verifyDownloadedAssetAttestation(
+        allocator,
+        io,
+        repository,
+        download_path,
+        debug_w,
+        auth_header,
+        w,
+        err_w,
+    );
 
-    try w.print("note: download is unverified (no checksum, minisign, sigstore, or authenticode)\n", .{});
+    const best = strongestOutcome(&.{
+        att_outcome,
+        sig_outcome,
+        mini_outcome,
+        ac_outcome,
+        sha_outcome,
+    });
+    if (best != .no_verification) return best;
+
+    try w.print("note: download is unverified (no checksum, minisign, sigstore, attestation, or authenticode)\n", .{});
     try w.flush();
     return .no_verification;
 }
@@ -3165,4 +3534,97 @@ test "verifyDownloadedAssetMinisign fails closed when sidecar is present but no 
         &out_writer.writer,
         &err_writer.writer,
     ));
+}
+
+test "outcome ranking implements the documented precedence" {
+    // github-attestation > sigstore > minisign > authenticode > checksum
+    // > github-digest > nothing.
+    const ordered = [_]VerifyOutcome{
+        .no_verification,
+        .github_digest_verified,
+        .sha256_verified,
+        .authenticode_verified,
+        .minisign_verified,
+        .sigstore_verified,
+        .github_attestation_verified,
+    };
+    for (ordered[1..], 0..) |stronger, i| {
+        try std.testing.expect(outcomeRank(stronger) > outcomeRank(ordered[i]));
+    }
+    try std.testing.expectEqual(
+        outcomeRank(.no_verification),
+        outcomeRank(.skipped),
+    );
+}
+
+test "strongestOutcome picks the highest-ranked success regardless of order" {
+    try std.testing.expectEqual(
+        VerifyOutcome.github_attestation_verified,
+        strongestOutcome(&.{ .sha256_verified, .github_attestation_verified, .sigstore_verified }),
+    );
+    // Install previously reported "authenticode" here because it assigned
+    // the label after minisign; ranking makes both pipelines agree.
+    try std.testing.expectEqual(
+        VerifyOutcome.minisign_verified,
+        strongestOutcome(&.{ .minisign_verified, .authenticode_verified }),
+    );
+    try std.testing.expectEqual(
+        VerifyOutcome.sha256_verified,
+        strongestOutcome(&.{ .github_digest_verified, .sha256_verified }),
+    );
+    try std.testing.expectEqual(
+        VerifyOutcome.no_verification,
+        strongestOutcome(&.{ .no_verification, .skipped }),
+    );
+    try std.testing.expectEqual(
+        VerifyOutcome.no_verification,
+        strongestOutcome(&.{}),
+    );
+}
+
+test "outcomeLabel matches the recorded ghr.json method names" {
+    try std.testing.expectEqualStrings("github-attestation", outcomeLabel(.github_attestation_verified).?);
+    try std.testing.expectEqualStrings("sigstore", outcomeLabel(.sigstore_verified).?);
+    try std.testing.expectEqualStrings("minisign", outcomeLabel(.minisign_verified).?);
+    try std.testing.expectEqualStrings("authenticode", outcomeLabel(.authenticode_verified).?);
+    try std.testing.expectEqualStrings("checksum", outcomeLabel(.sha256_verified).?);
+    try std.testing.expectEqualStrings("github-digest", outcomeLabel(.github_digest_verified).?);
+    try std.testing.expectEqualStrings("skipped", outcomeLabel(.skipped).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), outcomeLabel(.no_verification));
+}
+
+test "canonicalRepository prefers the release body over the requested slug" {
+    // `github/hub` still resolves, but GitHub files the release — and any
+    // attestation — under `mislav/hub`.
+    const renamed = canonicalRepository(.{
+        .tag_name = "v2.14.2",
+        .assets = &.{},
+        .html_url = "https://github.com/mislav/hub/releases/tag/v2.14.2",
+    }).?;
+    try std.testing.expectEqualStrings("mislav", renamed.owner);
+    try std.testing.expectEqualStrings("hub", renamed.repo);
+
+    // Trailing path segments beyond `owner/repo` are ignored, and a URL
+    // that stops at the repo still parses.
+    const bare = canonicalRepository(.{
+        .tag_name = "v1",
+        .assets = &.{},
+        .html_url = "https://github.com/owner/repo",
+    }).?;
+    try std.testing.expectEqualStrings("owner", bare.owner);
+    try std.testing.expectEqualStrings("repo", bare.repo);
+
+    // Anything unparseable falls back to the caller's slug.
+    for ([_]?[]const u8{
+        null,
+        "https://example.com/owner/repo/releases/tag/v1",
+        "https://github.com/owner",
+        "https://github.com//repo/releases",
+        "https://github.com/owner//releases",
+    }) |html_url| {
+        try std.testing.expectEqual(
+            @as(?attestation.Repository, null),
+            canonicalRepository(.{ .tag_name = "v1", .assets = &.{}, .html_url = html_url }),
+        );
+    }
 }
