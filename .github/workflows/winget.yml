@@ -32,6 +32,120 @@ jobs:
           fi
           echo "version=${V#v}" >> "$GITHUB_OUTPUT"
 
+      # komac reports an unreadable microsoft/winget-pkgs as
+      # "cataggar.ghr does not exist in microsoft/winget-pkgs" — a false
+      # negative that reads like a missing package rather than an auth
+      # failure. See #144. Check the token first and say what is actually
+      # wrong, and warn before an expiry lapses rather than after.
+      - name: Preflight WINGET_TOKEN
+        shell: bash
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          PACKAGE_IDENTIFIER: cataggar.ghr
+          MANIFEST_PATH: manifests/c/cataggar/ghr
+        run: |
+          set -uo pipefail
+
+          rotate="Rotate it in Settings > Environments > winget > Secrets. It must be a classic PAT with 'public_repo' (or 'repo') scope on an account that can fork microsoft/winget-pkgs."
+
+          fail() {
+            echo "::error title=WINGET_TOKEN preflight failed::$1"
+            exit 1
+          }
+
+          if [ -z "${WINGET_TOKEN:-}" ]; then
+            fail "The WINGET_TOKEN secret is empty or not set for the 'winget' environment. $rotate"
+          fi
+
+          hdr="$(mktemp)"
+          body="$(mktemp)"
+
+          api() {
+            curl -sS -o "$body" -D "$hdr" -w '%{http_code}' \
+              -H "authorization: Bearer $WINGET_TOKEN" \
+              -H "accept: application/vnd.github+json" \
+              -H "x-github-api-version: 2022-11-28" \
+              "https://api.github.com$1"
+          }
+
+          header() {
+            tr -d '\r' < "$hdr" | grep -i "^$1:" | tail -n1 | cut -d: -f2- | sed 's/^ *//'
+          }
+
+          # 1. Is the token itself still usable?
+          status="$(api /user)" || fail "Could not reach api.github.com."
+          case "$status" in
+            200) ;;
+            401) fail "WINGET_TOKEN is expired or revoked (GET /user returned 401). This is the failure behind komac's misleading '$PACKAGE_IDENTIFIER does not exist in microsoft/winget-pkgs'. $rotate" ;;
+            403) fail "WINGET_TOKEN was rejected (GET /user returned 403), typically SSO authorization or rate limiting. $rotate" ;;
+            *) fail "GET /user returned HTTP $status, expected 200. $rotate" ;;
+          esac
+
+          login="$(grep -o '"login"[[:space:]]*:[[:space:]]*"[^"]*"' "$body" | head -n1 | cut -d'"' -f4)"
+          scopes="$(header x-oauth-scopes)"
+          expiry="$(header github-authentication-token-expiration)"
+
+          echo "Authenticated as: ${login:-<unknown>}"
+          echo "Token scopes:     ${scopes:-<none reported>}"
+          echo "Token expires:    ${expiry:-<no expiration set>}"
+
+          # 2. Does it carry a scope that can push to a public fork?
+          case ",${scopes// /}," in
+            *,repo,* | *,public_repo,*) ;;
+            *)
+              if [ -z "$scopes" ]; then
+                echo "::warning title=WINGET_TOKEN scopes unknown::No x-oauth-scopes header was returned, which is normal for a fine-grained PAT. winget-releaser needs to fork microsoft/winget-pkgs and push a branch; a classic PAT with 'public_repo' is the supported configuration."
+              else
+                fail "WINGET_TOKEN is under-scoped: found '$scopes', which lacks 'public_repo' and 'repo'. komac reports this as '$PACKAGE_IDENTIFIER does not exist in microsoft/winget-pkgs'. $rotate"
+              fi
+              ;;
+          esac
+
+          # 3. Can it read the upstream repo at all? This is the exact
+          #    operation komac misreports.
+          status="$(api /repos/microsoft/winget-pkgs)" || fail "Could not reach api.github.com."
+          if [ "$status" != "200" ]; then
+            fail "WINGET_TOKEN cannot read microsoft/winget-pkgs (HTTP $status), even though it authenticated successfully. komac will report this as '$PACKAGE_IDENTIFIER does not exist in microsoft/winget-pkgs', which is a false negative. $rotate"
+          fi
+
+          # 4. Distinguish a genuinely absent package from an auth failure.
+          #    The token is known-good by this point, so a 404 here is real.
+          status="$(api "/repos/microsoft/winget-pkgs/contents/$MANIFEST_PATH")" ||
+            fail "Could not reach api.github.com."
+          case "$status" in
+            200) echo "Found existing package at microsoft/winget-pkgs/$MANIFEST_PATH" ;;
+            404) fail "$PACKAGE_IDENTIFIER is genuinely absent from microsoft/winget-pkgs at $MANIFEST_PATH. The token is valid and can read the repo, so this is a real missing package rather than the auth failure in #144 — the first submission has to be made manually." ;;
+            *) fail "Unexpected HTTP $status reading $MANIFEST_PATH from microsoft/winget-pkgs." ;;
+          esac
+
+          # 5. winget-releaser pushes its branch to the publisher's fork.
+          if [ -n "$login" ]; then
+            status="$(api "/repos/$login/winget-pkgs")" || true
+            if [ "$status" != "200" ]; then
+              echo "::warning title=winget-pkgs fork not found::$login/winget-pkgs returned HTTP $status. winget-releaser will try to create the fork, which needs 'public_repo'."
+            fi
+          fi
+
+          # 6. Surface an upcoming expiry while it is still fixable. A silent
+          #    lapse is what made #144 hard to diagnose.
+          if [ -z "$expiry" ]; then
+            echo "::notice title=WINGET_TOKEN has no expiry::GitHub reported no expiration date for this token, so it will not lapse silently."
+          else
+            exp_epoch="$(date -u -d "${expiry% UTC}" +%s 2>/dev/null || true)"
+            if [ -n "$exp_epoch" ]; then
+              days=$(( (exp_epoch - $(date -u +%s)) / 86400 ))
+              if [ "$days" -lt 0 ]; then
+                echo "::warning title=WINGET_TOKEN expired $(( -days )) day(s) ago::Expired $expiry, but GitHub still accepted it. Rotate it now."
+              elif [ "$days" -le 30 ]; then
+                echo "::warning title=WINGET_TOKEN expires in $days day(s)::Expires $expiry. Rotate it before then: an expired token surfaces as komac reporting '$PACKAGE_IDENTIFIER does not exist in microsoft/winget-pkgs', which looks like a missing package rather than an auth failure."
+              else
+                echo "$days day(s) until WINGET_TOKEN expires."
+              fi
+            fi
+          fi
+
+          rm -f "$hdr" "$body"
+
       - name: Publish to winget
         uses: vedantmgoyal9/winget-releaser@v2
         with:
