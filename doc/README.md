@@ -592,9 +592,14 @@ publishes:
   derived without a TSA witness.
 
 On any verification failure the operation is aborted and the cached
-download is deleted. If no checksum, minisign sidecar, sigstore bundle,
-GitHub attestation, or Authenticode signature is published the download
-proceeds with a `note:` line so you know it was unverified.
+download is deleted. Malformed input counts as a verification failure:
+every DER structure `ghr` parses — X.509 certificates, PKCS#7
+SignedData, RFC 3161 tokens — goes through a bounds-checked parser, so
+a truncated or hostile encoding is reported as an ordinary failure
+rather than crashing the process. If no checksum, minisign sidecar,
+sigstore bundle, GitHub attestation, or Authenticode signature is
+published the download proceeds with a `note:` line so you know it was
+unverified.
 
 Pass `--skip-verify` to bypass every check at once. To bypass only one
 step (e.g. when its sidecar is broken in a particular release while the

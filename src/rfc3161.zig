@@ -8,7 +8,7 @@
 const std = @import("std");
 
 const Certificate = std.crypto.Certificate;
-const der = Certificate.der;
+const der = @import("der.zig");
 
 pub const ChainClock = enum {
     wall_clock,
@@ -101,53 +101,7 @@ pub const VerifyError = error{
     TstInfoMessageImprintMismatch,
     InvalidGeneralizedTime,
     OutOfMemory,
-} || der.Element.ParseError || Certificate.ParseError || Certificate.Parsed.VerifyError;
-
-/// Bounds-checked replacement for `der.Element.parse`.
-///
-/// The standard-library parser reads the identifier and length octets and
-/// computes `slice.end` without ever comparing them against `bytes.len`, so
-/// a truncated or hostile token would panic (and, for a 4-octet long form,
-/// overflow the `u32` end offset) instead of returning an error. Timestamp
-/// tokens arrive straight from a downloaded bundle, so every element in this
-/// file is parsed through here and is guaranteed to yield a slice that lies
-/// entirely within `bytes`.
-pub fn parseElement(bytes: []const u8, index: u32) VerifyError!der.Element {
-    if (bytes.len > std.math.maxInt(u32)) return error.InvalidDerElement;
-    const len: u32 = @intCast(bytes.len);
-
-    const header_end = std.math.add(u32, index, 2) catch
-        return error.InvalidDerElement;
-    if (header_end > len) return error.InvalidDerElement;
-
-    const size_byte = bytes[index + 1];
-    var content_start = header_end;
-    var content_len: u32 = size_byte;
-
-    if ((size_byte >> 7) != 0) {
-        const len_size: u7 = @truncate(size_byte);
-        // A 4-octet long form is the widest that fits the u32 offsets used
-        // throughout this parser; the indefinite form (0) is not valid DER.
-        if (len_size == 0 or len_size > @sizeOf(u32))
-            return error.CertificateFieldHasInvalidLength;
-        content_start = std.math.add(u32, header_end, len_size) catch
-            return error.InvalidDerElement;
-        if (content_start > len) return error.InvalidDerElement;
-
-        content_len = 0;
-        for (bytes[header_end..content_start]) |byte|
-            content_len = (content_len << 8) | byte;
-    }
-
-    const content_end = std.math.add(u32, content_start, content_len) catch
-        return error.InvalidDerElement;
-    if (content_end > len) return error.InvalidDerElement;
-
-    return .{
-        .identifier = @bitCast(bytes[index]),
-        .slice = .{ .start = content_start, .end = content_end },
-    };
-}
+} || der.ParseError || der.CertificateParseError || Certificate.Parsed.VerifyError;
 
 /// Verify an RFC 3161 token over detached `signed_message` bytes.
 ///
@@ -236,10 +190,10 @@ fn verifyDetachedInternal(
 }
 
 fn unwrapTimestampToken(bytes: []const u8) VerifyError![]const u8 {
-    const outer = try parseElement(bytes, 0);
+    const outer = try der.parseElement(bytes, 0);
     if (outer.identifier.tag != .sequence) return error.InvalidTimestampResponse;
 
-    const first = try parseElement(bytes, outer.slice.start);
+    const first = try der.parseElement(bytes, outer.slice.start);
     if (first.identifier.tag == .object_identifier) {
         if (!std.mem.eql(u8, bytes[first.slice.start..first.slice.end], &oid.signed_data))
             return error.UnsupportedContentType;
@@ -247,7 +201,7 @@ fn unwrapTimestampToken(bytes: []const u8) VerifyError![]const u8 {
     }
     if (first.identifier.tag != .sequence) return error.InvalidTimestampResponse;
 
-    const status = try parseElement(bytes, first.slice.start);
+    const status = try der.parseElement(bytes, first.slice.start);
     if (status.identifier.tag != .integer or status.slice.end - status.slice.start != 1)
         return error.InvalidTimestampResponse;
     const status_value = bytes[status.slice.start];
@@ -255,30 +209,30 @@ fn unwrapTimestampToken(bytes: []const u8) VerifyError![]const u8 {
         return error.TimestampStatusNotGranted;
 
     if (first.slice.end >= outer.slice.end) return error.MissingTimestampToken;
-    const token = try parseElement(bytes, first.slice.end);
+    const token = try der.parseElement(bytes, first.slice.end);
     if (token.identifier.tag != .sequence or token.slice.end > outer.slice.end)
         return error.InvalidTimestampResponse;
     return bytes[first.slice.end..token.slice.end];
 }
 
 fn parseTimestampToken(bytes: []const u8) VerifyError!TimestampToken {
-    const ci = try parseElement(bytes, 0);
+    const ci = try der.parseElement(bytes, 0);
     if (ci.identifier.tag != .sequence) return error.InvalidContentInfo;
 
-    const ci_oid = try parseElement(bytes, ci.slice.start);
+    const ci_oid = try der.parseElement(bytes, ci.slice.start);
     if (ci_oid.identifier.tag != .object_identifier) return error.InvalidContentInfo;
     if (!std.mem.eql(u8, bytes[ci_oid.slice.start..ci_oid.slice.end], &oid.signed_data))
         return error.UnsupportedContentType;
 
-    const ci_content = try parseElement(bytes, ci_oid.slice.end);
+    const ci_content = try der.parseElement(bytes, ci_oid.slice.end);
     if (!isContextSpecificTag(ci_content.identifier, 0) or ci_content.slice.end > ci.slice.end)
         return error.InvalidContentInfo;
 
-    const signed_data = try parseElement(bytes, ci_content.slice.start);
+    const signed_data = try der.parseElement(bytes, ci_content.slice.start);
     if (signed_data.identifier.tag != .sequence) return error.InvalidSignedData;
     var i: u32 = signed_data.slice.start;
 
-    const version = try parseElement(bytes, i);
+    const version = try der.parseElement(bytes, i);
     if (version.identifier.tag != .integer) return error.InvalidSignedData;
     if (version.slice.end - version.slice.start != 1)
         return error.UnsupportedSignedDataVersion;
@@ -287,22 +241,22 @@ fn parseTimestampToken(bytes: []const u8) VerifyError!TimestampToken {
         return error.UnsupportedSignedDataVersion;
     i = version.slice.end;
 
-    const digest_algorithms = try parseElement(bytes, i);
+    const digest_algorithms = try der.parseElement(bytes, i);
     i = digest_algorithms.slice.end;
 
-    const encap = try parseElement(bytes, i);
+    const encap = try der.parseElement(bytes, i);
     if (encap.identifier.tag != .sequence) return error.InvalidSignedData;
     i = encap.slice.end;
 
-    const encap_type = try parseElement(bytes, encap.slice.start);
+    const encap_type = try der.parseElement(bytes, encap.slice.start);
     if (encap_type.identifier.tag != .object_identifier) return error.InvalidSignedData;
     if (!std.mem.eql(u8, bytes[encap_type.slice.start..encap_type.slice.end], &oid.tst_info))
         return error.UnsupportedEncapContentType;
 
-    const content_wrapper = try parseElement(bytes, encap_type.slice.end);
+    const content_wrapper = try der.parseElement(bytes, encap_type.slice.end);
     if (!isContextSpecificTag(content_wrapper.identifier, 0))
         return error.InvalidTstInfo;
-    const content = try parseElement(bytes, content_wrapper.slice.start);
+    const content = try der.parseElement(bytes, content_wrapper.slice.start);
     if (content.identifier.tag != .octetstring and content.identifier.tag != .sequence)
         return error.InvalidTstInfo;
     const tst_info_der = if (content.identifier.tag == .octetstring)
@@ -313,23 +267,23 @@ fn parseTimestampToken(bytes: []const u8) VerifyError!TimestampToken {
     var certificates_raw: []const u8 = &.{};
     var next_index = i;
     if (next_index < signed_data.slice.end) {
-        const next = try parseElement(bytes, next_index);
+        const next = try der.parseElement(bytes, next_index);
         if (isContextSpecificTag(next.identifier, 0)) {
             certificates_raw = bytes[next.slice.start..next.slice.end];
             next_index = next.slice.end;
         }
     }
     if (next_index < signed_data.slice.end) {
-        const next = try parseElement(bytes, next_index);
+        const next = try der.parseElement(bytes, next_index);
         if (isContextSpecificTag(next.identifier, 1))
             next_index = next.slice.end;
     }
 
-    const signer_infos = try parseElement(bytes, next_index);
+    const signer_infos = try der.parseElement(bytes, next_index);
     if (signer_infos.identifier.tag != .sequence_of and
         signer_infos.identifier.tag != .sequence)
         return error.InvalidSignedData;
-    const first_signer = try parseElement(bytes, signer_infos.slice.start);
+    const first_signer = try der.parseElement(bytes, signer_infos.slice.start);
     if (first_signer.identifier.tag != .sequence) return error.InvalidSignerInfo;
 
     return .{
@@ -342,24 +296,24 @@ fn parseTimestampToken(bytes: []const u8) VerifyError!TimestampToken {
 fn parseSignerInfo(bytes: []const u8, signer: der.Element) VerifyError!SignerInfo {
     var i: u32 = signer.slice.start;
 
-    const version = try parseElement(bytes, i);
+    const version = try der.parseElement(bytes, i);
     if (version.identifier.tag != .integer or version.slice.end - version.slice.start != 1)
         return error.InvalidSignerInfo;
     i = version.slice.end;
 
-    const sid = try parseElement(bytes, i);
+    const sid = try der.parseElement(bytes, i);
     const sid_start = i;
     const sid_raw = bytes[sid_start..sid.slice.end];
     i = sid.slice.end;
 
-    const digest_algorithm = try parseElement(bytes, i);
+    const digest_algorithm = try der.parseElement(bytes, i);
     if (digest_algorithm.identifier.tag != .sequence) return error.InvalidSignerInfo;
-    const digest_oid = try parseElement(bytes, digest_algorithm.slice.start);
+    const digest_oid = try der.parseElement(bytes, digest_algorithm.slice.start);
     if (digest_oid.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
     const digest_alg = try hashAlgorithm(bytes[digest_oid.slice.start..digest_oid.slice.end]);
     i = digest_algorithm.slice.end;
 
-    const signed_attrs = try parseElement(bytes, i);
+    const signed_attrs = try der.parseElement(bytes, i);
     if (!isContextSpecificTag(signed_attrs.identifier, 0)) return error.MissingSignedAttrs;
     const signed_attrs_raw = bytes[i..signed_attrs.slice.end];
     if (signed_attrs_raw.len > std.math.maxInt(u32)) return error.SignedAttrsTooLarge;
@@ -368,14 +322,14 @@ fn parseSignerInfo(bytes: []const u8, signer: der.Element) VerifyError!SignerInf
     var found_content_type = false;
     var attr_index: u32 = signed_attrs.slice.start;
     while (attr_index < signed_attrs.slice.end) {
-        const attr = try parseElement(bytes, attr_index);
+        const attr = try der.parseElement(bytes, attr_index);
         if (attr.identifier.tag != .sequence) return error.InvalidSignerInfo;
         attr_index = attr.slice.end;
 
-        const attr_oid = try parseElement(bytes, attr.slice.start);
+        const attr_oid = try der.parseElement(bytes, attr.slice.start);
         if (attr_oid.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
-        const values = try parseElement(bytes, attr_oid.slice.end);
-        const first_value = try parseElement(bytes, values.slice.start);
+        const values = try der.parseElement(bytes, attr_oid.slice.end);
+        const first_value = try der.parseElement(bytes, values.slice.start);
         const attr_oid_bytes = bytes[attr_oid.slice.start..attr_oid.slice.end];
 
         if (std.mem.eql(u8, attr_oid_bytes, &oid.message_digest)) {
@@ -396,14 +350,14 @@ fn parseSignerInfo(bytes: []const u8, signer: der.Element) VerifyError!SignerInf
     if (!found_content_type) return error.MissingContentTypeAttr;
     i = signed_attrs.slice.end;
 
-    const signature_algorithm = try parseElement(bytes, i);
+    const signature_algorithm = try der.parseElement(bytes, i);
     if (signature_algorithm.identifier.tag != .sequence) return error.InvalidSignerInfo;
-    const signature_oid = try parseElement(bytes, signature_algorithm.slice.start);
+    const signature_oid = try der.parseElement(bytes, signature_algorithm.slice.start);
     if (signature_oid.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
     const signature_alg = try signatureAlgorithm(bytes[signature_oid.slice.start..signature_oid.slice.end]);
     i = signature_algorithm.slice.end;
 
-    const signature = try parseElement(bytes, i);
+    const signature = try der.parseElement(bytes, i);
     if (signature.identifier.tag != .octetstring) return error.InvalidSignerInfo;
 
     return .{
@@ -417,38 +371,38 @@ fn parseSignerInfo(bytes: []const u8, signer: der.Element) VerifyError!SignerInf
 }
 
 fn parseTstInfo(bytes: []const u8) VerifyError!TstInfo {
-    const root = try parseElement(bytes, 0);
+    const root = try der.parseElement(bytes, 0);
     if (root.identifier.tag != .sequence) return error.InvalidTstInfo;
     var i: u32 = root.slice.start;
 
-    const version = try parseElement(bytes, i);
+    const version = try der.parseElement(bytes, i);
     if (version.identifier.tag != .integer) return error.InvalidTstInfo;
     if (version.slice.end - version.slice.start != 1)
         return error.UnsupportedTstInfoVersion;
     if (bytes[version.slice.start] != 1) return error.UnsupportedTstInfoVersion;
     i = version.slice.end;
 
-    const policy = try parseElement(bytes, i);
+    const policy = try der.parseElement(bytes, i);
     if (policy.identifier.tag != .object_identifier) return error.InvalidTstInfo;
     i = policy.slice.end;
 
-    const message_imprint = try parseElement(bytes, i);
+    const message_imprint = try der.parseElement(bytes, i);
     if (message_imprint.identifier.tag != .sequence) return error.InvalidTstInfo;
-    const algorithm = try parseElement(bytes, message_imprint.slice.start);
+    const algorithm = try der.parseElement(bytes, message_imprint.slice.start);
     if (algorithm.identifier.tag != .sequence) return error.InvalidTstInfo;
-    const algorithm_oid = try parseElement(bytes, algorithm.slice.start);
+    const algorithm_oid = try der.parseElement(bytes, algorithm.slice.start);
     if (algorithm_oid.identifier.tag != .object_identifier) return error.InvalidTstInfo;
     const imprint_alg = hashAlgorithm(bytes[algorithm_oid.slice.start..algorithm_oid.slice.end]) catch
         return error.InvalidTstInfo;
-    const imprint = try parseElement(bytes, algorithm.slice.end);
+    const imprint = try der.parseElement(bytes, algorithm.slice.end);
     if (imprint.identifier.tag != .octetstring) return error.InvalidTstInfo;
     i = message_imprint.slice.end;
 
-    const serial_number = try parseElement(bytes, i);
+    const serial_number = try der.parseElement(bytes, i);
     if (serial_number.identifier.tag != .integer) return error.InvalidTstInfo;
     i = serial_number.slice.end;
 
-    const gen_time = try parseElement(bytes, i);
+    const gen_time = try der.parseElement(bytes, i);
     if (gen_time.identifier.tag != .generalized_time) return error.InvalidTstInfo;
 
     return .{
@@ -469,8 +423,8 @@ fn verifySignerSignature(
     if (message.len == 0 or message[0] != 0xA0) return error.InvalidSignerInfo;
     message[0] = 0x31;
 
-    var cert: Certificate = .{ .buffer = signer_cert_der, .index = 0 };
-    const parsed = try cert.parse();
+    const cert: Certificate = .{ .buffer = signer_cert_der, .index = 0 };
+    const parsed = try der.parseCertificate(cert);
 
     switch (token.signer.signature_alg) {
         .rsa_pkcs1_v15_sha256 => try verifyRsa(
@@ -563,11 +517,11 @@ fn findSignerCertDer(
 ) VerifyError!?[]const u8 {
     if (token.signer.sid_raw.len == 0) return null;
     const sid = token.signer.sid_raw;
-    const sid_sequence = try parseElement(sid, 0);
+    const sid_sequence = try der.parseElement(sid, 0);
     if (sid_sequence.identifier.tag != .sequence) return error.InvalidSignerInfo;
-    const sid_issuer = try parseElement(sid, sid_sequence.slice.start);
+    const sid_issuer = try der.parseElement(sid, sid_sequence.slice.start);
     if (sid_issuer.identifier.tag != .sequence) return error.InvalidSignerInfo;
-    const sid_serial = try parseElement(sid, sid_issuer.slice.end);
+    const sid_serial = try der.parseElement(sid, sid_issuer.slice.end);
     if (sid_serial.identifier.tag != .integer) return error.InvalidSignerInfo;
 
     var iterator: CertificateSetIterator = .{ .bytes = token.certificates_raw };
@@ -579,7 +533,7 @@ fn findSignerCertDer(
     var trust_iterator = tsa_trust.map.iterator();
     while (trust_iterator.next()) |entry| {
         const cert_index = entry.value_ptr.*;
-        const cert_outer = try parseElement(tsa_trust.bytes.items, cert_index);
+        const cert_outer = try der.parseElement(tsa_trust.bytes.items, cert_index);
         if (try certificateMatchesSid(
             tsa_trust.bytes.items,
             cert_index,
@@ -598,21 +552,21 @@ fn certificateMatchesSid(
     sid_issuer: der.Element,
     sid_serial: der.Element,
 ) VerifyError!bool {
-    var cert: Certificate = .{ .buffer = cert_buffer, .index = cert_index };
-    const parsed = cert.parse() catch return false;
+    const cert: Certificate = .{ .buffer = cert_buffer, .index = cert_index };
+    const parsed = der.parseCertificate(cert) catch return false;
     if (!std.mem.eql(
         u8,
         cert_buffer[parsed.issuer_slice.start..parsed.issuer_slice.end],
         sid[sid_issuer.slice.start..sid_issuer.slice.end],
     )) return false;
 
-    const outer = try parseElement(cert_buffer, cert_index);
-    const tbs = try parseElement(cert_buffer, outer.slice.start);
+    const outer = try der.parseElement(cert_buffer, cert_index);
+    const tbs = try der.parseElement(cert_buffer, outer.slice.start);
     var serial_index: u32 = tbs.slice.start;
-    const maybe_version = try parseElement(cert_buffer, serial_index);
+    const maybe_version = try der.parseElement(cert_buffer, serial_index);
     if (isContextSpecificTag(maybe_version.identifier, 0))
         serial_index = maybe_version.slice.end;
-    const serial = try parseElement(cert_buffer, serial_index);
+    const serial = try der.parseElement(cert_buffer, serial_index);
     if (serial.identifier.tag != .integer) return error.InvalidSignerInfo;
     return std.mem.eql(
         u8,
@@ -622,30 +576,30 @@ fn certificateMatchesSid(
 }
 
 fn verifyTimestampingExtendedKeyUsage(cert_der: []const u8) VerifyError!void {
-    const certificate = try parseElement(cert_der, 0);
+    const certificate = try der.parseElement(cert_der, 0);
     if (certificate.identifier.tag != .sequence)
         return error.InvalidTsaExtendedKeyUsage;
-    const tbs = try parseElement(cert_der, certificate.slice.start);
+    const tbs = try der.parseElement(cert_der, certificate.slice.start);
     if (tbs.identifier.tag != .sequence)
         return error.InvalidTsaExtendedKeyUsage;
 
     var i: u32 = tbs.slice.start;
     while (i < tbs.slice.end) {
-        const field = try parseElement(cert_der, i);
+        const field = try der.parseElement(cert_der, i);
         i = field.slice.end;
         if (!isContextSpecificTag(field.identifier, 3)) continue;
 
-        const extensions = try parseElement(cert_der, field.slice.start);
+        const extensions = try der.parseElement(cert_der, field.slice.start);
         if (extensions.identifier.tag != .sequence)
             return error.InvalidTsaExtendedKeyUsage;
         var extension_index: u32 = extensions.slice.start;
         while (extension_index < extensions.slice.end) {
-            const extension = try parseElement(cert_der, extension_index);
+            const extension = try der.parseElement(cert_der, extension_index);
             extension_index = extension.slice.end;
             if (extension.identifier.tag != .sequence)
                 return error.InvalidTsaExtendedKeyUsage;
 
-            const extension_oid = try parseElement(cert_der, extension.slice.start);
+            const extension_oid = try der.parseElement(cert_der, extension.slice.start);
             if (extension_oid.identifier.tag != .object_identifier)
                 return error.InvalidTsaExtendedKeyUsage;
             if (!std.mem.eql(
@@ -654,18 +608,18 @@ fn verifyTimestampingExtendedKeyUsage(cert_der: []const u8) VerifyError!void {
                 &oid.extended_key_usage,
             )) continue;
 
-            var value = try parseElement(cert_der, extension_oid.slice.end);
+            var value = try der.parseElement(cert_der, extension_oid.slice.end);
             var critical = false;
             if (value.identifier.tag == .boolean) {
                 critical = value.slice.end - value.slice.start == 1 and
                     cert_der[value.slice.start] != 0;
-                value = try parseElement(cert_der, value.slice.end);
+                value = try der.parseElement(cert_der, value.slice.end);
             }
             if (!critical or value.identifier.tag != .octetstring)
                 return error.InvalidTsaExtendedKeyUsage;
 
             const encoded_eku = cert_der[value.slice.start..value.slice.end];
-            const eku = try parseElement(encoded_eku, 0);
+            const eku = try der.parseElement(encoded_eku, 0);
             if (eku.identifier.tag != .sequence or eku.slice.end != encoded_eku.len)
                 return error.InvalidTsaExtendedKeyUsage;
 
@@ -673,7 +627,7 @@ fn verifyTimestampingExtendedKeyUsage(cert_der: []const u8) VerifyError!void {
             var purpose_count: usize = 0;
             var timestamping_count: usize = 0;
             while (purpose_index < eku.slice.end) {
-                const purpose = try parseElement(encoded_eku, purpose_index);
+                const purpose = try der.parseElement(encoded_eku, purpose_index);
                 purpose_index = purpose.slice.end;
                 if (purpose.identifier.tag != .object_identifier)
                     return error.InvalidTsaExtendedKeyUsage;
@@ -699,7 +653,7 @@ const CertificateSetIterator = struct {
 
     fn next(self: *CertificateSetIterator) VerifyError!?[]const u8 {
         while (self.index < self.bytes.len) {
-            const element = try parseElement(self.bytes, self.index);
+            const element = try der.parseElement(self.bytes, self.index);
             const start = self.index;
             self.index = element.slice.end;
 
@@ -730,7 +684,7 @@ fn verifyChain(
         try pool.append(.{ .buffer = cert_der, .index = 0 });
 
     var subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
-    var subject = subject_cert.parse() catch return error.InvalidSignature;
+    var subject = der.parseCertificate(subject_cert) catch return error.InvalidSignature;
 
     var depth: u8 = 0;
     while (depth < 8) : (depth += 1) {
@@ -740,7 +694,7 @@ fn verifyChain(
                 .buffer = trust.bytes.items,
                 .index = issuer_index,
             };
-            const issuer = issuer_cert.parse() catch return error.InvalidSignature;
+            const issuer = der.parseCertificate(issuer_cert) catch return error.InvalidSignature;
             try subject.verify(issuer, verify_at);
             if (verify_at < issuer.validity.not_before or
                 verify_at > issuer.validity.not_after)
@@ -754,8 +708,8 @@ fn verifyChain(
         var matched: ?Certificate.Parsed = null;
         var matched_cert: ?Certificate = null;
         for (pool.items) |candidate| {
-            var cert = candidate;
-            const parsed = cert.parse() catch continue;
+            const cert = candidate;
+            const parsed = der.parseCertificate(cert) catch continue;
             if (std.mem.eql(u8, parsed.subject(), issuer_name)) {
                 matched = parsed;
                 matched_cert = cert;
@@ -1006,15 +960,15 @@ test "signer lookup falls back to trusted bundle when CMS cert set is empty" {
     defer allocator.free(cert_der);
     try decoder.decode(cert_der, stripped[0..stripped_len]);
 
-    const cert_outer = try parseElement(cert_der, 0);
-    const tbs = try parseElement(cert_der, cert_outer.slice.start);
+    const cert_outer = try der.parseElement(cert_der, 0);
+    const tbs = try der.parseElement(cert_der, cert_outer.slice.start);
     var serial_start = tbs.slice.start;
-    const version = try parseElement(cert_der, serial_start);
+    const version = try der.parseElement(cert_der, serial_start);
     if (isContextSpecificTag(version.identifier, 0)) serial_start = version.slice.end;
-    const serial = try parseElement(cert_der, serial_start);
-    const signature_algorithm = try parseElement(cert_der, serial.slice.end);
+    const serial = try der.parseElement(cert_der, serial_start);
+    const signature_algorithm = try der.parseElement(cert_der, serial.slice.end);
     const issuer_start = signature_algorithm.slice.end;
-    const issuer = try parseElement(cert_der, issuer_start);
+    const issuer = try der.parseElement(cert_der, issuer_start);
 
     var sid_writer: std.Io.Writer.Allocating = .init(allocator);
     defer sid_writer.deinit();
@@ -1024,8 +978,8 @@ test "signer lookup falls back to trusted bundle when CMS cert set is empty" {
     try sid_writer.writer.writeAll(cert_der[issuer_start..issuer.slice.end]);
     try sid_writer.writer.writeAll(cert_der[serial_start..serial.slice.end]);
 
-    var parsed_cert: Certificate = .{ .buffer = cert_der, .index = 0 };
-    const parsed = try parsed_cert.parse();
+    const parsed_cert: Certificate = .{ .buffer = cert_der, .index = 0 };
+    const parsed = try der.parseCertificate(parsed_cert);
     var trust: Certificate.Bundle = .empty;
     defer trust.deinit(allocator);
     try trust.bytes.appendSlice(allocator, cert_der);
@@ -1128,43 +1082,6 @@ test "GeneralizedTime accepts fractions and rejects invalid calendar values" {
         error.InvalidGeneralizedTime,
         parseGeneralizedTime("20260230102431Z"),
     );
-}
-
-test "malformed DER elements return errors instead of panicking" {
-    // Every case below indexes out of bounds under `der.Element.parse`.
-    try std.testing.expectError(error.InvalidDerElement, parseElement("", 0));
-    // Identifier present but the length octet is missing.
-    try std.testing.expectError(error.InvalidDerElement, parseElement("\x30", 0));
-    // Short form claiming more content than the buffer holds.
-    try std.testing.expectError(error.InvalidDerElement, parseElement("\x30\x20", 0));
-    // 4-octet long form whose end offset overflows u32.
-    try std.testing.expectError(
-        error.InvalidDerElement,
-        parseElement("\x30\x84\xFF\xFF\xFF\xFF", 0),
-    );
-    // Long form whose own size octets run past the buffer.
-    try std.testing.expectError(error.InvalidDerElement, parseElement("\x30\x83\x00", 0));
-    // Long form wider than the u32 offsets this parser uses.
-    try std.testing.expectError(
-        error.CertificateFieldHasInvalidLength,
-        parseElement("\x30\x85\x00\x00\x00\x00\x00", 0),
-    );
-    // Indefinite length is not valid DER.
-    try std.testing.expectError(
-        error.CertificateFieldHasInvalidLength,
-        parseElement("\x30\x80", 0),
-    );
-    // A start index past the end of the buffer.
-    try std.testing.expectError(error.InvalidDerElement, parseElement("\x30\x00", 9));
-
-    // Well-formed elements still parse, in both length forms.
-    const short = try parseElement("\x30\x02\xAA\xBB", 0);
-    try std.testing.expectEqual(@as(u32, 2), short.slice.start);
-    try std.testing.expectEqual(@as(u32, 4), short.slice.end);
-
-    const long = try parseElement("\x30\x81\x02\xAA\xBB", 0);
-    try std.testing.expectEqual(@as(u32, 3), long.slice.start);
-    try std.testing.expectEqual(@as(u32, 5), long.slice.end);
 }
 
 test "malformed timestamp tokens are rejected without panicking" {
