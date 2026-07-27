@@ -1,9 +1,12 @@
-//! Native Sigstore Bundle (v0.3) verification, Phase 2 of issue #50.
+//! Sigstore Bundle v0.3 verification for published sidecars and GitHub
+//! artifact attestations.
 //!
 //! Coverage:
 //!   * Embedded production Fulcio root + intermediate (Sigstore public good
 //!     instance) and the Rekor public key, pulled from
 //!     https://github.com/sigstore/root-signing.
+//!   * Embedded GitHub Fulcio and RFC 3161 TSA rotations from GitHub's
+//!     trusted-root TUF target.
 //!   * Asset-list helper to find the `<asset>.sigstore.json` sidecar (per
 //!     asset) or, as a fallback for in-toto multi-subject bundles, a bare
 //!     `*.sigstore.json` that names no specific asset.
@@ -27,24 +30,59 @@
 //!     Rekor public key. This is what makes `integratedTime` trustworthy.
 //!   * Merkle inclusion-proof verification (RFC 6962) plus signed checkpoint
 //!     verification, anchoring the entry to a published log root.
-//!   * X.509 chain walk against the embedded trust roots, using the parser
-//!     from `std.crypto.Certificate`. The verification clock is the Rekor
-//!     `integratedTime`, since cosign's leaf certs only live ~10 minutes.
-//!
-//! Future work: enforce a specific identity (`--cert-identity` /
-//! `--cert-oidc-issuer`).
+//!   * GitHub RFC 3161 verification over the decoded DSSE signature, including
+//!     pinned TSA chains and timestamping EKU enforcement.
+//!   * X.509 chain walking against the trust domain selected from the leaf
+//!     issuer. Public Good bundles use Rekor `integratedTime`; GitHub bundles
+//!     use RFC 3161 `genTime`.
+//!   * Repository, owner, OIDC issuer, build-config, predicate, and artifact
+//!     digest policy for GitHub provenance.
 
 const std = @import("std");
+const rfc3161 = @import("rfc3161.zig");
 const Io = std.Io;
 const Certificate = std.crypto.Certificate;
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 /// Embedded Sigstore production trust roots. Updating these requires a new
-/// ghr release; see `docs/sigstore.md` (TODO) for rotation notes.
+/// ghr release; see `sigstore/trust/README.md` for rotation notes.
 pub const fulcio_root_pem = @embedFile("sigstore/trust/fulcio_v1.crt.pem");
 pub const fulcio_intermediate_pem = @embedFile("sigstore/trust/fulcio_intermediate_v1.crt.pem");
 pub const rekor_pubkey_pem = @embedFile("sigstore/trust/rekor.pub");
+
+const github_fulcio_l1_pem = @embedFile("sigstore/trust/github/fulcio_l1.crt.pem");
+const github_tsa_intermediate_pem = @embedFile("sigstore/trust/github/tsa_intermediate.crt.pem");
+const github_internal_services_root_pem = @embedFile("sigstore/trust/github/internal_services_root.crt.pem");
+
+const TrustPeriod = struct {
+    start: i64,
+    end: ?i64,
+    pem: []const u8,
+
+    fn contains(self: TrustPeriod, timestamp: i64) bool {
+        if (timestamp < self.start) return false;
+        return if (self.end) |end| timestamp <= end else true;
+    }
+};
+
+const github_fulcio_periods = [_]TrustPeriod{
+    .{ .start = 1698424200, .end = 1716595200, .pem = @embedFile("sigstore/trust/github/fulcio_l2_2023-10-27.crt.pem") },
+    .{ .start = 1715558400, .end = 1729814400, .pem = @embedFile("sigstore/trust/github/fulcio_l2_2024-05-13.crt.pem") },
+    .{ .start = 1728259200, .end = 1750291200, .pem = @embedFile("sigstore/trust/github/fulcio_l2_2024-10-07.crt.pem") },
+    .{ .start = 1748304000, .end = 1765238400, .pem = @embedFile("sigstore/trust/github/fulcio_l2_2025-05-27.crt.pem") },
+    .{ .start = 1762992000, .end = 1783900800, .pem = @embedFile("sigstore/trust/github/fulcio_l2_2025-11-13.crt.pem") },
+    .{ .start = 1781222400, .end = null, .pem = @embedFile("sigstore/trust/github/fulcio_l2_2026-06-12.crt.pem") },
+};
+
+const github_tsa_periods = [_]TrustPeriod{
+    .{ .start = 1698424200, .end = 1716595200, .pem = @embedFile("sigstore/trust/github/tsa_leaf_2023-10-27.crt.pem") },
+    .{ .start = 1715558400, .end = 1729814400, .pem = @embedFile("sigstore/trust/github/tsa_leaf_2024-05-13.crt.pem") },
+    .{ .start = 1728259200, .end = 1750291200, .pem = @embedFile("sigstore/trust/github/tsa_leaf_2024-10-07.crt.pem") },
+    .{ .start = 1748304000, .end = 1765238400, .pem = @embedFile("sigstore/trust/github/tsa_leaf_2025-05-27.crt.pem") },
+    .{ .start = 1762992000, .end = 1783900800, .pem = @embedFile("sigstore/trust/github/tsa_leaf_2025-11-13.crt.pem") },
+    .{ .start = 1781222400, .end = null, .pem = @embedFile("sigstore/trust/github/tsa_leaf_2026-06-12.crt.pem") },
+};
 
 // ---------------------------------------------------------------------------
 // Asset-list helpers.
@@ -135,7 +173,8 @@ pub const RawBundle = struct {
     pub const VerificationMaterial = struct {
         certificate: ?CertEntry = null,
         x509CertificateChain: ?CertChain = null,
-        tlogEntries: []const TlogEntry,
+        tlogEntries: []const TlogEntry = &.{},
+        timestampVerificationData: ?TimestampVerificationData = null,
     };
 
     pub const CertEntry = struct {
@@ -144,6 +183,14 @@ pub const RawBundle = struct {
 
     pub const CertChain = struct {
         certificates: []const CertEntry,
+    };
+
+    pub const TimestampVerificationData = struct {
+        rfc3161Timestamps: []const Rfc3161Timestamp = &.{},
+    };
+
+    pub const Rfc3161Timestamp = struct {
+        signedTimestamp: []const u8,
     };
 
     pub const TlogEntry = struct {
@@ -240,28 +287,34 @@ pub const Dsse = struct {
     /// In-toto Statement subjects, parsed from `payload`. Ownership: the
     /// `Subject.name` slices borrow from `payload`.
     subjects: []const Subject,
+    /// In-toto Statement predicate type, retained for caller policy.
+    predicate_type: []const u8,
 };
 
-/// Artifact-binding payload of a Sigstore bundle. Tagged by the Rekor
-/// entry kind. New bundle kinds (e.g. `intoto / 0.0.2`) would add new
-/// variants here.
+/// Artifact-binding payload of a Sigstore bundle. The payload kind also
+/// determines the expected Rekor entry kind when a tlog observation exists.
 pub const BundlePayload = union(enum) {
     hashedrekord: HashedRekord,
     dsse: Dsse,
 };
 
+pub const RekorObservation = struct {
+    integrated_time: i64,
+    log_index: u64,
+    log_key_id: []const u8,
+    canonical_body: []const u8,
+    kind: RekorKind,
+    set: ?[]const u8,
+    inclusion: ?Inclusion,
+};
+
 pub const Bundle = struct {
     parsed: std.json.Parsed(RawBundle),
-    leaf_der: []const u8, // DER-decoded leaf cert (sub-slice of `arena_bytes`)
-    /// Artifact-binding payload. The variant matches `tlogEntries[0].kindVersion.kind`.
+    leaf_der: []const u8,
     payload: BundlePayload,
-    rekor_integrated_time: i64,
-    rekor_log_index: u64,
-    rekor_log_key_id: []const u8, // raw bytes (binary keyId), owned via arena
-    rekor_canonical_body: []const u8, // base64-decoded canonical Rekor entry body
-    rekor_kind: RekorKind,
-    rekor_set: ?[]const u8, // base64-decoded SET bytes, when inclusionPromise is present
-    inclusion: ?Inclusion, // present when the bundle carries an inclusionProof
+    rekor: ?RekorObservation,
+    /// DER-encoded RFC 3161 TimeStampResp values.
+    rfc3161_timestamps: []const []const u8,
     arena: *std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Bundle) void {
@@ -279,8 +332,8 @@ pub const RekorKind = enum { hashedrekord, dsse };
 /// the bundle's arena.
 pub const Inclusion = struct {
     /// 0-indexed position of the entry within the tree at the time the
-    /// proof was fetched (`inclusionProof.logIndex`). NOT the same as
-    /// `Bundle.rekor_log_index`, which is the global Rekor log index.
+    /// proof was fetched (`inclusionProof.logIndex`). This may differ from
+    /// the observation's global Rekor log index.
     leaf_index: u64,
     /// Total number of leaves in the tree the proof anchors to
     /// (`inclusionProof.treeSize`).
@@ -310,15 +363,36 @@ pub fn parseBundle(allocator: std.mem.Allocator, json_bytes: []const u8) !Bundle
     if (!std.mem.startsWith(u8, raw.mediaType, "application/vnd.dev.sigstore.bundle"))
         return error.UnsupportedBundleMediaType;
 
-    if (raw.verificationMaterial.tlogEntries.len == 0)
-        return error.BundleHasNoTlogEntry;
-
-    const tlog = raw.verificationMaterial.tlogEntries[0];
-    const rekor_kind: RekorKind = blk: {
-        if (std.mem.eql(u8, tlog.kindVersion.kind, "hashedrekord")) break :blk .hashedrekord;
-        if (std.mem.eql(u8, tlog.kindVersion.kind, "dsse")) break :blk .dsse;
-        return error.UnsupportedRekorEntryKind;
+    const payload_kind: RekorKind = blk: {
+        if (raw.messageSignature != null and raw.dsseEnvelope != null)
+            return error.BundleHasMultiplePayloads;
+        if (raw.messageSignature != null) break :blk .hashedrekord;
+        if (raw.dsseEnvelope != null) break :blk .dsse;
+        return error.BundleHasNoPayload;
     };
+
+    if (raw.verificationMaterial.tlogEntries.len > 1)
+        return error.UnsupportedMultipleTlogEntries;
+    const raw_tlog: ?RawBundle.TlogEntry = if (raw.verificationMaterial.tlogEntries.len == 1)
+        raw.verificationMaterial.tlogEntries[0]
+    else
+        null;
+    if (raw_tlog) |tlog| {
+        const tlog_kind: RekorKind = if (std.mem.eql(u8, tlog.kindVersion.kind, "hashedrekord"))
+            .hashedrekord
+        else if (std.mem.eql(u8, tlog.kindVersion.kind, "dsse"))
+            .dsse
+        else
+            return error.UnsupportedRekorEntryKind;
+        if (tlog_kind != payload_kind) return error.RekorPayloadKindMismatch;
+    }
+
+    const raw_timestamps = if (raw.verificationMaterial.timestampVerificationData) |data|
+        data.rfc3161Timestamps
+    else
+        &.{};
+    if (raw_tlog == null and raw_timestamps.len == 0)
+        return error.BundleHasNoTrustedObservation;
 
     // Locate the leaf cert: prefer singular `certificate`, fall back to the
     // first entry of `x509CertificateChain`.
@@ -341,7 +415,7 @@ pub fn parseBundle(allocator: std.mem.Allocator, json_bytes: []const u8) !Bundle
 
     const leaf_der = try base64Decode(aalloc, leaf_b64);
 
-    const payload: BundlePayload = switch (rekor_kind) {
+    const payload: BundlePayload = switch (payload_kind) {
         .hashedrekord => blk: {
             const ms = raw.messageSignature orelse return error.BundleHasNoMessageSignature;
             if (!std.ascii.eqlIgnoreCase(ms.messageDigest.algorithm, "SHA2_256"))
@@ -374,75 +448,88 @@ pub fn parseBundle(allocator: std.mem.Allocator, json_bytes: []const u8) !Bundle
 
             const payload_type_copy = try aalloc.dupe(u8, env.payloadType);
 
-            const subjects = try parseInTotoSubjects(aalloc, payload_bytes);
+            const statement = try parseInTotoStatement(aalloc, payload_bytes);
 
             break :blk .{ .dsse = .{
                 .payload = payload_bytes,
                 .payload_type = payload_type_copy,
                 .signature = sig_bytes,
-                .subjects = subjects,
+                .subjects = statement.subjects,
+                .predicate_type = statement.predicate_type,
             } };
         },
     };
 
-    const canonical_body = try base64Decode(aalloc, tlog.canonicalizedBody);
-    const log_key_id = try base64Decode(aalloc, tlog.logId.keyId);
+    const rekor: ?RekorObservation = if (raw_tlog) |tlog| blk: {
+        const canonical_body = try base64Decode(aalloc, tlog.canonicalizedBody);
+        const log_key_id = try base64Decode(aalloc, tlog.logId.keyId);
 
-    const set_bytes: ?[]const u8 = if (tlog.inclusionPromise) |ip|
-        try base64Decode(aalloc, ip.signedEntryTimestamp)
-    else
-        null;
-
-    const inclusion: ?Inclusion = if (tlog.inclusionProof) |ip| blk: {
-        const leaf_index = std.fmt.parseInt(u64, ip.logIndex, 10) catch
-            return error.InvalidInclusionProof;
-        const tree_size = std.fmt.parseInt(u64, ip.treeSize, 10) catch
-            return error.InvalidInclusionProof;
-        if (tree_size == 0 or leaf_index >= tree_size)
-            return error.InvalidInclusionProof;
-
-        const root_bytes = try base64Decode(aalloc, ip.rootHash);
-        if (root_bytes.len != 32) return error.InvalidInclusionProof;
-        var root_arr: [32]u8 = undefined;
-        @memcpy(&root_arr, root_bytes);
-
-        const hashes = try aalloc.alloc([32]u8, ip.hashes.len);
-        for (ip.hashes, 0..) |h_b64, i| {
-            const h_bytes = try base64Decode(aalloc, h_b64);
-            if (h_bytes.len != 32) return error.InvalidInclusionProof;
-            @memcpy(&hashes[i], h_bytes);
-        }
-
-        const envelope: ?[]const u8 = if (ip.checkpoint) |c|
-            if (c.envelope.len > 0) c.envelope else null
+        const set_bytes: ?[]const u8 = if (tlog.inclusionPromise) |ip|
+            try base64Decode(aalloc, ip.signedEntryTimestamp)
         else
             null;
 
+        const inclusion: ?Inclusion = if (tlog.inclusionProof) |ip| inc: {
+            const leaf_index = std.fmt.parseInt(u64, ip.logIndex, 10) catch
+                return error.InvalidInclusionProof;
+            const tree_size = std.fmt.parseInt(u64, ip.treeSize, 10) catch
+                return error.InvalidInclusionProof;
+            if (tree_size == 0 or leaf_index >= tree_size)
+                return error.InvalidInclusionProof;
+
+            const root_bytes = try base64Decode(aalloc, ip.rootHash);
+            if (root_bytes.len != 32) return error.InvalidInclusionProof;
+            var root_arr: [32]u8 = undefined;
+            @memcpy(&root_arr, root_bytes);
+
+            const hashes = try aalloc.alloc([32]u8, ip.hashes.len);
+            for (ip.hashes, 0..) |h_b64, i| {
+                const h_bytes = try base64Decode(aalloc, h_b64);
+                if (h_bytes.len != 32) return error.InvalidInclusionProof;
+                @memcpy(&hashes[i], h_bytes);
+            }
+
+            const envelope: ?[]const u8 = if (ip.checkpoint) |c|
+                if (c.envelope.len > 0) c.envelope else null
+            else
+                null;
+
+            break :inc .{
+                .leaf_index = leaf_index,
+                .tree_size = tree_size,
+                .root_hash = root_arr,
+                .proof_hashes = hashes,
+                .checkpoint_envelope = envelope,
+            };
+        } else null;
+
+        const integrated_time = std.fmt.parseInt(i64, tlog.integratedTime, 10) catch
+            return error.InvalidRekorEntry;
+        const log_index = std.fmt.parseInt(u64, tlog.logIndex, 10) catch
+            return error.InvalidRekorEntry;
+
         break :blk .{
-            .leaf_index = leaf_index,
-            .tree_size = tree_size,
-            .root_hash = root_arr,
-            .proof_hashes = hashes,
-            .checkpoint_envelope = envelope,
+            .integrated_time = integrated_time,
+            .log_index = log_index,
+            .log_key_id = log_key_id,
+            .canonical_body = canonical_body,
+            .kind = payload_kind,
+            .set = set_bytes,
+            .inclusion = inclusion,
         };
     } else null;
 
-    const integrated_time = std.fmt.parseInt(i64, tlog.integratedTime, 10) catch
-        return error.BundleHasNoTlogEntry;
-    const log_index = std.fmt.parseInt(u64, tlog.logIndex, 10) catch
-        return error.BundleHasNoTlogEntry;
+    const timestamps = try aalloc.alloc([]const u8, raw_timestamps.len);
+    for (raw_timestamps, 0..) |timestamp, i| {
+        timestamps[i] = try base64Decode(aalloc, timestamp.signedTimestamp);
+    }
 
     return .{
         .parsed = parsed,
         .leaf_der = leaf_der,
         .payload = payload,
-        .rekor_integrated_time = integrated_time,
-        .rekor_log_index = log_index,
-        .rekor_log_key_id = log_key_id,
-        .rekor_canonical_body = canonical_body,
-        .rekor_kind = rekor_kind,
-        .rekor_set = set_bytes,
-        .inclusion = inclusion,
+        .rekor = rekor,
+        .rfc3161_timestamps = timestamps,
         .arena = arena,
     };
 }
@@ -474,6 +561,136 @@ pub fn buildTrustBundle(allocator: std.mem.Allocator, now_sec: i64) !Certificate
     try addPemCertsToBundle(&bundle, allocator, fulcio_root_pem, now_sec);
     try addPemCertsToBundle(&bundle, allocator, fulcio_intermediate_pem, now_sec);
     return bundle;
+}
+
+fn buildGithubTsaTrustBundle(
+    allocator: std.mem.Allocator,
+    period: TrustPeriod,
+) !Certificate.Bundle {
+    var bundle: Certificate.Bundle = .empty;
+    errdefer bundle.deinit(allocator);
+    try addPemCertsToBundle(&bundle, allocator, period.pem, period.start);
+    try addPemCertsToBundle(
+        &bundle,
+        allocator,
+        github_tsa_intermediate_pem,
+        period.start,
+    );
+    try addPemCertsToBundle(
+        &bundle,
+        allocator,
+        github_internal_services_root_pem,
+        period.start,
+    );
+    return bundle;
+}
+
+fn verifyGithubTimestamp(
+    allocator: std.mem.Allocator,
+    timestamps: []const []const u8,
+    signed_message: []const u8,
+    now: i64,
+) !i64 {
+    if (timestamps.len == 0) return error.BundleHasNoRfc3161Timestamp;
+
+    for (timestamps) |timestamp| {
+        for (github_tsa_periods) |period| {
+            var trust = try buildGithubTsaTrustBundle(allocator, period);
+            defer trust.deinit(allocator);
+            const pinned_signer = try decodeSinglePem(
+                allocator,
+                period.pem,
+                "CERTIFICATE",
+            );
+            defer allocator.free(pinned_signer);
+
+            const gen_time = rfc3161.verifyDetachedWithPinnedSigner(
+                allocator,
+                timestamp,
+                signed_message,
+                trust,
+                pinned_signer,
+                now,
+                .gen_time,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+            if (period.contains(gen_time)) return gen_time;
+        }
+    }
+    return error.InvalidRfc3161Timestamp;
+}
+
+fn verifyGithubFulcioChain(
+    allocator: std.mem.Allocator,
+    leaf_der: []const u8,
+    verify_at: i64,
+) !void {
+    var matched_period = false;
+    for (github_fulcio_periods) |period| {
+        if (!period.contains(verify_at)) continue;
+        matched_period = true;
+
+        var trust: Certificate.Bundle = .empty;
+        defer trust.deinit(allocator);
+        try addPemCertsToBundle(&trust, allocator, period.pem, verify_at);
+        try addPemCertsToBundle(
+            &trust,
+            allocator,
+            github_fulcio_l1_pem,
+            verify_at,
+        );
+        try addPemCertsToBundle(
+            &trust,
+            allocator,
+            github_internal_services_root_pem,
+            verify_at,
+        );
+
+        _ = verifyCertChain(trust, leaf_der, verify_at) catch continue;
+        return;
+    }
+    if (!matched_period) return error.NoGithubFulcioTrustForTimestamp;
+    return error.InvalidGithubFulcioChain;
+}
+
+pub const TrustDomain = enum {
+    public_good,
+    github,
+};
+
+fn selectTrustDomain(
+    allocator: std.mem.Allocator,
+    leaf_der: []const u8,
+) !TrustDomain {
+    var leaf_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
+    const leaf = leaf_cert.parse() catch return error.LeafCertParseFailed;
+    const issuer = leaf.issuer();
+
+    if (try pemSubjectMatches(
+        allocator,
+        fulcio_intermediate_pem,
+        issuer,
+    )) return .public_good;
+    if (try pemSubjectMatches(
+        allocator,
+        github_fulcio_periods[0].pem,
+        issuer,
+    )) return .github;
+    return error.UnknownFulcioIssuer;
+}
+
+fn pemSubjectMatches(
+    allocator: std.mem.Allocator,
+    pem: []const u8,
+    expected_subject: []const u8,
+) !bool {
+    const cert_der = try decodeSinglePem(allocator, pem, "CERTIFICATE");
+    defer allocator.free(cert_der);
+    var cert: Certificate = .{ .buffer = cert_der, .index = 0 };
+    const parsed = cert.parse() catch return error.TrustBundleBuildFailed;
+    return std.mem.eql(u8, parsed.subject(), expected_subject);
 }
 
 /// Add every PEM-encoded `CERTIFICATE` block in `pem_bytes` to `cb`.
@@ -803,6 +1020,7 @@ const in_toto_statement_v1_type = "https://in-toto.io/Statement/v1";
 const RawInTotoStatement = struct {
     _type: []const u8 = "",
     subject: []const RawInTotoSubject = &.{},
+    predicateType: []const u8 = "",
 };
 
 const RawInTotoSubject = struct {
@@ -810,13 +1028,21 @@ const RawInTotoSubject = struct {
     digest: std.json.ArrayHashMap([]const u8),
 };
 
-/// Parse the in-toto v1 Statement embedded in a DSSE payload and extract
-/// the `subject` list. Subjects without a `sha256` digest are skipped
-/// silently — they couldn't match a `ghr` asset binding anyway.
+const ParsedInTotoStatement = struct {
+    subjects: []const Subject,
+    predicate_type: []const u8,
+};
+
+/// Parse the in-toto v1 Statement embedded in a DSSE payload and retain the
+/// subject list plus predicate type. Subjects without a `sha256` digest are
+/// skipped silently because they cannot match a `ghr` artifact binding.
 ///
 /// All returned slices are sub-slices of `payload` or freshly allocated
 /// from `aalloc`; ownership tracks the arena.
-fn parseInTotoSubjects(aalloc: std.mem.Allocator, payload: []const u8) ![]const Subject {
+fn parseInTotoStatement(
+    aalloc: std.mem.Allocator,
+    payload: []const u8,
+) !ParsedInTotoStatement {
     const parsed = std.json.parseFromSlice(RawInTotoStatement, aalloc, payload, .{
         .ignore_unknown_fields = true,
     }) catch return error.InvalidInTotoStatement;
@@ -839,7 +1065,10 @@ fn parseInTotoSubjects(aalloc: std.mem.Allocator, payload: []const u8) ![]const 
         out_len += 1;
     }
     if (out_len == 0) return error.InTotoStatementHasNoSha256Subjects;
-    return out[0..out_len];
+    return .{
+        .subjects = out[0..out_len],
+        .predicate_type = parsed.value.predicateType,
+    };
 }
 
 /// Look up a subject by file basename. Comparison is case-sensitive on
@@ -853,6 +1082,16 @@ pub fn findSubject(subjects: []const Subject, asset_name: []const u8) ?Subject {
         else
             s.name;
         if (std.mem.eql(u8, base, asset_name)) return s;
+    }
+    return null;
+}
+
+/// Return the first in-toto subject whose SHA-256 matches `digest`, without
+/// constraining the subject name. GitHub-native attestations are discovered
+/// by digest and release assets may be renamed after attestation.
+pub fn findSubjectByDigest(subjects: []const Subject, digest: [32]u8) ?Subject {
+    for (subjects) |subject| {
+        if (std.mem.eql(u8, &subject.sha256, &digest)) return subject;
     }
     return null;
 }
@@ -971,10 +1210,11 @@ pub fn verifyRekorSet(
     bundle: Bundle,
     rekor: RekorKey,
 ) !void {
-    const set_bytes = bundle.rekor_set orelse return error.BundleHasNoRekorSet;
+    const observation = bundle.rekor orelse return error.BundleHasNoTlogEntry;
+    const set_bytes = observation.set orelse return error.BundleHasNoRekorSet;
 
-    if (bundle.rekor_log_key_id.len != rekor.key_id.len or
-        !std.mem.eql(u8, bundle.rekor_log_key_id, &rekor.key_id))
+    if (observation.log_key_id.len != rekor.key_id.len or
+        !std.mem.eql(u8, observation.log_key_id, &rekor.key_id))
         return error.RekorKeyIdMismatch;
 
     // Re-extract the original base64 form of canonicalizedBody. The bundle's
@@ -983,20 +1223,20 @@ pub fn verifyRekorSet(
     // because base64 is deterministic.
     const body_b64_buf = try allocator.alloc(
         u8,
-        std.base64.standard.Encoder.calcSize(bundle.rekor_canonical_body.len),
+        std.base64.standard.Encoder.calcSize(observation.canonical_body.len),
     );
     defer allocator.free(body_b64_buf);
-    const body_b64 = std.base64.standard.Encoder.encode(body_b64_buf, bundle.rekor_canonical_body);
+    const body_b64 = std.base64.standard.Encoder.encode(body_b64_buf, observation.canonical_body);
 
     var key_id_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&key_id_hex, "{x}", .{bundle.rekor_log_key_id}) catch unreachable;
+    _ = std.fmt.bufPrint(&key_id_hex, "{x}", .{observation.log_key_id}) catch unreachable;
 
     // Build canonical JSON with no whitespace.
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();
     try buf.writer.print(
         "{{\"body\":\"{s}\",\"integratedTime\":{d},\"logID\":\"{s}\",\"logIndex\":{d}}}",
-        .{ body_b64, bundle.rekor_integrated_time, key_id_hex[0..key_id_hex.len], bundle.rekor_log_index },
+        .{ body_b64, observation.integrated_time, key_id_hex[0..key_id_hex.len], observation.log_index },
     );
     const canonical = buf.written();
 
@@ -1191,15 +1431,17 @@ pub fn verifyCheckpoint(
     return error.InvalidCheckpointSignature;
 }
 
-/// Verify the bundle's inclusion proof. Recomputes the Merkle root from
-/// the canonicalized Rekor body + audit path and compares it to the
-/// proof's `rootHash`. When a checkpoint envelope is present, also
-/// verifies its signature and binds it back to the proof.
+/// Verify the bundle's inclusion proof against a signed Rekor checkpoint.
+/// The proof's root hash is attacker-controlled without the checkpoint,
+/// so an unauthenticated proof is never reported as verified.
 pub fn verifyInclusionProof(bundle: Bundle, rekor: RekorKey) !void {
-    const inc = bundle.inclusion orelse return error.BundleHasNoInclusionProof;
+    const observation = bundle.rekor orelse return error.BundleHasNoTlogEntry;
+    const inc = observation.inclusion orelse return error.BundleHasNoInclusionProof;
+    const checkpoint = inc.checkpoint_envelope orelse
+        return error.BundleHasNoSignedCheckpoint;
 
     const computed = try computeMerkleRoot(
-        bundle.rekor_canonical_body,
+        observation.canonical_body,
         inc.leaf_index,
         inc.tree_size,
         inc.proof_hashes,
@@ -1207,8 +1449,7 @@ pub fn verifyInclusionProof(bundle: Bundle, rekor: RekorKey) !void {
     if (!std.mem.eql(u8, &computed, &inc.root_hash))
         return error.InclusionProofRootMismatch;
 
-    if (inc.checkpoint_envelope) |env|
-        try verifyCheckpoint(env, inc.tree_size, inc.root_hash, rekor);
+    try verifyCheckpoint(checkpoint, inc.tree_size, inc.root_hash, rekor);
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,8 +1459,9 @@ pub fn verifyInclusionProof(bundle: Bundle, rekor: RekorKey) !void {
 pub const VerifiedIdentity = struct {
     /// Signer identity extracted from the leaf cert, if present.
     identity: Identity,
-    /// Rekor `integratedTime`, useful for the install metadata and CLI
-    /// output.
+    trust_domain: TrustDomain,
+    observation: TrustedObservation,
+    /// Trusted Rekor integrated time or RFC 3161 generation time.
     integrated_time: i64,
     /// True if a Merkle inclusion proof was verified (and, when present,
     /// its signed checkpoint). False on legacy bundles that only carry an
@@ -1235,6 +1477,11 @@ pub const VerifiedIdentity = struct {
     artifact_digest: [32]u8,
 };
 
+pub const TrustedObservation = enum {
+    rekor,
+    rfc3161,
+};
+
 /// Signer identity extracted from a Sigstore leaf cert. All fields are
 /// borrowed from the bundle's leaf-cert byte buffer.
 pub const Identity = struct {
@@ -1247,6 +1494,16 @@ pub const Identity = struct {
     /// or .1.1 (legacy). Both encode the same value; `.8` wraps it in a
     /// DER UTF8String, `.1` is a raw URL.
     oidc_issuer: ?[]const u8 = null,
+    /// Workflow identity that signed the bundle. This may belong to a
+    /// reusable workflow in a different repository.
+    build_signer_uri: ?[]const u8 = null,
+    runner_environment: ?[]const u8 = null,
+    source_repository_uri: ?[]const u8 = null,
+    source_repository_owner_uri: ?[]const u8 = null,
+    build_config_uri: ?[]const u8 = null,
+    /// Legacy repository extension (`owner/repo`) used as a fallback when
+    /// the URI-form source repository extension is absent.
+    legacy_repository: ?[]const u8 = null,
 
     /// First non-null SAN value, preferring URI over email.
     pub fn primarySubject(self: Identity) ?[]const u8 {
@@ -1288,11 +1545,8 @@ pub fn extractIdentity(leaf_der: []const u8) !Identity {
         }
     }
 
-    // OIDC issuer — walk the extension list. We have to do this ourselves
-    // because std.crypto.Certificate only exposes SAN.
-    const oidc_issuer_v1 = [_]u8{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xbf, 0x30, 0x01, 0x01 };
-    const oidc_issuer_v2 = [_]u8{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xbf, 0x30, 0x01, 0x08 };
-
+    // Fulcio extensions are not exposed by std.crypto.Certificate, so walk
+    // the X.509 extension sequence and retain the GitHub identity fields.
     const certificate = Certificate.der.Element.parse(leaf_der, 0) catch return id;
     const tbs = Certificate.der.Element.parse(leaf_der, certificate.slice.start) catch
         return id;
@@ -1321,14 +1575,21 @@ pub fn extractIdentity(leaf_der: []const u8) !Identity {
             const oid_bytes = leaf_der[oid_elem.slice.start..oid_elem.slice.end];
             const value_bytes = leaf_der[value_elem.slice.start..value_elem.slice.end];
 
-            if (std.mem.eql(u8, oid_bytes, &oidc_issuer_v2)) {
-                // V2: extension value is a DER UTF8String.
-                const inner = Certificate.der.Element.parse(value_bytes, 0) catch continue;
-                if (@intFromEnum(inner.identifier.tag) == 12) {
-                    id.oidc_issuer = value_bytes[inner.slice.start..inner.slice.end];
-                }
-            } else if (std.mem.eql(u8, oid_bytes, &oidc_issuer_v1)) {
-                if (id.oidc_issuer == null) id.oidc_issuer = value_bytes;
+            const suffix = fulcioExtensionSuffix(oid_bytes) orelse continue;
+            switch (suffix) {
+                1 => if (id.oidc_issuer == null) {
+                    id.oidc_issuer = value_bytes;
+                },
+                5 => if (id.legacy_repository == null) {
+                    id.legacy_repository = value_bytes;
+                },
+                8 => id.oidc_issuer = parseDerUtf8String(value_bytes) orelse continue,
+                9 => id.build_signer_uri = parseDerUtf8String(value_bytes) orelse continue,
+                11 => id.runner_environment = parseDerUtf8String(value_bytes) orelse continue,
+                12 => id.source_repository_uri = parseDerUtf8String(value_bytes) orelse continue,
+                16 => id.source_repository_owner_uri = parseDerUtf8String(value_bytes) orelse continue,
+                18 => id.build_config_uri = parseDerUtf8String(value_bytes) orelse continue,
+                else => {},
             }
         }
         break;
@@ -1337,28 +1598,107 @@ pub fn extractIdentity(leaf_der: []const u8) !Identity {
     return id;
 }
 
-/// Run the full verification pipeline against a parsed bundle and the
-/// cached artifact:
-///
-///   1. Verify the Rekor SET (ties `integratedTime` to the embedded Rekor
-///      key) when the bundle carries an `inclusionPromise`.
-///   2. Verify the Merkle inclusion proof + signed checkpoint when the
-///      bundle carries an `inclusionProof`. At least one of (1) or (2)
-///      must be present and pass.
-///   3. Decode the canonicalized Rekor body and confirm it agrees with the
-///      bundle's claimed leaf cert, signature, and (for hashedrekord)
-///      artifact digest or (for dsse) payload hash.
-///   4. Per-kind artifact binding:
-///        - `hashedrekord`: stream the artifact through an ECDSA-P256/
-///          SHA-256 verifier with the leaf cert's pubkey and confirm
-///          both the signature and the digest match what Rekor witnessed.
-///        - `dsse`: verify the DSSE PAE signature over the in-toto
-///          Statement payload using the leaf cert's pubkey; compute the
-///          artifact's sha256 by streaming it; require that one of the
-///          in-toto `subject` entries names `asset_name` AND its
-///          sha256 equals the file's actual sha256.
-///   5. Walk the X.509 chain from the leaf to the embedded Fulcio root,
-///      using `integratedTime` as the validity clock.
+fn fulcioExtensionSuffix(oid_bytes: []const u8) ?u8 {
+    const prefix = [_]u8{
+        0x2b, 0x06, 0x01, 0x04, 0x01, 0x83, 0xbf, 0x30, 0x01,
+    };
+    if (oid_bytes.len != prefix.len + 1) return null;
+    if (!std.mem.eql(u8, oid_bytes[0..prefix.len], &prefix)) return null;
+    return oid_bytes[prefix.len];
+}
+
+fn parseDerUtf8String(value_bytes: []const u8) ?[]const u8 {
+    const inner = rfc3161.parseElement(value_bytes, 0) catch return null;
+    if (@intFromEnum(inner.identifier.tag) != 12) return null;
+    if (inner.slice.end != value_bytes.len) return null;
+    return value_bytes[inner.slice.start..inner.slice.end];
+}
+
+pub const SubjectBinding = enum {
+    name_and_digest,
+    digest_only,
+};
+
+pub const VerificationPolicy = struct {
+    expected_predicate_type: ?[]const u8 = null,
+    expected_oidc_issuer: ?[]const u8 = null,
+    expected_repository_uri: ?[]const u8 = null,
+    expected_owner_uri: ?[]const u8 = null,
+    expected_build_config_prefix: ?[]const u8 = null,
+    subject_binding: SubjectBinding = .name_and_digest,
+};
+
+fn enforcePolicy(
+    payload: BundlePayload,
+    identity: Identity,
+    policy: VerificationPolicy,
+) !void {
+    if (policy.expected_predicate_type) |expected| {
+        const actual = switch (payload) {
+            .dsse => |dsse| dsse.predicate_type,
+            .hashedrekord => return error.PredicateTypeMismatch,
+        };
+        if (!std.mem.eql(u8, actual, expected))
+            return error.PredicateTypeMismatch;
+    }
+
+    if (policy.expected_oidc_issuer) |expected| {
+        const actual = identity.oidc_issuer orelse
+            return error.OidcIssuerMismatch;
+        if (!std.mem.eql(u8, actual, expected))
+            return error.OidcIssuerMismatch;
+    }
+
+    if (policy.expected_repository_uri) |expected| {
+        if (!matchesRepository(identity, expected))
+            return error.SourceRepositoryMismatch;
+    }
+
+    if (policy.expected_owner_uri) |expected| {
+        if (!matchesOwner(identity, expected))
+            return error.SourceRepositoryOwnerMismatch;
+    }
+
+    if (policy.expected_build_config_prefix) |expected| {
+        const actual = identity.build_config_uri orelse
+            return error.BuildConfigMismatch;
+        if (!asciiStartsWithIgnoreCase(actual, expected))
+            return error.BuildConfigMismatch;
+    }
+}
+
+fn matchesRepository(identity: Identity, expected_uri: []const u8) bool {
+    if (identity.source_repository_uri) |actual| {
+        return std.ascii.eqlIgnoreCase(actual, expected_uri);
+    }
+    const legacy = identity.legacy_repository orelse return false;
+    const github_prefix = "https://github.com/";
+    if (!asciiStartsWithIgnoreCase(expected_uri, github_prefix)) return false;
+    return std.ascii.eqlIgnoreCase(legacy, expected_uri[github_prefix.len..]);
+}
+
+fn matchesOwner(identity: Identity, expected_uri: []const u8) bool {
+    if (identity.source_repository_owner_uri) |actual| {
+        return std.ascii.eqlIgnoreCase(actual, expected_uri);
+    }
+    const legacy = identity.legacy_repository orelse return false;
+    const slash = std.mem.indexOfScalar(u8, legacy, '/') orelse return false;
+    const github_prefix = "https://github.com/";
+    if (!asciiStartsWithIgnoreCase(expected_uri, github_prefix)) return false;
+    return std.ascii.eqlIgnoreCase(
+        legacy[0..slash],
+        expected_uri[github_prefix.len..],
+    );
+}
+
+fn asciiStartsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
+    if (haystack.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
+}
+
+/// Run the full verification pipeline with no additional identity policy.
+/// The leaf issuer selects the trust domain: Public Good bundles require
+/// Rekor, while GitHub bundles require RFC 3161 and reject Rekor.
 pub fn verifyBundle(
     allocator: std.mem.Allocator,
     io: Io,
@@ -1367,22 +1707,82 @@ pub fn verifyBundle(
     file: Io.File,
     asset_name: []const u8,
 ) !VerifiedIdentity {
-    var set_verified = false;
-    if (bundle.rekor_set != null) {
-        try verifyRekorSet(allocator, bundle, rekor);
-        set_verified = true;
-    }
+    return verifyBundleWithPolicy(
+        allocator,
+        io,
+        bundle,
+        rekor,
+        file,
+        asset_name,
+        .{},
+    );
+}
 
+pub fn verifyBundleWithPolicy(
+    allocator: std.mem.Allocator,
+    io: Io,
+    bundle: Bundle,
+    rekor: RekorKey,
+    file: Io.File,
+    asset_name: []const u8,
+    policy: VerificationPolicy,
+) !VerifiedIdentity {
+    const trust_domain = try selectTrustDomain(allocator, bundle.leaf_der);
     var inclusion_verified = false;
     var checkpoint_verified = false;
-    if (bundle.inclusion) |inc| {
-        try verifyInclusionProof(bundle, rekor);
-        inclusion_verified = true;
-        checkpoint_verified = inc.checkpoint_envelope != null;
-    }
+    var trusted_observation: TrustedObservation = undefined;
+    const trusted_time: i64 = switch (trust_domain) {
+        .public_good => blk: {
+            const observation = bundle.rekor orelse
+                return error.PublicGoodBundleRequiresRekor;
 
-    if (!set_verified and !inclusion_verified)
-        return error.BundleHasNoLogProof;
+            // integratedTime is covered by the SET, but not by the Merkle
+            // inclusion proof. Never use it as the Fulcio validation clock
+            // unless the SET verifies.
+            try verifyRekorSet(allocator, bundle, rekor);
+            if (observation.inclusion) |inc| {
+                if (inc.checkpoint_envelope != null) {
+                    try verifyInclusionProof(bundle, rekor);
+                    inclusion_verified = true;
+                    checkpoint_verified = true;
+                }
+            }
+
+            var trust = try buildTrustBundle(
+                allocator,
+                observation.integrated_time,
+            );
+            defer trust.deinit(allocator);
+            _ = try verifyCertChain(
+                trust,
+                bundle.leaf_der,
+                observation.integrated_time,
+            );
+            trusted_observation = .rekor;
+            break :blk observation.integrated_time;
+        },
+        .github => blk: {
+            if (bundle.rekor != null) return error.GithubBundleMustNotUseRekor;
+            const dsse = switch (bundle.payload) {
+                .dsse => |value| value,
+                .hashedrekord => return error.GithubBundleRequiresDsse,
+            };
+            const now = Io.Clock.now(.real, io).toSeconds();
+            const gen_time = try verifyGithubTimestamp(
+                allocator,
+                bundle.rfc3161_timestamps,
+                dsse.signature,
+                now,
+            );
+            try verifyGithubFulcioChain(
+                allocator,
+                bundle.leaf_der,
+                gen_time,
+            );
+            trusted_observation = .rfc3161;
+            break :blk gen_time;
+        },
+    };
 
     var leaf_cert: Certificate = .{ .buffer = bundle.leaf_der, .index = 0 };
     const leaf = leaf_cert.parse() catch return error.LeafCertParseFailed;
@@ -1392,7 +1792,11 @@ pub fn verifyBundle(
 
     switch (bundle.payload) {
         .hashedrekord => |hr| {
-            var body = try decodeRekorBody(allocator, bundle.rekor_canonical_body);
+            if (trust_domain != .public_good)
+                return error.GithubBundleRequiresDsse;
+            const observation = bundle.rekor orelse
+                return error.PublicGoodBundleRequiresRekor;
+            var body = try decodeRekorBody(allocator, observation.canonical_body);
             defer body.deinit();
 
             if (!std.mem.eql(u8, &body.digest, &hr.artifact_digest))
@@ -1407,21 +1811,24 @@ pub fn verifyBundle(
                 return error.ArtifactDigestMismatch;
         },
         .dsse => |dsse| {
-            // Bind the Rekor body to our DSSE envelope.
-            var body = try decodeDsseRekorBody(allocator, bundle.rekor_canonical_body);
-            defer body.deinit();
+            if (trust_domain == .public_good) {
+                const observation = bundle.rekor orelse
+                    return error.PublicGoodBundleRequiresRekor;
+                var body = try decodeDsseRekorBody(
+                    allocator,
+                    observation.canonical_body,
+                );
+                defer body.deinit();
 
-            // Verifier cert: must equal our bundle's leaf cert.
-            if (!std.mem.eql(u8, body.leaf_der, bundle.leaf_der))
-                return error.BundleCertMismatch;
-            // DSSE signature: must equal what Rekor witnessed.
-            if (!std.mem.eql(u8, body.signature, dsse.signature))
-                return error.BundleSignatureMismatch;
-            // Payload hash: sha256(payload bytes) must match what Rekor witnessed.
-            var payload_hash: [32]u8 = undefined;
-            Sha256.hash(dsse.payload, &payload_hash, .{});
-            if (!std.mem.eql(u8, &payload_hash, &body.payload_hash))
-                return error.BundleSignatureMismatch;
+                if (!std.mem.eql(u8, body.leaf_der, bundle.leaf_der))
+                    return error.BundleCertMismatch;
+                if (!std.mem.eql(u8, body.signature, dsse.signature))
+                    return error.BundleSignatureMismatch;
+                var payload_hash: [32]u8 = undefined;
+                Sha256.hash(dsse.payload, &payload_hash, .{});
+                if (!std.mem.eql(u8, &payload_hash, &body.payload_hash))
+                    return error.BundleSignatureMismatch;
+            }
 
             // Verify the DSSE signature over PAE(payloadType, payload).
             try verifyDsseSignature(
@@ -1432,24 +1839,30 @@ pub fn verifyBundle(
                 dsse.signature,
             );
 
-            // Bind the artifact: its name must appear as a subject and its
-            // sha256 must equal the subject's digest.
-            const subject = findSubject(dsse.subjects, asset_name) orelse
-                return error.AssetNotInInTotoSubjects;
-
             try streamFileSha256(io, file, &artifact_digest);
-            if (!std.mem.eql(u8, &artifact_digest, &subject.sha256))
-                return error.ArtifactDigestMismatch;
+            switch (policy.subject_binding) {
+                .name_and_digest => {
+                    const subject = findSubject(dsse.subjects, asset_name) orelse
+                        return error.AssetNotInInTotoSubjects;
+                    if (!std.mem.eql(u8, &artifact_digest, &subject.sha256))
+                        return error.ArtifactDigestMismatch;
+                },
+                .digest_only => {
+                    _ = findSubjectByDigest(dsse.subjects, artifact_digest) orelse
+                        return error.ArtifactDigestNotInInTotoSubjects;
+                },
+            }
         },
     }
 
-    var trust = try buildTrustBundle(allocator, bundle.rekor_integrated_time);
-    defer trust.deinit(allocator);
-    _ = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
+    const identity = try extractIdentity(bundle.leaf_der);
+    try enforcePolicy(bundle.payload, identity, policy);
 
     return .{
-        .identity = try extractIdentity(bundle.leaf_der),
-        .integrated_time = bundle.rekor_integrated_time,
+        .identity = identity,
+        .trust_domain = trust_domain,
+        .observation = trusted_observation,
+        .integrated_time = trusted_time,
         .inclusion_verified = inclusion_verified,
         .checkpoint_verified = checkpoint_verified,
         .artifact_digest = artifact_digest,
@@ -1501,7 +1914,7 @@ test "parseBundle on captured cosign fixture" {
     try std.testing.expect(leaf.subject_alt_name_slice.end > leaf.subject_alt_name_slice.start);
 
     // hashedrekord payload sanity.
-    try std.testing.expectEqual(RekorKind.hashedrekord, bundle.rekor_kind);
+    try std.testing.expectEqual(RekorKind.hashedrekord, bundle.rekor.?.kind);
     const hr = switch (bundle.payload) {
         .hashedrekord => |h| h,
         else => return error.TestUnexpectedPayload,
@@ -1517,9 +1930,9 @@ test "parseBundle on captured cosign fixture" {
     try std.testing.expectEqualSlices(u8, &expected_digest, &hr.artifact_digest);
 
     // Rekor scalars are parsed.
-    try std.testing.expect(bundle.rekor_integrated_time > 1700000000);
-    try std.testing.expect(bundle.rekor_log_index > 0);
-    try std.testing.expect(bundle.rekor_set != null);
+    try std.testing.expect(bundle.rekor.?.integrated_time > 1700000000);
+    try std.testing.expect(bundle.rekor.?.log_index > 0);
+    try std.testing.expect(bundle.rekor.?.set != null);
 }
 
 test "buildTrustBundle parses embedded Fulcio roots" {
@@ -1537,14 +1950,14 @@ test "verifyCertChain walks cosign fixture to embedded Fulcio root" {
     var bundle = try parseBundle(allocator, test_bundle_json);
     defer bundle.deinit();
 
-    var trust = try buildTrustBundle(allocator, bundle.rekor_integrated_time);
+    var trust = try buildTrustBundle(allocator, bundle.rekor.?.integrated_time);
     defer trust.deinit(allocator);
 
     // Walking from the leaf to the embedded Fulcio root must succeed.
     // (The returned `Parsed` is std.crypto.Certificate.Parsed; we don't
     // rely on its SAN slice here — our own `extractIdentity` is the
     // ground truth for that.)
-    _ = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
+    _ = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor.?.integrated_time);
 }
 
 test "embeddedRekorKey matches well-known production key id" {
@@ -1585,7 +1998,7 @@ test "verifyRekorSet rejects tampered SET signature" {
     const rekor = try embeddedRekorKey(allocator);
     // Tamper with the integrated time so the canonical payload no longer
     // matches what Rekor signed.
-    bundle.rekor_integrated_time += 1;
+    bundle.rekor.?.integrated_time += 1;
     const result = verifyRekorSet(allocator, bundle, rekor);
     try std.testing.expect(result == error.InvalidRekorSetSignature or
         result == error.SignatureVerificationFailed);
@@ -1595,7 +2008,7 @@ test "decodeRekorBody binds digest, signature, and cert to bundle" {
     const allocator = std.testing.allocator;
     var bundle = try parseBundle(allocator, test_bundle_json);
     defer bundle.deinit();
-    var body = try decodeRekorBody(allocator, bundle.rekor_canonical_body);
+    var body = try decodeRekorBody(allocator, bundle.rekor.?.canonical_body);
     defer body.deinit();
     const hr = switch (bundle.payload) {
         .hashedrekord => |h| h,
@@ -1719,7 +2132,7 @@ test "parseBundle extracts the inclusion proof" {
     var bundle = try parseBundle(allocator, test_bundle_json);
     defer bundle.deinit();
 
-    const inc = bundle.inclusion orelse return error.TestUnexpectedNull;
+    const inc = bundle.rekor.?.inclusion orelse return error.TestUnexpectedNull;
     try std.testing.expectEqual(@as(u64, 1122916277), inc.leaf_index);
     try std.testing.expectEqual(@as(u64, 1122916324), inc.tree_size);
     try std.testing.expectEqual(@as(usize, 21), inc.proof_hashes.len);
@@ -1743,13 +2156,13 @@ test "verifyInclusionProof rejects tampered proof" {
     const rekor = try embeddedRekorKey(allocator);
 
     // Flip a bit in the first sibling hash of the audit path.
-    const inc = bundle.inclusion orelse return error.TestUnexpectedNull;
+    const inc = bundle.rekor.?.inclusion orelse return error.TestUnexpectedNull;
     const tampered = try allocator.alloc([32]u8, inc.proof_hashes.len);
     defer allocator.free(tampered);
     @memcpy(tampered, inc.proof_hashes);
     tampered[0][0] ^= 0x01;
 
-    bundle.inclusion = .{
+    bundle.rekor.?.inclusion = .{
         .leaf_index = inc.leaf_index,
         .tree_size = inc.tree_size,
         .root_hash = inc.root_hash,
@@ -1763,12 +2176,32 @@ test "verifyInclusionProof rejects tampered proof" {
     );
 }
 
+test "verifyInclusionProof rejects an unsigned root hash" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    const inc = bundle.rekor.?.inclusion orelse return error.TestUnexpectedNull;
+    bundle.rekor.?.inclusion = .{
+        .leaf_index = inc.leaf_index,
+        .tree_size = inc.tree_size,
+        .root_hash = inc.root_hash,
+        .proof_hashes = inc.proof_hashes,
+        .checkpoint_envelope = null,
+    };
+
+    try std.testing.expectError(
+        error.BundleHasNoSignedCheckpoint,
+        verifyInclusionProof(bundle, try embeddedRekorKey(allocator)),
+    );
+}
+
 test "verifyCheckpoint rejects mismatched root or size" {
     const allocator = std.testing.allocator;
     var bundle = try parseBundle(allocator, test_bundle_json);
     defer bundle.deinit();
 
-    const inc = bundle.inclusion orelse return error.TestUnexpectedNull;
+    const inc = bundle.rekor.?.inclusion orelse return error.TestUnexpectedNull;
     const env = inc.checkpoint_envelope orelse return error.TestUnexpectedNull;
     const rekor = try embeddedRekorKey(allocator);
 
@@ -1790,7 +2223,7 @@ test "verifyCheckpoint rejects tampered signature body" {
     var bundle = try parseBundle(allocator, test_bundle_json);
     defer bundle.deinit();
 
-    const inc = bundle.inclusion orelse return error.TestUnexpectedNull;
+    const inc = bundle.rekor.?.inclusion orelse return error.TestUnexpectedNull;
     const env = inc.checkpoint_envelope orelse return error.TestUnexpectedNull;
     const rekor = try embeddedRekorKey(allocator);
 
@@ -1818,6 +2251,14 @@ test "verifyCheckpoint rejects tampered signature body" {
 // ---------------------------------------------------------------------------
 
 const test_wash_bundle_json = @embedFile("sigstore/testdata/wash.sigstore.json");
+const test_github_private_bundle_json =
+    @embedFile("sigstore/testdata/github-private-provenance.sigstore.json");
+const test_github_private_artifact =
+    @embedFile("sigstore/testdata/github-private-provenance.whl");
+const test_github_public_reusable_bundle_json =
+    @embedFile("sigstore/testdata/github-public-reusable.sigstore.json");
+const test_github_public_reusable_artifact =
+    @embedFile("sigstore/testdata/github-public-reusable.artifact");
 
 /// The wasmcloud v2.1.0 release publishes a single `wash.sigstore.json`
 /// that signs all eight platform binaries via the in-toto Statement's
@@ -1904,7 +2345,7 @@ test "parseBundle on wasmcloud wash.sigstore.json (DSSE in-toto)" {
     var bundle = try parseBundle(allocator, test_wash_bundle_json);
     defer bundle.deinit();
 
-    try std.testing.expectEqual(RekorKind.dsse, bundle.rekor_kind);
+    try std.testing.expectEqual(RekorKind.dsse, bundle.rekor.?.kind);
 
     const dsse = switch (bundle.payload) {
         .dsse => |d| d,
@@ -1916,8 +2357,8 @@ test "parseBundle on wasmcloud wash.sigstore.json (DSSE in-toto)" {
 
     // Inclusion proof + checkpoint present (wasmcloud builds anchor every
     // tlog entry to a signed checkpoint).
-    try std.testing.expect(bundle.inclusion != null);
-    try std.testing.expect(bundle.inclusion.?.checkpoint_envelope != null);
+    try std.testing.expect(bundle.rekor.?.inclusion != null);
+    try std.testing.expect(bundle.rekor.?.inclusion.?.checkpoint_envelope != null);
 }
 
 test "findSubject locates the wash-aarch64-unknown-linux-gnu entry" {
@@ -1942,7 +2383,7 @@ test "decodeDsseRekorBody binds payload hash + signature + cert" {
     var bundle = try parseBundle(allocator, test_wash_bundle_json);
     defer bundle.deinit();
 
-    var body = try decodeDsseRekorBody(allocator, bundle.rekor_canonical_body);
+    var body = try decodeDsseRekorBody(allocator, bundle.rekor.?.canonical_body);
     defer body.deinit();
 
     const dsse = switch (bundle.payload) {
@@ -2011,10 +2452,10 @@ test "verifyCertChain walks wash DSSE fixture to embedded Fulcio root" {
     var bundle = try parseBundle(allocator, test_wash_bundle_json);
     defer bundle.deinit();
 
-    var trust = try buildTrustBundle(allocator, bundle.rekor_integrated_time);
+    var trust = try buildTrustBundle(allocator, bundle.rekor.?.integrated_time);
     defer trust.deinit(allocator);
 
-    _ = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor_integrated_time);
+    _ = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor.?.integrated_time);
 }
 
 test "extractIdentity exposes GitHub Actions workflow URI from wash fixture" {
@@ -2027,6 +2468,102 @@ test "extractIdentity exposes GitHub Actions workflow URI from wash fixture" {
     try std.testing.expect(id.san_uri != null);
     try std.testing.expect(std.mem.startsWith(u8, id.san_uri.?, "https://github.com/wasmCloud/wasmCloud/"));
     try std.testing.expectEqualStrings("https://token.actions.githubusercontent.com", id.oidc_issuer.?);
+}
+
+test "extractIdentity exposes GitHub repository policy extensions" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_wash_bundle_json);
+    defer bundle.deinit();
+
+    const id = try extractIdentity(bundle.leaf_der);
+    try std.testing.expectEqualStrings(
+        "https://github.com/wasmCloud/wasmCloud/.github/workflows/release-tag.yml@refs/heads/main",
+        id.build_signer_uri.?,
+    );
+    try std.testing.expectEqualStrings("github-hosted", id.runner_environment.?);
+    try std.testing.expectEqualStrings(
+        "https://github.com/wasmCloud/wasmCloud",
+        id.source_repository_uri.?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://github.com/wasmCloud",
+        id.source_repository_owner_uri.?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://github.com/wasmCloud/wasmCloud/.github/workflows/release-tag.yml@refs/heads/main",
+        id.build_config_uri.?,
+    );
+}
+
+test "GitHub policy enforces predicate and repository identity" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_wash_bundle_json);
+    defer bundle.deinit();
+
+    const id = try extractIdentity(bundle.leaf_der);
+    const policy: VerificationPolicy = .{
+        .expected_predicate_type = "https://slsa.dev/provenance/v1",
+        .expected_oidc_issuer = "https://token.actions.githubusercontent.com",
+        .expected_repository_uri = "https://github.com/wasmcloud/wasmcloud",
+        .expected_owner_uri = "https://github.com/wasmcloud",
+        .expected_build_config_prefix = "https://github.com/wasmcloud/wasmcloud/.github/workflows/",
+        .subject_binding = .digest_only,
+    };
+    try enforcePolicy(bundle.payload, id, policy);
+
+    var wrong_repository = policy;
+    wrong_repository.expected_repository_uri = "https://github.com/attacker/repo";
+    try std.testing.expectError(
+        error.SourceRepositoryMismatch,
+        enforcePolicy(bundle.payload, id, wrong_repository),
+    );
+
+    var wrong_owner = policy;
+    wrong_owner.expected_owner_uri = "https://github.com/attacker";
+    try std.testing.expectError(
+        error.SourceRepositoryOwnerMismatch,
+        enforcePolicy(bundle.payload, id, wrong_owner),
+    );
+
+    var wrong_issuer = policy;
+    wrong_issuer.expected_oidc_issuer = "https://issuer.example.test";
+    try std.testing.expectError(
+        error.OidcIssuerMismatch,
+        enforcePolicy(bundle.payload, id, wrong_issuer),
+    );
+
+    var wrong_predicate = policy;
+    wrong_predicate.expected_predicate_type = "https://example.test/predicate";
+    try std.testing.expectError(
+        error.PredicateTypeMismatch,
+        enforcePolicy(bundle.payload, id, wrong_predicate),
+    );
+
+    var wrong_build_config = policy;
+    wrong_build_config.expected_build_config_prefix =
+        "https://github.com/wasmcloud/other/.github/workflows/";
+    try std.testing.expectError(
+        error.BuildConfigMismatch,
+        enforcePolicy(bundle.payload, id, wrong_build_config),
+    );
+}
+
+test "digest-only subject binding ignores release asset name" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_wash_bundle_json);
+    defer bundle.deinit();
+
+    const dsse = switch (bundle.payload) {
+        .dsse => |value| value,
+        else => return error.TestUnexpectedPayload,
+    };
+    const subject = findSubjectByDigest(dsse.subjects, wash_aarch64_linux_gnu_sha256) orelse
+        return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings(
+        "wash-aarch64-unknown-linux-gnu",
+        subject.name,
+    );
+    try std.testing.expect(findSubject(dsse.subjects, "renamed-release-asset") == null);
 }
 
 test "verifyBundle succeeds on wash DSSE fixture + matching artifact" {
@@ -2095,4 +2632,388 @@ test "verifyBundle rejects bundle when asset name not in subjects" {
     const rekor = try embeddedRekorKey(allocator);
     const result = verifyBundle(allocator, io, bundle, rekor, f, "not-a-wash-binary");
     try std.testing.expectError(error.AssetNotInInTotoSubjects, result);
+}
+
+test "parseBundle accepts GitHub private timestamp-only provenance" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_github_private_bundle_json);
+    defer bundle.deinit();
+
+    try std.testing.expect(bundle.rekor == null);
+    try std.testing.expectEqual(@as(usize, 1), bundle.rfc3161_timestamps.len);
+    const dsse = switch (bundle.payload) {
+        .dsse => |value| value,
+        else => return error.TestUnexpectedPayload,
+    };
+    try std.testing.expectEqualStrings(
+        "https://slsa.dev/provenance/v1",
+        dsse.predicate_type,
+    );
+}
+
+test "GitHub private provenance verifies through RFC3161 policy" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_github_private_bundle_json);
+    defer bundle.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    {
+        var artifact = try tmp.dir.createFile(io, "renamed.whl", .{});
+        try artifact.writeStreamingAll(io, test_github_private_artifact);
+        artifact.close(io);
+    }
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "renamed.whl", &path_buf);
+    var artifact = try Io.Dir.openFileAbsolute(io, path_buf[0..path_len], .{});
+    defer artifact.close(io);
+
+    const result = try verifyBundleWithPolicy(
+        allocator,
+        io,
+        bundle,
+        try embeddedRekorKey(allocator),
+        artifact,
+        "renamed-after-attestation.whl",
+        .{
+            .expected_predicate_type = "https://slsa.dev/provenance/v1",
+            .expected_oidc_issuer = "https://token.actions.githubusercontent.com",
+            .expected_repository_uri = "https://github.com/actions/attest-demo",
+            .expected_owner_uri = "https://github.com/actions",
+            .expected_build_config_prefix = "https://github.com/actions/attest-demo/.github/workflows/",
+            .subject_binding = .digest_only,
+        },
+    );
+    try std.testing.expectEqual(TrustDomain.github, result.trust_domain);
+    try std.testing.expectEqual(
+        TrustedObservation.rfc3161,
+        result.observation,
+    );
+    try std.testing.expectEqual(@as(i64, 1713807206), result.integrated_time);
+    try std.testing.expectEqualStrings(
+        "https://github.com/actions/attest-demo",
+        result.identity.source_repository_uri.?,
+    );
+}
+
+test "GitHub private timestamp rejects a tampered imprint target" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_github_private_bundle_json);
+    defer bundle.deinit();
+    const dsse = switch (bundle.payload) {
+        .dsse => |value| value,
+        else => return error.TestUnexpectedPayload,
+    };
+
+    const tampered_signature = try allocator.dupe(u8, dsse.signature);
+    defer allocator.free(tampered_signature);
+    tampered_signature[0] ^= 0x01;
+    try std.testing.expectError(
+        error.InvalidRfc3161Timestamp,
+        verifyGithubTimestamp(
+            allocator,
+            bundle.rfc3161_timestamps,
+            tampered_signature,
+            1713807206,
+        ),
+    );
+}
+
+test "GitHub private timestamp requires the pinned rotation signer" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_github_private_bundle_json);
+    defer bundle.deinit();
+    const dsse = switch (bundle.payload) {
+        .dsse => |value| value,
+        else => return error.TestUnexpectedPayload,
+    };
+
+    var trust = try buildGithubTsaTrustBundle(
+        allocator,
+        github_tsa_periods[0],
+    );
+    defer trust.deinit(allocator);
+    const wrong_signer = try decodeSinglePem(
+        allocator,
+        github_tsa_periods[1].pem,
+        "CERTIFICATE",
+    );
+    defer allocator.free(wrong_signer);
+
+    try std.testing.expectError(
+        error.SignerCertMismatch,
+        rfc3161.verifyDetachedWithPinnedSigner(
+            allocator,
+            bundle.rfc3161_timestamps[0],
+            dsse.signature,
+            trust,
+            wrong_signer,
+            1713807206,
+            .gen_time,
+        ),
+    );
+}
+
+test "GitHub private provenance rejects an artifact with the wrong digest" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_github_private_bundle_json);
+    defer bundle.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    {
+        var artifact = try tmp.dir.createFile(io, "wrong.whl", .{});
+        try artifact.writeStreamingAll(io, "not the attested artifact");
+        artifact.close(io);
+    }
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "wrong.whl", &path_buf);
+    var artifact = try Io.Dir.openFileAbsolute(io, path_buf[0..path_len], .{});
+    defer artifact.close(io);
+
+    try std.testing.expectError(
+        error.ArtifactDigestNotInInTotoSubjects,
+        verifyBundleWithPolicy(
+            allocator,
+            io,
+            bundle,
+            try embeddedRekorKey(allocator),
+            artifact,
+            "wrong.whl",
+            .{ .subject_binding = .digest_only },
+        ),
+    );
+}
+
+test "GitHub trust rejects Rekor observations" {
+    const allocator = std.testing.allocator;
+    var private_bundle = try parseBundle(
+        allocator,
+        test_github_private_bundle_json,
+    );
+    defer private_bundle.deinit();
+    var public_bundle = try parseBundle(
+        allocator,
+        test_github_public_reusable_bundle_json,
+    );
+    defer public_bundle.deinit();
+    private_bundle.rekor = public_bundle.rekor;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    {
+        var artifact = try tmp.dir.createFile(io, "artifact", .{});
+        try artifact.writeStreamingAll(io, test_github_private_artifact);
+        artifact.close(io);
+    }
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "artifact", &path_buf);
+    var artifact = try Io.Dir.openFileAbsolute(io, path_buf[0..path_len], .{});
+    defer artifact.close(io);
+
+    try std.testing.expectError(
+        error.GithubBundleMustNotUseRekor,
+        verifyBundle(
+            allocator,
+            io,
+            private_bundle,
+            try embeddedRekorKey(allocator),
+            artifact,
+            "artifact",
+        ),
+    );
+}
+
+test "GitHub Fulcio verification rejects a tampered leaf" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_github_private_bundle_json);
+    defer bundle.deinit();
+
+    const tampered_leaf = try allocator.dupe(u8, bundle.leaf_der);
+    defer allocator.free(tampered_leaf);
+    tampered_leaf[tampered_leaf.len - 1] ^= 0x01;
+
+    try std.testing.expectError(
+        error.InvalidGithubFulcioChain,
+        verifyGithubFulcioChain(allocator, tampered_leaf, 1713807206),
+    );
+}
+
+test "trust-domain selection rejects an unknown Fulcio issuer" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_github_private_bundle_json);
+    defer bundle.deinit();
+
+    const unknown_issuer_leaf = try allocator.dupe(u8, bundle.leaf_der);
+    defer allocator.free(unknown_issuer_leaf);
+    const issuer_name = std.mem.indexOf(u8, unknown_issuer_leaf, "GitHub, Inc.") orelse
+        return error.TestUnexpectedNull;
+    unknown_issuer_leaf[issuer_name] = 'X';
+
+    try std.testing.expectError(
+        error.UnknownFulcioIssuer,
+        selectTrustDomain(allocator, unknown_issuer_leaf),
+    );
+}
+
+test "public GitHub provenance permits an external reusable signer workflow" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(
+        allocator,
+        test_github_public_reusable_bundle_json,
+    );
+    defer bundle.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    {
+        var artifact = try tmp.dir.createFile(io, "renamed-artifact", .{});
+        try artifact.writeStreamingAll(
+            io,
+            test_github_public_reusable_artifact,
+        );
+        artifact.close(io);
+    }
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(
+        io,
+        "renamed-artifact",
+        &path_buf,
+    );
+    var artifact = try Io.Dir.openFileAbsolute(io, path_buf[0..path_len], .{});
+    defer artifact.close(io);
+
+    const result = try verifyBundleWithPolicy(
+        allocator,
+        io,
+        bundle,
+        try embeddedRekorKey(allocator),
+        artifact,
+        "renamed-after-attestation.whl",
+        .{
+            .expected_predicate_type = "https://slsa.dev/provenance/v1",
+            .expected_oidc_issuer = "https://token.actions.githubusercontent.com",
+            .expected_repository_uri = "https://github.com/malancas/attest-demo",
+            .expected_owner_uri = "https://github.com/malancas",
+            .expected_build_config_prefix = "https://github.com/malancas/attest-demo/.github/workflows/",
+            .subject_binding = .digest_only,
+        },
+    );
+    try std.testing.expectEqual(
+        TrustDomain.public_good,
+        result.trust_domain,
+    );
+    try std.testing.expectEqual(TrustedObservation.rekor, result.observation);
+    try std.testing.expectEqualStrings(
+        "https://github.com/github/artifact-attestations-workflows/.github/workflows/attest.yml@09b495c3f12c7881b3cc17209a327792065c1a1d",
+        result.identity.build_signer_uri.?,
+    );
+    try std.testing.expectEqualStrings(
+        "https://github.com/malancas/attest-demo/.github/workflows/shared.yml@refs/heads/main",
+        result.identity.build_config_uri.?,
+    );
+}
+
+test "Public Good trust requires a Rekor observation" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(
+        allocator,
+        test_github_public_reusable_bundle_json,
+    );
+    defer bundle.deinit();
+    bundle.rekor = null;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    {
+        var artifact = try tmp.dir.createFile(io, "artifact", .{});
+        try artifact.writeStreamingAll(
+            io,
+            test_github_public_reusable_artifact,
+        );
+        artifact.close(io);
+    }
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "artifact", &path_buf);
+    var artifact = try Io.Dir.openFileAbsolute(io, path_buf[0..path_len], .{});
+    defer artifact.close(io);
+
+    try std.testing.expectError(
+        error.PublicGoodBundleRequiresRekor,
+        verifyBundle(
+            allocator,
+            io,
+            bundle,
+            try embeddedRekorKey(allocator),
+            artifact,
+            "artifact",
+        ),
+    );
+}
+
+test "Public Good trust rejects inclusion-only Rekor timestamps" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(
+        allocator,
+        test_github_public_reusable_bundle_json,
+    );
+    defer bundle.deinit();
+    bundle.rekor.?.set = null;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    {
+        var artifact = try tmp.dir.createFile(io, "artifact", .{});
+        try artifact.writeStreamingAll(
+            io,
+            test_github_public_reusable_artifact,
+        );
+        artifact.close(io);
+    }
+
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "artifact", &path_buf);
+    var artifact = try Io.Dir.openFileAbsolute(io, path_buf[0..path_len], .{});
+    defer artifact.close(io);
+
+    try std.testing.expectError(
+        error.BundleHasNoRekorSet,
+        verifyBundle(
+            allocator,
+            io,
+            bundle,
+            try embeddedRekorKey(allocator),
+            artifact,
+            "artifact",
+        ),
+    );
+}
+
+test "Fulcio extension values reject malformed DER without panicking" {
+    // Short or truncated extension values index out of bounds under the
+    // std DER parser; they must simply fail to decode.
+    try std.testing.expectEqual(@as(?[]const u8, null), parseDerUtf8String(""));
+    try std.testing.expectEqual(@as(?[]const u8, null), parseDerUtf8String("\x0c"));
+    try std.testing.expectEqual(@as(?[]const u8, null), parseDerUtf8String("\x0c\x20"));
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        parseDerUtf8String("\x0c\x84\xFF\xFF\xFF\xFF"),
+    );
+    // Wrong tag (PrintableString) is rejected.
+    try std.testing.expectEqual(@as(?[]const u8, null), parseDerUtf8String("\x13\x01a"));
+    // Trailing bytes after the UTF8String are rejected.
+    try std.testing.expectEqual(@as(?[]const u8, null), parseDerUtf8String("\x0c\x01a\x00"));
+
+    try std.testing.expectEqualStrings("abc", parseDerUtf8String("\x0c\x03abc").?);
 }

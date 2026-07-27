@@ -288,6 +288,18 @@ Generalize the existing Sigstore verifier so GitHub public and private
 artifact attestations can be verified with repository-scoped policy while
 preserving sidecar behavior.
 
+### Implementation Status
+
+- [x] Extract reusable RFC 3161 verification while preserving Authenticode
+  clock behavior.
+- [x] Extend Sigstore Bundle parsing for timestamp-only observations and
+  retained predicate types.
+- [x] Add repository, owner, issuer, build-config, predicate, and digest
+  policy.
+- [x] Add Public Good and GitHub trust domains with embedded historical
+  Fulcio/TSA rotations.
+- [x] Add public/private fixtures and fail-closed trust-policy tests.
+
 ### Changes Required
 
 #### 1. Extract reusable RFC 3161 verification
@@ -430,6 +442,28 @@ preserving sidecar behavior.
   computed digest is present in the signed subject list.
 - Existing `cosign sign-blob` and multi-subject sidecar fixtures continue to
   pass unchanged.
+
+### Manual Verification
+
+- [ ] Verify the private fixture with GitHub's reference verifier:
+
+  ```sh
+  gh attestation verify \
+    src/sigstore/testdata/github-private-provenance.whl \
+    --repo actions/attest-demo \
+    --bundle src/sigstore/testdata/github-private-provenance.sigstore.json
+  ```
+
+- [ ] Verify the public reusable-workflow fixture with GitHub's reference
+  verifier:
+
+  ```sh
+  gh attestation verify \
+    src/sigstore/testdata/github-public-reusable.artifact \
+    --repo malancas/attest-demo \
+    --signer-repo github/artifact-attestations-workflows \
+    --bundle src/sigstore/testdata/github-public-reusable.sigstore.json
+  ```
 
 ---
 

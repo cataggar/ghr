@@ -1415,12 +1415,29 @@ pub fn verifyDownloadedAssetSigstore(
 
     var digest_hex: [64]u8 = undefined;
     sha256ToHex(identity.artifact_digest, &digest_hex);
-    var rekor_time_buf: [20]u8 = undefined;
-    const rekor_time_iso = authenticode.formatUnixTimeIso(identity.integrated_time, &rekor_time_buf);
-    try w.print(
-        "verified sigstore: sha256 {s}... (rekor t={s}, log {d})\n",
-        .{ digest_hex[0..12], rekor_time_iso, bundle.rekor_log_index },
+    var observation_time_buf: [20]u8 = undefined;
+    const observation_time_iso = authenticode.formatUnixTimeIso(
+        identity.integrated_time,
+        &observation_time_buf,
     );
+    switch (identity.observation) {
+        .rekor => {
+            const observation = bundle.rekor orelse
+                return error.SigstoreVerificationFailed;
+            try w.print(
+                "verified sigstore: sha256 {s}... (rekor t={s}, log {d})\n",
+                .{
+                    digest_hex[0..12],
+                    observation_time_iso,
+                    observation.log_index,
+                },
+            );
+        },
+        .rfc3161 => try w.print(
+            "verified sigstore: sha256 {s}... (rfc3161 t={s})\n",
+            .{ digest_hex[0..12], observation_time_iso },
+        ),
+    }
     if (identity.identity.primarySubject()) |subject| {
         try w.print("  identity: {s}\n", .{subject});
     }
@@ -1429,8 +1446,13 @@ pub fn verifyDownloadedAssetSigstore(
     }
     if (identity.inclusion_verified) {
         const cp_note: []const u8 = if (identity.checkpoint_verified) " + checkpoint" else "";
-        if (bundle.inclusion) |inc| {
-            try w.print("  inclusion: tree size {d}{s}\n", .{ inc.tree_size, cp_note });
+        if (bundle.rekor) |observation| {
+            if (observation.inclusion) |inc| {
+                try w.print("  inclusion: tree size {d}{s}\n", .{
+                    inc.tree_size,
+                    cp_note,
+                });
+            }
         }
     }
     try w.flush();

@@ -762,5 +762,6 @@ test {
     _ = @import("validate.zig");
     _ = @import("link.zig");
     _ = @import("minisign_cmd.zig");
+    _ = @import("rfc3161.zig");
     _ = @import("snappy.zig");
 }
