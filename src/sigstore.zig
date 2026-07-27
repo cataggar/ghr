@@ -758,13 +758,19 @@ fn stripWhitespace(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
 /// be found in the trust bundle; for sigstore we expect to terminate at the
 /// self-signed root. Returns `error.IssuerNotInTrustBundle` if the path
 /// breaks before reaching the root.
+///
+/// Returns the parsed **leaf**, not the last certificate walked — the leaf
+/// is what identifies the signer.
 pub fn verifyCertChain(
     bundle: Certificate.Bundle,
     leaf_der: []const u8,
     verify_at: i64,
 ) !Certificate.Parsed {
-    var subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
+    const subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
     var subject = der.parseCertificate(subject_cert) catch return error.LeafCertParseFailed;
+    // The walk below reassigns `subject` as it climbs toward the root, so
+    // capture the leaf now.
+    const leaf = subject;
 
     // Cap the chain depth to a small number to avoid pathological input.
     var depth: u8 = 0;
@@ -779,10 +785,9 @@ pub fn verifyCertChain(
             // Also enforce that the root is valid at `verify_at`.
             if (verify_at < issuer.validity.not_before) return error.CertificateNotYetValid;
             if (verify_at > issuer.validity.not_after) return error.CertificateExpired;
-            return der.parseCertificate(subject_cert) catch return error.LeafCertParseFailed;
+            return leaf;
         }
         subject = issuer;
-        subject_cert = issuer_cert;
     }
     return error.IssuerNotInTrustBundle;
 }
@@ -1997,11 +2002,12 @@ test "verifyCertChain walks cosign fixture to embedded Fulcio root" {
     var trust = try buildTrustBundle(allocator, bundle.rekor.?.integrated_time);
     defer trust.deinit(allocator);
 
-    // Walking from the leaf to the embedded Fulcio root must succeed.
-    // (The returned `Parsed` is std.crypto.Certificate.Parsed; we don't
-    // rely on its SAN slice here — our own `extractIdentity` is the
-    // ground truth for that.)
-    _ = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor.?.integrated_time);
+    // Walking from the leaf to the embedded Fulcio root must succeed, and
+    // must hand back the leaf rather than the Fulcio intermediate it climbs
+    // through. Every caller currently discards this value, so a wrong return
+    // would go unnoticed until someone used it for signer identity.
+    const returned = try verifyCertChain(trust, bundle.leaf_der, bundle.rekor.?.integrated_time);
+    try std.testing.expectEqualSlices(u8, bundle.leaf_der, returned.certificate.buffer);
 }
 
 test "embeddedRekorKey matches well-known production key id" {
