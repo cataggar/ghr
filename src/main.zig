@@ -750,6 +750,7 @@ fn printUsage(w: *Writer) !void {
 test {
     // Ensure tests in imported modules are discovered by `zig build test`.
     // Zig 0.16 does not auto-include tests from indirectly referenced files.
+    _ = @import("attestation.zig");
     _ = @import("install.zig");
     _ = @import("release.zig");
     _ = @import("ensurepath.zig");
@@ -761,4 +762,5 @@ test {
     _ = @import("validate.zig");
     _ = @import("link.zig");
     _ = @import("minisign_cmd.zig");
+    _ = @import("snappy.zig");
 }
