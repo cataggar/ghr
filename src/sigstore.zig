@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const rfc3161 = @import("rfc3161.zig");
+const der = @import("der.zig");
 const Io = std.Io;
 const Certificate = std.crypto.Certificate;
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
@@ -664,8 +665,8 @@ fn selectTrustDomain(
     allocator: std.mem.Allocator,
     leaf_der: []const u8,
 ) !TrustDomain {
-    var leaf_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
-    const leaf = leaf_cert.parse() catch return error.LeafCertParseFailed;
+    const leaf_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
+    const leaf = der.parseCertificate(leaf_cert) catch return error.LeafCertParseFailed;
     const issuer = leaf.issuer();
 
     if (try pemSubjectMatches(
@@ -688,8 +689,8 @@ fn pemSubjectMatches(
 ) !bool {
     const cert_der = try decodeSinglePem(allocator, pem, "CERTIFICATE");
     defer allocator.free(cert_der);
-    var cert: Certificate = .{ .buffer = cert_der, .index = 0 };
-    const parsed = cert.parse() catch return error.TrustBundleBuildFailed;
+    const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
+    const parsed = der.parseCertificate(cert) catch return error.TrustBundleBuildFailed;
     return std.mem.eql(u8, parsed.subject(), expected_subject);
 }
 
@@ -763,7 +764,7 @@ pub fn verifyCertChain(
     verify_at: i64,
 ) !Certificate.Parsed {
     var subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
-    var subject = subject_cert.parse() catch return error.LeafCertParseFailed;
+    var subject = der.parseCertificate(subject_cert) catch return error.LeafCertParseFailed;
 
     // Cap the chain depth to a small number to avoid pathological input.
     var depth: u8 = 0;
@@ -771,14 +772,14 @@ pub fn verifyCertChain(
         const issuer_name = subject.issuer();
         const issuer_idx = bundle.find(issuer_name) orelse return error.IssuerNotInTrustBundle;
         const issuer_cert: Certificate = .{ .buffer = bundle.bytes.items, .index = issuer_idx };
-        const issuer = issuer_cert.parse() catch return error.TrustBundleBuildFailed;
+        const issuer = der.parseCertificate(issuer_cert) catch return error.TrustBundleBuildFailed;
         try subject.verify(issuer, verify_at);
         // If the issuer is self-signed, we've reached a trusted root and can stop.
         if (std.mem.eql(u8, issuer.issuer(), issuer.subject())) {
             // Also enforce that the root is valid at `verify_at`.
             if (verify_at < issuer.validity.not_before) return error.CertificateNotYetValid;
             if (verify_at > issuer.validity.not_after) return error.CertificateExpired;
-            return subject_cert.parse() catch return error.LeafCertParseFailed;
+            return der.parseCertificate(subject_cert) catch return error.LeafCertParseFailed;
         }
         subject = issuer;
         subject_cert = issuer_cert;
@@ -806,11 +807,11 @@ pub fn embeddedRekorKey(allocator: std.mem.Allocator) !RekorKey {
     defer allocator.free(spki_der);
 
     // SubjectPublicKeyInfo := SEQUENCE { algo AlgorithmIdentifier, pk BIT STRING }
-    const root = try Certificate.der.Element.parse(spki_der, 0);
+    const root = try der.parseElement(spki_der, 0);
     if (root.identifier.tag != .sequence) return error.InvalidRekorPem;
-    const algo = try Certificate.der.Element.parse(spki_der, root.slice.start);
+    const algo = try der.parseElement(spki_der, root.slice.start);
     if (algo.identifier.tag != .sequence) return error.InvalidRekorPem;
-    const bit_string = try Certificate.der.Element.parse(spki_der, algo.slice.end);
+    const bit_string = try der.parseElement(spki_der, algo.slice.end);
     if (bit_string.identifier.tag != .bitstring) return error.InvalidRekorPem;
 
     const bit_bytes = spki_der[bit_string.slice.start..bit_string.slice.end];
@@ -1521,17 +1522,17 @@ pub const Identity = struct {
 pub fn extractIdentity(leaf_der: []const u8) !Identity {
     var id: Identity = .{};
 
-    var leaf_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
-    const leaf = leaf_cert.parse() catch return id;
+    const leaf_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
+    const leaf = der.parseCertificate(leaf_cert) catch return id;
 
     // SAN entries — walk the SEQUENCE OF GeneralName.
     const san = leaf.subjectAltName();
     if (san.len > 0) {
-        const general_names = Certificate.der.Element.parse(san, 0) catch
+        const general_names = der.parseElement(san, 0) catch
             return id;
         var i: u32 = general_names.slice.start;
         while (i < general_names.slice.end) {
-            const gn = Certificate.der.Element.parse(san, i) catch break;
+            const gn = der.parseElement(san, i) catch break;
             i = gn.slice.end;
             const ident: u8 = @bitCast(gn.identifier);
             const value = san[gn.slice.start..gn.slice.end];
@@ -1551,29 +1552,29 @@ pub fn extractIdentity(leaf_der: []const u8) !Identity {
 
     // Fulcio extensions are not exposed by std.crypto.Certificate, so walk
     // the X.509 extension sequence and retain the GitHub identity fields.
-    const certificate = Certificate.der.Element.parse(leaf_der, 0) catch return id;
-    const tbs = Certificate.der.Element.parse(leaf_der, certificate.slice.start) catch
+    const certificate = der.parseElement(leaf_der, 0) catch return id;
+    const tbs = der.parseElement(leaf_der, certificate.slice.start) catch
         return id;
     var ti: u32 = tbs.slice.start;
     while (ti < tbs.slice.end) {
-        const e = Certificate.der.Element.parse(leaf_der, ti) catch break;
+        const e = der.parseElement(leaf_der, ti) catch break;
         ti = e.slice.end;
         const ident: u8 = @bitCast(e.identifier);
         // [3] EXPLICIT extensions wrapper: class=context-specific,
         //   constructed, tag=3 -> 0xA3.
         if (ident != 0xa3) continue;
-        const exts = Certificate.der.Element.parse(leaf_der, e.slice.start) catch
+        const exts = der.parseElement(leaf_der, e.slice.start) catch
             break;
         var xi: u32 = exts.slice.start;
         while (xi < exts.slice.end) {
-            const ext = Certificate.der.Element.parse(leaf_der, xi) catch break;
+            const ext = der.parseElement(leaf_der, xi) catch break;
             xi = ext.slice.end;
-            const oid_elem = Certificate.der.Element.parse(leaf_der, ext.slice.start) catch
+            const oid_elem = der.parseElement(leaf_der, ext.slice.start) catch
                 continue;
-            const after_oid = Certificate.der.Element.parse(leaf_der, oid_elem.slice.end) catch
+            const after_oid = der.parseElement(leaf_der, oid_elem.slice.end) catch
                 continue;
             const value_elem = if (after_oid.identifier.tag == .boolean)
-                Certificate.der.Element.parse(leaf_der, after_oid.slice.end) catch continue
+                der.parseElement(leaf_der, after_oid.slice.end) catch continue
             else
                 after_oid;
             const oid_bytes = leaf_der[oid_elem.slice.start..oid_elem.slice.end];
@@ -1613,7 +1614,7 @@ fn fulcioExtensionSuffix(oid_bytes: []const u8) ?u8 {
 }
 
 fn parseDerUtf8String(value_bytes: []const u8) ?[]const u8 {
-    const inner = rfc3161.parseElement(value_bytes, 0) catch return null;
+    const inner = der.parseElement(value_bytes, 0) catch return null;
     if (@intFromEnum(inner.identifier.tag) != 12) return null;
     if (inner.slice.end != value_bytes.len) return null;
     return value_bytes[inner.slice.start..inner.slice.end];
@@ -1827,8 +1828,8 @@ pub fn verifyBundleWithPolicy(
         },
     };
 
-    var leaf_cert: Certificate = .{ .buffer = bundle.leaf_der, .index = 0 };
-    const leaf = leaf_cert.parse() catch return error.LeafCertParseFailed;
+    const leaf_cert: Certificate = .{ .buffer = bundle.leaf_der, .index = 0 };
+    const leaf = der.parseCertificate(leaf_cert) catch return error.LeafCertParseFailed;
     const leaf_pubkey_sec1 = leaf.pubKey();
 
     var artifact_digest: [32]u8 = undefined;
@@ -1952,8 +1953,8 @@ test "parseBundle on captured cosign fixture" {
     defer bundle.deinit();
 
     // Leaf is parseable as DER X.509.
-    var leaf_cert: Certificate = .{ .buffer = bundle.leaf_der, .index = 0 };
-    const leaf = try leaf_cert.parse();
+    const leaf_cert: Certificate = .{ .buffer = bundle.leaf_der, .index = 0 };
+    const leaf = try der.parseCertificate(leaf_cert);
     try std.testing.expect(leaf.subject_alt_name_slice.end > leaf.subject_alt_name_slice.start);
 
     // hashedrekord payload sanity.
@@ -2468,8 +2469,8 @@ test "verifyDsseSignature accepts the wash bundle's signature" {
         .dsse => |d| d,
         else => return error.TestUnexpectedPayload,
     };
-    var leaf_cert: Certificate = .{ .buffer = bundle.leaf_der, .index = 0 };
-    const leaf = try leaf_cert.parse();
+    const leaf_cert: Certificate = .{ .buffer = bundle.leaf_der, .index = 0 };
+    const leaf = try der.parseCertificate(leaf_cert);
     const leaf_pubkey_sec1 = leaf.pubKey();
 
     try verifyDsseSignature(
@@ -3132,4 +3133,115 @@ test "Fulcio extension values reject malformed DER without panicking" {
     try std.testing.expectEqual(@as(?[]const u8, null), parseDerUtf8String("\x0c\x01a\x00"));
 
     try std.testing.expectEqualStrings("abc", parseDerUtf8String("\x0c\x03abc").?);
+}
+
+test "malformed leaf certificates are rejected without panicking" {
+    const allocator = std.testing.allocator;
+
+    // Every buffer below panicked somewhere under `Certificate.parse` or the
+    // raw `der.Element.parse` walks in `extractIdentity` before #167.
+    const empty_bundle: Certificate.Bundle = .empty;
+    for ([_][]const u8{
+        "",
+        "\x30",
+        "\x30\x82\x05\xf4",
+        "\x30\x84\xFF\xFF\xFF\xFF",
+        "\x30\x82\x00\x02\x30\x00",
+    }) |leaf_der| {
+        // `extractIdentity` is best-effort and yields an empty identity.
+        const id = try extractIdentity(leaf_der);
+        try std.testing.expectEqual(@as(?[]const u8, null), id.san_uri);
+        try std.testing.expectEqual(@as(?[]const u8, null), id.source_repository_id);
+
+        try std.testing.expectError(
+            error.LeafCertParseFailed,
+            verifyCertChain(empty_bundle, leaf_der, 1735689600),
+        );
+        try std.testing.expectError(
+            error.LeafCertParseFailed,
+            selectTrustDomain(allocator, leaf_der),
+        );
+    }
+}
+
+test "truncated real leaf certificates are rejected without panicking" {
+    const allocator = std.testing.allocator;
+    var bundle = try parseBundle(allocator, test_bundle_json);
+    defer bundle.deinit();
+
+    const leaf_der = bundle.leaf_der;
+    // The intact leaf still yields a full identity, so the cases below are
+    // exercising truncation rather than a parser that stopped working.
+    const intact = try extractIdentity(leaf_der);
+    try std.testing.expect(intact.san_uri != null or intact.san_email != null);
+
+    // Half the certificate, with the outer SEQUENCE length rewritten so the
+    // top-level TLV still spans the buffer exactly. A top-level length guard
+    // alone does not catch this; the panic happened parsing `sig_algo` at
+    // `tbs_certificate.slice.end`.
+    const half = leaf_der.len / 2;
+    const truncated = try allocator.dupe(u8, leaf_der[0..half]);
+    defer allocator.free(truncated);
+    try std.testing.expectEqual(@as(u8, 0x82), truncated[1]);
+    std.mem.writeInt(u16, truncated[2..4], @intCast(truncated.len - 4), .big);
+
+    _ = try extractIdentity(truncated);
+    try std.testing.expectError(
+        error.LeafCertParseFailed,
+        verifyCertChain(.empty, truncated, 1735689600),
+    );
+
+    // Every single-byte truncation must fail cleanly rather than abort. This
+    // walks the SAN and Fulcio extension parsers off the end of the buffer at
+    // every possible offset.
+    var cut: usize = 1;
+    while (cut < leaf_der.len) : (cut += 1) {
+        _ = try extractIdentity(leaf_der[0..cut]);
+        _ = verifyCertChain(.empty, leaf_der[0..cut], 1735689600) catch {};
+    }
+}
+
+test "verifyBundle fails closed on a malformed leaf certificate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var bundle = try parseBundle(allocator, test_wash_bundle_json);
+    defer bundle.deinit();
+
+    // `leaf_der` is arena-owned, so restore the original slice before the
+    // bundle is torn down.
+    const original_leaf = bundle.leaf_der;
+    defer bundle.leaf_der = original_leaf;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try tmp.dir.createFile(io, "artifact", .{});
+        try f.writeStreamingAll(io, "irrelevant bytes");
+        f.close(io);
+    }
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPathFile(io, "artifact", &path_buf);
+    var f = try Io.Dir.openFileAbsolute(io, path_buf[0..n], .{});
+    defer f.close(io);
+
+    const rekor = try embeddedRekorKey(allocator);
+
+    // Truncate the leaf at every 16th byte and drive the full public entry
+    // point. Each one previously aborted the process inside `Certificate.parse`.
+    var cut: usize = 1;
+    while (cut < original_leaf.len) : (cut += 16) {
+        bundle.leaf_der = original_leaf[0..cut];
+        try std.testing.expectError(
+            error.LeafCertParseFailed,
+            verifyBundle(
+                allocator,
+                io,
+                bundle,
+                rekor,
+                f,
+                "wash-aarch64-unknown-linux-gnu",
+            ),
+        );
+    }
 }

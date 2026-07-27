@@ -588,7 +588,7 @@ test "stripAuthenticodeIntoBuffer rejects cert table not at end" {
 // ---------------------------------------------------------------------------
 
 const Certificate = std.crypto.Certificate;
-const der = Certificate.der;
+const der = @import("der.zig");
 
 /// Well-known OIDs in raw DER content form (without the leading tag +
 /// length prefix). These match `Certificate.der.Element.slice` content
@@ -654,7 +654,7 @@ pub const Pkcs7Error = error{
     MissingContentTypeAttr,
     UnsupportedCertificateSet,
     SignedAttrsTooLarge,
-} || der.Element.ParseError;
+} || der.ParseError;
 
 /// One signer of an Authenticode SignedData. We only model what we need
 /// to verify: the message digest claim, the signed-attrs re-encoding,
@@ -736,29 +736,29 @@ fn parseSignedDataInternal(
     expected_encap_content_type: []const u8,
 ) Pkcs7Error!SignedData {
     // ContentInfo := SEQUENCE { contentType OID, content [0] EXPLICIT SignedData }
-    const ci = try der.Element.parse(pkcs7_bytes, 0);
+    const ci = try der.parseElement(pkcs7_bytes, 0);
     if (ci.identifier.tag != .sequence) return error.InvalidContentInfo;
     const ci_end = ci.slice.end;
 
-    const ci_oid = try der.Element.parse(pkcs7_bytes, ci.slice.start);
+    const ci_oid = try der.parseElement(pkcs7_bytes, ci.slice.start);
     if (ci_oid.identifier.tag != .object_identifier) return error.InvalidContentInfo;
     if (!std.mem.eql(u8, pkcs7_bytes[ci_oid.slice.start..ci_oid.slice.end], &oid.signed_data))
         return error.UnsupportedContentType;
 
-    const ci_content_explicit = try der.Element.parse(pkcs7_bytes, ci_oid.slice.end);
+    const ci_content_explicit = try der.parseElement(pkcs7_bytes, ci_oid.slice.end);
     if (!isContextSpecificTag(ci_content_explicit.identifier, 0))
         return error.InvalidContentInfo;
     if (ci_content_explicit.slice.end > ci_end) return error.InvalidContentInfo;
 
     // SignedData := SEQUENCE { ... }
-    const sd = try der.Element.parse(pkcs7_bytes, ci_content_explicit.slice.start);
+    const sd = try der.parseElement(pkcs7_bytes, ci_content_explicit.slice.start);
     if (sd.identifier.tag != .sequence) return error.InvalidSignedData;
 
     var i: u32 = sd.slice.start;
     const sd_end: u32 = sd.slice.end;
 
     // version INTEGER
-    const ver_elem = try der.Element.parse(pkcs7_bytes, i);
+    const ver_elem = try der.parseElement(pkcs7_bytes, i);
     if (ver_elem.identifier.tag != .integer) return error.InvalidSignedData;
     if (ver_elem.slice.end - ver_elem.slice.start != 1) return error.UnsupportedSignedDataVersion;
     // version 1 (PKCS#7) or 3 (CMS with SubjectKeyIdentifier signer) are
@@ -769,24 +769,24 @@ fn parseSignedDataInternal(
 
     // digestAlgorithms SET OF AlgorithmIdentifier — skipped; we trust
     // the SignerInfo's own digestAlgorithm.
-    const dalgs = try der.Element.parse(pkcs7_bytes, i);
+    const dalgs = try der.parseElement(pkcs7_bytes, i);
     i = dalgs.slice.end;
 
     // encapContentInfo SEQUENCE { eContentType, [0] EXPLICIT eContent OCTET STRING }
-    const enc = try der.Element.parse(pkcs7_bytes, i);
+    const enc = try der.parseElement(pkcs7_bytes, i);
     if (enc.identifier.tag != .sequence) return error.InvalidSignedData;
     i = enc.slice.end;
 
-    const enc_ct = try der.Element.parse(pkcs7_bytes, enc.slice.start);
+    const enc_ct = try der.parseElement(pkcs7_bytes, enc.slice.start);
     if (enc_ct.identifier.tag != .object_identifier) return error.InvalidSignedData;
     const encap_content_type = pkcs7_bytes[enc_ct.slice.start..enc_ct.slice.end];
     if (!std.mem.eql(u8, encap_content_type, expected_encap_content_type))
         return error.UnsupportedEncapContentType;
 
-    const enc_content_wrap = try der.Element.parse(pkcs7_bytes, enc_ct.slice.end);
+    const enc_content_wrap = try der.parseElement(pkcs7_bytes, enc_ct.slice.end);
     if (!isContextSpecificTag(enc_content_wrap.identifier, 0))
         return error.InvalidSpcIndirectData;
-    const enc_content = try der.Element.parse(pkcs7_bytes, enc_content_wrap.slice.start);
+    const enc_content = try der.parseElement(pkcs7_bytes, enc_content_wrap.slice.start);
     if (enc_content.identifier.tag != .octetstring and enc_content.identifier.tag != .sequence)
         return error.InvalidSpcIndirectData;
 
@@ -817,7 +817,7 @@ fn parseSignedDataInternal(
     var certificates_raw: []const u8 = &.{};
     var ji = i;
     if (ji < sd_end) {
-        const next = try der.Element.parse(pkcs7_bytes, ji);
+        const next = try der.parseElement(pkcs7_bytes, ji);
         if (isContextSpecificTag(next.identifier, 0)) {
             certificates_raw = pkcs7_bytes[next.slice.start..next.slice.end];
             ji = next.slice.end;
@@ -825,16 +825,16 @@ fn parseSignedDataInternal(
     }
     // crls [1] IMPLICIT — skipped.
     if (ji < sd_end) {
-        const next = try der.Element.parse(pkcs7_bytes, ji);
+        const next = try der.parseElement(pkcs7_bytes, ji);
         if (isContextSpecificTag(next.identifier, 1)) ji = next.slice.end;
     }
 
     // signerInfos SET OF SignerInfo
-    const sinfos = try der.Element.parse(pkcs7_bytes, ji);
+    const sinfos = try der.parseElement(pkcs7_bytes, ji);
     if (sinfos.identifier.tag != .sequence_of and sinfos.identifier.tag != .sequence)
         return error.InvalidSignedData;
 
-    const first_signer = try der.Element.parse(pkcs7_bytes, sinfos.slice.start);
+    const first_signer = try der.parseElement(pkcs7_bytes, sinfos.slice.start);
     if (first_signer.identifier.tag != .sequence) return error.InvalidSignerInfo;
     const signer = try parseSignerInfo(pkcs7_bytes, first_signer);
 
@@ -852,24 +852,24 @@ fn parseSignedDataInternal(
 const FileDigest = struct { alg: HashAlgorithm, digest: []const u8 };
 
 fn parseSpcIndirectDataMessageDigest(spc: []const u8) Pkcs7Error!FileDigest {
-    const root = try der.Element.parse(spc, 0);
+    const root = try der.parseElement(spc, 0);
     if (root.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
 
     // SpcIndirectDataContent := SEQUENCE { data SpcAttributeTypeAndOptionalValue, messageDigest DigestInfo }
-    const data = try der.Element.parse(spc, root.slice.start);
+    const data = try der.parseElement(spc, root.slice.start);
     if (data.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
 
-    const digest_info = try der.Element.parse(spc, data.slice.end);
+    const digest_info = try der.parseElement(spc, data.slice.end);
     if (digest_info.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
 
     // DigestInfo := SEQUENCE { digestAlgorithm AlgorithmIdentifier, digest OCTET STRING }
-    const algo_seq = try der.Element.parse(spc, digest_info.slice.start);
+    const algo_seq = try der.parseElement(spc, digest_info.slice.start);
     if (algo_seq.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
-    const algo_oid = try der.Element.parse(spc, algo_seq.slice.start);
+    const algo_oid = try der.parseElement(spc, algo_seq.slice.start);
     if (algo_oid.identifier.tag != .object_identifier) return error.InvalidSpcIndirectData;
     const alg = try hashAlgFromOid(spc[algo_oid.slice.start..algo_oid.slice.end]);
 
-    const digest_oct = try der.Element.parse(spc, algo_seq.slice.end);
+    const digest_oct = try der.parseElement(spc, algo_seq.slice.end);
     if (digest_oct.identifier.tag != .octetstring) return error.InvalidSpcIndirectData;
 
     return .{ .alg = alg, .digest = spc[digest_oct.slice.start..digest_oct.slice.end] };
@@ -880,27 +880,27 @@ fn parseSignerInfo(buf: []const u8, sinfo: der.Element) Pkcs7Error!SignerInfo {
     const end: u32 = sinfo.slice.end;
 
     // version INTEGER
-    const ver = try der.Element.parse(buf, i);
+    const ver = try der.parseElement(buf, i);
     if (ver.identifier.tag != .integer) return error.InvalidSignerInfo;
     if (ver.slice.end - ver.slice.start != 1) return error.InvalidSignerInfo;
     const version = buf[ver.slice.start];
     i = ver.slice.end;
 
     // sid SignerIdentifier
-    const sid = try der.Element.parse(buf, i);
+    const sid = try der.parseElement(buf, i);
     const sid_raw = buf[sid.slice.start - elementHeaderLen(buf, sid) .. sid.slice.end];
     i = sid.slice.end;
 
     // digestAlgorithm AlgorithmIdentifier
-    const dalg = try der.Element.parse(buf, i);
+    const dalg = try der.parseElement(buf, i);
     if (dalg.identifier.tag != .sequence) return error.InvalidSignerInfo;
-    const dalg_oid = try der.Element.parse(buf, dalg.slice.start);
+    const dalg_oid = try der.parseElement(buf, dalg.slice.start);
     if (dalg_oid.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
     const digest_alg = try hashAlgFromOid(buf[dalg_oid.slice.start..dalg_oid.slice.end]);
     i = dalg.slice.end;
 
     // signedAttrs [0] IMPLICIT SET OF Attribute (required for Authenticode)
-    const sa = try der.Element.parse(buf, i);
+    const sa = try der.parseElement(buf, i);
     if (!isContextSpecificTag(sa.identifier, 0)) return error.MissingSignedAttrs;
     // Raw signed-attrs span (including its own [0] tag + length header)
     // so we can re-emit it as SET OF for signature verification.
@@ -914,17 +914,17 @@ fn parseSignerInfo(buf: []const u8, sinfo: der.Element) Pkcs7Error!SignerInfo {
     var found_content_type = false;
     var ai: u32 = sa.slice.start;
     while (ai < sa.slice.end) {
-        const attr = try der.Element.parse(buf, ai);
+        const attr = try der.parseElement(buf, ai);
         if (attr.identifier.tag != .sequence) return error.InvalidSignerInfo;
         ai = attr.slice.end;
 
-        const attr_oid_e = try der.Element.parse(buf, attr.slice.start);
+        const attr_oid_e = try der.parseElement(buf, attr.slice.start);
         if (attr_oid_e.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
         const attr_oid_bytes = buf[attr_oid_e.slice.start..attr_oid_e.slice.end];
 
-        const attr_vals = try der.Element.parse(buf, attr_oid_e.slice.end);
+        const attr_vals = try der.parseElement(buf, attr_oid_e.slice.end);
         // SET OF AttrValue — first value is what we want.
-        const first_val = try der.Element.parse(buf, attr_vals.slice.start);
+        const first_val = try der.parseElement(buf, attr_vals.slice.start);
 
         if (std.mem.eql(u8, attr_oid_bytes, &oid.message_digest)) {
             if (first_val.identifier.tag != .octetstring) return error.InvalidSignerInfo;
@@ -938,16 +938,16 @@ fn parseSignerInfo(buf: []const u8, sinfo: der.Element) Pkcs7Error!SignerInfo {
     i = @intCast(sa_full_end);
 
     // signatureAlgorithm AlgorithmIdentifier
-    const salg = try der.Element.parse(buf, i);
+    const salg = try der.parseElement(buf, i);
     if (salg.identifier.tag != .sequence) return error.InvalidSignerInfo;
-    const salg_oid_e = try der.Element.parse(buf, salg.slice.start);
+    const salg_oid_e = try der.parseElement(buf, salg.slice.start);
     if (salg_oid_e.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
     const salg_oid_bytes = buf[salg_oid_e.slice.start..salg_oid_e.slice.end];
     const sig_alg = try sigAlgFromOid(salg_oid_bytes);
     i = salg.slice.end;
 
     // signature OCTET STRING
-    const sig_e = try der.Element.parse(buf, i);
+    const sig_e = try der.parseElement(buf, i);
     if (sig_e.identifier.tag != .octetstring) return error.InvalidSignerInfo;
     const signature = buf[sig_e.slice.start..sig_e.slice.end];
     i = sig_e.slice.end;
@@ -955,7 +955,7 @@ fn parseSignerInfo(buf: []const u8, sinfo: der.Element) Pkcs7Error!SignerInfo {
     // unsignedAttrs [1] IMPLICIT SET OF Attribute OPTIONAL
     var unsigned_attrs_raw: []const u8 = &.{};
     if (i < end) {
-        const ua = try der.Element.parse(buf, i);
+        const ua = try der.parseElement(buf, i);
         if (isContextSpecificTag(ua.identifier, 1)) {
             unsigned_attrs_raw = buf[i..ua.slice.end];
             i = ua.slice.end;
@@ -1003,24 +1003,24 @@ pub fn signedAttrsForSigning(
 pub fn findUnsignedAttr(signer: SignerInfo, target_oid: []const u8) Pkcs7Error!?[]const u8 {
     if (signer.unsigned_attrs_raw.len == 0) return null;
     // unsigned_attrs_raw starts with the [1] IMPLICIT tag (0xA1).
-    const ua = try der.Element.parse(signer.unsigned_attrs_raw, 0);
+    const ua = try der.parseElement(signer.unsigned_attrs_raw, 0);
     if (!isContextSpecificTag(ua.identifier, 1)) return error.InvalidSignerInfo;
 
     var ai: u32 = ua.slice.start;
     while (ai < ua.slice.end) {
-        const attr = try der.Element.parse(signer.unsigned_attrs_raw, ai);
+        const attr = try der.parseElement(signer.unsigned_attrs_raw, ai);
         if (attr.identifier.tag != .sequence) return error.InvalidSignerInfo;
         ai = attr.slice.end;
 
-        const attr_oid_e = try der.Element.parse(signer.unsigned_attrs_raw, attr.slice.start);
+        const attr_oid_e = try der.parseElement(signer.unsigned_attrs_raw, attr.slice.start);
         if (attr_oid_e.identifier.tag != .object_identifier) return error.InvalidSignerInfo;
         const this_oid = signer.unsigned_attrs_raw[attr_oid_e.slice.start..attr_oid_e.slice.end];
         if (!std.mem.eql(u8, this_oid, target_oid)) continue;
 
-        const attr_vals = try der.Element.parse(signer.unsigned_attrs_raw, attr_oid_e.slice.end);
+        const attr_vals = try der.parseElement(signer.unsigned_attrs_raw, attr_oid_e.slice.end);
         // Return the full TLV span of the first AttrValue so callers
         // can re-parse it as the appropriate ASN.1 type.
-        const first_val = try der.Element.parse(signer.unsigned_attrs_raw, attr_vals.slice.start);
+        const first_val = try der.parseElement(signer.unsigned_attrs_raw, attr_vals.slice.start);
         const tlv_start = attr_vals.slice.start;
         const tlv_end = first_val.slice.end;
         return signer.unsigned_attrs_raw[tlv_start..tlv_end];
@@ -1086,7 +1086,7 @@ pub const VerifyError = error{
     UnsupportedSignerKeyType,
     InvalidCertificateChoice,
     OutOfMemory,
-} || Pkcs7Error || der.Element.ParseError || Certificate.ParseError || Certificate.Parsed.VerifyError;
+} || Pkcs7Error || der.ParseError || der.CertificateParseError || Certificate.Parsed.VerifyError;
 
 /// Iterator over a CMS `CertificateSet` body (i.e. `signed_data.certificates_raw`,
 /// the body of the `[0] IMPLICIT CertificateSet` wrapper).
@@ -1109,9 +1109,9 @@ const CertificateSetIterator = struct {
     /// silently skipped. Returns `error.InvalidCertificateChoice` if an
     /// element has neither a universal SEQUENCE tag nor a context-specific
     /// tag in the [0..3] CHOICE range.
-    fn next(self: *CertificateSetIterator) (der.Element.ParseError || error{InvalidCertificateChoice})!?[]const u8 {
+    fn next(self: *CertificateSetIterator) (der.ParseError || error{InvalidCertificateChoice})!?[]const u8 {
         while (self.index < self.bytes.len) {
-            const elem = try der.Element.parse(self.bytes, self.index);
+            const elem = try der.parseElement(self.bytes, self.index);
             const start = self.index;
             self.index = elem.slice.end;
 
@@ -1148,8 +1148,8 @@ pub fn verifySignerSignature(
 
     // Parse the leaf cert, extract its SubjectPublicKeyInfo, dispatch on
     // public-key + signature algorithm pair.
-    var cert: Certificate = .{ .buffer = signer_cert_der, .index = 0 };
-    const parsed = try cert.parse();
+    const cert: Certificate = .{ .buffer = signer_cert_der, .index = 0 };
+    const parsed = try der.parseCertificate(cert);
 
     switch (signed_data.signer.signature_alg) {
         .rsa_pkcs1_v15_sha256, .rsa_pkcs1_v15_implicit_hash => {
@@ -1246,18 +1246,18 @@ pub fn findSignerCertDer(signed_data: SignedData) VerifyError!?[]const u8 {
     // Parse the SignerIdentifier (IssuerAndSerialNumber) once.
     const sid = signed_data.signer.sid_raw;
     if (sid.len == 0) return null;
-    const sid_seq = try der.Element.parse(sid, 0);
+    const sid_seq = try der.parseElement(sid, 0);
     if (sid_seq.identifier.tag != .sequence) return error.InvalidSignerInfo;
-    const sid_issuer = try der.Element.parse(sid, sid_seq.slice.start);
+    const sid_issuer = try der.parseElement(sid, sid_seq.slice.start);
     if (sid_issuer.identifier.tag != .sequence) return error.InvalidSignerInfo;
-    const sid_serial = try der.Element.parse(sid, sid_issuer.slice.end);
+    const sid_serial = try der.parseElement(sid, sid_issuer.slice.end);
     if (sid_serial.identifier.tag != .integer) return error.InvalidSignerInfo;
 
     var iter: CertificateSetIterator = .{ .bytes = signed_data.certificates_raw };
     while (try iter.next()) |cert_der| {
         // Parse cert into Certificate.Parsed to grab issuer + serial.
-        var cert: Certificate = .{ .buffer = cert_der, .index = 0 };
-        const parsed = cert.parse() catch continue;
+        const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
+        const parsed = der.parseCertificate(cert) catch continue;
 
         // Compare issuer DN bytes.
         const cert_issuer = cert_der[parsed.issuer_slice.start..parsed.issuer_slice.end];
@@ -1269,14 +1269,14 @@ pub fn findSignerCertDer(signed_data: SignedData) VerifyError!?[]const u8 {
         // tbsCertificate := SEQUENCE { version [0] EXPLICIT, serial INTEGER, ... }
         // We don't need version; the serial is either the first or
         // second element of tbsCertificate.
-        const cert_outer = try der.Element.parse(cert_der, 0);
-        const tbs = try der.Element.parse(cert_der, cert_outer.slice.start);
+        const cert_outer = try der.parseElement(cert_der, 0);
+        const tbs = try der.parseElement(cert_der, cert_outer.slice.start);
         var serial_offset: u32 = tbs.slice.start;
-        const maybe_version = try der.Element.parse(cert_der, serial_offset);
+        const maybe_version = try der.parseElement(cert_der, serial_offset);
         if (isContextSpecificTag(maybe_version.identifier, 0)) {
             serial_offset = maybe_version.slice.end;
         }
-        const serial_elem = try der.Element.parse(cert_der, serial_offset);
+        const serial_elem = try der.parseElement(cert_der, serial_offset);
         if (serial_elem.identifier.tag != .integer) return error.InvalidSignerInfo;
         const cert_serial = cert_der[serial_elem.slice.start..serial_elem.slice.end];
         const sid_serial_bytes = sid[sid_serial.slice.start..sid_serial.slice.end];
@@ -1322,43 +1322,43 @@ pub const TstInfo = struct {
 
 /// Parse the raw DER bytes of a TSTInfo SEQUENCE.
 pub fn parseTstInfo(bytes: []const u8) TstError!TstInfo {
-    const root = try der.Element.parse(bytes, 0);
+    const root = try der.parseElement(bytes, 0);
     if (root.identifier.tag != .sequence) return error.InvalidTstInfo;
     var i: u32 = root.slice.start;
 
     // version INTEGER { v1(1) }
-    const ver = try der.Element.parse(bytes, i);
+    const ver = try der.parseElement(bytes, i);
     if (ver.identifier.tag != .integer) return error.InvalidTstInfo;
     if (ver.slice.end - ver.slice.start != 1) return error.UnsupportedTstInfoVersion;
     if (bytes[ver.slice.start] != 1) return error.UnsupportedTstInfoVersion;
     i = ver.slice.end;
 
     // policy TSAPolicyId (OBJECT IDENTIFIER)
-    const policy = try der.Element.parse(bytes, i);
+    const policy = try der.parseElement(bytes, i);
     if (policy.identifier.tag != .object_identifier) return error.InvalidTstInfo;
     i = policy.slice.end;
 
     // messageImprint SEQUENCE { hashAlgorithm AlgorithmIdentifier, hashedMessage OCTET STRING }
-    const mi = try der.Element.parse(bytes, i);
+    const mi = try der.parseElement(bytes, i);
     if (mi.identifier.tag != .sequence) return error.InvalidTstInfo;
-    const halg = try der.Element.parse(bytes, mi.slice.start);
+    const halg = try der.parseElement(bytes, mi.slice.start);
     if (halg.identifier.tag != .sequence) return error.InvalidTstInfo;
-    const halg_oid = try der.Element.parse(bytes, halg.slice.start);
+    const halg_oid = try der.parseElement(bytes, halg.slice.start);
     if (halg_oid.identifier.tag != .object_identifier) return error.InvalidTstInfo;
     const imprint_alg = hashAlgFromOid(bytes[halg_oid.slice.start..halg_oid.slice.end]) catch
         return error.InvalidTstInfo;
-    const himg = try der.Element.parse(bytes, halg.slice.end);
+    const himg = try der.parseElement(bytes, halg.slice.end);
     if (himg.identifier.tag != .octetstring) return error.InvalidTstInfo;
     const imprint = bytes[himg.slice.start..himg.slice.end];
     i = mi.slice.end;
 
     // serialNumber INTEGER
-    const sn = try der.Element.parse(bytes, i);
+    const sn = try der.parseElement(bytes, i);
     if (sn.identifier.tag != .integer) return error.InvalidTstInfo;
     i = sn.slice.end;
 
     // genTime GeneralizedTime
-    const gt = try der.Element.parse(bytes, i);
+    const gt = try der.parseElement(bytes, i);
     if (gt.identifier.tag != .generalized_time) return error.InvalidTstInfo;
     const gen_time = parseGeneralizedTime(bytes[gt.slice.start..gt.slice.end]) catch
         return error.InvalidGeneralizedTime;
@@ -1581,7 +1581,7 @@ pub fn verifyPe(
     // Authenticode hashes only the body of the SpcIndirectDataContent
     // SEQUENCE — not the outer tag/length octets. See signify's
     // documentation on the Authenticode messageDigest derivation.
-    const spc_outer = try der.Element.parse(signed.spc_indirect_data, 0);
+    const spc_outer = try der.parseElement(signed.spc_indirect_data, 0);
     if (spc_outer.identifier.tag != .sequence) return error.InvalidSpcIndirectData;
     const spc_body = signed.spc_indirect_data[spc_outer.slice.start..spc_outer.slice.end];
     var spc_digest: [32]u8 = undefined;
@@ -1624,28 +1624,27 @@ fn extractOrganization(leaf: Certificate.Parsed) ![]const u8 {
 }
 
 fn findRdnAttribute(name_der: []const u8, target_oid: []const u8) ![]const u8 {
-    // The subject_slice bytes already include the outer SEQUENCE
-    // header in std.crypto.Certificate.Parsed, so we re-parse it to
-    // step into the SEQUENCE OF RDN body.
-    if (name_der.len < 2) return &.{};
-    const outer = der.Element.parse(name_der, 0) catch return &.{};
-    if (outer.identifier.tag != .sequence) return &.{};
+    // `Parsed.subject_slice` spans the *content* of the Name SEQUENCE — the
+    // outer tag and length octets are not included — so walk the RDNs
+    // directly rather than trying to step into an enclosing SEQUENCE.
+    if (name_der.len > std.math.maxInt(u32)) return &.{};
+    const end: u32 = @intCast(name_der.len);
 
-    var i: u32 = outer.slice.start;
-    while (i < outer.slice.end) {
-        const rdn = try der.Element.parse(name_der, i);
+    var i: u32 = 0;
+    while (i < end) {
+        const rdn = der.parseElement(name_der, i) catch return &.{};
         i = rdn.slice.end;
         if (@intFromEnum(rdn.identifier.tag) != 17) continue; // SET OF
         var j: u32 = rdn.slice.start;
         while (j < rdn.slice.end) {
-            const attr = try der.Element.parse(name_der, j);
+            const attr = try der.parseElement(name_der, j);
             j = attr.slice.end;
             if (attr.identifier.tag != .sequence) continue;
-            const t = try der.Element.parse(name_der, attr.slice.start);
+            const t = try der.parseElement(name_der, attr.slice.start);
             if (t.identifier.tag != .object_identifier) continue;
             const oid_bytes = name_der[t.slice.start..t.slice.end];
             if (!std.mem.eql(u8, oid_bytes, target_oid)) continue;
-            const v = try der.Element.parse(name_der, t.slice.end);
+            const v = try der.parseElement(name_der, t.slice.end);
             // value is usually PrintableString / UTF8String / etc.
             return name_der[v.slice.start..v.slice.end];
         }
@@ -2047,7 +2046,7 @@ pub fn verifyChain(
     }
 
     var subject_cert: Certificate = .{ .buffer = leaf_der, .index = 0 };
-    var subject = subject_cert.parse() catch return error.InvalidSignature;
+    var subject = der.parseCertificate(subject_cert) catch return error.InvalidSignature;
 
     var depth: u8 = 0;
     while (depth < 8) : (depth += 1) {
@@ -2056,20 +2055,20 @@ pub fn verifyChain(
         // 1. Try to find issuer in the embedded trust bundle.
         if (trust.find(issuer_name)) |issuer_idx| {
             const issuer_cert: Certificate = .{ .buffer = trust.bytes.items, .index = issuer_idx };
-            const issuer = issuer_cert.parse() catch return error.InvalidSignature;
+            const issuer = der.parseCertificate(issuer_cert) catch return error.InvalidSignature;
             try subject.verify(issuer, verify_at);
             // Confirm root is valid at the same clock.
             if (verify_at < issuer.validity.not_before) return error.InvalidSignature;
             if (verify_at > issuer.validity.not_after) return error.InvalidSignature;
-            return subject_cert.parse() catch error.InvalidSignature;
+            return der.parseCertificate(subject_cert) catch error.InvalidSignature;
         }
 
         // 2. Try to find issuer among the in-bundle intermediates.
         var matched: ?Certificate.Parsed = null;
         var matched_cert: ?Certificate = null;
         for (pool.items) |c| {
-            var cc = c;
-            const p = cc.parse() catch continue;
+            const cc = c;
+            const p = der.parseCertificate(cc) catch continue;
             if (std.mem.eql(u8, p.subject(), issuer_name)) {
                 matched = p;
                 matched_cert = cc;
@@ -2263,4 +2262,114 @@ test "WinCertIterator walks a fabricated two-entry table" {
 
     const sig = (try findFirstPkcs7Entry(pe)) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings(pkcs7_payload, sig.data);
+}
+
+test "malformed PKCS#7 blobs are rejected without panicking" {
+    // Every blob below indexed out of bounds under the standard library's
+    // unchecked `der.Element.parse` before #167.
+    for ([_][]const u8{
+        "",
+        "\x30",
+        "\x30\x82\x05\xf4",
+        "\x30\x84\xFF\xFF\xFF\xFF",
+        "\x30\x80",
+        "\x30\x0b\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x07\x02",
+        "\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x07\x02\xa0\x82",
+    }) |blob| {
+        if (parseSignedData(blob)) |_| return error.TestExpectedError else |_| {}
+        if (parseTimestampToken(blob)) |_| return error.TestExpectedError else |_| {}
+
+        var iter: CertificateSetIterator = .{ .bytes = blob };
+        while (iter.next() catch continue) |_| {}
+    }
+}
+
+test "malformed certificate chains are rejected without panicking" {
+    const allocator = std.testing.allocator;
+    const now: i64 = 1735689600; // 2025-01-01
+
+    var trust = try buildTrustBundle(allocator, now);
+    defer trust.deinit(allocator);
+
+    for ([_][]const u8{
+        "",
+        "\x30",
+        "\x30\x82\x05\xf4",
+        "\x30\x84\xFF\xFF\xFF\xFF",
+    }) |leaf_der| {
+        try std.testing.expectError(
+            error.InvalidSignature,
+            verifyChain(allocator, leaf_der, "", trust, now),
+        );
+    }
+
+    // A real embedded root, truncated at every single-byte offset. The
+    // certificates in a trust bundle are stored back-to-back, so the first
+    // one starts at offset 0.
+    const first = try der.parseElement(trust.bytes.items, 0);
+    const cert_der = trust.bytes.items[0..first.slice.end];
+    try std.testing.expect(cert_der.len > 64);
+
+    var cut: usize = 1;
+    while (cut < cert_der.len) : (cut += 1) {
+        _ = verifyChain(allocator, cert_der[0..cut], "", trust, now) catch {};
+        _ = verifyChain(allocator, cert_der, cert_der[0..cut], trust, now) catch {};
+    }
+
+    // Half the certificate with the outer SEQUENCE length rewritten so the
+    // top-level TLV still spans the buffer exactly.
+    const truncated = try allocator.dupe(u8, cert_der[0 .. cert_der.len / 2]);
+    defer allocator.free(truncated);
+    try std.testing.expectEqual(@as(u8, 0x82), truncated[1]);
+    std.mem.writeInt(u16, truncated[2..4], @intCast(truncated.len - 4), .big);
+    try std.testing.expectError(
+        error.InvalidSignature,
+        verifyChain(allocator, truncated, "", trust, now),
+    );
+}
+
+/// The Authenticode signature blob (`WIN_CERTIFICATE.bCertificate`) lifted
+/// from a real signed PE. Nothing here is verified against the wall clock, so
+/// the fixture stays valid after its certificates expire.
+const test_pkcs7_der = @embedFile("authenticode/testdata/git-lfs-windows-v3.7.1.pkcs7.der");
+
+test "parseSignedData walks a real Authenticode signature" {
+    const signed_data = try parseSignedData(test_pkcs7_der);
+
+    try std.testing.expectEqualSlices(u8, &oid.spc_indirect_data, signed_data.encap_content_type);
+    try std.testing.expect(signed_data.spc_indirect_data.len > 0);
+    try std.testing.expect(signed_data.certificates_raw.len > 0);
+    try std.testing.expectEqual(@as(u8, 1), signed_data.signer.version);
+    try std.testing.expect(signed_data.signer.signed_attrs_raw.len > 0);
+    try std.testing.expect(signed_data.signer.signature.len > 0);
+    try std.testing.expect(signed_data.signer.message_digest.len > 0);
+
+    // The SpcIndirectDataContent body digest must match the SignerInfo's
+    // messageDigest signed attribute — the binding the verifier relies on.
+    // Authenticode hashes only the body, not the outer tag/length octets.
+    const spc_outer = try der.parseElement(signed_data.spc_indirect_data, 0);
+    const spc_body = signed_data.spc_indirect_data[spc_outer.slice.start..spc_outer.slice.end];
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(spc_body, &digest, .{});
+    try std.testing.expectEqual(HashAlgorithm.sha256, signed_data.signer.digest_alg);
+    try std.testing.expectEqualSlices(u8, &digest, signed_data.signer.message_digest);
+
+    // Every certificate in the SET parses, and one of them is the signer.
+    var count: usize = 0;
+    var iter: CertificateSetIterator = .{ .bytes = signed_data.certificates_raw };
+    while (try iter.next()) |cert_der| {
+        _ = try der.parseCertificate(.{ .buffer = cert_der, .index = 0 });
+        count += 1;
+    }
+    try std.testing.expect(count >= 2);
+
+    const signer_cert_der = (try findSignerCertDer(signed_data)) orelse
+        return error.TestSignerCertNotFound;
+    const signer = try der.parseCertificate(.{ .buffer = signer_cert_der, .index = 0 });
+    try std.testing.expect(signer.subject_slice.end > signer.subject_slice.start);
+    try std.testing.expectEqualStrings("GitHub, Inc.", try extractSubjectCn(signer));
+    try std.testing.expectEqualStrings("GitHub, Inc.", try extractOrganization(signer));
+
+    // The unsignedAttrs carry the RFC 3161 timestamp token.
+    try std.testing.expect(signed_data.signer.unsigned_attrs_raw.len > 0);
 }
