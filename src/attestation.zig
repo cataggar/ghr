@@ -27,12 +27,21 @@ pub const ApiResponse = struct {
     attestations: []const ApiAttestation,
 };
 
+/// One attestation candidate: the decoded Sigstore bundle JSON plus the
+/// repository id GitHub filed it under. The id is what makes a rename
+/// survivable — GitHub stores attestations by numeric id, while the
+/// certificate's repository URI is frozen at signing time.
+pub const Candidate = struct {
+    json: []u8,
+    repository_id: ?u64 = null,
+};
+
 pub const BundleSet = struct {
     allocator: std.mem.Allocator,
-    items: [][]u8,
+    items: []Candidate,
 
     pub fn deinit(self: BundleSet) void {
-        for (self.items) |item| self.allocator.free(item);
+        for (self.items) |item| self.allocator.free(item.json);
         self.allocator.free(self.items);
     }
 };
@@ -59,7 +68,20 @@ pub fn lookup(
     const url = try buildApiUrl(allocator, api_base, repository, sha256_hex);
     defer allocator.free(url);
 
-    const raw_api = try fetchApiBody(client, allocator, url, auth_header);
+    // Two distinct signals mean "no attestation for this digest", and both
+    // must preserve the existing fallback verification behaviour:
+    //
+    //   * 404 — the repository has never produced an attestation.
+    //   * 200 with an empty list — the repository uses attestations, but
+    //     not for this digest.
+    //
+    // Reaching this point already required read access to the repository's
+    // release asset, so a 404 here is an absence of attestations rather
+    // than an access-control redaction.
+    const raw_api = fetchApiBody(client, allocator, url, auth_header) catch |err| switch (err) {
+        error.HttpNotFound => return .none,
+        else => return err,
+    };
     defer allocator.free(raw_api.body);
     const api_body = try decompressHttpContentAlloc(
         allocator,
@@ -80,10 +102,10 @@ pub fn lookup(
         return error.TooManyAttestations;
     }
 
-    const items = try allocator.alloc([]u8, parsed.value.attestations.len);
+    const items = try allocator.alloc(Candidate, parsed.value.attestations.len);
     var item_count: usize = 0;
     errdefer {
-        for (items[0..item_count]) |item| allocator.free(item);
+        for (items[0..item_count]) |item| allocator.free(item.json);
         allocator.free(items);
     }
 
@@ -123,7 +145,10 @@ pub fn lookup(
             return error.ResponseTooLarge;
         }
 
-        items[item_count] = bundle_json;
+        items[item_count] = .{
+            .json = bundle_json,
+            .repository_id = candidate.repository_id,
+        };
         item_count += 1;
     }
 
@@ -279,6 +304,12 @@ fn fetchOnce(
             ),
         };
     }
+    // Distinguished from other statuses so the API caller can treat it as
+    // "this repository has no attestations" rather than a lookup failure.
+    // GitHub returns 404 for a repository that has never produced an
+    // attestation, and 200 with an empty list for one that has but not for
+    // the requested digest.
+    if (response.head.status == .not_found) return error.HttpNotFound;
     if (response.head.status != .ok) return error.UnexpectedHttpStatus;
 
     const body_limit = if (response.head.content_encoding == .identity)
