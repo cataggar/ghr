@@ -63,20 +63,32 @@ fn ensureDirWithParents(io: Io, abs_path: []const u8, max_parents: u8) void {
     Dir.createDirAbsolute(io, abs_path, .default_dir) catch {};
 }
 
-/// Best-effort recursive `mkdir -p` for an absolute path. Unlike
-/// `ensureDirWithParents`, this walks up an unbounded number of ancestor
-/// levels, recursing only when create fails because a parent is missing.
-/// All other errors (already-exists, access-denied on ancestors we don't
-/// own) are tolerated; the caller detects real failure by then trying to
-/// use `abs_path`.
-pub fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) void {
-    Dir.createDirAbsolute(io, abs_path, .default_dir) catch |err| {
-        if (err == error.FileNotFound) {
-            const parent = std.fs.path.dirname(abs_path) orelse return;
-            ensureDirAbsoluteRecursive(io, parent);
-            Dir.createDirAbsolute(io, abs_path, .default_dir) catch {};
-        }
+const CreateDirAbsoluteFn = *const fn (Io, []const u8, File.Permissions) Dir.CreateDirError!void;
+
+fn ensureDirAbsoluteRecursiveWith(
+    io: Io,
+    abs_path: []const u8,
+    create_dir: CreateDirAbsoluteFn,
+) Dir.CreateDirError!void {
+    create_dir(io, abs_path, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(abs_path) orelse return err;
+            try ensureDirAbsoluteRecursiveWith(io, parent, create_dir);
+            create_dir(io, abs_path, .default_dir) catch |retry_err| switch (retry_err) {
+                error.PathAlreadyExists => {},
+                else => return retry_err,
+            };
+        },
+        else => return err,
     };
+}
+
+/// Recursive `mkdir -p` for an absolute path. Missing ancestors are created
+/// from the top down, while permission and other filesystem errors are
+/// preserved for the caller to report.
+pub fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) Dir.CreateDirError!void {
+    try ensureDirAbsoluteRecursiveWith(io, abs_path, Dir.createDirAbsolute);
 }
 
 /// Build a hidden, deterministic staging path beside an install path.
@@ -115,12 +127,20 @@ fn deleteTreeIfExists(io: Io, abs_path: []const u8) !void {
 /// stale staging contents are removed, so a fresh tools hierarchy works even
 /// when the cache and tools roots are on different filesystems.
 fn prepareStagingDir(io: Io, staging_parent: []const u8, staging_path: []const u8) !void {
-    ensureDirAbsoluteRecursive(io, staging_parent);
+    try ensureDirAbsoluteRecursive(io, staging_parent);
     var parent = try Dir.openDirAbsolute(io, staging_parent, .{});
     defer parent.close(io);
 
     try deleteTreeIfExists(io, staging_path);
     try parent.createDir(io, std.fs.path.basename(staging_path), .default_dir);
+}
+
+fn reportStagingDirCreateError(err_w: *Writer, staging_path: []const u8, err: anyerror) !void {
+    try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
+    if (err == error.AccessDenied or err == error.PermissionDenied) {
+        try err_w.print("  try sudo, or point GHR_TOOL_DIR somewhere writable\n", .{});
+    }
+    try err_w.flush();
 }
 
 /// A stale backup with no live directory means the previous transaction
@@ -2144,7 +2164,7 @@ fn installWasmModuleUnit(
     try w.print("downloading {s} ...\n", .{asset.name});
     try w.flush();
 
-    ensureDirAbsoluteRecursive(io, d.cache);
+    ensureDirAbsoluteRecursive(io, d.cache) catch {};
 
     const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
         d.cache, std.fs.path.sep, asset.name,
@@ -2207,8 +2227,7 @@ fn installWasmModuleUnit(
     defer allocator.free(legacy_backup_path);
 
     prepareStagingDir(io, repo_path, staging_path) catch |err| {
-        try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
-        try err_w.flush();
+        try reportStagingDirCreateError(err_w, staging_path, err);
         return error.InstallStepFailed;
     };
     errdefer deleteTreeIfExists(io, staging_path) catch {};
@@ -2273,7 +2292,7 @@ fn installWasmModuleUnit(
         },
     }
 
-    ensureDirAbsoluteRecursive(io, d.bin);
+    ensureDirAbsoluteRecursive(io, d.bin) catch {};
     var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
         try err_w.print("error: failed to open bin directory '{s}': {t}\n", .{ d.bin, err });
         try err_w.flush();
@@ -2494,8 +2513,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     defer allocator.free(legacy_backup_path);
 
     prepareStagingDir(io, owner_path, staging_path) catch |err| {
-        try err_w.print("error: failed to create staging dir '{s}': {t}\n", .{ staging_path, err });
-        try err_w.flush();
+        try reportStagingDirCreateError(err_w, staging_path, err);
         return error.InstallStepFailed;
     };
     errdefer deleteTreeIfExists(io, staging_path) catch {};
@@ -2521,7 +2539,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Downloaded release assets remain in cache even though extraction now
     // stages beside the destination install.
-    ensureDirAbsoluteRecursive(io, d.cache);
+    ensureDirAbsoluteRecursive(io, d.cache) catch {};
 
     for (primary_assets.items) |asset| {
         // Pre-flight verification check: if a `.minisig` sidecar exists but
@@ -2707,7 +2725,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
                     d.tools, std.fs.path.sep, owner_lower,
                 });
                 defer allocator.free(canon_owner_path);
-                ensureDirAbsoluteRecursive(io, d.tools);
+                ensureDirAbsoluteRecursive(io, d.tools) catch {};
                 Dir.createDirAbsolute(io, canon_owner_path, .default_dir) catch {};
 
                 caseRenameDir(io, existing, tool_path) catch {};
@@ -2767,7 +2785,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     // Create bin dir and link executables. The bin directory normally lives
     // under `~/.local/bin`; on a fresh install neither `.local` nor `.local/bin`
     // may exist yet, so create the full ancestor chain before opening.
-    ensureDirAbsoluteRecursive(io, d.bin);
+    ensureDirAbsoluteRecursive(io, d.bin) catch {};
     var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
         try err_w.print(
             "error: failed to open bin directory '{s}': {t}\n",
@@ -3821,7 +3839,7 @@ test "ensureDirAbsoluteRecursive creates arbitrarily deep missing tree" {
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "a", .{}));
 
-    ensureDirAbsoluteRecursive(tio, leaf);
+    try ensureDirAbsoluteRecursive(tio, leaf);
 
     try std.testing.expect((try tmp.dir.statFile(tio, "a", .{})).kind == .directory);
     try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
@@ -3843,9 +3861,48 @@ test "ensureDirAbsoluteRecursive tolerates already-existing path" {
     var sub_buf: [Dir.max_path_bytes]u8 = undefined;
     const leaf = try std.fmt.bufPrint(&sub_buf, "{s}{c}a{c}b", .{ base, std.fs.path.sep, std.fs.path.sep });
 
-    ensureDirAbsoluteRecursive(tio, leaf);
+    try ensureDirAbsoluteRecursive(tio, leaf);
 
     try std.testing.expect((try tmp.dir.statFile(tio, "a/b", .{})).kind == .directory);
+}
+
+test "ensureDirAbsoluteRecursive preserves permission errors from missing ancestors" {
+    const TestCreateDir = struct {
+        var calls: usize = 0;
+
+        fn run(_: Io, _: []const u8, _: File.Permissions) Dir.CreateDirError!void {
+            calls += 1;
+            if (calls == 1) return error.FileNotFound;
+            return error.AccessDenied;
+        }
+    };
+    TestCreateDir.calls = 0;
+
+    const path = if (builtin.os.tag == .windows)
+        "C:\\tools\\owner"
+    else
+        "/tools/owner";
+    try std.testing.expectError(
+        error.AccessDenied,
+        ensureDirAbsoluteRecursiveWith(std.testing.io, path, TestCreateDir.run),
+    );
+    try std.testing.expectEqual(@as(usize, 2), TestCreateDir.calls);
+}
+
+test "staging permission errors include a writable-directory hint" {
+    const allocator = std.testing.allocator;
+    var collected = std.Io.Writer.Allocating.init(allocator);
+    defer collected.deinit();
+
+    try reportStagingDirCreateError(&collected.writer, "/opt/ghr/tools/owner/.repo.staging", error.AccessDenied);
+    const message = try collected.toOwnedSlice();
+    defer allocator.free(message);
+
+    try std.testing.expectEqualStrings(
+        "error: failed to create staging dir '/opt/ghr/tools/owner/.repo.staging': AccessDenied\n" ++
+            "  try sudo, or point GHR_TOOL_DIR somewhere writable\n",
+        message,
+    );
 }
 
 test "ensureDirAbsoluteRecursive restores a missing download cache hierarchy" {
@@ -3864,7 +3921,7 @@ test "ensureDirAbsoluteRecursive restores a missing download cache hierarchy" {
     });
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "cache", .{}));
-    ensureDirAbsoluteRecursive(tio, cache_path);
+    try ensureDirAbsoluteRecursive(tio, cache_path);
     try std.testing.expect((try tmp.dir.statFile(tio, "cache/ghr", .{})).kind == .directory);
 }
 

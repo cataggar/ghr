@@ -169,7 +169,7 @@ pub fn writeManifest(
 ) !void {
     const owner_dir = try manifestDir(allocator, environ, owner_lower);
     defer allocator.free(owner_dir);
-    install.ensureDirAbsoluteRecursive(io, owner_dir);
+    install.ensureDirAbsoluteRecursive(io, owner_dir) catch {};
 
     const final_path = try manifestPath(allocator, environ, owner_lower, repo_lower);
     defer allocator.free(final_path);
@@ -700,7 +700,7 @@ pub fn cmdLink(
 
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
-    install.ensureDirAbsoluteRecursive(io, d.bin);
+    install.ensureDirAbsoluteRecursive(io, d.bin) catch {};
     var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
         try err_w.print("error: failed to open bin directory '{s}': {t}\n", .{ d.bin, err });
         try err_w.flush();
@@ -1202,7 +1202,7 @@ fn writeBareExeManifest(
 ) !void {
     const dir = try bareExeManifestDir(allocator, environ);
     defer allocator.free(dir);
-    install.ensureDirAbsoluteRecursive(io, dir);
+    install.ensureDirAbsoluteRecursive(io, dir) catch {};
 
     const final_path = try bareExeManifestPath(allocator, environ, name_lower);
     defer allocator.free(final_path);
@@ -1453,7 +1453,7 @@ pub fn cmdLinkBareExe(
 
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
-    install.ensureDirAbsoluteRecursive(io, d.bin);
+    install.ensureDirAbsoluteRecursive(io, d.bin) catch {};
     var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
         try err_w.print("error: failed to open bin directory '{s}': {t}\n", .{ d.bin, err });
         try err_w.flush();
