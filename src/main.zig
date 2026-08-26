@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const Dirs = @import("dirs.zig").Dirs;
+const dns = @import("dns.zig");
 const install = @import("install.zig");
 const download = @import("download.zig");
 const ensurepath = @import("ensurepath.zig");
@@ -16,7 +17,9 @@ const Writer = Io.Writer;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    const io = init.io;
+    // Resolve host names even where `/etc/resolv.conf` defeats the standard
+    // library's parser, such as WSL on a corporate network. See `dns.zig`.
+    const io = dns.wrap(init.io);
     const environ = init.environ_map;
 
     var args = try init.minimal.args.iterateAllocator(allocator);
@@ -761,6 +764,7 @@ test {
     _ = @import("release.zig");
     _ = @import("ensurepath.zig");
     _ = @import("dirs.zig");
+    _ = @import("dns.zig");
     _ = @import("http.zig");
     _ = @import("archive.zig");
     _ = @import("auth.zig");
