@@ -76,6 +76,8 @@ pub fn main(init: std.process.Init) !void {
         var minisign_pubkey: ?[]const u8 = null;
         var entries: std.ArrayListUnmanaged(release_mod.SpecWithKey) = .empty;
         defer entries.deinit(allocator);
+        var bin_filters: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer bin_filters.deinit(allocator);
         while (args.next()) |arg| {
             if (eql(arg, "--debug")) {
                 debug = true;
@@ -102,6 +104,13 @@ pub fn main(init: std.process.Init) !void {
                     std.process.exit(1);
                 };
                 minisign_pubkey = v;
+            } else if (eql(arg, "--bin")) {
+                const v = args.next() orelse {
+                    try stderr.interface.print("error: '--bin' requires an installed command name\n", .{});
+                    try stderr.interface.flush();
+                    std.process.exit(1);
+                };
+                try bin_filters.append(allocator, v);
             } else if (eql(arg, "help") and entries.items.len == 0) {
                 try printInstallUsage(&stdout.interface);
                 return;
@@ -133,11 +142,6 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
-        if (entries.items.len == 0) {
-            try stderr.interface.print("error: 'ghr install' requires <owner/repo[@tag]> or <owner/repo/file[@tag]>\n", .{});
-            try stderr.interface.flush();
-            std.process.exit(1);
-        }
         const gates: release_mod.VerifyGates = .{
             .skip_verify = skip_verify,
             .skip_checksum = skip_checksum,
@@ -146,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
             .skip_attestation = skip_attestation,
             .skip_authenticode = skip_authenticode,
         };
-        try install.cmdInstallMany(
+        install.cmdInstallMany(
             allocator,
             io,
             environ,
@@ -157,8 +161,12 @@ pub fn main(init: std.process.Init) !void {
             no_auth,
             gates,
             minisign_pubkey,
+            bin_filters.items,
             keep_going,
-        );
+        ) catch |err| switch (err) {
+            error.MissingInstallSpec, error.BinFilterRequiresSingleSpec => std.process.exit(1),
+            else => return err,
+        };
     } else if (eql(cmd_str, "uninstall")) {
         const spec = args.next() orelse {
             try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
@@ -454,9 +462,13 @@ fn printInstallUsage(w: *Writer) !void {
         \\
         \\Downloads the matching release asset(s), extracts each if needed,
         \\and installs the resulting binaries into ghr's bin directory.
+        \\`--bin` filters links and metadata after extraction; archive contents
+        \\remain fully extracted in the tool directory.
         \\Multi-spec invocations share a single HTTP client + auth context.
         \\
         \\OPTIONS:
+        \\    --bin <name>            Link and record only this installed command (repeatable);
+        \\                            requires exactly one spec and is not supported for wasm modules
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
         \\    --skip-verify           Skip every verification step (checksum, minisign, sigstore, attestation, authenticode)
@@ -472,6 +484,7 @@ fn printInstallUsage(w: *Writer) !void {
         \\
         \\EXAMPLES:
         \\    ghr install burntsushi/ripgrep@15.1.0
+        \\    ghr install azuread/microsoft-authentication-cli --bin azureauth
         \\    ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
         \\    ghr install jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
         \\

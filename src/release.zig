@@ -632,7 +632,7 @@ fn isInstallableAsset(name: []const u8) bool {
     if (std.mem.endsWith(u8, name, ".tar.gz")) return true;
     if (std.mem.endsWith(u8, name, ".tgz")) return true;
     if (std.mem.endsWith(u8, name, ".tar.xz")) return true;
-    if (std.mem.endsWith(u8, name, ".exe")) return true;
+    if (name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe")) return true;
     if (std.mem.endsWith(u8, name, ".wasm")) return true;
     const non_installable = [_][]const u8{
         ".json",   ".txt",    ".pub", ".sig",     ".asc", ".pem", ".md",
@@ -2745,6 +2745,7 @@ test "isInstallableAsset" {
     try std.testing.expect(isInstallableAsset("foo.deb"));
     try std.testing.expect(isInstallableAsset("cosign-windows-amd64.exe"));
     try std.testing.expect(isInstallableAsset("tool.exe"));
+    try std.testing.expect(isInstallableAsset("AzureAuth.EXE"));
     try std.testing.expect(isInstallableAsset("cosign-linux-amd64"));
     try std.testing.expect(isInstallableAsset("cosign-darwin-arm64"));
     try std.testing.expect(!isInstallableAsset("checksums.txt"));
