@@ -17,7 +17,7 @@ Notes:
 
 ## Bare executable form
 
-A spec without a `/` (e.g. `ghr link git`, `ghr link az`) is treated as a bare Windows-PATH executable name. ghr resolves it via `where.exe` (honouring `PATHEXT`), converts the result with `wslpath -u`, and writes an entry in ghr's bin directory based on the resolved file's extension:
+A spec without a `/` (e.g. `ghr link az`) is treated as a bare Windows-PATH executable name. ghr resolves it via `where.exe` (honouring `PATHEXT`), converts the result with `wslpath -u`, and writes an entry in ghr's bin directory based on the resolved file's extension:
 
 - `.exe` / `.com` → symlink. WSL interop direct-executes the PE image, no extra process hop.
 - `.cmd` / `.bat` → small bash wrapper that runs `cmd.exe /c '<windows-path>' "$@"` via WSL interop. This is how `ghr link az` exposes Azure CLI's `az.cmd`, for example.
@@ -52,9 +52,9 @@ git config --global credential.helper manager
 Git needs credentials, it runs the linked Windows helper through WSL interop, so
 the sign-in flow and credential storage happen on Windows.
 
-Do not use `ghr link git` for this setup: that would expose Windows Git itself,
-not just the credential helper. Git authentication through GCM does not require
-a separate `keyring` install.
+Do not use a bare executable link for this setup: that would expose Windows Git
+itself, not just the credential helper. Git authentication through GCM does not
+require a separate `keyring` install.
 
 For Azure Repos, also configure WSL Git to pass the organization path:
 
