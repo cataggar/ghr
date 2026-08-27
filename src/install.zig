@@ -597,6 +597,98 @@ fn dedupeExecutablesByHostArch(
     dedupeExecutablesByArch(allocator, exes, release_mod.currentPlatformKeywords().arch);
 }
 
+fn hasWindowsExeSuffix(name: []const u8) bool {
+    return name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe");
+}
+
+fn installedCommandName(exe_rel_path: []const u8, windows: bool) []const u8 {
+    const base = std.fs.path.basename(exe_rel_path);
+    if (windows and hasWindowsExeSuffix(base)) return base[0 .. base.len - 4];
+    return base;
+}
+
+fn commandNamesEqual(a: []const u8, b: []const u8, windows: bool) bool {
+    return if (windows) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+}
+
+fn executableMatchesFilter(exe_rel_path: []const u8, filter: []const u8, windows: bool) bool {
+    return commandNamesEqual(installedCommandName(exe_rel_path, windows), filter, windows);
+}
+
+fn filterWasSeenEarlier(filters: []const []const u8, index: usize, windows: bool) bool {
+    for (filters[0..index]) |earlier| {
+        if (commandNamesEqual(earlier, filters[index], windows)) return true;
+    }
+    return false;
+}
+
+fn filterExecutables(
+    allocator: std.mem.Allocator,
+    exes: *std.ArrayListUnmanaged([]const u8),
+    filters: []const []const u8,
+    windows: bool,
+    err_w: *Writer,
+) !void {
+    if (filters.len == 0) return;
+
+    var unmatched: usize = 0;
+    for (filters, 0..) |filter, filter_index| {
+        if (filterWasSeenEarlier(filters, filter_index, windows)) continue;
+        var matched = false;
+        for (exes.items) |exe_rel_path| {
+            if (executableMatchesFilter(exe_rel_path, filter, windows)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            if (unmatched == 0) {
+                try err_w.print("error: requested --bin filter", .{});
+            }
+            try err_w.print("{s}'{s}'", .{ if (unmatched == 0) " " else ", ", filter });
+            unmatched += 1;
+        }
+    }
+
+    if (unmatched > 0) {
+        try err_w.print(" did not match an available binary\n", .{});
+        try err_w.print("available binaries:\n", .{});
+        var listed: usize = 0;
+        for (exes.items, 0..) |exe_rel_path, exe_index| {
+            const name = installedCommandName(exe_rel_path, windows);
+            var duplicate = false;
+            for (exes.items[0..exe_index]) |earlier| {
+                if (commandNamesEqual(installedCommandName(earlier, windows), name, windows)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            try err_w.print("  {s}\n", .{name});
+            listed += 1;
+        }
+        if (listed == 0) try err_w.print("  (none)\n", .{});
+        try err_w.print("  hint: pass the installed command name shown above, not an archive path\n", .{});
+        return error.UnmatchedBinFilter;
+    }
+
+    var i: usize = 0;
+    while (i < exes.items.len) {
+        var selected = false;
+        for (filters) |filter| {
+            if (executableMatchesFilter(exes.items[i], filter, windows)) {
+                selected = true;
+                break;
+            }
+        }
+        if (selected) {
+            i += 1;
+        } else {
+            allocator.free(exes.orderedRemove(i));
+        }
+    }
+}
+
 fn dedupeExecutablesByArch(
     allocator: std.mem.Allocator,
     exes: *std.ArrayListUnmanaged([]const u8),
@@ -1588,7 +1680,11 @@ fn cleanupStaleBinEntries(
         // Skip if this bin is also in the new install (already overwritten by linkToBin)
         var dominated = false;
         for (new_bins) |new_exe_rel| {
-            if (std.mem.eql(u8, std.fs.path.basename(new_exe_rel), old_name)) {
+            if (commandNamesEqual(
+                installedCommandName(new_exe_rel, builtin.os.tag == .windows),
+                installedCommandName(old_exe_rel, builtin.os.tag == .windows),
+                builtin.os.tag == .windows,
+            )) {
                 dominated = true;
                 break;
             }
@@ -1829,6 +1925,28 @@ pub fn cmdUninstall(
 /// printing a user-visible diagnostic. The outer multi-spec driver decides
 /// whether to abort (fail-fast) or continue (`--keep-going`).
 pub const InstallStepError = error{InstallStepFailed};
+pub const InstallOptionsError = error{
+    MissingInstallSpec,
+    BinFilterRequiresSingleSpec,
+};
+
+pub fn validateInstallOptions(
+    spec_count: usize,
+    bin_filters: []const []const u8,
+    err_w: *Writer,
+) (InstallOptionsError || Writer.Error)!void {
+    if (spec_count == 0) {
+        try err_w.print("error: 'ghr install' requires <owner/repo[@tag]> or <owner/repo/file[@tag]>\n", .{});
+        try err_w.flush();
+        return error.MissingInstallSpec;
+    }
+    if (bin_filters.len > 0 and spec_count != 1) {
+        try err_w.print("error: '--bin' can only be used when installing exactly one spec\n", .{});
+        try err_w.print("  hint: run a separate 'ghr install <spec> --bin <name>' command for each spec\n", .{});
+        try err_w.flush();
+        return error.BinFilterRequiresSingleSpec;
+    }
+}
 
 /// Shared state for one or more sequential per-spec installs in a single
 /// `ghr install` invocation. Built once by `cmdInstallMany`; reused by
@@ -1853,6 +1971,9 @@ pub const InstallContext = struct {
     /// Global default minisign public key (from `--minisign`). Applied to
     /// any spec whose `SpecWithKey.key` is null.
     minisign_pubkey_b64: ?[]const u8,
+    /// Installed command names selected by repeatable `--bin` options.
+    /// Validation guarantees this is non-empty only for a single-spec run.
+    bin_filters: []const []const u8,
 };
 
 /// True when `abs_dir` is a directory containing a `ghr.json` — i.e. an
@@ -2474,6 +2595,12 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     // assets are homogeneous (all wasm or a single non-wasm), so inspecting
     // the first is sufficient.
     if (release_mod.isWasmAssetName(primary_name)) {
+        if (ctx.bin_filters.len > 0) {
+            try err_w.print("error: '--bin' is not supported when installing wasm modules\n", .{});
+            try err_w.print("  hint: omit --bin; each wasm module installs its manifest-defined command\n", .{});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        }
         for (primary_assets.items) |asset| {
             const stem = installWasmModuleUnit(
                 ctx,
@@ -2668,6 +2795,20 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
     // the host-arch copy so linking can't land on a foreign-arch build (#123).
     dedupeExecutablesByHostArch(allocator, &exes);
 
+    filterExecutables(
+        allocator,
+        &exes,
+        ctx.bin_filters,
+        builtin.os.tag == .windows,
+        err_w,
+    ) catch |err| switch (err) {
+        error.UnmatchedBinFilter => {
+            try err_w.flush();
+            return error.InstallStepFailed;
+        },
+        else => return err,
+    };
+
     if (exes.items.len == 0) {
         try err_w.print("error: no executables found in archive\n", .{});
         try err_w.print("  selected asset: {s}\n", .{primary_name});
@@ -2844,9 +2985,10 @@ pub fn cmdInstallMany(
     no_auth: bool,
     gates: release_mod.VerifyGates,
     minisign_pubkey_b64: ?[]const u8,
+    bin_filters: []const []const u8,
     keep_going: bool,
 ) !void {
-    if (entries.len == 0) return;
+    try validateInstallOptions(entries.len, bin_filters, err_w);
 
     const dirs = try Dirs.detect(allocator, environ);
     defer dirs.deinit();
@@ -2879,6 +3021,7 @@ pub fn cmdInstallMany(
         .no_auth = no_auth,
         .gates = gates,
         .minisign_pubkey_b64 = minisign_pubkey_b64,
+        .bin_filters = bin_filters,
     };
 
     var failed_specs: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -2941,32 +3084,7 @@ pub fn cmdInstall(
         no_auth,
         gates,
         minisign_pubkey_b64,
-        false,
-    );
-}
-
-test "cmdInstallMany short-circuits on empty spec list" {
-    // No allocator/io is even consulted because len==0 returns immediately.
-    var out_buf: [64]u8 = undefined;
-    var out_w = std.Io.Writer.Discarding.init(&out_buf);
-    var err_buf: [64]u8 = undefined;
-    var err_w = std.Io.Writer.Discarding.init(&err_buf);
-
-    var environ_map = EnvironMap.init(std.testing.allocator);
-    defer environ_map.deinit();
-
-    const empty: []const release_mod.SpecWithKey = &.{};
-    try cmdInstallMany(
-        std.testing.allocator,
-        std.testing.io,
-        &environ_map,
-        empty,
-        &out_w.writer,
-        &err_w.writer,
-        false,
-        false,
-        .{},
-        null,
+        &.{},
         false,
     );
 }
@@ -2975,6 +3093,146 @@ test "wasmStem strips the .wasm extension from the basename" {
     try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm"));
     try std.testing.expectEqualStrings("hello", wasmStem("sub/dir/hello.wasm"));
     try std.testing.expectEqualStrings("a.b", wasmStem("a.b.wasm"));
+}
+
+test "validateInstallOptions requires one spec when bin filters are present" {
+    const allocator = std.testing.allocator;
+    var err_output = std.Io.Writer.Allocating.init(allocator);
+    defer err_output.deinit();
+
+    try validateInstallOptions(1, &.{"tool"}, &err_output.writer);
+    try std.testing.expectError(
+        error.BinFilterRequiresSingleSpec,
+        validateInstallOptions(2, &.{"tool"}, &err_output.writer),
+    );
+    const message = try err_output.toOwnedSlice();
+    defer allocator.free(message);
+    try std.testing.expect(std.mem.indexOf(u8, message, "exactly one spec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "separate 'ghr install") != null);
+}
+
+test "validateInstallOptions rejects a missing spec before setup" {
+    const allocator = std.testing.allocator;
+    var err_output = std.Io.Writer.Allocating.init(allocator);
+    defer err_output.deinit();
+
+    try std.testing.expectError(
+        error.MissingInstallSpec,
+        validateInstallOptions(0, &.{}, &err_output.writer),
+    );
+    const message = try err_output.toOwnedSlice();
+    defer allocator.free(message);
+    try std.testing.expect(std.mem.indexOf(u8, message, "requires <owner/repo") != null);
+}
+
+test "filterExecutables selects each requested command once and metadata records only selections" {
+    const allocator = std.testing.allocator;
+    var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitPathList(allocator, &exes);
+    try exes.append(allocator, try allocator.dupe(u8, "nested/alpha"));
+    try exes.append(allocator, try allocator.dupe(u8, "nested/beta"));
+    try exes.append(allocator, try allocator.dupe(u8, "nested/gamma"));
+
+    var err_output = std.Io.Writer.Allocating.init(allocator);
+    defer err_output.deinit();
+    try filterExecutables(allocator, &exes, &.{ "beta", "beta" }, false, &err_output.writer);
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("nested/beta", exes.items[0]);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeMetadata(allocator, std.testing.io, tmp.dir, "v1", "tool.tar.gz", exes.items, &.{}, "checksum", null);
+    const body = try tmp.dir.readFileAlloc(std.testing.io, "ghr.json", allocator, Io.Limit.limited(8192));
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(Metadata, allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.bins.len);
+    try std.testing.expectEqualStrings("nested/beta", parsed.value.bins[0]);
+}
+
+test "filterExecutables uses Windows command names without exe case-insensitively" {
+    const allocator = std.testing.allocator;
+    var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitPathList(allocator, &exes);
+    try exes.append(allocator, try allocator.dupe(u8, "bin/AzureAuth.EXE"));
+    try exes.append(allocator, try allocator.dupe(u8, "bin/Other.exe"));
+
+    var err_output = std.Io.Writer.Allocating.init(allocator);
+    defer err_output.deinit();
+    try filterExecutables(allocator, &exes, &.{"azureauth"}, true, &err_output.writer);
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("bin/AzureAuth.EXE", exes.items[0]);
+}
+
+test "filterExecutables preserves native command-name case sensitivity" {
+    const allocator = std.testing.allocator;
+    var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitPathList(allocator, &exes);
+    try exes.append(allocator, try allocator.dupe(u8, "bin/AzureAuth"));
+
+    var err_output = std.Io.Writer.Allocating.init(allocator);
+    defer err_output.deinit();
+    try std.testing.expectError(
+        error.UnmatchedBinFilter,
+        filterExecutables(allocator, &exes, &.{"azureauth"}, false, &err_output.writer),
+    );
+}
+
+test "filterExecutables reports every unmatched filter and available command name" {
+    const allocator = std.testing.allocator;
+    var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer deinitPathList(allocator, &exes);
+    try exes.append(allocator, try allocator.dupe(u8, "bin/alpha"));
+    try exes.append(allocator, try allocator.dupe(u8, "other/beta"));
+
+    var err_output = std.Io.Writer.Allocating.init(allocator);
+    defer err_output.deinit();
+    try std.testing.expectError(
+        error.UnmatchedBinFilter,
+        filterExecutables(allocator, &exes, &.{ "missing", "also-missing", "missing" }, false, &err_output.writer),
+    );
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+    const message = try err_output.toOwnedSlice();
+    defer allocator.free(message);
+    try std.testing.expectEqualStrings(
+        "error: requested --bin filter 'missing', 'also-missing' did not match an available binary\n" ++
+            "available binaries:\n" ++
+            "  alpha\n" ++
+            "  beta\n" ++
+            "  hint: pass the installed command name shown above, not an archive path\n",
+        message,
+    );
+}
+
+test "cleanupStaleBinEntries removes excluded owned links and preserves selected links" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(tio, "bin", .default_dir);
+    try tmp.dir.createDir(tio, "tool", .default_dir);
+
+    var root_buf: [Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(tio, &root_buf);
+    const root = root_buf[0..root_len];
+    var tool_buf: [Dir.max_path_bytes]u8 = undefined;
+    const tool_path = try std.fmt.bufPrint(&tool_buf, "{s}{c}tool", .{ root, std.fs.path.sep });
+    var alpha_target_buf: [Dir.max_path_bytes]u8 = undefined;
+    const alpha_target = try std.fmt.bufPrint(&alpha_target_buf, "{s}{c}alpha", .{ tool_path, std.fs.path.sep });
+    var beta_target_buf: [Dir.max_path_bytes]u8 = undefined;
+    const beta_target = try std.fmt.bufPrint(&beta_target_buf, "{s}{c}beta", .{ tool_path, std.fs.path.sep });
+    try tmp.dir.symLink(tio, alpha_target, "bin/alpha", .{});
+    try tmp.dir.symLink(tio, beta_target, "bin/beta", .{});
+
+    var bin_dir = try tmp.dir.openDir(tio, "bin", .{});
+    defer bin_dir.close(tio);
+    cleanupStaleBinEntries(tio, bin_dir, &.{ "alpha", "beta" }, &.{"alpha"}, tool_path);
+
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const alpha_len = try bin_dir.readLink(tio, "alpha", &link_buf);
+    try std.testing.expectEqualStrings(alpha_target, link_buf[0..alpha_len]);
+    try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "beta", &link_buf));
 }
 
 test "writeZonEscaped escapes backslashes, quotes, and control chars" {
