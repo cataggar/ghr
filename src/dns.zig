@@ -19,6 +19,12 @@
 //! The fallback is Linux-only because Linux is the only target where the
 //! standard library resolves names through `/etc/resolv.conf`; Windows uses
 //! `DnsQueryEx` and the BSDs go through libc.
+//!
+//! This module is a workaround for an upstream bug, tracked as
+//! https://codeberg.org/ziglang/zig/issues/35371 and milestoned for Zig
+//! 0.17.0. Delete it once ghr builds against a Zig release carrying the fix:
+//! drop the `dns.wrap` call in `main.zig` and remove this file, leaving the
+//! standard resolver to read these files on its own.
 
 const std = @import("std");
 const builtin = @import("builtin");

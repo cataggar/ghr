@@ -19,6 +19,8 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     // Resolve host names even where `/etc/resolv.conf` defeats the standard
     // library's parser, such as WSL on a corporate network. See `dns.zig`.
+    // Remove this once ghr builds against a Zig release that fixes
+    // https://codeberg.org/ziglang/zig/issues/35371 (milestone 0.17.0).
     const io = dns.wrap(init.io);
     const environ = init.environ_map;
 
