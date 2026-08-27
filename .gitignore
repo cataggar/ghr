@@ -23,3 +23,6 @@ ghr_debug
 
 # Local assets (not tracked)
 /assets/
+
+# Local planning/research notes (not tracked; durable docs belong in doc/)
+/thoughts/
