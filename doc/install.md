@@ -46,6 +46,9 @@ ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
 # Install a specific asset by name (exact match or unique substring)
 ghr install WebAssembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
 
+# Install only a selected binary from a release
+ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
+
 # Show where tools are stored
 ghr path tools
 
@@ -57,6 +60,23 @@ For archive assets, `ghr install` exposes executable candidates from the
 shallowest directory level containing any executables. It searches deeper only
 when no shallower candidates exist, so nested-only package layouts still work
 without putting executable-looking firmware or data files on `PATH`.
+
+## Filtering installed binaries
+
+`--bin <name>` is repeatable. When present, only the selected executable
+candidates are linked into ghr's bin directory and recorded in `ghr.json`. The
+release archive is still fully extracted; download verification and extraction
+are unchanged.
+
+A filtered reinstall reconciles existing links, removing ghr-owned binaries
+excluded by the new selection. If a name does not match, ghr reports an error
+with the available binary names and leaves the existing installation unchanged.
+Filters currently require exactly one install spec; combining them with
+multiple specs is rejected.
+
+This install-time filtering is separate from WSL-specific `ghr link --bin`,
+which filters links for a tool already installed on Windows. See
+[WSL linking](wsl-linking.md).
 
 ## Uninstall
 
