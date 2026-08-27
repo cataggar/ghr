@@ -301,7 +301,7 @@ fn chooseExistingToolPathAction(
     return if (same_directory) .retain_alias else .collision;
 }
 
-fn directoriesHaveSameRealPath(io: Io, a_path: []const u8, b_path: []const u8) bool {
+fn directoriesHaveSameIdentity(io: Io, a_path: []const u8, b_path: []const u8) bool {
     var a = Dir.openDirAbsolute(io, a_path, .{}) catch return false;
     defer a.close(io);
     var b = Dir.openDirAbsolute(io, b_path, .{}) catch return false;
@@ -312,10 +312,12 @@ fn directoriesHaveSameRealPath(io: Io, a_path: []const u8, b_path: []const u8) b
     var b_buf: [Dir.max_path_bytes]u8 = undefined;
     const b_len = b.realPath(io, &b_buf) catch return false;
     if (a_len != b_len) return false;
-    return if (builtin.os.tag == .windows)
-        std.ascii.eqlIgnoreCase(a_buf[0..a_len], b_buf[0..b_len])
-    else
-        std.mem.eql(u8, a_buf[0..a_len], b_buf[0..b_len]);
+    // `realPath` is reported from each opened handle. Exact equality is
+    // deliberately required even on Windows: per-directory case sensitivity
+    // can make paths that differ only by case identify distinct directories.
+    // If the handles do not report the same final spelling, treat them as a
+    // collision rather than guessing that they alias.
+    return std.mem.eql(u8, a_buf[0..a_len], b_buf[0..b_len]);
 }
 
 fn existingToolPathAction(io: Io, existing_path: []const u8, canonical_path: []const u8) ExistingToolPathAction {
@@ -325,7 +327,7 @@ fn existingToolPathAction(io: Io, existing_path: []const u8, canonical_path: []c
     return chooseExistingToolPathAction(
         true,
         true,
-        directoriesHaveSameRealPath(io, existing_path, canonical_path),
+        directoriesHaveSameIdentity(io, existing_path, canonical_path),
     );
 }
 
@@ -1284,7 +1286,9 @@ fn zonTargetValuePointsToToolDir(
     return switch (value[escaped_tool_path.len]) {
         '"' => true,
         '/' => true,
-        '\\' => value.len > escaped_tool_path.len + 1 and value[escaped_tool_path.len + 1] == '\\',
+        '\\' => windows and
+            value.len > escaped_tool_path.len + 1 and
+            value[escaped_tool_path.len + 1] == '\\',
         else => false,
     };
 }
@@ -1828,8 +1832,8 @@ fn cleanupStaleBinEntries(
             var link_buf: [Dir.max_path_bytes]u8 = undefined;
             const len = bin_dir.readLink(io, old_name, &link_buf) catch continue;
             const link_target = link_buf[0..len];
-            if (pathIsWithinTool(link_target, old_tool_path) or
-                (previous_tool_path != null and pathIsWithinTool(link_target, previous_tool_path.?)))
+            if (pathIsWithinTool(link_target, old_tool_path, false) or
+                (previous_tool_path != null and pathIsWithinTool(link_target, previous_tool_path.?, false)))
             {
                 bin_dir.deleteFile(io, old_name) catch {};
             }
@@ -1837,9 +1841,11 @@ fn cleanupStaleBinEntries(
     }
 }
 
-fn pathIsWithinTool(path: []const u8, tool_path: []const u8) bool {
+fn pathIsWithinTool(path: []const u8, tool_path: []const u8, windows: bool) bool {
     return std.mem.startsWith(u8, path, tool_path) and
-        (path.len == tool_path.len or path[tool_path.len] == '/' or path[tool_path.len] == '\\');
+        (path.len == tool_path.len or
+            path[tool_path.len] == '/' or
+            (windows and path[tool_path.len] == '\\'));
 }
 
 /// Unlink every bin in `bins` that this unit (`unit_path`) owns. Handles
@@ -3519,7 +3525,7 @@ test "existing tool path action detects distinct case-sensitive collisions" {
         std.fs.path.sep,
     });
 
-    if (directoriesHaveSameRealPath(tio, existing, canonical)) return error.SkipZigTest;
+    if (directoriesHaveSameIdentity(tio, existing, canonical)) return error.SkipZigTest;
     try std.testing.expectEqual(
         ExistingToolPathAction.collision,
         existingToolPathAction(tio, existing, canonical),
@@ -3556,6 +3562,69 @@ test "existing tool path action retains case-insensitive aliases when available"
         ExistingToolPathAction.retain_alias,
         existingToolPathAction(tio, existing, canonical),
     );
+}
+
+test "directory identity requires identical final handle paths" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "tools/repo");
+    try tmp.dir.createDirPath(tio, "tools/other");
+
+    var root_buf: [Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(tio, &root_buf);
+    const root = root_buf[0..root_len];
+    var repo_buf: [Dir.max_path_bytes]u8 = undefined;
+    const repo = try std.fmt.bufPrint(&repo_buf, "{s}{c}tools{c}repo", .{
+        root,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+    var other_buf: [Dir.max_path_bytes]u8 = undefined;
+    const other = try std.fmt.bufPrint(&other_buf, "{s}{c}tools{c}other", .{
+        root,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+
+    try std.testing.expect(directoriesHaveSameIdentity(tio, repo, repo));
+    try std.testing.expect(!directoriesHaveSameIdentity(tio, repo, other));
+}
+
+test "tool path boundaries use platform separators" {
+    try std.testing.expect(pathIsWithinTool(
+        "/tools/owner/repo/bin/tool",
+        "/tools/owner/repo",
+        false,
+    ));
+    try std.testing.expect(!pathIsWithinTool(
+        "/tools/owner/repo\\other/bin/tool",
+        "/tools/owner/repo",
+        false,
+    ));
+    try std.testing.expect(pathIsWithinTool(
+        "C:\\tools\\owner\\repo\\bin\\tool.exe",
+        "C:\\tools\\owner\\repo",
+        true,
+    ));
+    try std.testing.expect(!pathIsWithinTool(
+        "C:\\tools\\owner\\repo-cli\\bin\\tool.exe",
+        "C:\\tools\\owner\\repo",
+        true,
+    ));
+}
+
+test "zon target boundaries reject POSIX backslashes" {
+    try std.testing.expect(!zonTargetValuePointsToToolDir(
+        "/tools/owner/repo\\other/bin/tool\"",
+        "/tools/owner/repo",
+        false,
+    ));
+    try std.testing.expect(zonTargetValuePointsToToolDir(
+        "C:\\\\tools\\\\owner\\\\repo\\\\bin\\\\tool.exe\"",
+        "C:\\\\tools\\\\owner\\\\repo",
+        true,
+    ));
 }
 
 test "writeZonEscaped escapes backslashes, quotes, and control chars" {
