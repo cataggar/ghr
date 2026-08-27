@@ -52,9 +52,9 @@ git config --global credential.helper manager
 Git needs credentials, it runs the linked Windows helper through WSL interop, so
 the sign-in flow and credential storage happen on Windows.
 
-Do not use a bare executable link for this setup: that would expose Windows Git
-itself, not just the credential helper. Git authentication through GCM does not
-require a separate `keyring` install.
+Do not link the bare Windows Git executable for this setup: that would expose
+Windows Git itself, not just the credential helper. Git authentication through
+GCM does not require a separate `keyring` install.
 
 For Azure Repos, also configure WSL Git to pass the organization path:
 
