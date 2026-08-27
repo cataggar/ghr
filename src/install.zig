@@ -270,6 +270,20 @@ fn caseRenameDir(io: Io, old_abs: []const u8, new_abs: []const u8) !void {
     try Dir.renameAbsolute(old_abs, new_abs, io);
 }
 
+fn renameInstalledToolDir(
+    allocator: std.mem.Allocator,
+    io: Io,
+    existing_path: []const u8,
+    canonical_path: []const u8,
+) !?[]u8 {
+    const previous = try allocator.dupe(u8, existing_path);
+    caseRenameDir(io, existing_path, canonical_path) catch {
+        allocator.free(previous);
+        return null;
+    };
+    return previous;
+}
+
 /// Search `parent` for a directory entry whose name matches `target`
 /// (case-insensitive). Returns the actual on-disk name (heap-owned by
 /// `allocator`) so callers preserve the casing already present on the
@@ -433,6 +447,20 @@ const bare_binary_archs = [_][]const u8{
     "ppc64",   "s390x", "riscv64",
 };
 
+fn hasWindowsExeSuffix(name: []const u8) bool {
+    return name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe");
+}
+
+fn windowsExeStem(name: []const u8) []const u8 {
+    if (hasWindowsExeSuffix(name)) return name[0 .. name.len - 4];
+    return name;
+}
+
+fn windowsShimExeName(buf: []u8, exe_name: []const u8) ![]const u8 {
+    if (hasWindowsExeSuffix(exe_name)) return exe_name;
+    return std.fmt.bufPrint(buf, "{s}.exe", .{exe_name});
+}
+
 /// For bare-binary assets whose name follows the `<name>-<arch>-<triple>...`
 /// convention (e.g. `wash-aarch64-unknown-linux-musl`) or the
 /// `<name>-<os>-<arch>` convention (e.g. `mer-macos-aarch64`,
@@ -446,7 +474,7 @@ fn deriveBareBinaryName(
     is_windows: bool,
 ) ![]u8 {
     var name = asset_name;
-    if (std.mem.endsWith(u8, name, ".exe")) name = name[0 .. name.len - 4];
+    if (hasWindowsExeSuffix(name)) name = name[0 .. name.len - 4];
 
     // Find the first '-' or '_' separator.
     var sep_idx: ?usize = null;
@@ -533,6 +561,15 @@ fn deinitPathList(
 /// keeps executable-looking firmware and other data in deeper directories off
 /// PATH while preserving nested-only archive layouts.
 fn findExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
+    return findExecutablesForPlatform(allocator, io, dir, builtin.os.tag == .windows);
+}
+
+fn findExecutablesForPlatform(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    windows: bool,
+) !std.ArrayListUnmanaged([]const u8) {
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer deinitPathList(allocator, &result);
 
@@ -562,6 +599,7 @@ fn findExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayLis
                 &result,
                 &next,
                 prefix,
+                windows,
             );
         }
 
@@ -597,13 +635,9 @@ fn dedupeExecutablesByHostArch(
     dedupeExecutablesByArch(allocator, exes, release_mod.currentPlatformKeywords().arch);
 }
 
-fn hasWindowsExeSuffix(name: []const u8) bool {
-    return name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe");
-}
-
 fn installedCommandName(exe_rel_path: []const u8, windows: bool) []const u8 {
     const base = std.fs.path.basename(exe_rel_path);
-    if (windows and hasWindowsExeSuffix(base)) return base[0 .. base.len - 4];
+    if (windows) return windowsExeStem(base);
     return base;
 }
 
@@ -758,6 +792,7 @@ fn scanExecutableLevel(
     result: *std.ArrayListUnmanaged([]const u8),
     next: *std.ArrayListUnmanaged([]const u8),
     prefix: []const u8,
+    windows: bool,
 ) !void {
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
@@ -774,7 +809,7 @@ fn scanExecutableLevel(
             if (isMacAppBundle(io, dir, entry.name)) {
                 // Treat the bundle as a candidate at this level while only
                 // inspecting its Contents/MacOS directory for launchers.
-                scanAppBundle(allocator, io, dir, entry.name, result, rel_name) catch |err| {
+                scanAppBundle(allocator, io, dir, entry.name, result, rel_name, windows) catch |err| {
                     allocator.free(rel_name);
                     return err;
                 };
@@ -793,8 +828,8 @@ fn scanExecutableLevel(
                 allocator.free(rel_name);
                 continue;
             }
-            const is_exe = if (builtin.os.tag == .windows)
-                std.mem.endsWith(u8, entry.name, ".exe")
+            const is_exe = if (windows)
+                hasWindowsExeSuffix(entry.name)
             else blk: {
                 const stat = dir.statFile(io, entry.name, .{}) catch {
                     allocator.free(rel_name);
@@ -842,6 +877,7 @@ fn scanAppBundle(
     app_name: []const u8,
     result: *std.ArrayListUnmanaged([]const u8),
     app_prefix: []const u8,
+    windows: bool,
 ) !void {
     const macos_rel = try std.fmt.allocPrint(allocator, "{s}/Contents/MacOS", .{app_name});
     defer allocator.free(macos_rel);
@@ -855,8 +891,8 @@ fn scanAppBundle(
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (isSharedLibrary(entry.name)) continue;
-        const is_exe = if (builtin.os.tag == .windows)
-            std.mem.endsWith(u8, entry.name, ".exe")
+        const is_exe = if (windows)
+            hasWindowsExeSuffix(entry.name)
         else blk: {
             const stat = macos_dir.statFile(io, entry.name, .{}) catch continue;
             if ((@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0)
@@ -904,10 +940,7 @@ fn linkToBin(
         // release, etc.). This is the same technique used by npm and Scoop.
         const shim_exe_bytes = @import("shim_exe").bytes;
 
-        const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
-            exe_name[0 .. exe_name.len - 4]
-        else
-            exe_name;
+        const stem = windowsExeStem(exe_name);
 
         // Write the `<stem>.ghr` manifest naming the native target. The shim
         // reads this at run time; for a current shim it supersedes the legacy
@@ -926,12 +959,8 @@ fn linkToBin(
         } else |_| {}
 
         // Write the embedded shim exe as <name>.exe
-        const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe"))
-            exe_name
-        else blk: {
-            var name_buf: [Dir.max_path_bytes]u8 = undefined;
-            break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return error.PathTooLong;
-        };
+        var name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const shim_exe_name = windowsShimExeName(&name_buf, exe_name) catch return error.PathTooLong;
         bin_dir.deleteFile(io, shim_exe_name) catch {
             // On Windows a running shim exe cannot be deleted; rename it out of the way.
             var old_name_buf: [Dir.max_path_bytes]u8 = undefined;
@@ -1605,10 +1634,7 @@ fn cleanupOldInstall(
 /// only removed when a `.ghr` or `.shim` confirms the entry belongs to
 /// `tool_path`.
 fn cleanupWindowsBinEntry(io: Io, bin_dir: Dir, exe_name: []const u8, tool_path: []const u8) void {
-    const stem = if (std.mem.endsWith(u8, exe_name, ".exe"))
-        exe_name[0 .. exe_name.len - 4]
-    else
-        exe_name;
+    const stem = windowsExeStem(exe_name);
 
     var owned = false;
 
@@ -1631,10 +1657,8 @@ fn cleanupWindowsBinEntry(io: Io, bin_dir: Dir, exe_name: []const u8, tool_path:
     } else |_| {}
 
     if (owned) {
-        const shim_exe_name = if (std.mem.endsWith(u8, exe_name, ".exe")) exe_name else blk: {
-            var name_buf: [Dir.max_path_bytes]u8 = undefined;
-            break :blk std.fmt.bufPrint(&name_buf, "{s}.exe", .{stem}) catch return;
-        };
+        var name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const shim_exe_name = windowsShimExeName(&name_buf, exe_name) catch return;
         bin_dir.deleteFile(io, shim_exe_name) catch {};
     }
 
@@ -1674,6 +1698,7 @@ fn cleanupStaleBinEntries(
     old_bins: []const []const u8,
     new_bins: []const []const u8,
     old_tool_path: []const u8,
+    previous_tool_path: ?[]const u8,
 ) void {
     for (old_bins) |old_exe_rel| {
         const old_name = std.fs.path.basename(old_exe_rel);
@@ -1692,19 +1717,30 @@ fn cleanupStaleBinEntries(
         if (dominated) continue;
         if (release_mod.isWasmAssetName(old_exe_rel)) {
             cleanupWasmBinEntry(io, bin_dir, old_exe_rel, old_tool_path);
+            if (previous_tool_path) |previous| {
+                cleanupWasmBinEntry(io, bin_dir, old_exe_rel, previous);
+            }
         } else if (builtin.os.tag == .windows) {
             cleanupWindowsBinEntry(io, bin_dir, old_name, old_tool_path);
+            if (previous_tool_path) |previous| {
+                cleanupWindowsBinEntry(io, bin_dir, old_name, previous);
+            }
         } else {
             var link_buf: [Dir.max_path_bytes]u8 = undefined;
             const len = bin_dir.readLink(io, old_name, &link_buf) catch continue;
             const link_target = link_buf[0..len];
-            if (std.mem.startsWith(u8, link_target, old_tool_path) and
-                (link_target.len == old_tool_path.len or link_target[old_tool_path.len] == '/'))
+            if (pathIsWithinTool(link_target, old_tool_path) or
+                (previous_tool_path != null and pathIsWithinTool(link_target, previous_tool_path.?)))
             {
                 bin_dir.deleteFile(io, old_name) catch {};
             }
         }
     }
+}
+
+fn pathIsWithinTool(path: []const u8, tool_path: []const u8) bool {
+    return std.mem.startsWith(u8, path, tool_path) and
+        (path.len == tool_path.len or path[tool_path.len] == '/' or path[tool_path.len] == '\\');
 }
 
 /// Unlink every bin in `bins` that this unit (`unit_path`) owns. Handles
@@ -2428,7 +2464,7 @@ fn installWasmModuleUnit(
 
     // Clean up stale bin entries from a previous install of this module.
     if (old_meta) |m| {
-        cleanupStaleBinEntries(io, bin_dir, m.parsed.value.bins, &.{asset.name}, module_path);
+        cleanupStaleBinEntries(io, bin_dir, m.parsed.value.bins, &.{asset.name}, module_path, null);
     }
 
     return stem;
@@ -2845,6 +2881,9 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
         return error.InstallStepFailed;
     };
 
+    var previous_tool_path: ?[]const u8 = null;
+    defer if (previous_tool_path) |path| allocator.free(path);
+
     // Opportunistic case-migration: a pre-migration install of the same
     // repo may live at a mixed-case path (e.g. `<tools>/AzureAD/foo`).
     // If found, rename it to the canonical lowercase path before we
@@ -2869,7 +2908,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
                 ensureDirAbsoluteRecursive(io, d.tools) catch {};
                 Dir.createDirAbsolute(io, canon_owner_path, .default_dir) catch {};
 
-                caseRenameDir(io, existing, tool_path) catch {};
+                previous_tool_path = try renameInstalledToolDir(allocator, io, existing, tool_path);
 
                 // Best-effort: remove the now-empty mixed-case owner dir
                 // (only succeeds when there are no other repos under it).
@@ -2946,7 +2985,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Clean up stale bin entries from old install that aren't in the new one
     if (old_meta) |m| {
-        cleanupStaleBinEntries(io, bin_dir, m.parsed.value.bins, exes.items, tool_path);
+        cleanupStaleBinEntries(io, bin_dir, m.parsed.value.bins, exes.items, tool_path, previous_tool_path);
     }
 
     // On macOS, copy .app bundles into ~/Applications for Spotlight discovery
@@ -3150,18 +3189,37 @@ test "filterExecutables selects each requested command once and metadata records
     try std.testing.expectEqualStrings("nested/beta", parsed.value.bins[0]);
 }
 
-test "filterExecutables uses Windows command names without exe case-insensitively" {
+test "Windows executable discovery and filtering accept uppercase exe suffixes" {
     const allocator = std.testing.allocator;
-    var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "AzureAuth.EXE", "Other.exe", "README.txt" }) |name| {
+        var file = try tmp.dir.createFile(std.testing.io, name, .{});
+        try file.writeStreamingAll(std.testing.io, "content");
+        file.close(std.testing.io);
+    }
+
+    var scan_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    defer scan_dir.close(std.testing.io);
+    var exes = try findExecutablesForPlatform(allocator, std.testing.io, scan_dir, true);
     defer deinitPathList(allocator, &exes);
-    try exes.append(allocator, try allocator.dupe(u8, "bin/AzureAuth.EXE"));
-    try exes.append(allocator, try allocator.dupe(u8, "bin/Other.exe"));
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
 
     var err_output = std.Io.Writer.Allocating.init(allocator);
     defer err_output.deinit();
     try filterExecutables(allocator, &exes, &.{"azureauth"}, true, &err_output.writer);
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
-    try std.testing.expectEqualStrings("bin/AzureAuth.EXE", exes.items[0]);
+    try std.testing.expectEqualStrings("AzureAuth.EXE", exes.items[0]);
+}
+
+test "Windows shim and cleanup names strip exe suffix case-insensitively" {
+    try std.testing.expectEqualStrings("AzureAuth", windowsExeStem("AzureAuth.EXE"));
+    try std.testing.expectEqualStrings("AzureAuth", windowsExeStem("AzureAuth.ExE"));
+    try std.testing.expectEqualStrings("AzureAuth", windowsExeStem("AzureAuth"));
+
+    var name_buf: [Dir.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqualStrings("AzureAuth.EXE", try windowsShimExeName(&name_buf, "AzureAuth.EXE"));
+    try std.testing.expectEqualStrings("AzureAuth.exe", try windowsShimExeName(&name_buf, "AzureAuth"));
 }
 
 test "filterExecutables preserves native command-name case sensitivity" {
@@ -3227,12 +3285,91 @@ test "cleanupStaleBinEntries removes excluded owned links and preserves selected
 
     var bin_dir = try tmp.dir.openDir(tio, "bin", .{});
     defer bin_dir.close(tio);
-    cleanupStaleBinEntries(tio, bin_dir, &.{ "alpha", "beta" }, &.{"alpha"}, tool_path);
+    cleanupStaleBinEntries(tio, bin_dir, &.{ "alpha", "beta" }, &.{"alpha"}, tool_path, null);
 
     var link_buf: [Dir.max_path_bytes]u8 = undefined;
     const alpha_len = try bin_dir.readLink(tio, "alpha", &link_buf);
     try std.testing.expectEqualStrings(alpha_target, link_buf[0..alpha_len]);
     try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "beta", &link_buf));
+}
+
+test "stale cleanup accepts the prior mixed-case tool path after migration" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "tools/AzureAD/repo");
+    try tmp.dir.createDir(tio, "bin", .default_dir);
+
+    var old_dir = try tmp.dir.openDir(tio, "tools/AzureAD/repo", .{});
+    defer old_dir.close(tio);
+    try writeMetadata(
+        allocator,
+        tio,
+        old_dir,
+        "v1",
+        "tool.zip",
+        &.{ "alpha", "beta", "foreign" },
+        &.{},
+        "checksum",
+        null,
+    );
+
+    var root_buf: [Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(tio, &root_buf);
+    const root = root_buf[0..root_len];
+    var tools_buf: [Dir.max_path_bytes]u8 = undefined;
+    const tools_path = try std.fmt.bufPrint(&tools_buf, "{s}{c}tools", .{ root, std.fs.path.sep });
+    const resolved = (try resolveInstalledToolPath(allocator, tio, tools_path, "azuread", "repo")).?;
+    defer allocator.free(resolved);
+
+    try tmp.dir.createDirPath(tio, "tools/azuread");
+    var canonical_buf: [Dir.max_path_bytes]u8 = undefined;
+    const canonical_path = try std.fmt.bufPrint(&canonical_buf, "{s}{c}azuread{c}repo", .{
+        tools_path,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+    var alpha_old_buf: [Dir.max_path_bytes]u8 = undefined;
+    const alpha_old = try std.fmt.bufPrint(&alpha_old_buf, "{s}{c}alpha", .{ resolved, std.fs.path.sep });
+    var beta_old_buf: [Dir.max_path_bytes]u8 = undefined;
+    const beta_old = try std.fmt.bufPrint(&beta_old_buf, "{s}{c}beta", .{ resolved, std.fs.path.sep });
+    var foreign_buf: [Dir.max_path_bytes]u8 = undefined;
+    const foreign_target = try std.fmt.bufPrint(&foreign_buf, "{s}-unrelated{c}foreign", .{ resolved, std.fs.path.sep });
+    try tmp.dir.symLink(tio, alpha_old, "bin/alpha", .{});
+    try tmp.dir.symLink(tio, beta_old, "bin/beta", .{});
+    try tmp.dir.symLink(tio, foreign_target, "bin/foreign", .{});
+
+    const previous_path = (try renameInstalledToolDir(allocator, tio, resolved, canonical_path)).?;
+    defer allocator.free(previous_path);
+    const old_meta = readMetadata(allocator, tio, canonical_path).?;
+    defer old_meta.parsed.deinit();
+    defer allocator.free(old_meta.body);
+
+    var bin_dir = try tmp.dir.openDir(tio, "bin", .{});
+    defer bin_dir.close(tio);
+    bin_dir.deleteFile(tio, "alpha") catch {};
+    var alpha_new_buf: [Dir.max_path_bytes]u8 = undefined;
+    const alpha_new = try std.fmt.bufPrint(&alpha_new_buf, "{s}{c}alpha", .{ canonical_path, std.fs.path.sep });
+    try bin_dir.symLink(tio, alpha_new, "alpha", .{});
+
+    cleanupStaleBinEntries(
+        tio,
+        bin_dir,
+        old_meta.parsed.value.bins,
+        &.{"alpha"},
+        canonical_path,
+        previous_path,
+    );
+
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const alpha_len = try bin_dir.readLink(tio, "alpha", &link_buf);
+    try std.testing.expectEqualStrings(alpha_new, link_buf[0..alpha_len]);
+    try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "beta", &link_buf));
+    const foreign_len = try bin_dir.readLink(tio, "foreign", &link_buf);
+    try std.testing.expectEqualStrings(foreign_target, link_buf[0..foreign_len]);
 }
 
 test "writeZonEscaped escapes backslashes, quotes, and control chars" {

@@ -234,7 +234,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Strip a trailing .exe (if any) to get the stem shared by the companion
     // `.ghr` / `.shim` files.
-    const stem = if (std.mem.endsWith(u8, self_path, ".exe") or std.mem.endsWith(u8, self_path, ".EXE"))
+    const stem = if (self_path.len >= 4 and std.ascii.eqlIgnoreCase(self_path[self_path.len - 4 ..], ".exe"))
         self_path[0 .. self_path.len - 4]
     else
         self_path;
