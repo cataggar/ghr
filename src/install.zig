@@ -284,6 +284,51 @@ fn renameInstalledToolDir(
     return previous;
 }
 
+const ExistingToolPathAction = enum {
+    none,
+    rename,
+    retain_alias,
+    collision,
+};
+
+fn chooseExistingToolPathAction(
+    spelling_differs: bool,
+    canonical_exists: bool,
+    same_directory: bool,
+) ExistingToolPathAction {
+    if (!spelling_differs) return .none;
+    if (!canonical_exists) return .rename;
+    return if (same_directory) .retain_alias else .collision;
+}
+
+fn directoriesHaveSameRealPath(io: Io, a_path: []const u8, b_path: []const u8) bool {
+    var a = Dir.openDirAbsolute(io, a_path, .{}) catch return false;
+    defer a.close(io);
+    var b = Dir.openDirAbsolute(io, b_path, .{}) catch return false;
+    defer b.close(io);
+
+    var a_buf: [Dir.max_path_bytes]u8 = undefined;
+    const a_len = a.realPath(io, &a_buf) catch return false;
+    var b_buf: [Dir.max_path_bytes]u8 = undefined;
+    const b_len = b.realPath(io, &b_buf) catch return false;
+    if (a_len != b_len) return false;
+    return if (builtin.os.tag == .windows)
+        std.ascii.eqlIgnoreCase(a_buf[0..a_len], b_buf[0..b_len])
+    else
+        std.mem.eql(u8, a_buf[0..a_len], b_buf[0..b_len]);
+}
+
+fn existingToolPathAction(io: Io, existing_path: []const u8, canonical_path: []const u8) ExistingToolPathAction {
+    if (std.mem.eql(u8, existing_path, canonical_path)) return .none;
+    var canonical = Dir.openDirAbsolute(io, canonical_path, .{}) catch return .rename;
+    canonical.close(io);
+    return chooseExistingToolPathAction(
+        true,
+        true,
+        directoriesHaveSameRealPath(io, existing_path, canonical_path),
+    );
+}
+
 /// Search `parent` for a directory entry whose name matches `target`
 /// (case-insensitive). Returns the actual on-disk name (heap-owned by
 /// `allocator`) so callers preserve the casing already present on the
@@ -1211,9 +1256,63 @@ fn cleanupWasmBinEntry(io: Io, bin_dir: Dir, wasm_rel_path: []const u8, tool_pat
 
 /// Ownership check for a bin-dir `<stem>.ghr`: true when the manifest text
 /// references `tool_path` in its `target` / `targetWasm` field. Allocation-
-/// free: matches `tool_path` after applying the same ZON `\`-escaping ghr
-/// wrote, so Windows backslash paths compare correctly.
+/// free: matches `tool_path` at the start of a generated target field after
+/// applying the same ZON `\`-escaping ghr wrote, and requires a path-component
+/// boundary so similarly prefixed repositories are not treated as owned.
 fn binGhrPointsToToolDir(io: Io, bin_dir: Dir, ghr_name: []const u8, tool_path: []const u8) bool {
+    return binGhrPointsToToolDirForPlatform(
+        io,
+        bin_dir,
+        ghr_name,
+        tool_path,
+        builtin.os.tag == .windows,
+    );
+}
+
+fn zonTargetValuePointsToToolDir(
+    value: []const u8,
+    escaped_tool_path: []const u8,
+    windows: bool,
+) bool {
+    if (value.len < escaped_tool_path.len) return false;
+    const prefix_matches = if (windows)
+        std.ascii.eqlIgnoreCase(value[0..escaped_tool_path.len], escaped_tool_path)
+    else
+        std.mem.eql(u8, value[0..escaped_tool_path.len], escaped_tool_path);
+    if (!prefix_matches) return false;
+    if (value.len == escaped_tool_path.len) return true;
+    return switch (value[escaped_tool_path.len]) {
+        '"' => true,
+        '/' => true,
+        '\\' => value.len > escaped_tool_path.len + 1 and value[escaped_tool_path.len + 1] == '\\',
+        else => false,
+    };
+}
+
+fn binGhrContentPointsToToolDir(
+    content: []const u8,
+    escaped_tool_path: []const u8,
+    windows: bool,
+) bool {
+    const fields = [_][]const u8{
+        ".target = \"",
+        ".targetWasm = \"",
+    };
+    for (fields) |field| {
+        const field_pos = std.mem.indexOf(u8, content, field) orelse continue;
+        const value = content[field_pos + field.len ..];
+        if (zonTargetValuePointsToToolDir(value, escaped_tool_path, windows)) return true;
+    }
+    return false;
+}
+
+fn binGhrPointsToToolDirForPlatform(
+    io: Io,
+    bin_dir: Dir,
+    ghr_name: []const u8,
+    tool_path: []const u8,
+    windows: bool,
+) bool {
     var content_buf: [16 * 1024]u8 = undefined;
     const file = bin_dir.openFile(io, ghr_name, .{}) catch return false;
     defer file.close(io);
@@ -1233,7 +1332,7 @@ fn binGhrPointsToToolDir(io: Io, bin_dir: Dir, ghr_name: []const u8, tool_path: 
         needle_buf[n] = c;
         n += 1;
     }
-    return std.mem.indexOf(u8, content, needle_buf[0..n]) != null;
+    return binGhrContentPointsToToolDir(content, needle_buf[0..n], windows);
 }
 
 /// Validate a downloaded `.ghr` manifest (ZON): `.version` must be present and
@@ -2886,19 +2985,19 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
 
     // Opportunistic case-migration: a pre-migration install of the same
     // repo may live at a mixed-case path (e.g. `<tools>/AzureAD/foo`).
-    // If found, rename it to the canonical lowercase path before we
-    // touch anything else. Best-effort: a collision with an already-
-    // canonical entry, or a failed rename, falls through to the
-    // normal delete-and-replace path.
+    // If found, rename it to the canonical lowercase path when necessary.
+    // On a case-insensitive filesystem the canonical spelling may already
+    // alias the same directory; retain the resolved spelling for stale-link
+    // ownership checks without renaming. A genuinely distinct canonical
+    // collision is never claimed as the same install.
     if (try resolveInstalledToolPath(allocator, io, d.tools, owner_lower, repo_lower)) |existing| {
         defer allocator.free(existing);
-        if (!std.mem.eql(u8, existing, tool_path)) {
-            const dest_already_present = blk: {
-                var dc = Dir.openDirAbsolute(io, tool_path, .{}) catch break :blk false;
-                dc.close(io);
-                break :blk true;
-            };
-            if (!dest_already_present) {
+        switch (existingToolPathAction(io, existing, tool_path)) {
+            .none, .collision => {},
+            .retain_alias => {
+                previous_tool_path = try allocator.dupe(u8, existing);
+            },
+            .rename => {
                 // Ensure the canonical owner dir exists at the right
                 // casing before moving the repo dir into it.
                 const canon_owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
@@ -2917,7 +3016,7 @@ fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerr
                         Dir.deleteDirAbsolute(io, old_owner_path) catch {};
                     }
                 }
-            }
+            },
         }
     }
 
@@ -3332,6 +3431,10 @@ test "stale cleanup accepts the prior mixed-case tool path after migration" {
         std.fs.path.sep,
         std.fs.path.sep,
     });
+    try std.testing.expectEqual(
+        ExistingToolPathAction.rename,
+        existingToolPathAction(tio, resolved, canonical_path),
+    );
     var alpha_old_buf: [Dir.max_path_bytes]u8 = undefined;
     const alpha_old = try std.fmt.bufPrint(&alpha_old_buf, "{s}{c}alpha", .{ resolved, std.fs.path.sep });
     var beta_old_buf: [Dir.max_path_bytes]u8 = undefined;
@@ -3370,6 +3473,89 @@ test "stale cleanup accepts the prior mixed-case tool path after migration" {
     try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "beta", &link_buf));
     const foreign_len = try bin_dir.readLink(tio, "foreign", &link_buf);
     try std.testing.expectEqualStrings(foreign_target, link_buf[0..foreign_len]);
+}
+
+test "existing tool path action retains aliases but rejects collisions" {
+    try std.testing.expectEqual(
+        ExistingToolPathAction.none,
+        chooseExistingToolPathAction(false, true, true),
+    );
+    try std.testing.expectEqual(
+        ExistingToolPathAction.rename,
+        chooseExistingToolPathAction(true, false, false),
+    );
+    try std.testing.expectEqual(
+        ExistingToolPathAction.retain_alias,
+        chooseExistingToolPathAction(true, true, true),
+    );
+    try std.testing.expectEqual(
+        ExistingToolPathAction.collision,
+        chooseExistingToolPathAction(true, true, false),
+    );
+}
+
+test "existing tool path action detects distinct case-sensitive collisions" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "tools/AzureAD/repo");
+    try tmp.dir.createDirPath(tio, "tools/azuread/repo");
+
+    var root_buf: [Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(tio, &root_buf);
+    const root = root_buf[0..root_len];
+    var existing_buf: [Dir.max_path_bytes]u8 = undefined;
+    const existing = try std.fmt.bufPrint(&existing_buf, "{s}{c}tools{c}AzureAD{c}repo", .{
+        root,
+        std.fs.path.sep,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+    var canonical_buf: [Dir.max_path_bytes]u8 = undefined;
+    const canonical = try std.fmt.bufPrint(&canonical_buf, "{s}{c}tools{c}azuread{c}repo", .{
+        root,
+        std.fs.path.sep,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+
+    if (directoriesHaveSameRealPath(tio, existing, canonical)) return error.SkipZigTest;
+    try std.testing.expectEqual(
+        ExistingToolPathAction.collision,
+        existingToolPathAction(tio, existing, canonical),
+    );
+}
+
+test "existing tool path action retains case-insensitive aliases when available" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "tools/AzureAD/repo");
+
+    var root_buf: [Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(tio, &root_buf);
+    const root = root_buf[0..root_len];
+    var existing_buf: [Dir.max_path_bytes]u8 = undefined;
+    const existing = try std.fmt.bufPrint(&existing_buf, "{s}{c}tools{c}AzureAD{c}repo", .{
+        root,
+        std.fs.path.sep,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+    var canonical_buf: [Dir.max_path_bytes]u8 = undefined;
+    const canonical = try std.fmt.bufPrint(&canonical_buf, "{s}{c}tools{c}azuread{c}repo", .{
+        root,
+        std.fs.path.sep,
+        std.fs.path.sep,
+        std.fs.path.sep,
+    });
+
+    var alias = Dir.openDirAbsolute(tio, canonical, .{}) catch return error.SkipZigTest;
+    alias.close(tio);
+    try std.testing.expectEqual(
+        ExistingToolPathAction.retain_alias,
+        existingToolPathAction(tio, existing, canonical),
+    );
 }
 
 test "writeZonEscaped escapes backslashes, quotes, and control chars" {
@@ -4126,6 +4312,79 @@ test "writeLegacyShim writes a single-line target readable by shimPointsToToolDi
     const body2 = try tmp.dir.readFileAlloc(std.testing.io, "tool.shim", allocator, Io.Limit.limited(4096));
     defer allocator.free(body2);
     try std.testing.expectEqualStrings(target2 ++ "\n", body2);
+}
+
+test "bin ghr ownership uses escaped field values and Windows path semantics" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeNativeGhr(
+        tio,
+        tmp.dir,
+        "tool.ghr",
+        "C:\\Tools\\Owner\\Repo\\bin\\AzureAuth.EXE",
+    );
+    try std.testing.expect(binGhrPointsToToolDirForPlatform(
+        tio,
+        tmp.dir,
+        "tool.ghr",
+        "C:\\Tools\\Owner\\Repo",
+        true,
+    ));
+    try std.testing.expect(binGhrPointsToToolDirForPlatform(
+        tio,
+        tmp.dir,
+        "tool.ghr",
+        "c:\\tools\\owner\\repo",
+        true,
+    ));
+    try std.testing.expect(!binGhrPointsToToolDirForPlatform(
+        tio,
+        tmp.dir,
+        "tool.ghr",
+        "C:\\Tools\\Owner\\Rep",
+        true,
+    ));
+
+    try writeNativeGhr(
+        tio,
+        tmp.dir,
+        "tool.ghr",
+        "C:\\Tools\\Owner\\Repo-Cli\\bin\\tool.exe",
+    );
+    try std.testing.expect(!binGhrPointsToToolDirForPlatform(
+        tio,
+        tmp.dir,
+        "tool.ghr",
+        "c:\\tools\\owner\\repo",
+        true,
+    ));
+}
+
+test "Windows cleanup preserves prefix-collision ghr shims" {
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeNativeGhr(
+        tio,
+        tmp.dir,
+        "tool.ghr",
+        "C:\\tools\\owner\\repo-cli\\bin\\tool.exe",
+    );
+    var shim = try tmp.dir.createFile(tio, "tool.EXE", .{});
+    shim.close(tio);
+
+    cleanupWindowsBinEntry(
+        tio,
+        tmp.dir,
+        "tool.EXE",
+        "C:\\tools\\owner\\repo",
+    );
+
+    try std.testing.expect((try tmp.dir.statFile(tio, "tool.ghr", .{})).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile(tio, "tool.EXE", .{})).kind == .file);
 }
 
 test "ensureDirWithParents creates leaf and one missing parent" {
