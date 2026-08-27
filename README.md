@@ -63,9 +63,11 @@ iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
 ghr install cataggar/ghr RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 ```
 
-See [doc/README.md](doc/README.md) for download, install, directories,
-uninstall, and verification details (including
-[verifying ghr's own releases](doc/README.md#verification)).
+See the
+[documentation](https://github.com/cataggar/ghr/blob/main/doc/README.md)
+for download, install, directories, uninstall, and verification details
+(including
+[verifying ghr's own releases](https://github.com/cataggar/ghr/blob/main/doc/verification.md)).
 
 ## GitHub Actions
 
@@ -83,10 +85,12 @@ The action shares git tags with the `ghr` CLI — pinning `@v0.5.1` pins
 both the action body and the `ghr-bin` binary. Pick the latest tag from
 [the releases page](https://github.com/cataggar/ghr/releases).
 
-See [`actions/install`](actions/install/README.md),
-[`actions/download`](actions/download/README.md), and the
-[Caching in GitHub Actions](doc/README.md#caching-in-github-actions)
-section for details.
+See
+[`actions/install`](https://github.com/cataggar/ghr/blob/main/actions/install/README.md),
+[`actions/download`](https://github.com/cataggar/ghr/blob/main/actions/download/README.md),
+and
+[Caching in GitHub Actions](https://github.com/cataggar/ghr/blob/main/doc/github-actions.md)
+for details.
 
 ## Signing releases
 
