@@ -203,10 +203,6 @@ pub fn cmdDownload(
     err_w: *Writer,
 ) !void {
     var opts = parseArgs(allocator, args, err_w) catch |err| switch (err) {
-        error.HelpRequested => {
-            try printDownloadUsage(w);
-            return;
-        },
         error.MissingValue, error.InvalidArgument, error.MissingTarget, error.ConflictingFlag => std.process.exit(exit_arg_error),
         else => return err,
     };
@@ -921,8 +917,6 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
             try err_w.print("error: unknown flag '{s}' for 'ghr download'\n", .{arg});
             try err_w.flush();
             return error.InvalidArgument;
-        } else if (eql(arg, "help") and opts.targets.items.len == 0) {
-            return error.HelpRequested;
         } else {
             switch (release_mod.classifySpecOrKey(arg, opts.targets.items)) {
                 .spec => |s| try opts.targets.append(allocator, .{ .spec = s }),
@@ -1006,7 +1000,7 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn printDownloadUsage(w: *Writer) !void {
+pub fn printDownloadUsage(w: *Writer) !void {
     try w.print(
         \\ghr download - download one or more release assets
         \\
@@ -1049,8 +1043,7 @@ fn printDownloadUsage(w: *Writer) !void {
         \\        --quiet                Suppress progress output
         \\        --no-auth              Do not send GitHub auth even for github.com URLs
         \\        --debug                Verbose diagnostic output
-        \\
-        \\Run 'ghr download help' to show this help.
+        \\    -h, --help                  Show this help
         \\
         \\EXAMPLES:
         \\    ghr download burntsushi/ripgrep@15.1.0

@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip debug info");
-    const version_str = b.option([]const u8, "version", "Override version string") orelse "0.7.0";
+    const version_str = b.option([]const u8, "version", "Override version string") orelse "0.8.0";
 
     const exe_options = b.addOptions();
     exe_options.addOption([]const u8, "version", version_str);
@@ -66,4 +66,74 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    const help_cases = [_]struct {
+        args: []const []const u8,
+        usage: []const u8,
+    }{
+        .{ .args = &.{}, .usage = "    ghr <COMMAND> [OPTIONS]" },
+        .{ .args = &.{"list"}, .usage = "    ghr list" },
+        .{ .args = &.{"install"}, .usage = "    ghr install <spec>" },
+        .{ .args = &.{"uninstall"}, .usage = "    ghr uninstall <owner/repo>" },
+        .{ .args = &.{"download"}, .usage = "    ghr download <spec>" },
+        .{ .args = &.{"link"}, .usage = "    ghr link <owner/repo>" },
+        .{ .args = &.{"unlink"}, .usage = "    ghr unlink <owner/repo>" },
+        .{ .args = &.{"path"}, .usage = "    ghr path <SUBCOMMAND> [OPTIONS]" },
+        .{ .args = &.{ "path", "add" }, .usage = "    ghr path add [--dry-run]" },
+        .{ .args = &.{ "path", "bin" }, .usage = "    ghr path bin" },
+        .{ .args = &.{ "path", "tools" }, .usage = "    ghr path tools" },
+        .{ .args = &.{ "path", "cache" }, .usage = "    ghr path cache" },
+        .{ .args = &.{"validate"}, .usage = "    ghr validate <SUBCOMMAND> [OPTIONS]" },
+        .{ .args = &.{ "validate", "strip-authenticode" }, .usage = "    ghr validate strip-authenticode <input.exe> <output.exe>" },
+        .{ .args = &.{"minisign"}, .usage = "    ghr minisign <SUBCOMMAND> [OPTIONS]" },
+        .{ .args = &.{ "minisign", "sign" }, .usage = "    ghr minisign sign <file>" },
+        .{ .args = &.{"version"}, .usage = "    ghr version" },
+        // Help must win after positional arguments so no command reaches IO.
+        .{ .args = &.{ "install", "example/tool" }, .usage = "    ghr install <spec>" },
+        .{ .args = &.{ "download", "example/tool" }, .usage = "    ghr download <spec>" },
+        .{ .args = &.{ "link", "example/tool" }, .usage = "    ghr link <owner/repo>" },
+        .{ .args = &.{ "uninstall", "example/tool" }, .usage = "    ghr uninstall <owner/repo>" },
+        .{ .args = &.{ "validate", "strip-authenticode", "input.exe", "output.exe" }, .usage = "    ghr validate strip-authenticode <input.exe> <output.exe>" },
+        .{ .args = &.{ "minisign", "sign", "input" }, .usage = "    ghr minisign sign <file>" },
+    };
+    for (help_cases) |case| {
+        addHelpFlagTests(b, test_step, exe, case.args, case.usage);
+    }
+
+    const removed_help_cases = [_]struct {
+        args: []const []const u8,
+        stderr: []const u8,
+    }{
+        .{ .args = &.{"help"}, .stderr = "error: unknown command 'help'" },
+        .{ .args = &.{ "path", "help" }, .stderr = "error: unknown subcommand 'help' for 'ghr path'" },
+        .{ .args = &.{ "validate", "help" }, .stderr = "error: unknown subcommand 'help' for 'ghr validate'" },
+        .{ .args = &.{ "minisign", "help" }, .stderr = "error: unknown subcommand 'help' for 'ghr minisign'" },
+        .{ .args = &.{ "list", "help" }, .stderr = "error: unexpected argument 'help' for 'ghr list'" },
+    };
+    for (removed_help_cases) |case| {
+        const removed_help = b.addRunArtifact(exe);
+        removed_help.addArgs(case.args);
+        removed_help.expectExitCode(1);
+        removed_help.expectStdOutEqual("");
+        removed_help.expectStdErrMatch(case.stderr);
+        test_step.dependOn(&removed_help.step);
+    }
+}
+
+fn addHelpFlagTests(
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    exe: *std.Build.Step.Compile,
+    args: []const []const u8,
+    usage: []const u8,
+) void {
+    for ([_][]const u8{ "-h", "--help" }) |flag| {
+        const help = b.addRunArtifact(exe);
+        help.addArgs(args);
+        help.addArg(flag);
+        help.expectExitCode(0);
+        help.expectStdOutMatch(usage);
+        help.expectStdErrEqual("");
+        test_step.dependOn(&help.step);
+    }
 }
