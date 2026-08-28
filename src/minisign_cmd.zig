@@ -36,11 +36,6 @@ pub fn cmdMinisign(
         std.process.exit(1);
     };
 
-    if (std.mem.eql(u8, sub, "help")) {
-        try printUsage(w);
-        return;
-    }
-
     if (std.mem.eql(u8, sub, "sign")) {
         try cmdSign(allocator, io, environ, args, w, err_w);
         return;
@@ -73,10 +68,7 @@ fn cmdSign(
     var untrusted_comment: ?[]const u8 = null;
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "help") or std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            try printSignUsage(w);
-            return;
-        } else if (std.mem.eql(u8, arg, "-t")) {
+        if (std.mem.eql(u8, arg, "-t")) {
             trusted_comment = nextValue(args, err_w, arg);
         } else if (std.mem.eql(u8, arg, "-c")) {
             untrusted_comment = nextValue(args, err_w, arg);
@@ -220,15 +212,17 @@ pub fn printUsage(w: *Writer) !void {
         \\
         \\SUBCOMMANDS:
         \\    sign     Sign one or more files, writing <file>.minisig sidecars
-        \\    help     Show this help
         \\
-        \\Run 'ghr minisign sign help' for signing usage and the required
+        \\Run 'ghr minisign sign --help' for signing usage and the required
         \\MINISIGN_SECRET_KEY / MINISIGN_PASSWORD environment variables.
+        \\
+        \\OPTIONS:
+        \\    -h, --help  Show this help
         \\
     , .{});
 }
 
-fn printSignUsage(w: *Writer) !void {
+pub fn printSignUsage(w: *Writer) !void {
     try w.print(
         \\ghr minisign sign - write a minisign .minisig sidecar (no external binary)
         \\

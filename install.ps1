@@ -275,7 +275,7 @@ try {
     }
     Show-PostInstallHint
 
-    Write-Info "done -- run 'ghr help' to get started"
+    Write-Info "done -- run 'ghr --help' to get started"
 } catch {
     Write-Err $_.Exception.Message
     exit 1

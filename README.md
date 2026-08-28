@@ -25,14 +25,19 @@ ghr path add [--dry-run]                          Add ghr's bin dir to your user
 ghr path [bin|tools|cache]                        Show ghr directories
 ghr minisign sign <file> [<file> ...]             Sign release artifacts with a minisign key
 ghr version                                       Print version and exit
-ghr help                                          Print this help and exit
+ghr -h | --help                                   Print this help and exit
 ```
 
 Each `<spec>` is `owner/repo[@tag]` (auto-pick asset) or
 `owner/repo/file[@tag]` (specific asset). A 56-char `RW`/`RU`-prefixed
 base64 token immediately after a spec is treated as that spec's
-minisign public key. Run `ghr <COMMAND> help` to show help for a
-specific command, e.g. `ghr download help`.
+minisign public key. Run `ghr <COMMAND> --help` to show help for a
+specific command, e.g. `ghr download --help`.
+
+> [!IMPORTANT]
+> **Breaking change in v0.8.0:** the `help` command and positional help
+> aliases were removed. Replace `ghr help` with `ghr --help`, and replace
+> `ghr <COMMAND> help` with `ghr <COMMAND> --help` or `ghr <COMMAND> -h`.
 
 ### Examples
 
@@ -114,7 +119,7 @@ come from `MINISIGN_SECRET_KEY` and an encrypted key's password from
 `MINISIGN_PASSWORD` — there is no key-file flag, and the password is never
 read from a tty or stdin. Signatures use the prehashed (`ED`) format and
 are byte-for-byte identical to `minisign -S` output. Run
-`ghr minisign sign help` for all options.
+`ghr minisign sign --help` for all options.
 
 ## License
 

@@ -32,11 +32,6 @@ pub fn cmdValidate(
         std.process.exit(1);
     };
 
-    if (std.mem.eql(u8, sub, "help")) {
-        try printUsage(w);
-        return;
-    }
-
     if (std.mem.eql(u8, sub, "strip-authenticode")) {
         try cmdStripAuthenticode(allocator, io, args, w, err_w);
         return;
@@ -59,10 +54,6 @@ fn cmdStripAuthenticode(
     var output_path: ?[]const u8 = null;
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "help")) {
-            try printStripUsage(w);
-            return;
-        }
         if (std.mem.eql(u8, arg, "--quiet")) {
             // Reserved for future use.
             continue;
@@ -191,12 +182,14 @@ pub fn printUsage(w: *Writer) !void {
         \\        binary, writing a bit-identical-to-unsigned copy to
         \\        <output.exe>. Used by the reproducibility workflow to
         \\        compare a published signed .exe against a source rebuild.
-        \\    help                 Show this help
+        \\
+        \\OPTIONS:
+        \\    -h, --help  Show this help
         \\
     , .{});
 }
 
-fn printStripUsage(w: *Writer) !void {
+pub fn printStripUsage(w: *Writer) !void {
     try w.print(
         \\ghr validate strip-authenticode - strip Authenticode signature from a PE
         \\
@@ -216,6 +209,10 @@ fn printStripUsage(w: *Writer) !void {
         \\    not Authenticode-signed
         \\    certificate table not at end of file (refuses to guess)
         \\    not a valid PE/COFF binary
+        \\
+        \\OPTIONS:
+        \\    --quiet     Reserved for future use
+        \\    -h, --help  Show this help
         \\
     , .{});
 }

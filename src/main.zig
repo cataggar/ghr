@@ -24,10 +24,6 @@ pub fn main(init: std.process.Init) !void {
     const io = dns.wrap(init.io);
     const environ = init.environ_map;
 
-    var args = try init.minimal.args.iterateAllocator(allocator);
-    defer args.deinit();
-    _ = args.skip();
-
     var stdout_buf: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writer(io, &stdout_buf);
     defer stdout.interface.flush() catch {};
@@ -35,6 +31,26 @@ pub fn main(init: std.process.Init) !void {
     var stderr_buf: [4096]u8 = undefined;
     var stderr = Io.File.stderr().writer(io, &stderr_buf);
     defer stderr.interface.flush() catch {};
+
+    {
+        var help_args_iter = try init.minimal.args.iterateAllocator(allocator);
+        defer help_args_iter.deinit();
+        _ = help_args_iter.skip();
+
+        var help_args: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer help_args.deinit(allocator);
+        while (help_args_iter.next()) |arg| {
+            try help_args.append(allocator, arg);
+        }
+        if (detectHelpTopic(help_args.items)) |topic| {
+            try printHelpTopic(topic, &stdout.interface);
+            return;
+        }
+    }
+
+    var args = try init.minimal.args.iterateAllocator(allocator);
+    defer args.deinit();
+    _ = args.skip();
 
     const cmd_str = args.next() orelse {
         try printUsage(&stdout.interface);
@@ -45,19 +61,10 @@ pub fn main(init: std.process.Init) !void {
         try stdout.interface.print("{s}\n", .{version});
         return;
     }
-    if (eql(cmd_str, "help")) {
-        try printUsage(&stdout.interface);
-        return;
-    }
-
     if (eql(cmd_str, "path")) {
         try cmdPath(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
         if (args.next()) |arg| {
-            if (eql(arg, "help")) {
-                try printListUsage(&stdout.interface);
-                return;
-            }
             try stderr.interface.print("error: unexpected argument '{s}' for 'ghr list'\n", .{arg});
             try stderr.interface.flush();
             std.process.exit(1);
@@ -111,9 +118,6 @@ pub fn main(init: std.process.Init) !void {
                     std.process.exit(1);
                 };
                 try bin_filters.append(allocator, v);
-            } else if (eql(arg, "help") and entries.items.len == 0) {
-                try printInstallUsage(&stdout.interface);
-                return;
             } else {
                 switch (release_mod.classifySpecOrKey(arg, entries.items)) {
                     .spec => |s| try entries.append(allocator, .{ .spec = s }),
@@ -173,10 +177,6 @@ pub fn main(init: std.process.Init) !void {
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        if (eql(spec, "help")) {
-            try printUninstallUsage(&stdout.interface);
-            return;
-        }
         try install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "download")) {
         try download.cmdDownload(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
@@ -193,6 +193,109 @@ pub fn main(init: std.process.Init) !void {
         try printUsage(&stderr.interface);
         try stderr.interface.flush();
         std.process.exit(1);
+    }
+}
+
+const HelpTopic = enum {
+    root,
+    list,
+    install,
+    uninstall,
+    download,
+    link,
+    unlink,
+    path,
+    path_add,
+    path_bin,
+    path_tools,
+    path_cache,
+    validate,
+    validate_strip_authenticode,
+    minisign,
+    minisign_sign,
+    version,
+};
+
+fn detectHelpTopic(args: []const []const u8) ?HelpTopic {
+    if (args.len == 0) return null;
+    if (isHelpFlag(args[0])) return .root;
+
+    const command = args[0];
+    if (eql(command, "path")) {
+        return detectNestedHelpTopic(args[1..], &.{
+            .{ "add", .path_add },
+            .{ "bin", .path_bin },
+            .{ "tools", .path_tools },
+            .{ "cache", .path_cache },
+        }, .path);
+    }
+    if (eql(command, "validate")) {
+        return detectNestedHelpTopic(args[1..], &.{
+            .{ "strip-authenticode", .validate_strip_authenticode },
+        }, .validate);
+    }
+    if (eql(command, "minisign")) {
+        return detectNestedHelpTopic(args[1..], &.{
+            .{ "sign", .minisign_sign },
+        }, .minisign);
+    }
+    if (!containsHelpFlag(args[1..])) return null;
+
+    if (eql(command, "list")) return .list;
+    if (eql(command, "install")) return .install;
+    if (eql(command, "uninstall")) return .uninstall;
+    if (eql(command, "download")) return .download;
+    if (eql(command, "link")) return .link;
+    if (eql(command, "unlink")) return .unlink;
+    if (eql(command, "version")) return .version;
+    return null;
+}
+
+fn detectNestedHelpTopic(
+    args: []const []const u8,
+    subcommands: []const struct { []const u8, HelpTopic },
+    parent: HelpTopic,
+) ?HelpTopic {
+    if (args.len == 0) return null;
+    if (isHelpFlag(args[0])) return parent;
+    if (!containsHelpFlag(args[1..])) return null;
+
+    for (subcommands) |subcommand| {
+        if (eql(args[0], subcommand[0])) return subcommand[1];
+    }
+    return null;
+}
+
+fn containsHelpFlag(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return true;
+    }
+    return false;
+}
+
+fn isHelpFlag(arg: []const u8) bool {
+    return eql(arg, "-h") or eql(arg, "--help");
+}
+
+fn printHelpTopic(topic: HelpTopic, w: *Writer) !void {
+    switch (topic) {
+        .root => try printUsage(w),
+        .list => try printListUsage(w),
+        .install => try printInstallUsage(w),
+        .uninstall => try printUninstallUsage(w),
+        .download => try download.printDownloadUsage(w),
+        .link => try printLinkUsage(w),
+        .unlink => try printUnlinkUsage(w),
+        .path => try printPathUsage(w),
+        .path_add => try printPathAddUsage(w),
+        .path_bin => try printPathDirectoryUsage(w, "bin", "Print the bin directory"),
+        .path_tools => try printPathDirectoryUsage(w, "tools", "Print the tool storage directory"),
+        .path_cache => try printPathDirectoryUsage(w, "cache", "Print the download cache directory"),
+        .validate => try validate.printUsage(w),
+        .validate_strip_authenticode => try validate.printStripUsage(w),
+        .minisign => try minisign_cmd.printUsage(w),
+        .minisign_sign => try minisign_cmd.printSignUsage(w),
+        .version => try printVersionUsage(w),
     }
 }
 
@@ -247,11 +350,6 @@ fn cmdPath(
         return;
     }
 
-    if (eql(sub, "help")) {
-        try printPathUsage(w);
-        return;
-    }
-
     try err_w.print("error: unknown subcommand '{s}' for 'ghr path'\n\n", .{sub});
     try printPathUsage(err_w);
     try err_w.flush();
@@ -281,12 +379,6 @@ fn runLinkCmd(
                 std.process.exit(1);
             };
             try filters.append(allocator, v);
-        } else if (eql(arg, "help") and spec == null) {
-            switch (kind) {
-                .link => try printLinkUsage(w),
-                .unlink => try printUnlinkUsage(w),
-            }
-            return;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try err_w.print("error: unknown flag '{s}' for 'ghr {s}'\n", .{ arg, @tagName(kind) });
             try err_w.flush();
@@ -378,7 +470,8 @@ fn printLinkUsage(w: *Writer) !void {
         \\    ghr link git
         \\    ghr link az
         \\
-        \\Run 'ghr link help' to show this help.
+        \\OPTIONS:
+        \\    -h, --help  Show this help
         \\
     , .{});
 }
@@ -405,7 +498,8 @@ fn printUnlinkUsage(w: *Writer) !void {
         \\
         \\Requires WSL_INTEROP to be set (i.e., running in WSL).
         \\
-        \\Run 'ghr unlink help' to show this help.
+        \\OPTIONS:
+        \\    -h, --help  Show this help
         \\
     , .{});
 }
@@ -422,9 +516,38 @@ fn printPathUsage(w: *Writer) !void {
         \\    bin                  Print the bin directory
         \\    tools                Print the tool storage directory
         \\    cache                Print the cache directory
-        \\    help                 Show this help
+        \\
+        \\OPTIONS:
+        \\    -h, --help           Show this help
         \\
     , .{});
+}
+
+fn printPathAddUsage(w: *Writer) !void {
+    try w.print(
+        \\ghr path add - add ghr's bin directory to your user PATH
+        \\
+        \\USAGE:
+        \\    ghr path add [--dry-run]
+        \\
+        \\OPTIONS:
+        \\    --dry-run   Print the change without modifying shell configuration
+        \\    -h, --help  Show this help
+        \\
+    , .{});
+}
+
+fn printPathDirectoryUsage(w: *Writer, subcommand: []const u8, description: []const u8) !void {
+    try w.print(
+        \\ghr path {s} - {s}
+        \\
+        \\USAGE:
+        \\    ghr path {s}
+        \\
+        \\OPTIONS:
+        \\    -h, --help  Show this help
+        \\
+    , .{ subcommand, description, subcommand });
 }
 
 fn printListUsage(w: *Writer) !void {
@@ -439,7 +562,8 @@ fn printListUsage(w: *Writer) !void {
         \\(inline or via --minisign), the pubkey is appended on the same line
         \\so it is directly pasteable back as `ghr install <line>`.
         \\
-        \\Run 'ghr list help' to show this help.
+        \\OPTIONS:
+        \\    -h, --help  Show this help
         \\
     , .{});
 }
@@ -481,14 +605,13 @@ fn printInstallUsage(w: *Writer) !void {
         \\                            <pubkey> is a base64 minisign public key string
         \\    --keep-going            Continue past per-spec failures; exit non-zero
         \\                            with a summary at the end if any spec failed
+        \\    -h, --help              Show this help
         \\
         \\EXAMPLES:
         \\    ghr install burntsushi/ripgrep@15.1.0
         \\    ghr install azuread/microsoft-authentication-cli --bin azureauth
         \\    ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
         \\    ghr install jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
-        \\
-        \\Run 'ghr install help' to show this help.
         \\
     , .{});
 }
@@ -509,7 +632,21 @@ fn printUninstallUsage(w: *Writer) !void {
         \\<owner/repo> removes only the repo-level (archive) install and
         \\leaves any wasm modules in place.
         \\
-        \\Run 'ghr uninstall help' to show this help.
+        \\OPTIONS:
+        \\    -h, --help  Show this help
+        \\
+    , .{});
+}
+
+fn printVersionUsage(w: *Writer) !void {
+    try w.print(
+        \\ghr version - print the ghr version
+        \\
+        \\USAGE:
+        \\    ghr version
+        \\
+        \\OPTIONS:
+        \\    -h, --help  Show this help
         \\
     , .{});
 }
@@ -752,13 +889,13 @@ fn printUsage(w: *Writer) !void {
         \\    validate <SUBCOMMAND>                Run validations against published artifacts
         \\    minisign <SUBCOMMAND>                Sign release artifacts with a minisign key
         \\    version                              Print version and exit
-        \\    help                                 Print this help and exit
         \\
         \\Each <spec> is `owner/repo[@tag]` (auto-pick asset) or
         \\`owner/repo/file[@tag]` (specific asset).
-        \\Run 'ghr <COMMAND> help' to show help for a specific command.
+        \\Run 'ghr <COMMAND> --help' to show help for a specific command.
         \\
         \\OPTIONS:
+        \\    -h, --help              Show this help
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
         \\    --skip-verify           Skip every verification step: checksum, minisign,

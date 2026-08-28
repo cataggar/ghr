@@ -257,7 +257,7 @@ main() {
         run_path_add
     fi
     post_install_hint
-    info "done — run 'ghr help' to get started"
+    info "done — run 'ghr --help' to get started"
 }
 
 main "$@"
