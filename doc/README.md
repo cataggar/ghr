@@ -14,6 +14,12 @@ Detailed documentation for ghr. For a quick overview and usage, see the
 - [Verification](verification.md) — verifier behavior, trust roots, skip flags, and recorded results.
 - [Reproducible builds](reproducible-builds.md) — release archive reproducibility and Authenticode stripping.
 
+## Design and implementation plans
+
+- [Install identifiers](install-identifiers.md) — planned stable install IDs,
+  explicit command aliases, versioned state, and lazy migration. This design is
+  not implemented in the current release.
+
 ## Install
 
 Install ghr with pipx, uv, pip, winget, or Homebrew; see [Install](install.md).
