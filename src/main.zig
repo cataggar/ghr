@@ -927,4 +927,5 @@ test {
     _ = @import("der.zig");
     _ = @import("rfc3161.zig");
     _ = @import("snappy.zig");
+    _ = @import("install_request.zig");
 }
