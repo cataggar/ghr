@@ -96,11 +96,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ghr-tools" "$RUNNER_TEMP/ghr-bin" "$RUNNER_TEMP/ghr-cache"
-          echo "GHR_TOOL_DIR=$RUNNER_TEMP/ghr-tools"   >> "$GITHUB_ENV"
-          echo "GHR_BIN_DIR=$RUNNER_TEMP/ghr-bin"      >> "$GITHUB_ENV"
-          echo "GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache"  >> "$GITHUB_ENV"
-          echo "$RUNNER_TEMP/ghr-bin" >> "$GITHUB_PATH"
+          mkdir -p \
+            "$RUNNER_TEMP/ghr-smoke-tools" \
+            "$RUNNER_TEMP/ghr-smoke-bin" \
+            "$RUNNER_TEMP/ghr-smoke-cache"
+          echo "GHR_TOOL_DIR=$RUNNER_TEMP/ghr-smoke-tools"   >> "$GITHUB_ENV"
+          echo "GHR_BIN_DIR=$RUNNER_TEMP/ghr-smoke-bin"      >> "$GITHUB_ENV"
+          echo "GHR_CACHE_DIR=$RUNNER_TEMP/ghr-smoke-cache"  >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/ghr-smoke-bin" >> "$GITHUB_PATH"
 
       - name: Resolve stable-ID cache key
         id: stable-id-key
@@ -134,9 +137,9 @@ jobs:
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
-            ${{ runner.temp }}/ghr-tools
-            ${{ runner.temp }}/ghr-bin
-            ${{ runner.temp }}/ghr-cache
+            ${{ runner.temp }}/ghr-smoke-tools
+            ${{ runner.temp }}/ghr-smoke-bin
+            ${{ runner.temp }}/ghr-smoke-cache
           key: ghr-smoke-${{ runner.os }}-${{ runner.arch }}-layout2-${{ steps.stable-id-key.outputs.key }}-${{ github.sha }}
 
       - name: Install two ripgrep releases + fd in one invocation
