@@ -407,6 +407,8 @@ fn runLinkCmd(
     kind: LinkKind,
 ) !void {
     var spec: ?[]const u8 = null;
+    var force_path = false;
+    var force_id = false;
     var filters: std.ArrayListUnmanaged([]const u8) = .empty;
     defer filters.deinit(allocator);
 
@@ -418,6 +420,10 @@ fn runLinkCmd(
                 std.process.exit(1);
             };
             try filters.append(allocator, v);
+        } else if (eql(arg, "--path")) {
+            force_path = true;
+        } else if (eql(arg, "--id")) {
+            force_id = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try err_w.print("error: unknown flag '{s}' for 'ghr {s}'\n", .{ arg, @tagName(kind) });
             try err_w.flush();
@@ -436,30 +442,19 @@ fn runLinkCmd(
     }
 
     const spec_str = spec orelse {
-        try err_w.print("error: 'ghr {s}' requires <owner/repo> or a bare executable name\n", .{@tagName(kind)});
+        try err_w.print("error: 'ghr {s}' requires <id> or a bare executable name\n", .{@tagName(kind)});
         try err_w.flush();
         std.process.exit(1);
     };
-
-    // A spec with no `/` is interpreted as a bare Windows-PATH executable
-    // name (e.g. `ghr link git`). An owner/repo spec must contain `/`.
-    // Reject `@` in bare form upfront so `git@1.0` doesn't slip through.
-    const looks_bare = std.mem.indexOfScalar(u8, spec_str, '/') == null;
-    if (looks_bare and std.mem.indexOfScalar(u8, spec_str, '@') != null) {
-        try err_w.print(
-            "error: bare executable names cannot contain '@' (got '{s}')\n",
-            .{spec_str},
-        );
+    if (force_path and force_id) {
+        try err_w.print("error: '--id' and '--path' are mutually exclusive\n", .{});
         try err_w.flush();
         std.process.exit(1);
     }
 
-    const result = if (looks_bare) switch (kind) {
-        .link => link.cmdLinkBareExe(allocator, io, environ, spec_str, filters.items, w, err_w),
-        .unlink => link.cmdUnlinkBareExe(allocator, io, environ, spec_str, filters.items, w, err_w),
-    } else switch (kind) {
-        .link => link.cmdLink(allocator, io, environ, spec_str, filters.items, w, err_w),
-        .unlink => link.cmdUnlink(allocator, io, environ, spec_str, filters.items, w, err_w),
+    const result = switch (kind) {
+        .link => link.cmdLinkAuto(allocator, io, environ, spec_str, filters.items, force_path, force_id, w, err_w),
+        .unlink => link.cmdUnlinkAuto(allocator, io, environ, spec_str, filters.items, force_path, force_id, w, err_w),
     };
     result catch |err| switch (err) {
         link.LinkCmdError.LinkStepFailed => std.process.exit(1),
@@ -472,13 +467,13 @@ fn printLinkUsage(w: *Writer) !void {
         \\ghr link - link Windows-side bins or PATH executables into WSL
         \\
         \\USAGE:
-        \\    ghr link <owner/repo> [--bin <name>] [--bin <name> ...]
-        \\    ghr link <name>                              (e.g. 'ghr link git')
+        \\    ghr link <id> [--bin <name>] [--bin <name> ...]
+        \\    ghr link [--path] <name>                     (e.g. 'ghr link git')
         \\
-        \\With <owner/repo>, reads `ghr.json` from the Windows-side install
-        \\of that tool and creates Linux symlinks in ghr's bin directory
-        \\pointing at the original `.exe` binaries (via `/mnt/c/...`). WSL
-        \\interop executes the `.exe` transparently.
+        \\With <id>, reads the exact Windows-side install from ghr's inventory
+        \\and creates Linux symlinks in ghr's bin directory for the commands
+        \\owned by that ID. The links point at the original `.exe` binaries
+        \\(via `/mnt/c/...`), which WSL interop executes transparently.
         \\
         \\Without `--bin`, links every bin advertised by the Windows
         \\install and removes any previously-linked bins that no longer
@@ -487,9 +482,10 @@ fn printLinkUsage(w: *Writer) !void {
         \\With one or more `--bin <name>` filters, only the named bins
         \\are touched; other previously-linked entries are left alone.
         \\
-        \\With a bare <name> (no `/`), looks up the Windows `%PATH%` via
-        \\`where.exe`, converts the result with `wslpath -u`, and creates
-        \\an entry in ghr's bin directory:
+        \\When a one-segment name is not an installed ID, it retains the
+        \\historical Windows `%PATH%` lookup. Use `--path` to force this mode
+        \\when an installed ID has the same name. It resolves via `where.exe`
+        \\and `wslpath -u`, then creates an entry in ghr's bin directory:
         \\  * `.exe` / `.com` targets  → symlink (WSL interop direct-executes)
         \\  * `.cmd` / `.bat` targets  → bash wrapper invoking cmd.exe
         \\`.ps1` and other extensions are rejected. `--bin` is not
@@ -505,11 +501,14 @@ fn printLinkUsage(w: *Writer) !void {
         \\
         \\EXAMPLES:
         \\    ghr link AzureAD/microsoft-authentication-cli
-        \\    ghr link cataggar/microsoft-authentication-cli --bin azureauth
+        \\    ghr link zigb
+        \\    ghr link zigb --bin zigb
         \\    ghr link git
-        \\    ghr link az
+        \\    ghr link --path az
         \\
         \\OPTIONS:
+        \\    --id        Force install-ID mode for an ambiguous one-segment name
+        \\    --path      Force Windows PATH executable mode
         \\    -h, --help  Show this help
         \\
     , .{});
@@ -520,24 +519,25 @@ fn printUnlinkUsage(w: *Writer) !void {
         \\ghr unlink - remove WSL symlinks created by 'ghr link'
         \\
         \\USAGE:
-        \\    ghr unlink <owner/repo> [--bin <name> ...]
-        \\    ghr unlink <name>                            (bare executable form)
+        \\    ghr unlink <id> [--bin <name> ...]
+        \\    ghr unlink [--path] <name>                   (bare executable form)
         \\
-        \\With <owner/repo>, removes every symlink ghr created for that
-        \\tool from the bin directory. Verifies each symlink still points
-        \\where the manifest recorded before deleting, so a user-rewritten
-        \\symlink is never clobbered.
+        \\With <id>, removes every symlink recorded for that exact install ID.
+        \\Verifies each symlink still points where the ID manifest recorded
+        \\before deleting, so a user-rewritten symlink is never clobbered.
         \\
         \\With `--bin <name>` filters, only the named entries are
         \\removed.
         \\
-        \\With a bare <name> (no `/`), removes the single symlink that
-        \\was created by `ghr link <name>`. `--bin` is not supported
-        \\with the bare form.
+        \\When a one-segment name has no install ID state, removes the bare
+        \\Windows PATH entry created by `ghr link <name>`. Use `--path` to
+        \\force bare mode. `--bin` is not supported with the bare form.
         \\
         \\Requires WSL_INTEROP to be set (i.e., running in WSL).
         \\
         \\OPTIONS:
+        \\    --id        Force install-ID mode for an ambiguous one-segment name
+        \\    --path      Force Windows PATH executable mode
         \\    -h, --help  Show this help
         \\
     , .{});
@@ -1219,8 +1219,8 @@ fn printUsage(w: *Writer) !void {
         \\    install <source> [<source> ...]      Install one or more tools by install id
         \\    uninstall <id>                       Remove one installed unit by id
         \\    download <spec> [<spec> ...]         Download one or more release assets
-        \\    link <owner/repo>|<name>             (WSL) Symlink Windows bins/PATH exes into ghr's bin dir
-        \\    unlink <owner/repo>|<name>           (WSL) Remove ghr-created WSL symlinks
+        \\    link <id>|[--path] <name>            (WSL) Link Windows install/PATH commands by ID or name
+        \\    unlink <id>|[--path] <name>          (WSL) Remove ghr-created WSL links by ID or name
         \\    path add [--dry-run]                 Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
         \\    validate <SUBCOMMAND>                Run validations against published artifacts
