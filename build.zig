@@ -73,8 +73,8 @@ pub fn build(b: *std.Build) void {
     }{
         .{ .args = &.{}, .usage = "    ghr <COMMAND> [OPTIONS]" },
         .{ .args = &.{"list"}, .usage = "    ghr list" },
-        .{ .args = &.{"install"}, .usage = "    ghr install <spec>" },
-        .{ .args = &.{"uninstall"}, .usage = "    ghr uninstall <owner/repo>" },
+        .{ .args = &.{"install"}, .usage = "    ghr install <source>" },
+        .{ .args = &.{"uninstall"}, .usage = "    ghr uninstall <id>" },
         .{ .args = &.{"download"}, .usage = "    ghr download <spec>" },
         .{ .args = &.{"link"}, .usage = "    ghr link <owner/repo>" },
         .{ .args = &.{"unlink"}, .usage = "    ghr unlink <owner/repo>" },
@@ -89,10 +89,10 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{ "minisign", "sign" }, .usage = "    ghr minisign sign <file>" },
         .{ .args = &.{"version"}, .usage = "    ghr version" },
         // Help must win after positional arguments so no command reaches IO.
-        .{ .args = &.{ "install", "example/tool" }, .usage = "    ghr install <spec>" },
+        .{ .args = &.{ "install", "example/tool" }, .usage = "    ghr install <source>" },
         .{ .args = &.{ "download", "example/tool" }, .usage = "    ghr download <spec>" },
         .{ .args = &.{ "link", "example/tool" }, .usage = "    ghr link <owner/repo>" },
-        .{ .args = &.{ "uninstall", "example/tool" }, .usage = "    ghr uninstall <owner/repo>" },
+        .{ .args = &.{ "uninstall", "example/tool" }, .usage = "    ghr uninstall <id>" },
         .{ .args = &.{ "validate", "strip-authenticode", "input.exe", "output.exe" }, .usage = "    ghr validate strip-authenticode <input.exe> <output.exe>" },
         .{ .args = &.{ "minisign", "sign", "input" }, .usage = "    ghr minisign sign <file>" },
     };

@@ -132,7 +132,7 @@ fn isLowerAlnum(c: u8) bool {
 
 /// A GitHub owner/repo path component: bounded, alphanumeric edges, inner set
 /// `[A-Za-z0-9._-]`. Case is preserved (GitHub identifiers are not lowercased).
-fn isSafeGithubSegment(segment: []const u8) bool {
+pub fn isSafeGithubSegment(segment: []const u8) bool {
     if (segment.len == 0 or segment.len > 100) return false;
     if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
     if (!std.ascii.isAlphanumeric(segment[0]) or !std.ascii.isAlphanumeric(segment[segment.len - 1]))
@@ -356,7 +356,7 @@ const credential_query_params = [_][]const u8{
 ///   * no query parameter name (percent-decoded, case-insensitive) on the
 ///     credential/expiry denylist.
 /// Applied to `source.url` and `resolved.download_url`.
-fn isSafeNonCredentialUrl(url: []const u8) bool {
+pub fn isSafeNonCredentialUrl(url: []const u8) bool {
     if (url.len == 0 or url.len > 4096) return false;
     // Reject SP (0x20), all control bytes, DEL, and any non-ASCII byte outright.
     for (url) |c| if (c <= 0x20 or c >= 0x7f) return false;
@@ -435,7 +435,7 @@ fn isSafeNonCredentialUrl(url: []const u8) bool {
 /// A bounded, control-free metadata string (non-empty, <= 512 bytes, no ASCII
 /// control or DEL). Used for durable-but-freeform fields (tags, selectors,
 /// verification result/kind labels) that must not carry arbitrary bytes.
-fn isBoundedMetaString(s: []const u8) bool {
+pub fn isBoundedMetaString(s: []const u8) bool {
     if (s.len == 0 or s.len > 512) return false;
     for (s) |c| if (c < 0x20 or c == 0x7f) return false;
     return true;
@@ -2036,6 +2036,64 @@ pub fn scan(
     return .{ .records = recs };
 }
 
+/// Read and classify exactly ONE v2 unit, addressed by canonical ID.
+///
+/// This is deliberately not a filtered `scan`. During a lazy migration the
+/// legacy unit and its v2 replacement intentionally share one canonical ID, so
+/// a whole-store scan reports both as `conflict(duplicate_id)` for the duration
+/// of the transaction. Crash recovery must still be able to read the v2 unit it
+/// is finishing, and it must read exactly that unit -- addressed by the same
+/// reversible encoding the writer used -- rather than searching for it.
+///
+/// Returns null when the unit directory or its metadata is absent. Every other
+/// classification (corrupt, unsupported) is returned as a record so the caller
+/// can refuse to act on it. The caller owns the record.
+pub fn readUnitById(
+    allocator: Allocator,
+    io: Io,
+    tools_dir: []const u8,
+    id: []const u8,
+    options: ScanOptions,
+) !?InventoryRecord {
+    if (!try isCanonicalId(allocator, id)) return null;
+
+    const abs = encodeUnitPath(allocator, tools_dir, id, options.platform) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer allocator.free(abs);
+    const rel = try encodeRelPath(allocator, id);
+    defer allocator.free(rel);
+
+    var dir = Dir.openDirAbsolute(io, abs, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var b = Builder{ .allocator = allocator, .platform = options.platform };
+    errdefer b.deinit();
+    switch (try readMetaNoFollow(allocator, io, dir)) {
+        .absent => {
+            b.records.deinit(allocator);
+            return null;
+        },
+        .corrupt => |reason| try b.addDiagnostic(.v2, corrupt(reason), rel, id),
+        .body => |body| {
+            defer allocator.free(body);
+            try classifyV2Body(&b, body, rel, id);
+        },
+    }
+    if (b.records.items.len == 0) {
+        b.records.deinit(allocator);
+        return null;
+    }
+    const rec = b.records.items[0];
+    b.records.items.len = 0;
+    b.records.deinit(allocator);
+    return rec;
+}
+
 // ===========================================================================
 // Tests (read-only; no runtime behavior is activated by this module)
 // ===========================================================================
@@ -3047,4 +3105,65 @@ test "scan: non-directory structural nodes are corrupt" {
         try testing.expectEqual(RecordReason.not_a_directory, rec.reason);
         try testing.expectEqualStrings("a", rec.id.?);
     }
+}
+
+test "readUnitById addresses one unit by its encoded path" {
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tWriteUnit(tio, tmp.dir, "_v2/units/u-owner/u-repo/_unit", t_v2_ownerrepo);
+
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(tio, &buf);
+    const base = buf[0..len];
+
+    var rec = (try readUnitById(testing.allocator, tio, base, "owner/repo", .{ .platform = .posix })).?;
+    defer rec.deinit(testing.allocator);
+    try testing.expectEqual(Status.ok, rec.status);
+    try testing.expectEqual(UnitKind.v2, rec.kind);
+    try testing.expectEqualStrings("owner/repo", rec.id.?);
+    try testing.expectEqualStrings("tool", rec.commands[0].name);
+
+    try testing.expect(try readUnitById(testing.allocator, tio, base, "owner/absent", .{ .platform = .posix }) == null);
+    try testing.expect(try readUnitById(testing.allocator, tio, base, "Owner/Repo", .{ .platform = .posix }) == null);
+}
+
+test "readUnitById is unaffected by a same-id legacy unit" {
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tWriteUnit(tio, tmp.dir, "_v2/units/u-owner/u-repo/_unit", t_v2_ownerrepo);
+    try tWriteUnit(tio, tmp.dir, "owner/repo", "{\"tag\":\"v1\",\"asset\":\"a\",\"bins\":[\"tool\"]}");
+
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(tio, &buf);
+    const base = buf[0..len];
+
+    // A full scan reports the duplicate-id conflict a migration transiently
+    // creates ...
+    var inv = try scan(testing.allocator, tio, base, .{ .platform = .posix });
+    defer inv.deinit(testing.allocator);
+    for (inv.records) |r| try testing.expectEqual(Status.conflict, r.status);
+
+    // ... but addressing the v2 unit directly still works, which is what
+    // recovery depends on.
+    var rec = (try readUnitById(testing.allocator, tio, base, "owner/repo", .{ .platform = .posix })).?;
+    defer rec.deinit(testing.allocator);
+    try testing.expectEqual(Status.ok, rec.status);
+}
+
+test "readUnitById reports corrupt metadata instead of hiding it" {
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tWriteUnit(tio, tmp.dir, "_v2/units/u-owner/u-repo/_unit", "{ not json");
+
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPath(tio, &buf);
+    const base = buf[0..len];
+
+    var rec = (try readUnitById(testing.allocator, tio, base, "owner/repo", .{ .platform = .posix })).?;
+    defer rec.deinit(testing.allocator);
+    try testing.expectEqual(Status.corrupt, rec.status);
+    try testing.expectEqual(RecordReason.malformed_json, rec.reason);
 }

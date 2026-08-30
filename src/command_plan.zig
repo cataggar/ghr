@@ -488,6 +488,39 @@ fn artifactFamily(name: []const u8, kind: Kind, platform: Platform) Family {
     return f;
 }
 
+/// Every physical file a FINAL published name of `kind` occupies on `platform`,
+/// in write order followed by the legacy/rename companions publication also
+/// touches. This is the same expansion the planner uses, exported so the
+/// activation code can revalidate and remove exactly the files a record owns
+/// without duplicating the suffix rules. The caller owns the result.
+pub fn artifactsFor(
+    gpa: Allocator,
+    name: []const u8,
+    kind: Kind,
+    platform: Platform,
+) Allocator.Error![]const []const u8 {
+    const family = artifactFamily(name, kind, platform);
+    const pieces = family.all();
+    const out = try gpa.alloc([]const u8, pieces.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |s| gpa.free(s);
+        gpa.free(out);
+    }
+    for (pieces, 0..) |piece, i| {
+        const buf = try gpa.alloc(u8, piece.len());
+        out[i] = piece.write(buf);
+        filled = i + 1;
+    }
+    return out;
+}
+
+/// The subset of `artifactsFor` that publication actually writes (the launcher
+/// and its manifest), excluding legacy wrappers and rename targets.
+pub fn publishArtifactCount(name: []const u8, kind: Kind, platform: Platform) usize {
+    return artifactFamily(name, kind, platform).publish_len;
+}
+
 /// Comparison key for a physical artifact: Windows folds ASCII case, POSIX is
 /// exact.
 fn artifactKey(allocator: Allocator, piece: Piece, platform: Platform) Allocator.Error![]u8 {
@@ -2023,4 +2056,36 @@ test "snapshot ownership survives induced OOM" {
     var buf: [Dir.max_path_bytes]u8 = undefined;
     const path = try tSnapshotPath(tmp.dir, io, &buf, "");
     try testing.checkAllAllocationFailures(testing.allocator, tSnapshotUnderOom, .{path});
+}
+
+test "artifactsFor exposes the same expansion the planner uses" {
+    const gpa = std.testing.allocator;
+
+    const posix_native = try artifactsFor(gpa, "rg", .native, .posix);
+    defer freeArtifacts(gpa, posix_native);
+    try std.testing.expectEqual(@as(usize, 1), posix_native.len);
+    try std.testing.expectEqualStrings("rg", posix_native[0]);
+
+    const posix_wasm = try artifactsFor(gpa, "parser", .wasm, .posix);
+    defer freeArtifacts(gpa, posix_wasm);
+    try std.testing.expectEqual(@as(usize, 3), posix_wasm.len);
+    try std.testing.expectEqualStrings("parser", posix_wasm[0]);
+    try std.testing.expectEqualStrings("parser.ghr", posix_wasm[1]);
+    try std.testing.expectEqualStrings("parser.shim", posix_wasm[2]);
+
+    const win_native = try artifactsFor(gpa, "rg", .native, .windows);
+    defer freeArtifacts(gpa, win_native);
+    try std.testing.expectEqual(@as(usize, 5), win_native.len);
+    try std.testing.expectEqualStrings("rg.exe", win_native[0]);
+    try std.testing.expectEqualStrings("rg.ghr", win_native[1]);
+    try std.testing.expectEqualStrings("rg.cmd", win_native[2]);
+    try std.testing.expectEqualStrings("rg.shim", win_native[3]);
+    try std.testing.expectEqualStrings("rg.exe.old", win_native[4]);
+
+    try std.testing.expectEqual(@as(usize, 2), publishArtifactCount("rg", .native, .windows));
+}
+
+fn freeArtifacts(gpa: Allocator, items: []const []const u8) void {
+    for (items) |s| gpa.free(s);
+    gpa.free(items);
 }
