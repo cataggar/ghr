@@ -929,4 +929,5 @@ test {
     _ = @import("snappy.zig");
     _ = @import("install_request.zig");
     _ = @import("install_state.zig");
+    _ = @import("command_plan.zig");
 }
