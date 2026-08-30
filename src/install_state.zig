@@ -1037,7 +1037,10 @@ fn readMetaNoFollow(allocator: Allocator, io: Io, dir: Dir) !ReadMeta {
     if (st.kind != .file) return .{ .corrupt = .symlinked_path };
 
     var buf: [4096]u8 = undefined;
-    var fr = file.reader(io, &buf);
+    // Windows' threaded I/O backend can reject positional reads for files
+    // opened through a directory handle. Metadata is consumed once from the
+    // beginning, so use the sequential reader on every platform.
+    var fr = file.readerStreaming(io, &buf);
     const body = fr.interface.allocRemaining(allocator, Io.Limit.limited(max_metadata_bytes)) catch |err|
         switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
