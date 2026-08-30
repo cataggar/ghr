@@ -186,7 +186,7 @@ fn isSafeCommandName(name: []const u8) bool {
 
 /// A portable relative path (v2 `relative_target`, `apps`): forward-slash
 /// separated, no absolute/drive/UNC prefix, every component portable-safe.
-fn isSafePortableRelPath(path: []const u8) bool {
+pub fn isSafePortableRelPath(path: []const u8) bool {
     if (path.len == 0) return false;
     if (path[0] == '/' or path[0] == '\\') return false;
     if (path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':') return false;
@@ -206,7 +206,7 @@ fn isSep(platform: Platform, c: u8) bool {
 /// A legacy (v1 `bins`/`apps`) relative path. Accepts the install platform's
 /// separator but rejects absolute/drive/UNC/control/empty/`.`/`..`/traversal and
 /// cross-platform separator escapes (a backslash on POSIX).
-fn isSafeLegacyRelPath(path: []const u8, platform: Platform) bool {
+pub fn isSafeLegacyRelPath(path: []const u8, platform: Platform) bool {
     if (path.len == 0) return false;
     if (path[0] == '/') return false;
     if (platform == .windows) {
@@ -447,16 +447,23 @@ fn isBoundedMetaString(s: []const u8) bool {
 /// incomplete Unicode case folding for Windows case-insensitive collisions --
 /// the store may be inventoried from a different platform (WSL), so the persisted
 /// name must be comparable regardless of the scanning host.
-fn isSafeV2CommandName(name: []const u8) bool {
+/// A v2 command name is the FINAL published logical name; it is never
+/// re-normalized by a reader, so every hazard must be rejected here rather than
+/// hidden by a later suffix strip.
+pub fn isSafeV2CommandName(name: []const u8) bool {
     if (name.len == 0 or name.len > max_v2_command_bytes) return false;
     for (name) |c| if (c >= 0x80) return false;
     return isSafePortableName(name);
 }
 
-/// The derived (post-suffix) publishable command name must itself be safe. On
-/// Windows the derived name gains a shim/companion path, so also enforce the
-/// ASCII + bounded rule there; POSIX keeps the general portable-name rule.
-fn isSafeDerivedCommandName(name: []const u8, platform: Platform) bool {
+/// The publishable command name of a record must itself be safe. On Windows the
+/// name gains case-insensitive shim/companion files, so also enforce the ASCII +
+/// bounded rule there; POSIX compares names exactly and keeps the general
+/// portable-name rule. This is the acceptance rule for a v1-derived name, and
+/// therefore the weakest name any OK record can carry -- a consumer that has to
+/// reason about an existing record (rather than validate a new one) should use
+/// this, not the stricter v2 rule.
+pub fn isSafeDerivedCommandName(name: []const u8, platform: Platform) bool {
     if (!isSafeCommandName(name)) return false;
     if (platform == .windows) return isSafeV2CommandName(name);
     return true;
@@ -1052,16 +1059,35 @@ fn isTransactionDir(name: []const u8) bool {
 // Command-name derivation and conflict keys
 // ---------------------------------------------------------------------------
 
-/// Return the logical published command name as a slice of `raw` (no copy).
-/// Mirrors the legacy publication suffix rules exactly: take the basename
-/// (normalizing `/` and `\`); recognize wasm ONLY by the case-sensitive lower
-/// `.wasm` rule that `release.isWasmAssetName` uses, and if wasm strip only
-/// `.wasm` (never then `.exe`); otherwise, on Windows, strip a trailing `.exe`
-/// case-insensitively. Case is otherwise preserved.
-fn logicalCommandSlice(raw: []const u8, platform: Platform) []const u8 {
+/// True when `raw` (a relative target or asset name) is a wasm module, using
+/// exactly the case-sensitive lowercase `.wasm` rule the release/publication
+/// code uses. Applied to the basename so a directory named `x.wasm/` cannot
+/// make a native target look like a module.
+pub fn isWasmTarget(raw: []const u8) bool {
+    return release.isWasmAssetName(basenameSlice(raw));
+}
+
+fn basenameSlice(raw: []const u8) []const u8 {
     var base = raw;
     if (std.mem.lastIndexOfScalar(u8, base, '/')) |i| base = base[i + 1 ..];
     if (std.mem.lastIndexOfScalar(u8, base, '\\')) |i| base = base[i + 1 ..];
+    return base;
+}
+
+/// Derive the DISCOVERED SOURCE command name from a raw relative target,
+/// returned as a slice of `raw` (no copy). This is the name a user would type
+/// today for a freshly discovered executable, and it is applied exactly once:
+/// take the basename (normalizing `/` and `\`); recognize wasm ONLY by the
+/// case-sensitive lower `.wasm` rule that `release.isWasmAssetName` uses, and
+/// if wasm strip only `.wasm` (never then `.exe`); otherwise, on Windows, strip
+/// one trailing `.exe` case-insensitively. Case is otherwise preserved.
+///
+/// This derivation applies to RAW TARGETS ONLY. A final published name (a v2
+/// `commands[].name`, or an alias's requested name) is never passed through
+/// here: re-deriving would strip a suffix the user asked for and collapse
+/// distinct published names.
+pub fn sourceCommandSlice(raw: []const u8, platform: Platform) []const u8 {
+    var base = basenameSlice(raw);
     if (release.isWasmAssetName(base)) {
         base = base[0 .. base.len - ".wasm".len];
     } else if (platform == .windows and base.len >= 4 and std.ascii.endsWithIgnoreCase(base, ".exe")) {
@@ -1070,14 +1096,15 @@ fn logicalCommandSlice(raw: []const u8, platform: Platform) []const u8 {
     return base;
 }
 
-/// Owned copy of `logicalCommandSlice`. Caller owns the result.
-fn logicalCommandName(allocator: Allocator, raw: []const u8, platform: Platform) Allocator.Error![]u8 {
-    return allocator.dupe(u8, logicalCommandSlice(raw, platform));
+/// Owned copy of `sourceCommandSlice`. Caller owns the result.
+pub fn sourceCommandName(allocator: Allocator, raw: []const u8, platform: Platform) Allocator.Error![]u8 {
+    return allocator.dupe(u8, sourceCommandSlice(raw, platform));
 }
 
-/// Case-fold a logical command name into a conflict-comparison key. Windows
-/// compares command names ASCII case-insensitively; POSIX is exact.
-fn conflictKey(allocator: Allocator, name: []const u8, platform: Platform) Allocator.Error![]u8 {
+/// Case-fold a final published command name into a conflict-comparison key.
+/// Windows compares command names ASCII case-insensitively; POSIX is exact.
+/// The input must already be a final name; this never strips a suffix.
+pub fn conflictKey(allocator: Allocator, name: []const u8, platform: Platform) Allocator.Error![]u8 {
     const out = try allocator.dupe(u8, name);
     if (platform == .windows) {
         for (out) |*c| c.* = std.ascii.toLower(c.*);
@@ -1098,7 +1125,7 @@ fn validateV1(wire: WireV1, platform: Platform) Judgment {
         if (!isSafeLegacyRelPath(b, platform)) return corrupt(.unsafe_relative_path);
         // The derived (post-`.wasm`/`.exe`) published name must itself be safe;
         // on Windows it must also be ASCII + bounded for shim companions.
-        if (!isSafeDerivedCommandName(logicalCommandSlice(b, platform), platform))
+        if (!isSafeDerivedCommandName(sourceCommandSlice(b, platform), platform))
             return corrupt(.unsafe_command_name);
     };
     if (wire.apps) |apps| for (apps) |a| {
@@ -1120,11 +1147,14 @@ fn buildV1Commands(
         allocator.free(out);
     }
     for (bins, 0..) |b, i| {
-        const name = try logicalCommandName(allocator, b, platform);
+        // v1 has no persisted published name: derive it from the raw bin path
+        // exactly once, here. `OwnedCommand.name` is the final published name
+        // from this point on and is never re-derived.
+        const name = try sourceCommandName(allocator, b, platform);
         errdefer allocator.free(name);
         const target = try allocator.dupe(u8, b);
         errdefer allocator.free(target);
-        const kind: ?[]const u8 = if (release.isWasmAssetName(b))
+        const kind: ?[]const u8 = if (isWasmTarget(b))
             try allocator.dupe(u8, "wasm")
         else
             null;
@@ -1193,7 +1223,7 @@ fn validateV2(
 
     // canonical id
     const id = wire.id orelse return corrupt(.missing_required_field);
-    if (!try isCanonicalIdInline(allocator, id)) return corrupt(.invalid_id);
+    if (!try isCanonicalId(allocator, id)) return corrupt(.invalid_id);
 
     // source: kind-specific and mutually exclusive fields.
     const src = wire.source orelse return corrupt(.missing_required_field);
@@ -1226,22 +1256,21 @@ fn validateV2(
     // commands (may be empty; every entry safe; no internal duplicate published
     // command). Build the record's published-name set and the available
     // source-or-published-name set so config correspondence can be checked.
-    var published: std.StringHashMapUnmanaged(void) = .empty; // logical published keys
+    var published: std.StringHashMapUnmanaged(void) = .empty; // final published keys
     var avail: std.StringHashMapUnmanaged(void) = .empty; // published keys + source_name keys
     const commands = wire.commands orelse return corrupt(.missing_required_field);
     for (commands) |cmd| {
         const name = cmd.name orelse return corrupt(.invalid_command);
         const target = cmd.relative_target orelse return corrupt(.invalid_command);
-        // Persisted published/source names are ASCII + bounded (Windows-safe,
-        // room for companion suffixes) regardless of the scanning platform.
+        // `name` is the FINAL published logical name. It is validated exactly as
+        // persisted and never re-normalized: stripping `.wasm`/`.exe` here would
+        // discard a name the installing request explicitly asked for and would
+        // collapse two distinct published commands into one key.
         if (!isSafeV2CommandName(name)) return corrupt(.unsafe_command_name);
         if (!isSafePortableRelPath(target)) return corrupt(.unsafe_relative_path);
         if (cmd.source_name) |sn| if (!isSafeV2CommandName(sn)) return corrupt(.invalid_command);
         if (cmd.kind) |k| if (!isBoundedMetaString(k)) return corrupt(.invalid_command);
-        // The derived (post-suffix) published name must itself be safe.
-        const logical = logicalCommandSlice(name, platform);
-        if (!isSafeV2CommandName(logical)) return corrupt(.unsafe_command_name);
-        const pk = try conflictKey(scratch, logical, platform);
+        const pk = try conflictKey(scratch, name, platform);
         if ((try published.getOrPut(scratch, pk)).found_existing)
             return corrupt(.duplicate_command_internal);
         try avail.put(scratch, pk, {});
@@ -1334,7 +1363,7 @@ fn validateV2(
 /// Canonical check that does not leak: canonicalize into a scratch buffer and
 /// compare. Returns false on a non-OOM validation failure; OOM propagates so it
 /// is never conflated with "non-canonical".
-fn isCanonicalIdInline(allocator: Allocator, id: []const u8) Allocator.Error!bool {
+pub fn isCanonicalId(allocator: Allocator, id: []const u8) Allocator.Error!bool {
     const canon = install_request.canonicalizeId(allocator, id) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
@@ -1410,7 +1439,6 @@ fn copyVerification(allocator: Allocator, v: WireVerification) Allocator.Error!O
 fn copyCommands(
     allocator: Allocator,
     commands: []WireCommand,
-    platform: Platform,
 ) Allocator.Error![]OwnedCommand {
     const out = try allocator.alloc(OwnedCommand, commands.len);
     var filled: usize = 0;
@@ -1419,7 +1447,10 @@ fn copyCommands(
         allocator.free(out);
     }
     for (commands, 0..) |cmd, i| {
-        const name = try logicalCommandName(allocator, cmd.name.?, platform);
+        // The persisted `name` IS the final published logical name. Copy it
+        // verbatim; deriving it again would strip a `.wasm`/`.exe` the request
+        // deliberately published (e.g. a POSIX alias to `foo.wasm`).
+        const name = try allocator.dupe(u8, cmd.name.?);
         errdefer allocator.free(name);
         const source_name = try dupOpt(allocator, cmd.source_name);
         errdefer freeOpt(allocator, source_name);
@@ -1445,7 +1476,6 @@ fn addV2Record(
     path: []const u8,
     id: []const u8,
     wire: WireV2,
-    platform: Platform,
 ) Allocator.Error!void {
     const allocator = b.allocator;
     const path_owned = try allocator.dupe(u8, path);
@@ -1462,7 +1492,7 @@ fn addV2Record(
     rec.config = try copyConfig(allocator, wire.config.?);
     rec.resolved = try copyResolved(allocator, wire.resolved.?);
     rec.verification = try copyVerification(allocator, wire.verification.?);
-    rec.commands = try copyCommands(allocator, wire.commands.?, platform);
+    rec.commands = try copyCommands(allocator, wire.commands.?);
     if (wire.apps) |apps| rec.apps = try dupStrings(allocator, apps);
     rec.tag = try dupOpt(allocator, wire.tag);
     rec.asset = try dupOpt(allocator, wire.asset);
@@ -1568,7 +1598,7 @@ fn classifyV2Body(
 
     const judg = try validateV2(alloc, wire, b.platform);
     if (judg.status == .ok) {
-        try addV2Record(b, path, decoded_id, wire, b.platform);
+        try addV2Record(b, path, decoded_id, wire);
     } else {
         try b.addDiagnostic(.v2, judg, path, decoded_id);
     }
@@ -1897,8 +1927,12 @@ fn markDuplicateIds(b: *Builder) Allocator.Error!void {
     }
 }
 
-/// Mark OK records that publish the same logical command (under the selected
-/// platform's case/`.exe` semantics) as `conflict(duplicate_command)`.
+/// Mark OK records that publish the same FINAL logical command name (compared
+/// under the selected platform's case rules only -- Windows ASCII
+/// case-insensitive, POSIX exact) as `conflict(duplicate_command)`. Names are
+/// never re-normalized here: physical artifact collisions between distinct
+/// logical names (Windows `foo` vs `foo.exe`, or a wasm launcher's `.ghr`
+/// companion) are the command planner's responsibility, not the reader's.
 fn markDuplicateCommands(b: *Builder) Allocator.Error!void {
     var arena = std.heap.ArenaAllocator.init(b.allocator);
     defer arena.deinit();
@@ -2106,7 +2140,7 @@ test "credential/userinfo URLs are rejected" {
     try testing.expect(!isSafeNonCredentialUrl("https://example.com/a?token=t"));
 }
 
-test "logical command derivation mirrors legacy suffix rules" {
+test "source command derivation mirrors legacy suffix rules" {
     const a = testing.allocator;
     const cases = .{
         .{ "bin/tool", Platform.posix, "tool" },
@@ -2127,7 +2161,7 @@ test "logical command derivation mirrors legacy suffix rules" {
         .{ "app.exe", Platform.posix, "app.exe" },
     };
     inline for (cases) |c| {
-        const got = try logicalCommandName(a, c[0], c[1]);
+        const got = try sourceCommandName(a, c[0], c[1]);
         defer a.free(got);
         try testing.expectEqualStrings(c[2], got);
     }
@@ -2381,7 +2415,7 @@ test "scan: mixed-case legacy owners collapse to one id conflict" {
     try testing.expectEqual(Status.conflict, tFind(inv, "foo/bar").?.status);
 }
 
-test "scan: duplicate published command ownership conflicts (windows .exe)" {
+test "scan: duplicate published command ownership uses case rules only" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
@@ -2391,44 +2425,83 @@ test "scan: duplicate published command ownership conflicts (windows .exe)" {
         \\{"schema":2,"layout_generation":2,"id":"a/one","source":{"kind":"github","owner":"a","repo":"one"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"tool","relative_target":"bin/tool"}],"apps":[],"verification":{"result":"none"}}
     );
     try tWriteUnit(io, tmp.dir, "_v2/units/u-a/u-two/_unit",
-        \\{"schema":2,"layout_generation":2,"id":"a/two","source":{"kind":"github","owner":"a","repo":"two"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"tool.exe","relative_target":"bin/tool.exe"}],"apps":[],"verification":{"result":"none"}}
+        \\{"schema":2,"layout_generation":2,"id":"a/two","source":{"kind":"github","owner":"a","repo":"two"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"TOOL","relative_target":"bin/TOOL"}],"apps":[],"verification":{"result":"none"}}
     );
-    // POSIX: "tool" != "tool.exe" -> no conflict.
+    // A distinct final name that only collides PHYSICALLY (Windows `tool` vs
+    // `tool.exe`) is the planner's problem, not the reader's.
+    try tWriteUnit(io, tmp.dir, "_v2/units/u-a/u-three/_unit",
+        \\{"schema":2,"layout_generation":2,"id":"a/three","source":{"kind":"github","owner":"a","repo":"three"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"tool.exe","relative_target":"bin/tool.exe"}],"apps":[],"verification":{"result":"none"}}
+    );
+    // POSIX: names compare exactly -> all three coexist.
     {
         var inv = try tScan(a, io, tmp.dir, .posix);
         defer inv.deinit(a);
         try testing.expectEqual(Status.ok, tFind(inv, "_v2/units/u-a/u-one/_unit").?.status);
         try testing.expectEqual(Status.ok, tFind(inv, "_v2/units/u-a/u-two/_unit").?.status);
+        try testing.expectEqual(Status.ok, tFind(inv, "_v2/units/u-a/u-three/_unit").?.status);
     }
-    // Windows: both derive "tool" -> conflict.
+    // Windows: `tool` vs `TOOL` collide case-insensitively; `tool.exe` stays a
+    // distinct logical name and remains ok here.
     {
         var inv = try tScan(a, io, tmp.dir, .windows);
         defer inv.deinit(a);
         try testing.expectEqual(Status.conflict, tFind(inv, "_v2/units/u-a/u-one/_unit").?.status);
         try testing.expectEqual(RecordReason.duplicate_command, tFind(inv, "_v2/units/u-a/u-two/_unit").?.reason);
+        try testing.expectEqual(Status.ok, tFind(inv, "_v2/units/u-a/u-three/_unit").?.status);
     }
 }
 
-test "scan: command collision keys do not normalize logical names twice" {
+test "scan: v1 derives a final name once, v2 preserves the persisted one" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    // v1 has no persisted published name: `bin/tool.exe.wasm` strips exactly one
+    // `.wasm` and keeps the residual `.exe` -> `tool.exe`.
     try tWriteUnit(io, tmp.dir, "legacy/repo",
         \\{"tag":"v","asset":"a","bins":["bin/tool.exe.wasm"],"apps":[]}
     );
-    try tWriteUnit(io, tmp.dir, "_v2/units/u-modern/u-repo/_unit",
-        \\{"schema":2,"layout_generation":2,"id":"modern/repo","source":{"kind":"github","owner":"modern","repo":"repo"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"tool.exe.wasm","relative_target":"bin/tool.exe.wasm"}],"apps":[],"verification":{"result":"none"}}
+    // v2 persists the FINAL name. `tool.exe.wasm` must survive verbatim and must
+    // NOT be re-normalized into `tool.exe` (which would forge a collision).
+    try tWriteUnit(io, tmp.dir, "_v2/units/u-modern/u-keep/_unit",
+        \\{"schema":2,"layout_generation":2,"id":"modern/keep","source":{"kind":"github","owner":"modern","repo":"keep"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"tool.exe.wasm","relative_target":"bin/tool.exe.wasm","kind":"wasm"}],"apps":[],"verification":{"result":"none"}}
     );
     var inv = try tScan(a, io, tmp.dir, .windows);
     defer inv.deinit(a);
     const legacy = tFind(inv, "legacy/repo").?;
-    const modern = tFind(inv, "_v2/units/u-modern/u-repo/_unit").?;
+    const keep = tFind(inv, "_v2/units/u-modern/u-keep/_unit").?;
     try testing.expectEqualStrings("tool.exe", legacy.commands[0].name);
-    try testing.expectEqualStrings("tool.exe", modern.commands[0].name);
-    try testing.expectEqual(Status.conflict, legacy.status);
-    try testing.expectEqual(RecordReason.duplicate_command, modern.reason);
+    try testing.expectEqualStrings("tool.exe.wasm", keep.commands[0].name);
+    try testing.expectEqual(Status.ok, legacy.status);
+    try testing.expectEqual(Status.ok, keep.status);
+}
+
+test "scan: v2 final names survive suffixes on both platforms" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A POSIX alias to `foo.wasm` must remain `foo.wasm`; a Windows name that
+    // already carries `.exe` must remain `foo.exe`.
+    try tWriteUnit(io, tmp.dir, "_v2/units/u-p/u-wasm/_unit",
+        \\{"schema":2,"layout_generation":2,"id":"p/wasm","source":{"kind":"github","owner":"p","repo":"wasm"},"config":{"aliases":[{"from":"mod","to":"foo.wasm"}]},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"foo.wasm","source_name":"mod","relative_target":"pkg/mod.wasm","kind":"wasm"}],"apps":[],"verification":{"result":"none"}}
+    );
+    try tWriteUnit(io, tmp.dir, "_v2/units/u-p/u-exe/_unit",
+        \\{"schema":2,"layout_generation":2,"id":"p/exe","source":{"kind":"github","owner":"p","repo":"exe"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"foo.exe","relative_target":"bin/foo.exe","kind":"native"}],"apps":[],"verification":{"result":"none"}}
+    );
+    inline for (.{ Platform.posix, Platform.windows }) |platform| {
+        var inv = try tScan(a, io, tmp.dir, platform);
+        defer inv.deinit(a);
+        const w = tFind(inv, "_v2/units/u-p/u-wasm/_unit").?;
+        const e = tFind(inv, "_v2/units/u-p/u-exe/_unit").?;
+        try testing.expectEqual(Status.ok, w.status);
+        try testing.expectEqual(Status.ok, e.status);
+        try testing.expectEqualStrings("foo.wasm", w.commands[0].name);
+        try testing.expectEqualStrings("mod", w.commands[0].source_name.?);
+        try testing.expectEqualStrings("foo.exe", e.commands[0].name);
+    }
 }
 
 test "scan: internal duplicate command and credential url are corrupt" {
@@ -2643,29 +2716,33 @@ test "scan: deep marker-free v2 chain is bounded with path_too_long" {
     try testing.expect(tCountReason(inv, .path_too_long) >= 1);
 }
 
-test "scan: derived command names validated after normalization" {
+test "scan: v2 command names are validated exactly as persisted" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Empty derived name from a bare ".wasm" command.
+    // A leading-dot name is an exact published name, not a raw wasm target.
     try tWriteUnit(io, tmp.dir, "_v2/units/u-a/u-empty/_unit",
-        \\{"schema":2,"layout_generation":2,"id":"a/empty","source":{"kind":"github","owner":"a","repo":"empty"},"config":{},"resolved":{},"commands":[{"name":".wasm","relative_target":"bin/x"}],"apps":[],"verification":{}}
+        \\{"schema":2,"layout_generation":2,"id":"a/empty","source":{"kind":"github","owner":"a","repo":"empty"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":".wasm","relative_target":"bin/x"}],"apps":[],"verification":{"result":"none"}}
     );
     // A reserved raw command name is rejected.
     try tWriteUnit(io, tmp.dir, "_v2/units/u-a/u-res/_unit",
         \\{"schema":2,"layout_generation":2,"id":"a/res","source":{"kind":"github","owner":"a","repo":"res"},"config":{},"resolved":{},"commands":[{"name":"aux.exe","relative_target":"bin/x"}],"apps":[],"verification":{}}
     );
-    // Valid .wasm derivation stays ok.
+    // A published name that merely ENDS in `.wasm` is fine and is kept verbatim.
     try tWriteUnit(io, tmp.dir, "_v2/units/u-a/u-ok/_unit",
         \\{"schema":2,"layout_generation":2,"id":"a/ok","source":{"kind":"github","owner":"a","repo":"ok"},"config":{},"resolved":{"tag":"v","asset":"a.tgz"},"commands":[{"name":"thing.wasm","relative_target":"bin/thing.wasm","kind":"wasm"}],"apps":[],"verification":{"result":"none"}}
     );
     var inv = try tScan(a, io, tmp.dir, .windows);
     defer inv.deinit(a);
-    try testing.expectEqual(RecordReason.unsafe_command_name, tFind(inv, "_v2/units/u-a/u-empty/_unit").?.reason);
+    const dotrec = tFind(inv, "_v2/units/u-a/u-empty/_unit").?;
+    try testing.expectEqual(Status.ok, dotrec.status);
+    try testing.expectEqualStrings(".wasm", dotrec.commands[0].name);
     try testing.expectEqual(RecordReason.unsafe_command_name, tFind(inv, "_v2/units/u-a/u-res/_unit").?.reason);
-    try testing.expectEqual(Status.ok, tFind(inv, "_v2/units/u-a/u-ok/_unit").?.status);
+    const okrec = tFind(inv, "_v2/units/u-a/u-ok/_unit").?;
+    try testing.expectEqual(Status.ok, okrec.status);
+    try testing.expectEqualStrings("thing.wasm", okrec.commands[0].name);
 }
 
 test "scan: v1 windows .exe derivation" {
