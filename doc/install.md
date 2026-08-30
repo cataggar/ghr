@@ -46,8 +46,22 @@ ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
 # Install a specific asset by name (exact match or unique substring)
 ghr install WebAssembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
 
+# Keep two releases from the same repository under independent IDs
+ghr install BurntSushi/ripgrep@14.1.0 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
+ghr install BurntSushi/ripgrep@14.1.1 "?id=rg-14-1-1&alias=rg:rg-14-1-1"
+
+# A direct URL has no repository identity, so its ID is explicit
+ghr install https://example.com/tool.tar.xz "?id=example/tool"
+
 # Install only a selected binary from a release
 ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
+
+# Report stable identities or complete machine-readable definitions
+ghr list --ids
+ghr list --json
+
+# Remove exactly one ID
+ghr uninstall rg-14-1-0
 
 # Show where tools are stored
 ghr path tools
@@ -55,6 +69,30 @@ ghr path tools
 # Show where binaries are symlinked
 ghr path bin
 ```
+
+## Stable IDs and replacement
+
+Install IDs are ownership keys, separate from release sources and published
+command names. GitHub sources default to lowercase `owner/repo`; an optional
+quoted query token overrides the ID and configures aliases:
+
+```text
+"?id=<id>&alias=<source-command>:<published-command>&minisign=<public-key>"
+```
+
+`alias=` is repeatable. Query names and values use percent encoding, and `+`
+remains a literal plus so base64 minisign keys round-trip unchanged. An ID does
+not rename a command implicitly.
+
+Installing an existing ID is the upgrade operation: ghr stages the replacement
+and publishes its complete command set transactionally, or restores the prior
+unit. `ghr uninstall <id>` removes exactly that ID; ID prefixes are not
+recursive.
+
+Legacy owner/repo installs remain readable in place. Reinstalling the same
+derived ID migrates one unambiguous legacy unit only after the replacement is
+durable. Use an ID-capable ghr for later mutations; older releases do not
+understand v2 install state.
 
 For archive assets, `ghr install` exposes executable candidates from the
 shallowest directory level containing any executables. It searches deeper only
@@ -78,7 +116,7 @@ This install-time filtering is separate from WSL-specific `ghr link --bin`,
 which filters links for a tool already installed on Windows. See
 [WSL linking](wsl-linking.md).
 
-## Uninstall
+## Uninstall ghr itself
 
 ```sh
 # pipx

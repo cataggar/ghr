@@ -102,6 +102,33 @@ jobs:
           echo "GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache"  >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/ghr-bin" >> "$GITHUB_PATH"
 
+      - name: Resolve stable-ID cache key
+        id: stable-id-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(
+            ghr install --print-cache-key \
+              BurntSushi/ripgrep@14.1.0 '?id=smoke/rg-14-1-0&alias=rg:rg-14-1-0' \
+              BurntSushi/ripgrep@14.1.1 '?id=smoke/rg-14-1-1&alias=rg:rg-14-1-1' \
+              sharkdp/fd@v10.2.0
+          )"
+          reordered="$(
+            ghr install --print-cache-key \
+              sharkdp/fd@v10.2.0 \
+              BurntSushi/ripgrep@14.1.1 '?alias=rg:rg-14-1-1&id=smoke/rg-14-1-1' \
+              BurntSushi/ripgrep@14.1.0 '?alias=rg:rg-14-1-0&id=smoke/rg-14-1-0'
+          )"
+          changed="$(
+            ghr install --print-cache-key \
+              BurntSushi/ripgrep@14.1.0 '?id=smoke/rg-other&alias=rg:rg-14-1-0' \
+              BurntSushi/ripgrep@14.1.1 '?id=smoke/rg-14-1-1&alias=rg:rg-14-1-1' \
+              sharkdp/fd@v10.2.0
+          )"
+          test "$key" = "$reordered"
+          test "$key" != "$changed"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
       - name: Restore tool cache (cold expected on first push)
         id: ghr-cache
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
@@ -110,9 +137,9 @@ jobs:
             ${{ runner.temp }}/ghr-tools
             ${{ runner.temp }}/ghr-bin
             ${{ runner.temp }}/ghr-cache
-          key: ghr-smoke-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0-${{ github.sha }}
+          key: ghr-smoke-${{ runner.os }}-${{ runner.arch }}-layout2-${{ steps.stable-id-key.outputs.key }}-${{ github.sha }}
 
-      - name: Install ripgrep + fd in one ghr invocation
+      - name: Install two ripgrep releases + fd in one invocation
         if: steps.ghr-cache.outputs.cache-hit != 'true'
         shell: bash
         env:
@@ -120,7 +147,8 @@ jobs:
         run: |
           set -euo pipefail
           ghr install --keep-going \
-            BurntSushi/ripgrep@14.1.1 \
+            BurntSushi/ripgrep@14.1.0 '?id=smoke/rg-14-1-0&alias=rg:rg-14-1-0' \
+            BurntSushi/ripgrep@14.1.1 '?id=smoke/rg-14-1-1&alias=rg:rg-14-1-1' \
             sharkdp/fd@v10.2.0
 
       - name: Sanity check
@@ -128,8 +156,51 @@ jobs:
         run: |
           set -euo pipefail
           ghr list
-          rg --version
+          ids="$(ghr list --ids)"
+          grep -Fxq 'smoke/rg-14-1-0' <<< "$ids"
+          grep -Fxq 'smoke/rg-14-1-1' <<< "$ids"
+          grep -Fxq 'burntsushi/ripgrep' <<< "$ids" && {
+            echo "error: source repository leaked into explicit install identity" >&2
+            exit 1
+          }
+          rg-14-1-0 --version | grep -F 'ripgrep 14.1.0'
+          rg-14-1-1 --version | grep -F 'ripgrep 14.1.1'
           fd --version
+
+      - name: Replace, reject collision, and uninstall by exact ID
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ghr install \
+            BurntSushi/ripgrep@14.1.1 \
+            '?id=smoke/rg-14-1-0&alias=rg:rg-14-1-0'
+          rg-14-1-0 --version | grep -F 'ripgrep 14.1.1'
+
+          before="$(ghr list --json)"
+          if ghr install \
+              BurntSushi/ripgrep@14.1.1 \
+              '?id=smoke/collision&alias=rg:rg-14-1-1'; then
+            echo "error: cross-ID command collision should have been rejected" >&2
+            exit 1
+          fi
+          test "$before" = "$(ghr list --json)"
+
+          ghr uninstall smoke/rg-14-1-0
+          if ghr list --ids | grep -Fxq 'smoke/rg-14-1-0'; then
+            echo "error: exact-ID uninstall left its target installed" >&2
+            exit 1
+          fi
+          ghr list --ids | grep -Fxq 'smoke/rg-14-1-1'
+          rg-14-1-1 --version | grep -F 'ripgrep 14.1.1'
+
+          # Leave the cache in the state described by its request key.
+          ghr install \
+            BurntSushi/ripgrep@14.1.0 \
+            '?id=smoke/rg-14-1-0&alias=rg:rg-14-1-0'
+          rg-14-1-0 --version | grep -F 'ripgrep 14.1.0'
 
   action-download-smoke:
     # Parallel smoke for the multi-spec download path. Same matrix as
@@ -232,4 +303,3 @@ jobs:
             exit 1
           fi
           echo "ok: '--sha256' with multi-spec was rejected as expected"
-

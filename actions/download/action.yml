@@ -36,7 +36,8 @@ inputs:
   cache:
     description: >-
       Cache the `dest` directory across runs. Default: true. The cache
-      key is `os + arch + sorted(tools) + extract flag + ghr version`.
+      key covers OS, architecture, normalized sources, extraction settings,
+      verification policy, minisign key, and ghr version.
     required: false
     default: 'true'
   minisign:
@@ -94,7 +95,7 @@ inputs:
     description: >-
       Override the `ghr-bin` version installed via pipx. By default the
       action installs the `ghr-bin` version matching its own git ref —
-      e.g. when pinned at `@v0.3.0` it installs `ghr-bin==0.3.0`. Pass
+      e.g. when pinned at `@v0.8.0` it installs `ghr-bin==0.8.0`. Pass
       this input to override (e.g. `latest`, or a specific version).
       When set to `latest`, the literal value `latest` is interpreted as
       "no version pin" (pipx installs whatever PyPI considers latest).
@@ -124,7 +125,7 @@ runs:
         # Resolution order:
         #   1. explicit `ghr-version:` input (literal "latest" means "no pin")
         #   2. derived from $GITHUB_ACTION_REF if it looks like a semver tag
-        #      (e.g. `v0.3.0` -> `0.3.0`)
+        #      (e.g. `v0.8.0` -> `0.8.0`)
         #   3. fall back to latest on PyPI
         resolved=""
         if [[ -n "${INPUT_VERSION}" ]]; then
@@ -153,8 +154,13 @@ runs:
           dest="${DEST_INPUT}"
         fi
         mkdir -p "$dest"
-        # Canonicalise to an absolute path for cache stability.
-        dest_abs="$(cd "$dest" && pwd)"
+        # The Actions runner consumes `working-directory` before launching
+        # bash, so Windows must retain a native path rather than MSYS `/d/...`.
+        if [[ "${RUNNER_OS}" == "Windows" ]]; then
+          dest_abs="$(cygpath -aw "$dest")"
+        else
+          dest_abs="$(cd "$dest" && pwd)"
+        fi
         echo "dest=$dest_abs" >> "$GITHUB_OUTPUT"
 
     - name: Resolve cache key
@@ -164,30 +170,73 @@ runs:
         TOOLS_INPUT: ${{ inputs.tools }}
         EXTRACT: ${{ inputs.extract }}
         STRIP: ${{ inputs.strip-components }}
+        MINISIGN: ${{ inputs.minisign }}
+        SKIP_VERIFY: ${{ inputs.skip-verify }}
+        SKIP_CHECKSUM: ${{ inputs.skip-checksum }}
+        SKIP_MINISIGN: ${{ inputs.skip-minisign }}
+        SKIP_SIGSTORE: ${{ inputs.skip-sigstore }}
+        SKIP_ATTESTATION: ${{ inputs.skip-attestation }}
+        SKIP_AUTHENTICODE: ${{ inputs.skip-authenticode }}
       run: |
         set -euo pipefail
         ghr_version="$(ghr version)"
-        sorted_specs="$(printf '%s\n' "${TOOLS_INPUT}" \
-          | sed -e 's/[[:space:]]\{1,\}/\n/g' \
-          | grep -v '^$' \
-          | grep -v '^#' \
-          | LC_ALL=C sort -u)"
-        if [[ -z "$sorted_specs" ]]; then
+        if ! ghr_target="$(ghr version --target 2>/dev/null)"; then
+          echo "error: ghr ${ghr_version} does not support target-aware action cache keys" >&2
+          echo "       pin this action to a release with target-aware cache keys, or set ghr-version accordingly" >&2
+          exit 1
+        fi
+        if [[ ! "$ghr_target" =~ ^[A-Za-z0-9_]+-[A-Za-z0-9_]+-[A-Za-z0-9_]+$ ]]; then
+          echo "error: ghr ${ghr_version} does not report a cache-safe target ABI" >&2
+          echo "       pin this action to a release with target-aware cache keys, or set ghr-version accordingly" >&2
+          exit 1
+        fi
+        canonical_lines=()
+        while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+          line="${raw_line#"${raw_line%%[![:space:]]*}"}"
+          line="${line%"${line##*[![:space:]]}"}"
+          [[ -z "$line" ]] && continue
+          [[ "${line:0:1}" == "#" ]] && continue
+          read -ra tokens <<< "$line"
+          if (( ${#tokens[@]} != 1 )); then
+            echo "error: each download tools line must contain exactly one source" >&2
+            exit 1
+          fi
+          canonical_lines+=("${tokens[0]}")
+        done <<< "${TOOLS_INPUT}"
+        if (( ${#canonical_lines[@]} == 0 )); then
           echo "error: 'tools' input is empty" >&2
           exit 1
         fi
+        sorted_specs="$(printf '%s\n' "${canonical_lines[@]}" | LC_ALL=C sort -u)"
+
+        cache_material="$(
+          printf '%s\n' \
+            'download-cache-schema=2' \
+            "extract=${EXTRACT}" \
+            "strip-components=${STRIP}" \
+            "minisign=${MINISIGN}" \
+            "skip-verify=${SKIP_VERIFY}" \
+            "skip-checksum=${SKIP_CHECKSUM}" \
+            "skip-minisign=${SKIP_MINISIGN}" \
+            "skip-sigstore=${SKIP_SIGSTORE}" \
+            "skip-attestation=${SKIP_ATTESTATION}" \
+            "skip-authenticode=${SKIP_AUTHENTICODE}"
+          while IFS= read -r spec; do
+            printf 'source=%s\n' "$spec"
+          done <<< "$sorted_specs"
+        )"
         # macOS runner images don't always ship GNU coreutils' `sha256sum`
         # (e.g. the `macos-14` image), so fall back to `shasum -a 256`. Both
         # emit the same SHA-256 hex, so the cache key is identical either way.
         if command -v sha256sum >/dev/null 2>&1; then
-          specs_hash="$(printf '%s' "$sorted_specs" | sha256sum | cut -c1-16)"
+          definition_hash="$(printf '%s' "$cache_material" | sha256sum | cut -c1-16)"
         else
-          specs_hash="$(printf '%s' "$sorted_specs" | shasum -a 256 | cut -c1-16)"
+          definition_hash="$(printf '%s' "$cache_material" | shasum -a 256 | cut -c1-16)"
         fi
         extract_tag="x0"
         if [[ "${EXTRACT}" == "true" ]]; then extract_tag="x1"; fi
         strip_tag="s${STRIP:-0}"
-        key="ghr-dl-${RUNNER_OS}-${RUNNER_ARCH}-ghrv${ghr_version}-${extract_tag}-${strip_tag}-${specs_hash}"
+        key="ghr-dl-${RUNNER_OS}-${RUNNER_ARCH}-${ghr_target}-cfg2-ghrv${ghr_version}-${extract_tag}-${strip_tag}-${definition_hash}"
         {
           echo "key=$key"
           echo "ghr_version=$ghr_version"
@@ -234,8 +283,14 @@ runs:
         if [[ "${SKIP_ATTESTATION}" == "true" ]]; then flags+=(--skip-attestation); fi
         if [[ "${SKIP_AUTHENTICODE}" == "true" ]]; then flags+=(--skip-authenticode); fi
         if [[ -n "${MINISIGN}" ]]; then flags+=(--minisign "${MINISIGN}"); fi
-        readarray -t specs <<< "${SORTED_SPECS}"
-        ghr download "${flags[@]}" "${specs[@]}"
+        specs=()
+        while IFS= read -r spec; do
+          [[ -z "$spec" ]] && continue
+          specs+=("$spec")
+        done <<< "${SORTED_SPECS}"
+        ghr download \
+          ${flags[@]+"${flags[@]}"} \
+          ${specs[@]+"${specs[@]}"}
 
     - name: Sanity check (list dest)
       shell: bash

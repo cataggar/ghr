@@ -1,6 +1,6 @@
-//! Pure parsing for the planned ID-based install request grammar.
+//! Pure parsing for the ID-based install request grammar.
 //!
-//! This module deliberately has no command-line integration yet. It accepts
+//! The install command and action cache-key mode share this parser. It accepts
 //! positional source/configuration tokens, allocates all normalized IDs and
 //! configuration strings, and performs no I/O. Source values borrow from the
 //! caller's token storage, which must therefore outlive `ParsedRequests`.
@@ -9,10 +9,8 @@ const std = @import("std");
 const minisign = @import("minisign.zig");
 const release = @import("release.zig");
 
-/// Conservative limits chosen before the eventual filesystem encoding exists.
-/// Keeping the whole logical ID below one common component limit leaves room
-/// for encoding overhead; the segment bound still accommodates long repository
-/// names while preventing unexpectedly large individual components.
+/// Conservative portable limits that leave room for the v2 path encoding and
+/// still accommodate long repository names.
 pub const max_id_bytes: usize = 240;
 pub const max_id_segment_bytes: usize = 100;
 
