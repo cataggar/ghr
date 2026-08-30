@@ -23,19 +23,22 @@ end-to-end:
   cross-run caching.
 
 ```yaml
-- uses: cataggar/ghr/actions/install@v0.3.0  # pin to the matching ghr release
+- uses: cataggar/ghr/actions/install@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.1
+      BurntSushi/ripgrep@14.1.0 ?id=rg-14-1-0&alias=rg:rg-14-1-0
+      BurntSushi/ripgrep@14.1.1 ?id=rg-14-1-1&alias=rg:rg-14-1-1
       sharkdp/fd@v10.2.0
 ```
 
-To verify some tools with minisign, attach the public key as a second
-whitespace-separated token on the same line. Inline keys override the
-action-level `minisign:` default for that one spec:
+Each line is one complete install request: a source, optional query token, and
+optional bare minisign key. Query tokens do not need shell quotes inside the
+YAML block, though matching quotes are accepted. To verify some tools with
+minisign, attach the public key after that request. Inline keys override the
+action-level `minisign:` default:
 
 ```yaml
-- uses: cataggar/ghr/actions/install@v0.3.0
+- uses: cataggar/ghr/actions/install@v0.8.0
   with:
     tools: |
       jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
@@ -44,7 +47,7 @@ action-level `minisign:` default for that one spec:
 ```
 
 The actions ship in this same repository, so their git tags are the
-same as `ghr`'s — pinning `@v0.3.0` pins both the action body and the
+same as `ghr`'s — pinning `@v0.8.0` pins both the action body and the
 `ghr-bin` binary the action installs. Pick the latest tag from
 [the releases page](https://github.com/cataggar/ghr/releases).
 
@@ -90,18 +93,20 @@ and the cache step pairs naturally with one install step. Use
 
 ## Cache key shape
 
-A cache-key like `ghr-<os>-<arch>-<sorted-specs>-<ghr-version>` invalidates
-cleanly when:
+The install action asks the ID-capable CLI to hash normalized complete
+definitions. Its key invalidates cleanly when:
 
 - the runner OS or architecture changes,
-- a tool is added, removed, or its pinned tag changes,
+- the target ABI changes (for example, glibc versus musl),
+- a source, pinned tag, stable ID, alias, or selected command changes,
+- a verification skip policy or minisign key changes,
+- the install-state schema/layout generation changes,
 - `ghr` itself is upgraded (the install layout could shift between
   versions).
 
-For tiny lists, an inline literal is fine. For larger lists, check the
-tool list into a file and key on `${{ hashFiles('.github/ghr-tools.txt') }}`.
-The composite actions above hash the sorted tool list internally, so you
-don't have to choose.
+Request order does not affect the key, but query tokens and keys are never
+sorted away from their source. The action refuses to run with an older CLI
+that cannot produce this fingerprint.
 
 ## Caveats
 
@@ -121,7 +126,7 @@ destination directory and the extracted contents (if `--extract` is
 used):
 
 ```yaml
-- uses: cataggar/ghr/actions/download@v0.3.0  # pin to the matching ghr release
+- uses: cataggar/ghr/actions/download@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
       BurntSushi/ripgrep@14.1.1
@@ -155,3 +160,7 @@ more than one spec is supplied — `--extract <dir>` is the multi-spec
 equivalent of `-o`, and verification falls back to whatever GitHub asset
 digest, sigstore, or sha256 sidecars the release publishes, plus any
 GitHub artifact attestation covering the downloaded digest.
+
+The download action's cache key includes extraction settings, every
+verification skip flag, and the minisign key as hashed material. A cache
+created under one verification policy is therefore never reused under another.

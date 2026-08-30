@@ -11,16 +11,17 @@ branding:
 inputs:
   tools:
     description: >-
-      Newline-separated list of release specs to install. Each entry is
-      `owner/repo[@tag]` (auto-pick asset) or `owner/repo/file[@tag]`
-      (specific asset). Lines that are empty or start with `#` are
-      ignored.
+      Newline-separated install requests. Each line is
+      `<source> [?id=...&alias=...] [minisign-key]`; the query token may be
+      quoted, and a bare key remains compatible. Lines that are empty or start
+      with `#` are ignored.
     required: true
   cache:
     description: >-
       Cache installed tools across runs. Default: true. The cache key is
-      `os + arch + sorted(tools) + ghr version`, so adding a tool or
-      bumping ghr invalidates the cache cleanly.
+      `os + arch + ABI + normalized install definitions + state layout + ghr
+      version`, so changing an ID, source, alias, verification policy, key, or
+      ghr version invalidates the cache cleanly.
     required: false
     default: 'true'
   minisign:
@@ -30,7 +31,7 @@ inputs:
       requires a `.minisig` sidecar to be present and verifies it. An inline
       key on a `tools:` line (the second whitespace-separated token, e.g.
       `jedisct1/minisign@0.12 RWQf6LR…`) overrides this default for that
-      single spec.
+      single request.
     required: false
     default: ''
   skip-verify:
@@ -82,7 +83,7 @@ inputs:
     description: >-
       Override the `ghr-bin` version installed via pipx. By default the
       action installs the `ghr-bin` version matching its own git ref —
-      e.g. when pinned at `@v0.3.0` it installs `ghr-bin==0.3.0`. Pass
+      e.g. when pinned at `@v0.8.0` it installs `ghr-bin==0.8.0`. Pass
       this input to override (e.g. `latest`, or a specific version).
       When set to `latest`, the literal value `latest` is interpreted as
       "no version pin" (pipx installs whatever PyPI considers latest).
@@ -109,7 +110,7 @@ runs:
         # Resolution order:
         #   1. explicit `ghr-version:` input (literal "latest" means "no pin")
         #   2. derived from $GITHUB_ACTION_REF if it looks like a semver tag
-        #      (e.g. `v0.3.0` -> `0.3.0`)
+        #      (e.g. `v0.8.0` -> `0.8.0`)
         #   3. fall back to latest on PyPI
         resolved=""
         if [[ -n "${INPUT_VERSION}" ]]; then
@@ -147,67 +148,91 @@ runs:
       shell: bash
       env:
         TOOLS_INPUT: ${{ inputs.tools }}
+        MINISIGN: ${{ inputs.minisign }}
+        SKIP_VERIFY: ${{ inputs.skip-verify }}
+        SKIP_CHECKSUM: ${{ inputs.skip-checksum }}
+        SKIP_MINISIGN: ${{ inputs.skip-minisign }}
+        SKIP_SIGSTORE: ${{ inputs.skip-sigstore }}
+        SKIP_ATTESTATION: ${{ inputs.skip-attestation }}
+        SKIP_AUTHENTICODE: ${{ inputs.skip-authenticode }}
       run: |
         set -euo pipefail
         ghr_version="$(ghr version)"
+        install_help="$(ghr install --help)"
+        if ! grep -Fq -- '--print-cache-key' <<< "$install_help" ||
+           ! grep -Fq -- '--single-request' <<< "$install_help"; then
+          echo "error: ghr ${ghr_version} does not support stable-ID action cache keys" >&2
+          echo "       pin this action to a release with an ID-capable ghr, or set ghr-version accordingly" >&2
+          exit 1
+        fi
+        if ! ghr_target="$(ghr version --target 2>/dev/null)"; then
+          echo "error: ghr ${ghr_version} does not support target-aware action cache keys" >&2
+          echo "       pin this action to a release with an ID-capable ghr, or set ghr-version accordingly" >&2
+          exit 1
+        fi
+        if [[ ! "$ghr_target" =~ ^[A-Za-z0-9_]+-[A-Za-z0-9_]+-[A-Za-z0-9_]+$ ]]; then
+          echo "error: ghr ${ghr_version} did not report a cache-safe target ABI" >&2
+          exit 1
+        fi
 
-        # The `tools:` input is one entry per line: `spec` or `spec key`
-        # (whitespace-separated). Drop blanks and `#` comments, validate
-        # the optional key, and produce a deterministic sorted list of
-        # `spec [key]` lines.
-        canonical_lines=()
+        # Each non-comment line is one complete request:
+        #   source [query-token] [bare-minisign-key]
+        # Quotes around the query token are accepted for parity with shell
+        # examples, but are not required inside a YAML block scalar.
+        request_tokens=()
         while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
           line="${raw_line#"${raw_line%%[![:space:]]*}"}"  # ltrim
           line="${line%"${line##*[![:space:]]}"}"          # rtrim
           [[ -z "$line" ]] && continue
           [[ "${line:0:1}" == "#" ]] && continue
-          # Split on whitespace -> tokens
           read -ra tokens <<< "$line"
           n="${#tokens[@]}"
-          if (( n < 1 || n > 2 )); then
-            printf 'error: tools line must be `spec` or `spec key`, got %d tokens: %s\n' "$n" "$line" >&2
+          if (( n < 1 || n > 3 )); then
+            printf 'error: tools line must be `source [query] [key]`, got %d tokens\n' "$n" >&2
             exit 1
           fi
-          spec="${tokens[0]}"
-          if (( n == 2 )); then
-            key="${tokens[1]}"
-            # Structural validation: 56-char base64, starts with RW or RU.
-            # `ghr install` re-validates via parsePublicKey and surfaces
-            # any decode failure with a clear error.
-            if [[ ! "$key" =~ ^(RW|RU)[A-Za-z0-9+/]{53}[A-Za-z0-9+/=]$ ]]; then
-              printf 'error: invalid minisign key for spec %s: %s\n' "$spec" "$key" >&2
-              exit 1
-            fi
-            canonical_lines+=("$spec $key")
-          else
-            canonical_lines+=("$spec")
-          fi
+
+          line_tokens=("${tokens[0]}")
+          for (( i=1; i<n; i++ )); do
+            token="${tokens[$i]}"
+            case "$token" in
+              \"*\") token="${token#\"}"; token="${token%\"}" ;;
+              \'*\') token="${token#\'}"; token="${token%\'}" ;;
+            esac
+            line_tokens+=("$token")
+          done
+          ghr install --print-cache-key --single-request "${line_tokens[@]}" >/dev/null
+          request_tokens+=("${line_tokens[@]}")
         done <<< "${TOOLS_INPUT}"
 
-        if (( ${#canonical_lines[@]} == 0 )); then
+        if (( ${#request_tokens[@]} == 0 )); then
           echo "error: 'tools' input is empty" >&2
           exit 1
         fi
 
-        # Sort the (spec [key]) lines so the cache key is stable. Including
-        # the key in the hash makes the cache identity reflect the
-        # verification material — changing a tool's key forces a re-install
-        # and therefore re-verification.
-        sorted_specs="$(printf '%s\n' "${canonical_lines[@]}" | LC_ALL=C sort -u)"
-        # macOS runner images don't always ship GNU coreutils' `sha256sum`
-        # (e.g. the `macos-14` image), so fall back to `shasum -a 256`. Both
-        # emit the same SHA-256 hex, so the cache key is identical either way.
-        if command -v sha256sum >/dev/null 2>&1; then
-          specs_hash="$(printf '%s' "$sorted_specs" | sha256sum | cut -c1-16)"
-        else
-          specs_hash="$(printf '%s' "$sorted_specs" | shasum -a 256 | cut -c1-16)"
+        flags=()
+        if [[ "${SKIP_VERIFY}" == "true" ]]; then flags+=(--skip-verify); fi
+        if [[ "${SKIP_CHECKSUM}" == "true" ]]; then flags+=(--skip-checksum); fi
+        if [[ "${SKIP_MINISIGN}" == "true" ]]; then flags+=(--skip-minisign); fi
+        if [[ "${SKIP_SIGSTORE}" == "true" ]]; then flags+=(--skip-sigstore); fi
+        if [[ "${SKIP_ATTESTATION}" == "true" ]]; then flags+=(--skip-attestation); fi
+        if [[ "${SKIP_AUTHENTICODE}" == "true" ]]; then flags+=(--skip-authenticode); fi
+        if [[ -n "${MINISIGN}" ]]; then flags+=(--minisign "${MINISIGN}"); fi
+        definition_hash="$(
+          ghr install --print-cache-key \
+            ${flags[@]+"${flags[@]}"} \
+            ${request_tokens[@]+"${request_tokens[@]}"}
+        )"
+        if [[ ! "$definition_hash" =~ ^[0-9a-f]{64}$ ]]; then
+          echo "error: ghr returned an invalid install cache fingerprint" >&2
+          exit 1
         fi
-        key="ghr-${RUNNER_OS}-${RUNNER_ARCH}-ghrv${ghr_version}-${specs_hash}"
+        key="ghr-${RUNNER_OS}-${RUNNER_ARCH}-${ghr_target}-layout2-ghrv${ghr_version}-${definition_hash:0:16}"
         {
           echo "key=$key"
           echo "ghr_version=$ghr_version"
-          echo 'sorted_specs<<__GHR_EOF__'
-          echo "$sorted_specs"
+          echo 'request_tokens<<__GHR_EOF__'
+          printf '%s\n' "${request_tokens[@]}"
           echo '__GHR_EOF__'
         } >> "$GITHUB_OUTPUT"
 
@@ -226,7 +251,7 @@ runs:
       if: steps.ghr-cache.outputs.cache-hit != 'true'
       shell: bash
       env:
-        SORTED_SPECS: ${{ steps.cache-key.outputs.sorted_specs }}
+        REQUEST_TOKENS: ${{ steps.cache-key.outputs.request_tokens }}
         MINISIGN: ${{ inputs.minisign }}
         SKIP_VERIFY: ${{ inputs.skip-verify }}
         SKIP_CHECKSUM: ${{ inputs.skip-checksum }}
@@ -246,16 +271,14 @@ runs:
         if [[ "${SKIP_ATTESTATION}" == "true" ]]; then flags+=(--skip-attestation); fi
         if [[ "${SKIP_AUTHENTICODE}" == "true" ]]; then flags+=(--skip-authenticode); fi
         if [[ -n "${MINISIGN}" ]]; then flags+=(--minisign "${MINISIGN}"); fi
-        # SORTED_SPECS is newline-separated `spec` or `spec key` lines.
-        # Split each line into individual whitespace-separated tokens so
-        # ghr install sees `<spec> [<pubkey>] <spec> ...` as positional
-        # arguments.
+        # REQUEST_TOKENS is one already-validated CLI token per line. Keeping
+        # request tokens together avoids sorting a query or key away from its
+        # source.
         positionals=()
-        while IFS= read -r line; do
-          [[ -z "$line" ]] && continue
-          read -ra tokens <<< "$line"
-          positionals+=("${tokens[@]}")
-        done <<< "${SORTED_SPECS}"
+        while IFS= read -r token; do
+          [[ -z "$token" ]] && continue
+          positionals+=("$token")
+        done <<< "${REQUEST_TOKENS}"
         # Bash 3.2 (macOS `/bin/bash`) treats `"${arr[@]}"` on an empty
         # array as an unbound variable under `set -u`. Use the
         # `${arr[@]+...}` guard so an empty `flags`/`positionals` expands to

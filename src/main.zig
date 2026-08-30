@@ -60,7 +60,27 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (eql(cmd_str, "version")) {
-        try stdout.interface.print("{s}\n", .{version});
+        const version_arg = args.next();
+        if (version_arg == null) {
+            try stdout.interface.print("{s}\n", .{version});
+            return;
+        }
+        if (!eql(version_arg.?, "--target")) {
+            try stderr.interface.print("error: unexpected argument '{s}' for 'ghr version'\n", .{version_arg.?});
+            try stderr.interface.flush();
+            std.process.exit(1);
+        }
+        if (args.next()) |arg| {
+            try stderr.interface.print("error: unexpected argument '{s}' for 'ghr version'\n", .{arg});
+            try stderr.interface.flush();
+            std.process.exit(1);
+        }
+        const builtin = @import("builtin");
+        try stdout.interface.print("{t}-{t}-{t}\n", .{
+            builtin.os.tag,
+            builtin.cpu.arch,
+            builtin.abi,
+        });
         return;
     }
     if (eql(cmd_str, "path")) {
@@ -104,6 +124,8 @@ pub fn main(init: std.process.Init) !void {
         var skip_attestation = false;
         var skip_authenticode = false;
         var keep_going = false;
+        var print_cache_key = false;
+        var single_request = false;
         var minisign_pubkey: ?[]const u8 = null;
         // Positional tokens are handed to `install_request` verbatim: sources,
         // quoted query tokens, and bare minisign keys are classified there so
@@ -131,6 +153,10 @@ pub fn main(init: std.process.Init) !void {
                 skip_authenticode = true;
             } else if (eql(arg, "--keep-going")) {
                 keep_going = true;
+            } else if (eql(arg, "--print-cache-key")) {
+                print_cache_key = true;
+            } else if (eql(arg, "--single-request")) {
+                single_request = true;
             } else if (eql(arg, "--minisign")) {
                 const v = args.next() orelse {
                     try stderr.interface.print("error: '--minisign' requires a base64 minisign public key value\n", .{});
@@ -167,22 +193,42 @@ pub fn main(init: std.process.Init) !void {
             .skip_attestation = skip_attestation,
             .skip_authenticode = skip_authenticode,
         };
-        install.cmdInstallRequests(
-            allocator,
-            io,
-            environ,
-            tokens.items,
-            &stdout.interface,
-            &stderr.interface,
-            .{
-                .debug = debug,
-                .no_auth = no_auth,
-                .gates = gates,
-                .minisign_pubkey_b64 = minisign_pubkey,
-                .bin_filters = bin_filters.items,
-                .keep_going = keep_going,
-            },
-        ) catch |err| switch (err) {
+        if (single_request and !print_cache_key) {
+            try stderr.interface.print(
+                "error: '--single-request' requires '--print-cache-key'\n",
+                .{},
+            );
+            try stderr.interface.flush();
+            std.process.exit(1);
+        }
+        const install_options: install.InstallOptions = .{
+            .debug = debug,
+            .no_auth = no_auth,
+            .gates = gates,
+            .minisign_pubkey_b64 = minisign_pubkey,
+            .bin_filters = bin_filters.items,
+            .keep_going = keep_going,
+        };
+        const result = if (print_cache_key)
+            install.cmdInstallCacheKey(
+                allocator,
+                tokens.items,
+                &stdout.interface,
+                &stderr.interface,
+                install_options,
+                single_request,
+            )
+        else
+            install.cmdInstallRequests(
+                allocator,
+                io,
+                environ,
+                tokens.items,
+                &stdout.interface,
+                &stderr.interface,
+                install_options,
+            );
+        result catch |err| switch (err) {
             error.MissingInstallSpec,
             error.BinFilterRequiresSingleSpec,
             error.InvalidInstallRequest,
@@ -668,6 +714,9 @@ fn printInstallUsage(w: *Writer) !void {
         \\    --keep-going            Continue past per-source resolution failures; the
         \\                            surviving sources are still planned together and
         \\                            the command exits non-zero with a summary
+        \\    --print-cache-key       Print a normalized state/cache fingerprint and exit
+        \\                            without network or filesystem access
+        \\    --single-request        With --print-cache-key, require exactly one request
         \\    -h, --help              Show this help
         \\
         \\A direct URL publishes no GitHub digest, sigstore sidecar, or
@@ -712,9 +761,10 @@ fn printVersionUsage(w: *Writer) !void {
         \\ghr version - print the ghr version
         \\
         \\USAGE:
-        \\    ghr version
+        \\    ghr version [--target]
         \\
         \\OPTIONS:
+        \\    --target     Print the build OS, architecture, and ABI
         \\    -h, --help  Show this help
         \\
     , .{});

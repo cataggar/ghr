@@ -2102,18 +2102,14 @@ fn reportPlanError(
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Install every request in one invocation.
-pub fn cmdInstallRequests(
+fn parseInstallRequests(
     allocator: std.mem.Allocator,
-    io: Io,
-    environ: *const EnvironMap,
     tokens: []const []const u8,
-    w: *Writer,
+    bin_filters: []const []const u8,
     err_w: *Writer,
-    options: InstallOptions,
-) !void {
+) !install_request.ParsedRequests {
     if (tokens.len == 0) {
-        try validateInstallOptions(0, options.bin_filters, err_w);
+        try validateInstallOptions(0, bin_filters, err_w);
         return error.MissingInstallSpec;
     }
 
@@ -2125,24 +2121,248 @@ pub fn cmdInstallRequests(
             return error.InvalidInstallRequest;
         },
     };
-    defer parsed.deinit();
+    errdefer parsed.deinit();
 
-    try validateInstallOptions(parsed.items.len, options.bin_filters, err_w);
-    {
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
-        defer seen.deinit(allocator);
-        for (parsed.items, 0..) |request, i| {
-            if ((try seen.getOrPut(allocator, request.id)).found_existing) {
-                try err_w.print(
-                    "error: install request {d} repeats id '{s}' in the same invocation\n",
-                    .{ i + 1, request.id },
-                );
-                try err_w.print("  no install state was changed\n", .{});
-                try err_w.flush();
-                return error.InvalidInstallRequest;
-            }
+    try validateInstallOptions(parsed.items.len, bin_filters, err_w);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    for (parsed.items, 0..) |request, i| {
+        if ((try seen.getOrPut(allocator, request.id)).found_existing) {
+            try err_w.print(
+                "error: install request {d} repeats id '{s}' in the same invocation\n",
+                .{ i + 1, request.id },
+            );
+            try err_w.print("  no install state was changed\n", .{});
+            try err_w.flush();
+            return error.InvalidInstallRequest;
         }
     }
+    return parsed;
+}
+
+fn writeCacheJsonString(w: *Writer, value: []const u8, ascii_lower: bool) !void {
+    try w.writeByte('"');
+    for (value) |raw| {
+        const c = if (ascii_lower) std.ascii.toLower(raw) else raw;
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => {
+                if (c < 0x20 or c == 0x7f) {
+                    try w.print("\\u{x:0>4}", .{c});
+                } else {
+                    try w.writeByte(c);
+                }
+            },
+        }
+    }
+    try w.writeByte('"');
+}
+
+fn writeCacheOptionalString(w: *Writer, value: ?[]const u8) !void {
+    if (value) |v| {
+        try writeCacheJsonString(w, v, false);
+    } else {
+        try w.writeAll("null");
+    }
+}
+
+fn writeCacheGithubSource(
+    w: *Writer,
+    owner: []const u8,
+    repo: []const u8,
+    tag: ?[]const u8,
+    asset_selector: ?[]const u8,
+) !void {
+    try w.writeAll("{\"kind\":\"github\",\"owner\":");
+    try writeCacheJsonString(w, owner, true);
+    try w.writeAll(",\"repo\":");
+    try writeCacheJsonString(w, repo, true);
+    try w.writeAll(",\"tag\":");
+    try writeCacheOptionalString(w, tag);
+    try w.writeAll(",\"asset_selector\":");
+    try writeCacheOptionalString(w, asset_selector);
+    try w.writeByte('}');
+}
+
+fn writeCacheSource(
+    allocator: std.mem.Allocator,
+    w: *Writer,
+    source: install_request.Source,
+) !void {
+    switch (source) {
+        .github_repo => |repo| try writeCacheGithubSource(
+            w,
+            repo.owner,
+            repo.repo,
+            repo.tag,
+            null,
+        ),
+        .github_file => |file| try writeCacheGithubSource(
+            w,
+            file.owner,
+            file.repo,
+            file.tag,
+            file.file,
+        ),
+        .github_release_url => |url| {
+            const parsed = (try release_mod.parseGitHubReleaseUrl(allocator, url)) orelse
+                return error.InvalidInstallRequest;
+            defer parsed.deinit(allocator);
+            try writeCacheGithubSource(
+                w,
+                parsed.owner,
+                parsed.repo,
+                parsed.tag,
+                parsed.file,
+            );
+        },
+        .generic_url => |url| {
+            try w.writeAll("{\"kind\":\"generic_url\",\"url\":");
+            try writeCacheJsonString(w, url, false);
+            try w.writeByte('}');
+        },
+    }
+}
+
+fn cacheRequestLessThan(
+    _: void,
+    a: *const install_request.InstallRequest,
+    b: *const install_request.InstallRequest,
+) bool {
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
+fn cacheAliasLessThan(_: void, a: install_request.Alias, b: install_request.Alias) bool {
+    return switch (std.mem.order(u8, a.source, b.source)) {
+        .lt => true,
+        .gt => false,
+        .eq => std.mem.order(u8, a.published, b.published) == .lt,
+    };
+}
+
+fn cacheStringLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn writeInstallCacheMaterial(
+    allocator: std.mem.Allocator,
+    w: *Writer,
+    parsed: *const install_request.ParsedRequests,
+    options: InstallOptions,
+) !void {
+    const requests = try allocator.alloc(*const install_request.InstallRequest, parsed.items.len);
+    defer allocator.free(requests);
+    for (parsed.items, 0..) |*request, i| requests[i] = request;
+    std.mem.sort(*const install_request.InstallRequest, requests, {}, cacheRequestLessThan);
+
+    const selected = try allocator.alloc([]const u8, options.bin_filters.len);
+    defer allocator.free(selected);
+    @memcpy(selected, options.bin_filters);
+    std.mem.sort([]const u8, selected, {}, cacheStringLessThan);
+
+    try w.print(
+        "{{\"schema\":1,\"form\":\"install-cache-key\",\"target\":{{\"os\":\"{t}\",\"arch\":\"{t}\",\"abi\":\"{t}\"}},\"state_schema\":{d},\"layout_generation\":{d},\"requests\":[",
+        .{
+            builtin.os.tag,
+            builtin.cpu.arch,
+            builtin.abi,
+            install_state_write.schema_version,
+            install_state_write.layout_generation,
+        },
+    );
+    for (requests, 0..) |request, request_index| {
+        if (request_index > 0) try w.writeByte(',');
+        try w.writeAll("{\"id\":");
+        try writeCacheJsonString(w, request.id, false);
+        try w.writeAll(",\"source\":");
+        try writeCacheSource(allocator, w, request.source);
+        try w.writeAll(",\"config\":{\"aliases\":[");
+
+        const aliases = try allocator.alloc(install_request.Alias, request.config.aliases.len);
+        defer allocator.free(aliases);
+        @memcpy(aliases, request.config.aliases);
+        std.mem.sort(install_request.Alias, aliases, {}, cacheAliasLessThan);
+        for (aliases, 0..) |alias, alias_index| {
+            if (alias_index > 0) try w.writeByte(',');
+            try w.writeAll("{\"from\":");
+            try writeCacheJsonString(w, alias.source, false);
+            try w.writeAll(",\"to\":");
+            try writeCacheJsonString(w, alias.published, false);
+            try w.writeByte('}');
+        }
+
+        try w.writeAll("],\"selected_commands\":[");
+        for (selected, 0..) |name, selected_index| {
+            if (selected_index > 0) try w.writeByte(',');
+            try writeCacheJsonString(w, name, false);
+        }
+        try w.writeAll("],\"minisign\":");
+        try writeCacheOptionalString(
+            w,
+            request.config.minisign orelse options.minisign_pubkey_b64,
+        );
+        try w.print(
+            ",\"verification_policy\":{{\"skip_verify\":{},\"skip_checksum\":{},\"skip_minisign\":{},\"skip_sigstore\":{},\"skip_attestation\":{},\"skip_authenticode\":{}}}}}}}",
+            .{
+                options.gates.skip_verify,
+                options.gates.skip_checksum,
+                options.gates.skip_minisign,
+                options.gates.skip_sigstore,
+                options.gates.skip_attestation,
+                options.gates.skip_authenticode,
+            },
+        );
+    }
+    try w.writeAll("]}");
+}
+
+/// Print a deterministic SHA-256 cache key for normalized install requests.
+/// This performs no network or filesystem access and shares parsing and
+/// duplicate-ID validation with a real install.
+pub fn cmdInstallCacheKey(
+    allocator: std.mem.Allocator,
+    tokens: []const []const u8,
+    w: *Writer,
+    err_w: *Writer,
+    options: InstallOptions,
+    require_single_request: bool,
+) !void {
+    var parsed = try parseInstallRequests(allocator, tokens, options.bin_filters, err_w);
+    defer parsed.deinit();
+    if (require_single_request and parsed.items.len != 1) {
+        try err_w.print(
+            "error: cache-key input contains {d} install requests; expected exactly one\n",
+            .{parsed.items.len},
+        );
+        try err_w.flush();
+        return error.InvalidInstallRequest;
+    }
+
+    var material = std.Io.Writer.Allocating.init(allocator);
+    defer material.deinit();
+    try writeInstallCacheMaterial(allocator, &material.writer, &parsed, options);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(material.written(), &digest, .{});
+    try w.print("{x}\n", .{&digest});
+}
+
+/// Install every request in one invocation.
+pub fn cmdInstallRequests(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    tokens: []const []const u8,
+    w: *Writer,
+    err_w: *Writer,
+    options: InstallOptions,
+) !void {
+    var parsed = try parseInstallRequests(allocator, tokens, options.bin_filters, err_w);
+    defer parsed.deinit();
 
     const dirs = try Dirs.detect(allocator, environ);
     defer dirs.deinit();
@@ -6128,6 +6348,107 @@ test "recovery artifact ownership never matches an unrelated entry" {
     try std.testing.expect(artifactBelongsToUnit(ctx.io, bin_dir, "tool", unit.paths.unit, null));
     try std.testing.expect(!artifactBelongsToUnit(ctx.io, bin_dir, "tool", "/somewhere/else", null));
     try std.testing.expect(!artifactBelongsToUnit(ctx.io, bin_dir, "absent", unit.paths.unit, null));
+}
+
+fn tInstallCacheKey(tokens: []const []const u8, options: InstallOptions) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(t_alloc);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(t_alloc);
+    defer err_out.deinit();
+    try cmdInstallCacheKey(t_alloc, tokens, &out.writer, &err_out.writer, options, false);
+    try std.testing.expectEqual(@as(usize, 0), err_out.written().len);
+    return out.toOwnedSlice();
+}
+
+test "install cache key normalizes request and alias order" {
+    const minisign_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+    const first = try tInstallCacheKey(
+        &.{
+            "BurntSushi/ripgrep@14.1.1",
+            "?id=Tools/RG&alias=rg:rg14&alias=rgx:rgx14",
+            minisign_key,
+            "sharkdp/fd@v10.2.0",
+        },
+        .{},
+    );
+    defer t_alloc.free(first);
+    const reordered = try tInstallCacheKey(
+        &.{
+            "SHARKDP/FD@v10.2.0",
+            "burntsushi/RIPGREP@14.1.1",
+            "?alias=rgx:rgx14&alias=rg:rg14&id=tools/rg",
+            minisign_key,
+        },
+        .{},
+    );
+    defer t_alloc.free(reordered);
+
+    try std.testing.expectEqualStrings(first, reordered);
+    try std.testing.expectEqual(@as(usize, 65), first.len);
+}
+
+test "install cache key covers identity source configuration and policy" {
+    const base = try tInstallCacheKey(
+        &.{ "owner/repo/file.tar.gz@v1", "?id=tool&alias=from:to" },
+        .{},
+    );
+    defer t_alloc.free(base);
+
+    const cases = [_]struct {
+        tokens: []const []const u8,
+        options: InstallOptions = .{},
+    }{
+        .{ .tokens = &.{ "owner/repo/file.tar.gz@v1", "?id=other&alias=from:to" } },
+        .{ .tokens = &.{ "owner/repo/other.tar.gz@v1", "?id=tool&alias=from:to" } },
+        .{ .tokens = &.{ "owner/repo/file.tar.gz@v1", "?id=tool&alias=from:else" } },
+        .{
+            .tokens = &.{ "owner/repo/file.tar.gz@v1", "?id=tool&alias=from:to" },
+            .options = .{ .gates = .{ .skip_checksum = true } },
+        },
+    };
+    for (cases) |case| {
+        const changed = try tInstallCacheKey(case.tokens, case.options);
+        defer t_alloc.free(changed);
+        try std.testing.expect(!std.mem.eql(u8, base, changed));
+    }
+}
+
+test "install cache key preserves plus in query minisign material" {
+    const minisign_key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+    const query = try tInstallCacheKey(
+        &.{
+            "owner/repo@v1",
+            "?minisign=RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U",
+        },
+        .{},
+    );
+    defer t_alloc.free(query);
+    const bare = try tInstallCacheKey(&.{ "owner/repo@v1", minisign_key }, .{});
+    defer t_alloc.free(bare);
+    try std.testing.expectEqualStrings(query, bare);
+}
+
+test "install cache key can require one complete request" {
+    var out = std.Io.Writer.Allocating.init(t_alloc);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(t_alloc);
+    defer err_out.deinit();
+    try std.testing.expectError(
+        error.InvalidInstallRequest,
+        cmdInstallCacheKey(
+            t_alloc,
+            &.{ "owner/first", "RWATools/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+            &out.writer,
+            &err_out.writer,
+            .{},
+            true,
+        ),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        err_out.written(),
+        "contains 2 install requests; expected exactly one",
+    ) != null);
 }
 
 test "install refuses a lone query token before any work happens" {

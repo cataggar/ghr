@@ -1,15 +1,14 @@
-//! Read-only, schema-versioned install metadata and inventory reader (PR 3).
+//! Read-only, schema-versioned install metadata and inventory reader.
 //!
-//! This module is intentionally INACTIVE: nothing in the running `ghr` binary
-//! calls `scan`. It exists so a later activation PR can enumerate installed
+//! Install, list, uninstall, and WSL linking use this inventory to enumerate
 //! units by canonical ID, classify their state, and refuse mutation on
-//! conflicting/corrupt/unsupported records. Because it is a reader, every code
-//! path here fails CLOSED: genuine I/O, permission, and traversal errors
-//! propagate; only an actually-missing tool store / v2 root / unit metadata is
-//! treated as absence. Symlinks are never followed. Nothing on disk is mutated.
+//! conflicting/corrupt/unsupported records. Every code path here fails CLOSED:
+//! genuine I/O, permission, and traversal errors propagate; only an
+//! actually-missing tool store / v2 root / unit metadata is treated as
+//! absence. Symlinks are never followed. Nothing on disk is mutated.
 //!
 //! Dependency direction is acyclic. This module imports `install_request`
-//! (canonical ID rules from PR 2) and `release` (wasm asset detection); neither
+//! (canonical ID rules) and `release` (wasm asset detection); neither
 //! imports this file. It deliberately does NOT import `install.zig` to avoid
 //! coupling the reader to the writer; the legacy `ghr.json` wire shape is
 //! redefined locally and tested against the current on-disk format.
@@ -45,7 +44,7 @@ const Dir = Io.Dir;
 const File = Io.File;
 const Allocator = std.mem.Allocator;
 
-/// Canonical-ID limits are reused from PR 2 so the two modules cannot drift.
+/// Canonical-ID limits are reused from the request parser so the modules cannot drift.
 pub const max_id_bytes = install_request.max_id_bytes;
 pub const max_id_segment_bytes = install_request.max_id_segment_bytes;
 

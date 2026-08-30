@@ -4,7 +4,7 @@ Download one or more release assets inside a workflow, optionally extracting
 each archive into a destination directory, and cache the result across runs.
 
 ```yaml
-- uses: cataggar/ghr/actions/download@v0.3.0  # pin to the matching ghr release
+- uses: cataggar/ghr/actions/download@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
       BurntSushi/ripgrep@14.1.1
@@ -13,16 +13,16 @@ each archive into a destination directory, and cache the result across runs.
 ```
 
 The action ships in the same git repository as `ghr` and shares its release
-stream: a tag like `v0.3.0` pins **both** the action body and the
+stream: a tag like `v0.8.0` pins **both** the action body and the
 `ghr-bin` PyPI package the action installs. Pick the tag from
 [the releases page](https://github.com/cataggar/ghr/releases); pin to a
 specific commit SHA for full reproducibility.
 
 A cache-hit on subsequent runs restores the destination directory and skips
-the download entirely. The cache key is
-`os + arch + sorted(tools) + extract flag + strip-components + ghr version`,
-so adding a tool, toggling extraction, or bumping the action's tag
-invalidates the cache cleanly.
+the download entirely. The cache key covers OS/architecture and ABI, sorted
+sources, extraction settings, the complete verification policy, the minisign
+key, and the ghr version. Changing any input that affects downloaded or
+verified content therefore invalidates the cache.
 
 ## Inputs
 
@@ -41,7 +41,7 @@ invalidates the cache cleanly.
 | `skip-attestation`  | `false`                          | Skip just GitHub artifact attestation verification, which is looked up by digest rather than published as a release asset. |
 | `skip-authenticode` | `false`                          | Skip just the Authenticode (Windows PE) verification step. |
 | `keep-going`        | `false`                          | Continue past per-spec failures; exit non-zero with a summary if any spec failed. |
-| `ghr-version`       | _(derived from action ref)_      | Override the `ghr-bin` version installed. Default: derived from the action's git ref (e.g. `@v0.3.0` → `ghr-bin==0.3.0`). Pass `latest` to install the latest from PyPI. |
+| `ghr-version`       | _(derived from action ref)_      | Override the `ghr-bin` version installed. Default: derived from the action's git ref (e.g. `@v0.8.0` -> `ghr-bin==0.8.0`). Pass `latest` to install the latest from PyPI. |
 
 ## Outputs
 
@@ -54,8 +54,8 @@ invalidates the cache cleanly.
 
 1. `pipx install ghr-bin` (pre-installed on GitHub-hosted runners).
 2. Resolves `dest` to an absolute path (defaulting to `$RUNNER_TEMP/ghr-download`).
-3. Computes a stable cache key from the sorted tool list + `extract` /
-   `strip-components` settings + `ghr version` + OS/arch.
+3. Computes a stable cache key from sorted sources, extraction settings,
+   verification policy, minisign key, `ghr version`, and OS/architecture.
 4. Restores the cache via `actions/cache@v4` (pinned by SHA).
 5. On cache miss, runs `ghr download` with every spec (sharing a single
    HTTP client + auth context).
@@ -123,8 +123,8 @@ unattested artifact. Set `skip-attestation: 'true'` to opt out deliberately.
 
 ## Pinning
 
-The action shares git tags with the `ghr` CLI: `@v0.3.0` references the
+The action shares git tags with the `ghr` CLI: `@v0.8.0` references the
 action body **and** pins `ghr-bin` (via the `ghr-version` input default)
 to the matching release. To explicitly pin the installed binary to a
 different release, pass `ghr-version:`. For full reproducibility, pin to
-a commit SHA: `cataggar/ghr/actions/download@<sha> # v0.3.0`.
+a commit SHA: `cataggar/ghr/actions/download@<sha> # v0.8.0`.

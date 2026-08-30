@@ -1,10 +1,8 @@
-//! Collision-safe command publication planner (PR 4).
+//! Collision-safe command publication planner.
 //!
-//! This module is intentionally INACTIVE: nothing in the running `ghr` binary
-//! calls `plan` or `snapshotBinDir`. It exists so the activation PR can decide,
-//! BEFORE the first live mutation of the bin directory, exactly which files an
-//! invocation would create, refresh, and retire -- and refuse the whole
-//! invocation when any of those files is owned by another install ID or is not
+//! Before the first live mutation of the bin directory, it decides exactly
+//! which files an invocation would create, refresh, and retire, and refuses the
+//! whole invocation when any file is owned by another install ID or is not
 //! managed by ghr at all.
 //!
 //! ## Shape
@@ -18,8 +16,7 @@
 //!
 //! Dependency direction is acyclic: this module imports `install_state` (whose
 //! canonical-ID rules come from `install_request`) and deliberately does NOT
-//! import `install.zig`, because the activation PR will import this module from
-//! there.
+//! import `install.zig`; the install pipeline imports this planner.
 //!
 //! ## Command names
 //!

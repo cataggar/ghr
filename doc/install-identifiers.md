@@ -1,19 +1,11 @@
-# Install identifiers: design and implementation plan
+# Install identifiers: design and migration
 
 ## Status
 
-This document is a design contract and implementation plan. The syntax and v2
-storage described here are **not implemented in the current ghr release**.
-Current behavior remains documented in [Download](download.md),
-[Verification](verification.md), and the command help.
-
-Implementation is intentionally split into ordered pull requests. Until the
-activation pull request lands, continue to use existing forms such as:
-
-```sh
-ghr install owner/repo[@tag] [minisign-public-key]
-ghr uninstall owner/repo
-```
+This document is the design contract and migration reference for the stable-ID
+syntax and v2 install state introduced in ghr v0.8.0. The ordered rollout is
+complete. Older ghr releases continue to understand untouched legacy installs,
+but they cannot safely mutate v2 state.
 
 ## Goals
 
@@ -37,7 +29,7 @@ This separation permits:
 - replacing one ID without disturbing another;
 - explicit executable renaming;
 - safe ownership and collision checks before publication; and
-- a future upgrade command that can resolve the durable source intent again.
+- durable source intent that a future upgrade command can resolve again.
 
 ## Non-goals for this release
 
@@ -48,8 +40,6 @@ This separation permits:
   paths.
 - Legacy installs are not eagerly rewritten.
 - Downgrading to an old ghr after v2 state has been written is unsupported.
-- The exact path encoding and transaction journal representation are not fixed
-  here. Their required properties are fixed below.
 
 ## Motivating examples
 
@@ -95,13 +85,13 @@ source. It is not a second install request.
 - **Command**: a name published into ghr's bin directory.
 - **Alias**: an explicit mapping from a discovered command name to its
   published command name.
-- **Legacy state** or **v1**: the current unversioned `ghr.json` layout under
+- **Legacy state** or **v1**: the pre-v2 unversioned `ghr.json` layout under
   `<tools>/<owner>/<repo>/`, including nested wasm units.
-- **v2 state**: the versioned, ID-keyed state introduced by this plan.
+- **v2 state**: the versioned, ID-keyed state used by ID-capable ghr releases.
 
 ## Command grammar
 
-The planned positional grammar is:
+The positional grammar is:
 
 ```text
 install       = "ghr install" request *(request) [options]
@@ -117,7 +107,7 @@ Splitting at the first `=` keeps base64 values intact, because minisign keys
 and other base64 material carry trailing `=` padding that must survive
 verbatim. A pair with no `=`, or with an empty name, is an error.
 
-The first implementation will recognize these query names:
+The grammar recognizes these query names:
 
 | Name | Repeats? | Meaning |
 |------|----------|---------|
@@ -171,8 +161,8 @@ errors. This is URI query decoding, not HTML form decoding: `+` remains a
 literal plus and is never turned into a space. Preserving `+` is required for
 minisign keys, which commonly contain `+`.
 
-The parser should retain enough source spans to report which token and which
-query name failed, identifying the field by name and position only. It must not
+The parser retains enough source spans to report which token and which query
+name failed, identifying the field by name and position only. It does not
 echo whole query tokens or raw values in diagnostics or logs, because a value
 may be a minisign key or other credential-like material. Report the offending
 field by name (for example, "invalid value for `id`"), not by dumping the
@@ -190,7 +180,7 @@ them per-request query forms.
 
 ## Normalized request model
 
-Parsing should produce a model independent of download resolution:
+Parsing produces a model independent of download resolution:
 
 ```text
 InstallRequest
@@ -220,10 +210,9 @@ ResolvedInstall
   verification outcomes and evidence references
 ```
 
-Resolved URLs are provenance, not the durable source definition. Reinstalling
-an existing ID without changing its source should resolve the stored source
-intent again rather than treating an expiring redirect or API asset URL as the
-source.
+Resolved URLs are provenance, not the durable source definition. A future
+upgrade-by-ID operation can resolve the stored source intent again rather than
+treating an expiring redirect or API asset URL as the source.
 
 Resolved provenance must never persist secrets. Auth headers, bearer or
 installation tokens, API credentials, and sensitive or expiring signed query
@@ -238,13 +227,13 @@ URL. Digests remain safe to persist and are preferred for provenance.
 
 ## ID rules
 
-The ID is the only identity accepted by the planned install-state operations:
+The ID is the only identity accepted by install-state operations:
 
 - `ghr install` creates or replaces IDs.
 - `ghr list` reports IDs and their definitions.
 - `ghr uninstall <id>` removes exactly that ID.
 
-The initial canonical ID rules should be deliberately portable:
+Canonical IDs follow deliberately portable rules:
 
 - IDs are non-empty ASCII and are canonicalized to lowercase.
 - IDs consist of slash-separated segments.
@@ -255,9 +244,8 @@ The initial canonical ID rules should be deliberately portable:
   are rejected.
 - Canonical comparison is byte-for-byte after lowercasing. Thus `ZigB` and
   `zigb` are one ID, including on case-sensitive filesystems.
-- Reasonable total and segment length limits must be enforced before any
-  filesystem work. Exact limits are an implementation choice that should be
-  tested on all supported platforms.
+- IDs are limited to 240 bytes total and 100 bytes per segment. These limits
+  are enforced before any filesystem work.
 
 GitHub source specs may derive an ID as
 `lowercase(owner)/lowercase(repo)`. An explicit `id=` overrides that
@@ -270,15 +258,15 @@ definition.
 
 ## ID path encoding
 
-v2 units belong in a dedicated, versioned namespace under the tool store. The
-examples in this document use the conceptual path:
+v2 units live in a dedicated, versioned namespace under the tool store:
 
 ```text
-<tools>/<v2-namespace>/units/<encoded-canonical-id>/
+<tools>/_v2/units/u-<segment>/.../_unit/
 ```
 
-The final namespace spelling and encoding are implementation choices, but the
-encoding must:
+Each canonical ID segment is stored in its own `u-`-prefixed directory. The
+terminal `_unit` marker allows prefix-related IDs such as `a` and `a/b` to
+coexist. The encoding:
 
 - be reversible and injective for every accepted canonical ID;
 - never interpret an arbitrary ID directly as an absolute or relative path;
@@ -342,9 +330,8 @@ Today, archive and bare-binary installs live at
 `<tools>/<owner>/<repo>/<stem>/`. Their unversioned `ghr.json` records `tag`,
 `asset`, `verified`, optional `minisign`, and `bins`/`apps`.
 
-v2 metadata must be schema-versioned and sufficient to reconstruct ownership
-and a future upgrade request. The following is a schema sketch, not a final
-field-by-field wire format:
+v2 metadata is schema-versioned and sufficient to reconstruct ownership and a
+future upgrade request. The following illustrates its wire shape:
 
 ```json
 {
@@ -392,7 +379,7 @@ field-by-field wire format:
 }
 ```
 
-Requirements for the final schema:
+Schema requirements:
 
 - `id`, durable `source`, normalized `config`, resolved provenance, explicit
   commands and ownership, and existing verification data are required
@@ -424,9 +411,10 @@ Installing an existing ID is replacement, not a separate upgrade operation.
 Replacement must be transactional across both the unit directory and command
 publication.
 
-The current installer stages and swaps the tool directory, then publishes bin
-entries. Publication failures can currently be warnings after the directory
-has changed. That is not sufficient for ID ownership.
+The v2 installer stages the unit and complete command plan before publication.
+A per-ID transaction journal coordinates the staged, backup, live, and command
+states so publication failure restores the previous definition instead of
+leaving a partially replaced ID.
 
 The v2 implementation must satisfy these invariants:
 
@@ -452,40 +440,35 @@ The v2 implementation must satisfy these invariants:
   first live mutation. Runtime failure policy may still be per request, as
   selected by fail-fast or `--keep-going`.
 
-The implementation may use rename-based staging, a transaction journal, a
-generation directory, or another mechanism. The exact journal format is left
-to implementation and failure-injection tests; relying only on the current
-directory transaction is explicitly insufficient.
+The implementation uses rename-based staging and a per-ID transaction journal,
+with failure-injection tests covering recovery at each publication boundary.
 
 ## List and uninstall semantics
 
-`ghr list` should use the inventory reader rather than infer identity only from
-directory depth. It should:
+`ghr list` uses the inventory reader rather than inferring identity only from
+directory depth. It:
 
-- report the canonical ID for every valid unit;
-- distinguish v1 and v2 entries during migration;
-- expose enough source and configuration to reproduce an install definition
+- reports the canonical ID for every valid unit;
+- distinguishes v1 and v2 entries during migration;
+- exposes enough source and configuration to reproduce an install definition
   without substituting resolved URLs for source intent;
-- report conflict, corrupt, and unsupported entries clearly; and
-- avoid presenting malformed metadata as an unowned but healthy install.
+- reports conflict, corrupt, and unsupported entries clearly; and
+- avoids presenting malformed metadata as an unowned but healthy install.
 
-The exact human and machine-readable list formats remain an implementation
-choice, but they must not be ambiguous about what a line is. Today `ghr list`
-prints pasteable `owner/repo[@tag] [key]` install arguments; under v2 a
-definition line and a bare ID are not interchangeable, because an ID can carry
-aliases, a selector, and configuration that a plain slug cannot. The design
-therefore separates two concerns that must not be conflated:
+The implemented human and machine-readable list formats are deliberately
+unambiguous. A definition and a bare ID are not interchangeable because an ID
+can carry aliases, a selector, and configuration that a plain slug cannot.
+The separate forms are:
 
 - a plain **list of IDs** (one canonical ID per line) for scripting that only
   needs identities; and
 - a **reproducible install definition** per ID (source intent plus effective
   configuration) suitable for re-running an install.
 
-The default human output and any machine-readable form must each state which of
-these they are, so a caller never mistakes a reproducible definition for a bare
-ID or vice versa. A stable machine-readable form (for example, one keyed object
-per ID) should accompany any change that makes the human form unsuitable for
-action caching or reconciliation.
+The default output labels itself as a report, `--ids` emits one healthy ID per
+line, and `--json` emits deterministic versioned records with a full definition
+for each v2 unit. Legacy definitions are explicitly null because v1 state does
+not retain enough source intent to reproduce them.
 
 `ghr uninstall <id>` removes exactly the canonical ID and its owned commands,
 apps, metadata, and unit directory. It must inventory and validate ownership
@@ -521,8 +504,8 @@ For legacy nested wasm units, the synthesized ID is
 
 ## WSL manifests
 
-Current WSL manifests are keyed by owner/repo and persist command targets as
-paths. v2 linking needs versioned, ID-keyed manifests derived from the same
+Legacy WSL manifests are keyed by owner/repo and persist command targets as
+paths. v2 linking uses versioned, ID-keyed manifests derived from the same
 install inventory used by install, list, and uninstall.
 
 Requirements:
@@ -590,18 +573,20 @@ add that support without emitting broken links today.
 
 ## GitHub Actions and caches
 
-The install composite action currently parses `spec [minisign-key]` lines and
-hashes their sorted text. It must not accept query configuration until the
-installed CLI is ID-capable.
+The install composite action accepts one complete
+`source [query-token] [minisign-key]` request per line. It gates on an
+ID-capable CLI and asks that CLI to produce the cache fingerprint, so shell
+token handling cannot drift from the install parser.
 
-After activation, the action should:
+The implemented action:
 
-- parse complete install definitions without losing quoted query tokens;
-- normalize source plus effective ID and configuration before hashing;
-- include the state layout/schema generation and ghr version in the key;
-- reject duplicate IDs and malformed definitions consistently with the CLI;
-- preserve `+` in minisign material; and
-- cache the tool store, command store, and any required transaction/state
+- parses complete install definitions without losing quoted query tokens;
+- normalizes source plus effective ID and configuration before hashing;
+- includes the state layout/schema generation, target OS/architecture/ABI, and
+  ghr version in the key;
+- rejects duplicate IDs and malformed definitions consistently with the CLI;
+- preserves `+` in minisign material; and
+- caches the tool store, command store, and any required transaction/state
   roots as one compatible generation.
 
 The cache definition must be complete: changing an ID, alias, source selector,
@@ -609,9 +594,9 @@ verification policy, or minisign key must invalidate the cache. Sorting is
 permitted only after requests have been parsed into complete definitions; raw
 token sorting could detach a query token or key from its source.
 
-Action rollout is gated on installing an ID-capable CLI. An action revision
-must not emit the new syntax while its default `ghr-bin` version can only parse
-the old positional grammar.
+Action rollout is gated by checking for the CLI's normalized cache-key mode.
+The action fails clearly rather than emitting new syntax to a `ghr-bin` version
+that only understands the old positional grammar.
 
 ## Migration plan
 
@@ -689,9 +674,9 @@ has mutated the store, using an older ghr to install, uninstall, link, or
 unlink is unsupported. Recovery should use an ID-capable ghr, not manual
 movement into owner/repo paths.
 
-## Ordered implementation plan
+## Rollout sequence
 
-The pull requests must merge in this strict order:
+The implementation was split and merged in this strict order:
 
 1. **Design contract only**: add `doc/install-identifiers.md` and index it from
    `doc/README.md`.
@@ -707,15 +692,13 @@ The pull requests must merge in this strict order:
 7. **Update action and public surfaces**: composite action, help, CI smoke
    tests, and user documentation; gate action rollout on an ID-capable CLI.
 
-For future code pull requests, enable auto-merge only on the next PR in this
-sequence. After it merges and `main` CI is green, rebase every remaining branch
-onto `origin/main`, rerun `zig build test`, force-update with lease, and then
-enable auto-merge on exactly one successor.
+Each stage was enabled for auto-merge only after its predecessor merged and
+post-merge `main` CI passed.
 
 ## Validation matrix
 
-Each implementation phase should add focused tests, with end-to-end coverage
-before activation.
+The rollout added focused tests across this matrix, with lifecycle smoke
+coverage on every supported runner platform.
 
 | Area | Required cases |
 |------|----------------|
@@ -741,24 +724,26 @@ before activation.
 | Actions/cache | Complete normalized definitions; reordered requests; changed ID/alias/policy/key invalidates; layout generation invalidates; old CLI gate. |
 | Platforms | Linux symlinks, Windows shims and case rules, macOS app bundles, path limits, reserved names, and recovery on each filesystem model. |
 
-The activation PR should run the repository test suite with:
+The repository test suite runs with:
 
 ```sh
 zig build test
 ```
 
-and add CI smoke tests for install, replacement, list, uninstall, multi-ID
-coexistence, collision refusal, wasm independence, and cache restoration.
+It covers install, replacement, list, uninstall, multi-ID coexistence,
+collision refusal, wasm independence, and cache restoration. Platform CI
+smoke jobs additionally exercise the full native install lifecycle.
 
-## Implementation choices intentionally left open
+## Implemented storage choices
 
-The following choices should be settled by the relevant implementation PR and
-failure-injection tests, without weakening the contract above:
+The rollout settled the previously open implementation choices as follows:
 
-- the exact dedicated v2 directory name and reversible path encoding;
-- exact portable ID length limits;
-- the on-disk transaction journal or generation-switch format; and
-- the final human and machine-readable `ghr list` presentation.
+- v2 units use `_v2/units/u-<segment>/.../_unit`;
+- canonical IDs are limited to 240 bytes with 100-byte segments;
+- per-ID journals coordinate staged, backup, live, and command-publication
+  recovery; and
+- `ghr list`, `ghr list --ids`, and `ghr list --json` provide separate human,
+  identity-only, and machine-readable forms.
 
-These are implementation choices, not permission to relax ID safety,
-ownership, schema-versioning, or rollback requirements.
+These choices preserve the ID safety, ownership, schema-versioning, and
+rollback requirements above.
