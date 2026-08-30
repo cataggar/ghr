@@ -476,7 +476,7 @@ pub fn readJournal(allocator: Allocator, io: Io, journal_path: []const u8) !?Own
         };
         defer file.close(io);
         var buf: [4096]u8 = undefined;
-        var fr = file.readerStreaming(io, &buf);
+        var fr = file.reader(io, &buf);
         break :blk fr.interface.allocRemaining(allocator, Io.Limit.limited(max_journal_bytes)) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.StreamTooLong => return error.JournalTooLarge,
