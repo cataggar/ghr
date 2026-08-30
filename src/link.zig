@@ -1,10 +1,9 @@
 //! WSL-side `ghr link` / `ghr unlink`.
 //!
-//! These commands let a tool that was installed on the Windows side run
-//! from inside WSL by creating Linux symlinks in `~/.local/bin` that point
-//! at the original Windows-side `.exe` (e.g. `/mnt/c/Users/<u>/AppData/
-//! Roaming/ghr/data/tools/<owner>/<repo>/<bin>`). WSL interop runs the
-//! `.exe` transparently when the symlink is invoked.
+//! These commands let an install ID on the Windows side run from inside WSL by
+//! creating Linux symlinks in ghr's bin directory that point at the original
+//! Windows-side executable. Exact unit paths and command ownership come from
+//! the shared install inventory, including v2 encoded paths and aliases.
 //!
 //! The link target is the real executable, NOT the shim — the shim lives
 //! in the Windows bin dir, not under `tools/`, and going through it adds
@@ -15,7 +14,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Dirs = @import("dirs.zig").Dirs;
 const install = @import("install.zig");
-const release_mod = @import("release.zig");
+const install_request = @import("install_request.zig");
+const install_state = @import("install_state.zig");
+const install_state_write = @import("install_state_write.zig");
 
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -73,10 +74,10 @@ pub fn linkNameForBin(rel_normalized: []const u8) []const u8 {
 // ---------------------------------------------------------------------------
 // Link manifest.
 //
-// Records, per `<owner>/<repo>`, the set of `~/.local/bin/<name>` symlinks
-// ghr created and where each one points. Used by `ghr unlink` so removal
-// is safe even if the Windows-side install has since been removed or
-// `GHR_WIN_TOOLS_DIR` has changed.
+// `Manifest` is the common read shape for legacy owner/repo manifests, v2
+// ID-keyed manifests, and the separate bare-PATH kind. ID writers require
+// schema/layout/id/unit_path; legacy fields remain optional only so old state
+// can be validated and migrated lazily.
 // ---------------------------------------------------------------------------
 
 pub const LinkEntry = struct {
@@ -93,12 +94,23 @@ pub const LinkEntry = struct {
 };
 
 pub const Manifest = struct {
+    schema: ?i64 = null,
+    layout_generation: ?i64 = null,
     kind: []const u8 = "wsl",
+    id: ?[]const u8 = null,
+    unit_path: ?[]const u8 = null,
     /// Windows-side tool dir at link time, e.g.
     /// `/mnt/c/Users/x/AppData/Roaming/ghr/data/tools/azuread/foo`.
     source: []const u8,
     links: []LinkEntry,
 };
+
+const id_manifest_schema: i64 = 2;
+const id_manifest_layout: i64 = 2;
+const id_manifest_kind = "wsl-id";
+const id_manifest_root = "by-id";
+const id_manifest_file = "_manifest.json";
+const max_manifest_bytes: usize = 16 * 1024 * 1024;
 
 /// Compose the manifest directory path: `<XDG_DATA_HOME-or-equiv>/ghr/links/<owner>`.
 /// Owned by caller.
@@ -132,6 +144,44 @@ pub fn manifestPath(
     return std.fs.path.join(allocator, &.{ dir, fname });
 }
 
+/// Directory containing the manifest for a canonical install ID. Each ID
+/// segment receives the same `u-` prefix used by install-state encoding, and
+/// the terminal manifest filename permits prefix IDs such as `a` and `a/b`.
+pub fn idManifestDir(
+    allocator: std.mem.Allocator,
+    environ: *const EnvironMap,
+    id: []const u8,
+) ![]u8 {
+    if (!try install_state.isCanonicalId(allocator, id)) return error.InvalidId;
+
+    const root = try linksRoot(allocator, environ);
+    defer allocator.free(root);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(root);
+    try out.writer.print("{c}{s}", .{ std.fs.path.sep, id_manifest_root });
+    var segments = std.mem.splitScalar(u8, id, '/');
+    while (segments.next()) |segment| {
+        try out.writer.print("{c}{s}{s}", .{
+            std.fs.path.sep,
+            install_state.segment_prefix,
+            segment,
+        });
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn idManifestPath(
+    allocator: std.mem.Allocator,
+    environ: *const EnvironMap,
+    id: []const u8,
+) ![]u8 {
+    const dir = try idManifestDir(allocator, environ, id);
+    defer allocator.free(dir);
+    return std.fs.path.join(allocator, &.{ dir, id_manifest_file });
+}
+
 /// Read a manifest from disk. Returns `null` when missing (a first
 /// `ghr link` for the repo). On parse failure returns `error.InvalidManifest`.
 pub fn readManifest(
@@ -139,22 +189,173 @@ pub fn readManifest(
     io: Io,
     abs_path: []const u8,
 ) !?std.json.Parsed(Manifest) {
-    var f = Dir.openFileAbsolute(io, abs_path, .{}) catch |err| switch (err) {
+    var f = Dir.openFileAbsolute(io, abs_path, .{
+        .follow_symlinks = false,
+        .allow_directory = false,
+    }) catch |err| switch (err) {
         error.FileNotFound => return null,
+        error.SymLinkLoop, error.IsDir, error.NotDir => return error.InvalidManifest,
         else => return err,
     };
     defer f.close(io);
+    const stat = try f.stat(io);
+    if (stat.kind != .file) return error.InvalidManifest;
+    if (comptime builtin.os.tag == .windows) f.flags.nonblocking = true;
     var read_buf: [4096]u8 = undefined;
     var reader = f.reader(io, &read_buf);
-    var body_w = std.Io.Writer.Allocating.init(allocator);
-    defer body_w.deinit();
-    _ = reader.interface.streamRemaining(&body_w.writer) catch |err| return err;
-    const body = try body_w.toOwnedSlice();
+    const body = reader.interface.allocRemaining(allocator, Io.Limit.limited(max_manifest_bytes)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.StreamTooLong => return error.InvalidManifest,
+        error.ReadFailed => return reader.err orelse error.ReadFailed,
+    };
     defer allocator.free(body);
     return std.json.parseFromSlice(Manifest, allocator, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch return error.InvalidManifest;
+}
+
+fn isSafeManifestTarget(target: []const u8) bool {
+    if (target.len == 0 or target[0] != '/') return false;
+    for (target) |c| if (c < 0x20 or c == 0x7f) return false;
+    return true;
+}
+
+fn validLinkEntries(links: []const LinkEntry) bool {
+    for (links, 0..) |entry, i| {
+        if (!install_state.isSafeV2CommandName(entry.name)) return false;
+        if (!isSafeManifestTarget(entry.target)) return false;
+        if (!std.mem.eql(u8, entry.target_kind, "symlink")) return false;
+        for (links[0..i]) |prior| {
+            if (std.ascii.eqlIgnoreCase(prior.name, entry.name)) return false;
+        }
+    }
+    return true;
+}
+
+/// Read and strictly validate one v2 manifest for `expected_id`. The ID in the
+/// payload must match the ID encoded by the caller-selected path.
+pub fn readIdManifest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    abs_path: []const u8,
+    expected_id: []const u8,
+) !?std.json.Parsed(Manifest) {
+    var parsed = (try readManifest(allocator, io, abs_path)) orelse return null;
+    errdefer parsed.deinit();
+    const manifest = parsed.value;
+    if (manifest.schema == null or manifest.schema.? != id_manifest_schema or
+        manifest.layout_generation == null or manifest.layout_generation.? != id_manifest_layout or
+        !std.mem.eql(u8, manifest.kind, id_manifest_kind) or
+        manifest.id == null or !std.mem.eql(u8, manifest.id.?, expected_id) or
+        manifest.unit_path == null or !install_state.isSafePortableRelPath(manifest.unit_path.?) or
+        !isSafeManifestTarget(manifest.source) or
+        !validLinkEntries(manifest.links))
+    {
+        return error.InvalidManifest;
+    }
+    return parsed;
+}
+
+fn stringifyIdManifest(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    unit_path: []const u8,
+    source: []const u8,
+    links: []const LinkEntry,
+) ![]u8 {
+    if (!try install_state.isCanonicalId(allocator, id) or
+        !install_state.isSafePortableRelPath(unit_path) or
+        !isSafeManifestTarget(source) or
+        !validLinkEntries(links))
+    {
+        return error.InvalidManifest;
+    }
+
+    var body = std.Io.Writer.Allocating.init(allocator);
+    errdefer body.deinit();
+    const w = &body.writer;
+    try w.print(
+        "{{\"schema\":{d},\"layout_generation\":{d},\"kind\":\"{s}\",\"id\":\"",
+        .{ id_manifest_schema, id_manifest_layout, id_manifest_kind },
+    );
+    try writeJsonEscaped(w, id);
+    try w.writeAll("\",\"unit_path\":\"");
+    try writeJsonEscaped(w, unit_path);
+    try w.writeAll("\",\"source\":\"");
+    try writeJsonEscaped(w, source);
+    try w.writeAll("\",\"links\":[");
+    for (links, 0..) |entry, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":\"");
+        try writeJsonEscaped(w, entry.name);
+        try w.writeAll("\",\"target\":\"");
+        try writeJsonEscaped(w, entry.target);
+        try w.writeAll("\",\"target_kind\":\"");
+        try writeJsonEscaped(w, entry.target_kind);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("]}\n");
+    if (body.written().len > max_manifest_bytes) return error.ManifestTooLarge;
+    return body.toOwnedSlice();
+}
+
+fn persistIdManifestBody(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    id: []const u8,
+    body: []const u8,
+) !void {
+    if (body.len > max_manifest_bytes) return error.ManifestTooLarge;
+    const manifest_dir = try idManifestDir(allocator, environ, id);
+    defer allocator.free(manifest_dir);
+    try install.ensureDirAbsoluteRecursive(io, manifest_dir);
+
+    const final_path = try idManifestPath(allocator, environ, id);
+    defer allocator.free(final_path);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{final_path});
+    defer allocator.free(tmp_path);
+    Dir.deleteFileAbsolute(io, tmp_path) catch {};
+
+    {
+        var file = try Dir.createFileAbsolute(io, tmp_path, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, body);
+    }
+
+    Dir.renameAbsolute(tmp_path, final_path, io) catch |err| {
+        Dir.deleteFileAbsolute(io, tmp_path) catch {};
+        return err;
+    };
+}
+
+pub fn writeIdManifest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    id: []const u8,
+    unit_path: []const u8,
+    source: []const u8,
+    links: []const LinkEntry,
+) !void {
+    const body = try stringifyIdManifest(allocator, id, unit_path, source, links);
+    defer allocator.free(body);
+    try persistIdManifestBody(allocator, io, environ, id, body);
+}
+
+pub fn deleteIdManifest(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    id: []const u8,
+) !void {
+    const final_path = try idManifestPath(allocator, environ, id);
+    defer allocator.free(final_path);
+    Dir.deleteFileAbsolute(io, final_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 }
 
 /// Atomically write a manifest to `<owner>/<repo>.json` under the links
@@ -167,6 +368,25 @@ pub fn writeManifest(
     repo_lower: []const u8,
     manifest: Manifest,
 ) !void {
+    var body_writer = std.Io.Writer.Allocating.init(allocator);
+    defer body_writer.deinit();
+    const body_w = &body_writer.writer;
+    try body_w.print("{{\"kind\":\"", .{});
+    try writeJsonEscaped(body_w, manifest.kind);
+    try body_w.print("\",\"source\":\"", .{});
+    try writeJsonEscaped(body_w, manifest.source);
+    try body_w.print("\",\"links\":[", .{});
+    for (manifest.links, 0..) |entry, i| {
+        if (i > 0) try body_w.print(",", .{});
+        try body_w.print("{{\"name\":\"", .{});
+        try writeJsonEscaped(body_w, entry.name);
+        try body_w.print("\",\"target\":\"", .{});
+        try writeJsonEscaped(body_w, entry.target);
+        try body_w.print("\"}}", .{});
+    }
+    try body_w.print("]}}\n", .{});
+    if (body_writer.written().len > max_manifest_bytes) return error.ManifestTooLarge;
+
     const owner_dir = try manifestDir(allocator, environ, owner_lower);
     defer allocator.free(owner_dir);
     install.ensureDirAbsoluteRecursive(io, owner_dir) catch {};
@@ -182,24 +402,7 @@ pub fn writeManifest(
     {
         var f = try Dir.createFileAbsolute(io, tmp_path, .{});
         defer f.close(io);
-        var wbuf: [4096]u8 = undefined;
-        var fw = f.writer(io, &wbuf);
-        const w = &fw.interface;
-        try w.print("{{\"kind\":\"", .{});
-        try writeJsonEscaped(w, manifest.kind);
-        try w.print("\",\"source\":\"", .{});
-        try writeJsonEscaped(w, manifest.source);
-        try w.print("\",\"links\":[", .{});
-        for (manifest.links, 0..) |entry, i| {
-            if (i > 0) try w.print(",", .{});
-            try w.print("{{\"name\":\"", .{});
-            try writeJsonEscaped(w, entry.name);
-            try w.print("\",\"target\":\"", .{});
-            try writeJsonEscaped(w, entry.target);
-            try w.print("\"}}", .{});
-        }
-        try w.print("]}}\n", .{});
-        try fw.end();
+        try f.writeStreamingAll(io, body_writer.written());
     }
 
     Dir.renameAbsolute(tmp_path, final_path, io) catch |err| {
@@ -289,15 +492,22 @@ pub fn requireWsl(environ: *const EnvironMap, err_w: *Writer, cmd_name: []const 
 ///
 /// Returned path is owned by `allocator`. Caller is responsible for
 /// verifying it actually exists; this function does not stat.
-pub fn windowsToolsDirFromWsl(
+const WindowsToolsDiscovery = enum {
+    allow_username_fallback,
+    strict,
+};
+
+fn discoverWindowsToolsDirFromWsl(
     allocator: std.mem.Allocator,
     environ: *const EnvironMap,
     io: Io,
     err_w: *Writer,
+    mode: WindowsToolsDiscovery,
 ) ![]u8 {
     if (environ.get("GHR_WIN_TOOLS_DIR")) |v| {
         if (looksLikeWindowsPath(v)) {
-            if (wslpathToUnix(allocator, io, v)) |p| return p else |_| {
+            if (wslpathToUnix(allocator, io, v)) |p| return p else |err| {
+                if (mode == .strict) return err;
                 try err_w.print(
                     "warning: GHR_WIN_TOOLS_DIR='{s}' looked like a Windows path but wslpath conversion failed; using verbatim\n",
                     .{v},
@@ -307,23 +517,38 @@ pub fn windowsToolsDirFromWsl(
         return allocator.dupe(u8, v);
     }
 
-    if (queryAppDataViaCmd(allocator, io)) |appdata_unix| {
-        defer allocator.free(appdata_unix);
-        return std.fs.path.join(allocator, &.{ appdata_unix, "ghr", "data", "tools" });
-    } else |_| {}
-
-    const user = environ.get("USER") orelse environ.get("LOGNAME") orelse {
-        try err_w.print("error: cannot resolve Windows tools dir: USER is not set and cmd.exe lookup failed\n", .{});
-        try err_w.print("       hint: set GHR_WIN_TOOLS_DIR to the WSL path of the Windows tools dir\n", .{});
-        try err_w.flush();
-        return error.NoWindowsToolsDir;
+    const appdata_unix = queryAppDataViaCmd(allocator, io) catch |err| {
+        if (mode == .strict) return err;
+        const user = environ.get("USER") orelse environ.get("LOGNAME") orelse {
+            try err_w.print("error: cannot resolve Windows tools dir: USER is not set and cmd.exe lookup failed\n", .{});
+            try err_w.print("       hint: set GHR_WIN_TOOLS_DIR to the WSL path of the Windows tools dir\n", .{});
+            try err_w.flush();
+            return error.NoWindowsToolsDir;
+        };
+        try err_w.print(
+            "warning: cmd.exe lookup of %APPDATA% failed; assuming /mnt/c/Users/{s}/AppData/Roaming\n",
+            .{user},
+        );
+        try err_w.print("         set GHR_WIN_TOOLS_DIR to override\n", .{});
+        return std.fmt.allocPrint(allocator, "/mnt/c/Users/{s}/AppData/Roaming/ghr/data/tools", .{user});
     };
-    try err_w.print(
-        "warning: cmd.exe lookup of %APPDATA% failed; assuming /mnt/c/Users/{s}/AppData/Roaming\n",
-        .{user},
+    defer allocator.free(appdata_unix);
+    return std.fs.path.join(allocator, &.{ appdata_unix, "ghr", "data", "tools" });
+}
+
+pub fn windowsToolsDirFromWsl(
+    allocator: std.mem.Allocator,
+    environ: *const EnvironMap,
+    io: Io,
+    err_w: *Writer,
+) ![]u8 {
+    return discoverWindowsToolsDirFromWsl(
+        allocator,
+        environ,
+        io,
+        err_w,
+        .allow_username_fallback,
     );
-    try err_w.print("         set GHR_WIN_TOOLS_DIR to override\n", .{});
-    return std.fmt.allocPrint(allocator, "/mnt/c/Users/{s}/AppData/Roaming/ghr/data/tools", .{user});
 }
 
 fn looksLikeWindowsPath(s: []const u8) bool {
@@ -411,6 +636,7 @@ pub const DesiredError = error{
     DuplicateLinkName,
     NoBinsInMetadata,
     NoValidBinsAfterNormalize,
+    UnsupportedCommandKind,
     OutOfMemory,
 };
 
@@ -511,107 +737,371 @@ pub fn computeDesiredLinks(
     };
 }
 
+/// Compute WSL links from an inventory record's explicit command ownership.
+/// Unlike the legacy `bins` form, command names are already final persisted
+/// names and must never be re-derived from their target paths.
+pub fn computeDesiredCommandLinks(
+    parent_allocator: std.mem.Allocator,
+    commands: []const install_state.OwnedCommand,
+    tool_dir_abs: []const u8,
+    bin_filters: []const []const u8,
+) DesiredError!ComputedLinks {
+    var arena = std.heap.ArenaAllocator.init(parent_allocator);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+
+    if (commands.len == 0) return DesiredError.NoBinsInMetadata;
+
+    var all_links: std.ArrayListUnmanaged(DesiredLink) = .empty;
+    var available: std.ArrayListUnmanaged([]const u8) = .empty;
+
+    for (commands) |command| {
+        if ((command.kind != null and std.mem.eql(u8, command.kind.?, "wasm")) or
+            install_state.isWasmTarget(command.relative_target))
+        {
+            return DesiredError.UnsupportedCommandKind;
+        }
+        const normalized_target = try aa.dupe(u8, command.relative_target);
+        normalizeBinPathInPlace(normalized_target);
+        if (!isSafeRelativeBinPath(normalized_target)) continue;
+        const name = try aa.dupe(u8, command.name);
+        for (all_links.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.name, name))
+                return DesiredError.DuplicateLinkName;
+        }
+        const target = try std.fmt.allocPrint(aa, "{s}/{s}", .{ tool_dir_abs, normalized_target });
+        try all_links.append(aa, .{ .name = name, .target = target });
+        try available.append(aa, name);
+    }
+
+    if (all_links.items.len == 0) return DesiredError.NoValidBinsAfterNormalize;
+
+    std.mem.sort([]const u8, available.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    var matched: std.ArrayListUnmanaged(DesiredLink) = .empty;
+    var unmatched_filters: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (bin_filters.len == 0) {
+        try matched.appendSlice(aa, all_links.items);
+    } else {
+        for (bin_filters) |filter| {
+            const filter_owned = try aa.dupe(u8, filter);
+            var any = false;
+            for (all_links.items) |link_entry| {
+                if (!std.ascii.eqlIgnoreCase(link_entry.name, filter)) continue;
+                any = true;
+                var seen = false;
+                for (matched.items) |existing| {
+                    if (std.mem.eql(u8, existing.name, link_entry.name)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try matched.append(aa, link_entry);
+            }
+            if (!any) try unmatched_filters.append(aa, filter_owned);
+        }
+    }
+
+    return .{
+        .arena = arena,
+        .links = try matched.toOwnedSlice(aa),
+        .unmatched_filters = try unmatched_filters.toOwnedSlice(aa),
+        .available_names = try available.toOwnedSlice(aa),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // `ghr link` and `ghr unlink` commands.
 // ---------------------------------------------------------------------------
 
 pub const LinkCmdError = error{LinkStepFailed};
 
-/// Emit a friendly "not installed" error for `ghr link`. The original
-/// wording printed only the tools dir path, which read like a wrong-dir
-/// bug whenever the real issue was a typo in the owner or repo. We now
-/// distinguish three cases:
-///
-///   1. tools dir doesn't exist on disk
-///   2. tools dir exists but is empty
-///   3. tools dir has other tools installed — list them so a typo is
-///      immediately obvious
-///
-/// On any I/O error while listing, we degrade to a generic message
-/// rather than failing the command with a confusing nested error.
-fn writeNotInstalledError(
+fn idManifestEntryExists(
     allocator: std.mem.Allocator,
     io: Io,
+    environ: *const EnvironMap,
+    id: []const u8,
+) !bool {
+    const path = try idManifestPath(allocator, environ, id);
+    defer allocator.free(path);
+    var file = Dir.openFileAbsolute(io, path, .{
+        .follow_symlinks = false,
+        .allow_directory = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        error.NotDir, error.IsDir, error.SymLinkLoop => return true,
+        else => return err,
+    };
+    file.close(io);
+    return true;
+}
+
+/// Resolve the one-segment syntax shared by install IDs and Windows PATH
+/// executable names. Existing ID state wins; otherwise the historical bare
+/// executable shorthand remains available. `--path` bypasses this lookup.
+fn isKnownOneSegmentId(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    spec: []const u8,
+    err_w: *Writer,
+) !bool {
+    const id = install_request.canonicalizeId(allocator, spec) catch return false;
+    defer allocator.free(id);
+    if (std.mem.indexOfScalar(u8, id, '/') != null) return true;
+    if (try idManifestEntryExists(allocator, io, environ, id)) return true;
+
+    const win_tools = discoverWindowsToolsDirFromWsl(
+        allocator,
+        environ,
+        io,
+        err_w,
+        .strict,
+    ) catch |err| {
+        try err_w.print(
+            "error: cannot disambiguate '{s}' as an install ID because Windows tools discovery failed: {t}\n",
+            .{ spec, err },
+        );
+        try err_w.print("       use --path only when Windows PATH mode is intended\n", .{});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+    defer allocator.free(win_tools);
+    var inventory = install_state.scan(allocator, io, win_tools, .{ .platform = .windows }) catch |err| {
+        try err_w.print(
+            "error: cannot disambiguate '{s}' as an install ID because Windows inventory failed: {t}\n",
+            .{ spec, err },
+        );
+        try err_w.print("       use --path only when Windows PATH mode is intended\n", .{});
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    };
+    defer inventory.deinit(allocator);
+    return inventoryRecordById(&inventory, id) != null;
+}
+
+pub fn cmdLinkAuto(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    spec: []const u8,
+    bin_filters: []const []const u8,
+    force_path: bool,
+    force_id: bool,
+    w: *Writer,
+    err_w: *Writer,
+) !void {
+    requireWsl(environ, err_w, "link") catch return LinkCmdError.LinkStepFailed;
+    const id_mode = force_id or (!force_path and
+        (std.mem.indexOfScalar(u8, spec, '/') != null or
+            try isKnownOneSegmentId(allocator, io, environ, spec, err_w)));
+    if (id_mode)
+        return cmdLink(allocator, io, environ, spec, bin_filters, w, err_w);
+    return cmdLinkBareExe(allocator, io, environ, spec, bin_filters, w, err_w);
+}
+
+pub fn cmdUnlinkAuto(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    spec: []const u8,
+    bin_filters: []const []const u8,
+    force_path: bool,
+    force_id: bool,
+    w: *Writer,
+    err_w: *Writer,
+) !void {
+    requireWsl(environ, err_w, "unlink") catch return LinkCmdError.LinkStepFailed;
+    const id_mode = force_id or (!force_path and
+        (std.mem.indexOfScalar(u8, spec, '/') != null or
+            try isKnownOneSegmentId(allocator, io, environ, spec, err_w)));
+    if (id_mode)
+        return cmdUnlink(allocator, io, environ, spec, bin_filters, w, err_w);
+    return cmdUnlinkBareExe(allocator, io, environ, spec, bin_filters, w, err_w);
+}
+
+fn inventoryRecordById(
+    inventory: *const install_state.Inventory,
+    id: []const u8,
+) ?*const install_state.InventoryRecord {
+    var match: ?*const install_state.InventoryRecord = null;
+    for (inventory.records) |*record| {
+        const record_id = record.id orelse continue;
+        if (!std.mem.eql(u8, record_id, id)) continue;
+        if (match != null) return record;
+        match = record;
+    }
+    return match;
+}
+
+fn writeIdNotInstalledError(
     err_w: *Writer,
     win_tools: []const u8,
-    owner: []const u8,
-    repo: []const u8,
+    id: []const u8,
+    inventory: *const install_state.Inventory,
 ) !void {
-    try err_w.print("error: {s}/{s} is not installed on the Windows side\n", .{ owner, repo });
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
-    if (listInstalledSlugs(aa, io, win_tools)) |result| {
-        if (result.present) {
-            if (result.slugs.len == 0) {
-                try err_w.print("       Windows tools dir exists but is empty: {s}\n", .{win_tools});
-            } else {
-                try err_w.print("       installed tools under {s}:\n", .{win_tools});
-                for (result.slugs) |slug| try err_w.print("         {s}\n", .{slug});
-            }
-        } else {
-            try err_w.print("       Windows tools dir does not exist: {s}\n", .{win_tools});
+    try err_w.print("error: install id '{s}' is not installed on the Windows side\n", .{id});
+    var any = false;
+    for (inventory.records) |record| {
+        if (record.id == null) continue;
+        if (!any) {
+            try err_w.print("       installed ids under {s}:\n", .{win_tools});
+            any = true;
         }
-    } else |_| {
-        try err_w.print("       looked under {s}\n", .{win_tools});
+        try err_w.print("         {s}", .{record.id.?});
+        if (record.status != .ok)
+            try err_w.print(" ({s}: {s})", .{ @tagName(record.status), @tagName(record.reason) });
+        try err_w.writeByte('\n');
     }
-
-    try err_w.print("       run `ghr install {s}/{s}` from Windows to add it\n", .{ owner, repo });
+    if (!any) try err_w.print("       no install records found under {s}\n", .{win_tools});
     try err_w.flush();
 }
 
-const InstalledListing = struct {
-    /// True when `tools_dir` exists on disk (whether or not any tools
-    /// are installed inside it).
-    present: bool,
-    /// `<owner>/<repo>` slugs of installed tools, sorted alphabetically.
-    /// Transaction directories are filtered out so they don't pollute
-    /// user-facing output.
-    slugs: []const []const u8,
+const LegacyManifestCandidate = struct {
+    path: []u8,
+    parsed: std.json.Parsed(Manifest),
+
+    fn deinit(self: *LegacyManifestCandidate, allocator: std.mem.Allocator) void {
+        self.parsed.deinit();
+        allocator.free(self.path);
+    }
 };
 
-/// Enumerate `<tools_dir>/<owner>/<repo>` entries, returning the listing
-/// in `arena`-owned memory. The arena owns every returned slice.
-fn listInstalledSlugs(
-    arena: std.mem.Allocator,
-    io: Io,
-    tools_dir: []const u8,
-) !InstalledListing {
-    var tools = Dir.openDirAbsolute(io, tools_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return .{ .present = false, .slugs = &.{} },
-        else => return err,
-    };
-    defer tools.close(io);
+fn splitDefaultGithubId(
+    record: *const install_state.InventoryRecord,
+    id: []const u8,
+) ?struct { owner: []const u8, repo: []const u8 } {
+    const slash = std.mem.indexOfScalar(u8, id, '/') orelse return null;
+    if (std.mem.indexOfScalar(u8, id[slash + 1 ..], '/') != null) return null;
+    const owner = id[0..slash];
+    const repo = id[slash + 1 ..];
+    switch (record.kind) {
+        .v1_repo => {},
+        .v2 => {
+            const source = record.source orelse return null;
+            if (source.kind != .github or source.owner == null or source.repo == null) return null;
+            if (!std.ascii.eqlIgnoreCase(source.owner.?, owner) or
+                !std.ascii.eqlIgnoreCase(source.repo.?, repo)) return null;
+        },
+        else => return null,
+    }
+    return .{ .owner = owner, .repo = repo };
+}
 
-    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+fn hasPathPrefix(path: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, prefix) or path.len <= prefix.len or path[prefix.len] != '/')
+        return null;
+    return path[prefix.len + 1 ..];
+}
 
-    var it = tools.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        if (std.mem.endsWith(u8, entry.name, ".old") or
-            (std.mem.startsWith(u8, entry.name, ".") and std.mem.endsWith(u8, entry.name, ".staging"))) continue;
-        const owner_name = entry.name;
-        var owner_dir = tools.openDir(io, owner_name, .{ .iterate = true }) catch continue;
-        defer owner_dir.close(io);
-        var it2 = owner_dir.iterate();
-        while (try it2.next(io)) |sub| {
-            if (sub.kind != .directory) continue;
-            if (std.mem.endsWith(u8, sub.name, ".old") or
-                (std.mem.startsWith(u8, sub.name, ".") and std.mem.endsWith(u8, sub.name, ".staging"))) continue;
-            const slug = try std.fmt.allocPrint(arena, "{s}/{s}", .{ owner_name, sub.name });
-            try out.append(arena, slug);
-        }
+fn validateLegacyManifest(
+    manifest: Manifest,
+    win_tools: []const u8,
+    owner: []const u8,
+    repo: []const u8,
+) bool {
+    if (manifest.schema != null or manifest.layout_generation != null or
+        !std.mem.eql(u8, manifest.kind, "wsl") or manifest.id != null or
+        manifest.unit_path != null or !isSafeManifestTarget(manifest.source) or
+        !validLinkEntries(manifest.links))
+    {
+        return false;
     }
 
-    std.mem.sort([]const u8, out.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lt);
+    const tools_root = std.mem.trimEnd(u8, win_tools, "/");
+    if (tools_root.len == 0) return false;
+    const source_relative = hasPathPrefix(manifest.source, tools_root) orelse return false;
+    var source_parts = std.mem.splitScalar(u8, source_relative, '/');
+    const actual_owner = source_parts.next() orelse return false;
+    const actual_repo = source_parts.next() orelse return false;
+    if (source_parts.next() != null or
+        !std.ascii.eqlIgnoreCase(actual_owner, owner) or
+        !std.ascii.eqlIgnoreCase(actual_repo, repo))
+    {
+        return false;
+    }
 
-    return .{ .present = true, .slugs = out.items };
+    for (manifest.links) |entry| {
+        const relative = hasPathPrefix(entry.target, manifest.source) orelse return false;
+        if (!isSafeRelativeBinPath(relative)) return false;
+        if (!std.mem.eql(u8, linkNameForBin(relative), entry.name)) return false;
+    }
+    return true;
+}
+
+fn splitLegacyManifestId(id: []const u8) ?struct { owner: []const u8, repo: []const u8 } {
+    const slash = std.mem.indexOfScalar(u8, id, '/') orelse return null;
+    if (std.mem.indexOfScalar(u8, id[slash + 1 ..], '/') != null) return null;
+    return .{ .owner = id[0..slash], .repo = id[slash + 1 ..] };
+}
+
+fn readLegacyManifestForId(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    win_tools: []const u8,
+    id: []const u8,
+) !?LegacyManifestCandidate {
+    const parts = splitLegacyManifestId(id) orelse return null;
+    const path = try manifestPath(allocator, environ, parts.owner, parts.repo);
+    errdefer allocator.free(path);
+    var parsed = (readManifest(allocator, io, path) catch |err| switch (err) {
+        error.InvalidManifest => return error.InvalidLegacyManifest,
+        else => return err,
+    }) orelse {
+        allocator.free(path);
+        return null;
+    };
+    errdefer parsed.deinit();
+
+    if (!validateLegacyManifest(parsed.value, win_tools, parts.owner, parts.repo))
+        return error.InvalidLegacyManifest;
+    return .{ .path = path, .parsed = parsed };
+}
+
+/// Find the owner/repo manifest that can belong to this exact inferred ID.
+/// Custom IDs never claim a legacy manifest merely because their source points
+/// at the same GitHub repository.
+fn readLegacyManifestCandidate(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    win_tools: []const u8,
+    record: *const install_state.InventoryRecord,
+    id: []const u8,
+) !?LegacyManifestCandidate {
+    _ = splitDefaultGithubId(record, id) orelse return null;
+    return readLegacyManifestForId(allocator, io, environ, win_tools, id);
+}
+
+test "legacy manifest validation preserves source casing within tools root" {
+    var links = [_]LinkEntry{.{
+        .name = "zig",
+        .target = "/mnt/c/ghr/tools/Cataggar/Zig/zig.exe",
+    }};
+    const manifest: Manifest = .{
+        .source = "/mnt/c/ghr/tools/Cataggar/Zig",
+        .links = &links,
+    };
+    try std.testing.expect(validateLegacyManifest(
+        manifest,
+        "/mnt/c/ghr/tools",
+        "cataggar",
+        "zig",
+    ));
+
+    var escaped = manifest;
+    escaped.source = "/mnt/c/other/Cataggar/Zig";
+    try std.testing.expect(!validateLegacyManifest(
+        escaped,
+        "/mnt/c/ghr/tools",
+        "cataggar",
+        "zig",
+    ));
 }
 
 pub fn cmdLink(
@@ -625,59 +1115,69 @@ pub fn cmdLink(
 ) !void {
     requireWsl(environ, err_w, "link") catch return LinkCmdError.LinkStepFailed;
 
-    const owned = release_mod.parseRepoSpecOwned(allocator, spec_str) catch {
-        try err_w.print("error: invalid spec '{s}', expected owner/repo\n", .{spec_str});
+    const id = install_request.canonicalizeId(allocator, spec_str) catch {
+        try err_w.print("error: invalid install id '{s}'\n", .{spec_str});
         try err_w.flush();
         return LinkCmdError.LinkStepFailed;
     };
-    defer owned.deinit();
-
-    if (owned.tag != null) {
-        try err_w.print("error: 'ghr link' does not accept a tag — link reflects whatever is installed on Windows\n", .{});
-        try err_w.flush();
-        return LinkCmdError.LinkStepFailed;
-    }
+    defer allocator.free(id);
 
     const win_tools = windowsToolsDirFromWsl(allocator, environ, io, err_w) catch return LinkCmdError.LinkStepFailed;
     defer allocator.free(win_tools);
 
-    const tool_path = (try install.resolveInstalledToolPath(allocator, io, win_tools, owned.owner, owned.repo)) orelse {
-        try writeNotInstalledError(allocator, io, err_w, win_tools, owned.owner, owned.repo);
-        return LinkCmdError.LinkStepFailed;
-    };
-    defer allocator.free(tool_path);
-
-    const meta = install.readMetadata(allocator, io, tool_path) orelse {
-        try err_w.print("error: failed to read {s}/ghr.json\n", .{tool_path});
+    var inventory = install_state.scan(allocator, io, win_tools, .{ .platform = .windows }) catch |err| {
+        try err_w.print("error: failed to read Windows install state under '{s}': {t}\n", .{ win_tools, err });
         try err_w.flush();
         return LinkCmdError.LinkStepFailed;
     };
-    defer {
-        meta.parsed.deinit();
-        allocator.free(meta.body);
+    defer inventory.deinit(allocator);
+
+    const record = inventoryRecordById(&inventory, id) orelse {
+        try writeIdNotInstalledError(err_w, win_tools, id, &inventory);
+        return LinkCmdError.LinkStepFailed;
+    };
+    if (record.status != .ok) {
+        try err_w.print(
+            "error: install id '{s}' is {s} ({s}); refusing to link\n",
+            .{ id, @tagName(record.status), @tagName(record.reason) },
+        );
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
     }
 
-    var computed = computeDesiredLinks(allocator, meta.parsed.value.bins, tool_path, bin_filters) catch |err| switch (err) {
+    const tool_path = try std.fs.path.join(allocator, &.{ win_tools, record.path });
+    defer allocator.free(tool_path);
+
+    var computed = computeDesiredCommandLinks(allocator, record.commands, tool_path, bin_filters) catch |err| switch (err) {
         DesiredError.DuplicateLinkName => {
             try err_w.print(
-                "error: two or more entries in {s}/ghr.json collapse to the same link name\n",
-                .{tool_path},
+                "error: install id '{s}' owns duplicate Windows command names\n",
+                .{id},
             );
             try err_w.print("       refusing to link to avoid clobbering one with the other\n", .{});
             try err_w.flush();
             return LinkCmdError.LinkStepFailed;
         },
         DesiredError.NoBinsInMetadata => {
-            try err_w.print("error: {s}/ghr.json lists no bins\n", .{tool_path});
+            try err_w.print("error: install id '{s}' owns no commands\n", .{id});
             try err_w.flush();
             return LinkCmdError.LinkStepFailed;
         },
         DesiredError.NoValidBinsAfterNormalize => {
             try err_w.print(
-                "error: every bin entry in {s}/ghr.json is unsafe (absolute or contains '..'); metadata looks corrupt\n",
-                .{tool_path},
+                "error: every command target for install id '{s}' is unsafe\n",
+                .{id},
             );
             try err_w.print("       refusing to reconcile to avoid removing existing valid links\n", .{});
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        },
+        DesiredError.UnsupportedCommandKind => {
+            try err_w.print(
+                "error: install id '{s}' owns a wasm command that cannot be executed through a direct WSL link\n",
+                .{id},
+            );
+            try err_w.print("       refusing to link the raw wasm module\n", .{});
             try err_w.flush();
             return LinkCmdError.LinkStepFailed;
         },
@@ -708,54 +1208,143 @@ pub fn cmdLink(
     };
     defer bin_dir.close(io);
 
-    // Load prior manifest (may be absent on first link).
-    const manifest_abs = try manifestPath(allocator, environ, owned.owner, owned.repo);
+    // Prefer an ID-keyed manifest. A legacy owner/repo manifest can seed
+    // ownership only for the exact inferred repository ID.
+    const manifest_abs = try idManifestPath(allocator, environ, id);
     defer allocator.free(manifest_abs);
-    var prior_parsed = readManifest(allocator, io, manifest_abs) catch |err| switch (err) {
-        error.InvalidManifest => blk: {
-            try err_w.print("warning: ignoring corrupt manifest at {s}\n", .{manifest_abs});
-            break :blk null;
+    var prior_parsed = readIdManifest(allocator, io, manifest_abs, id) catch |err| switch (err) {
+        error.InvalidManifest => {
+            try err_w.print("error: invalid ID manifest at {s}; refusing to reconcile\n", .{manifest_abs});
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
         },
         else => return err,
     };
     defer if (prior_parsed) |*p| p.deinit();
-    const prior_links: []const LinkEntry = if (prior_parsed) |p| p.value.links else &.{};
+
+    var legacy_candidate: ?LegacyManifestCandidate = null;
+    defer if (legacy_candidate) |*candidate| candidate.deinit(allocator);
+    if (prior_parsed == null) {
+        legacy_candidate = readLegacyManifestCandidate(
+            allocator,
+            io,
+            environ,
+            win_tools,
+            record,
+            id,
+        ) catch |err| switch (err) {
+            error.InvalidLegacyManifest => {
+                try err_w.print(
+                    "error: legacy link manifest for '{s}' does not match its install paths; refusing to import it\n",
+                    .{id},
+                );
+                try err_w.flush();
+                return LinkCmdError.LinkStepFailed;
+            },
+            else => return err,
+        };
+        if (legacy_candidate != null and bin_filters.len > 0) {
+            try err_w.print(
+                "error: legacy link manifest for '{s}' requires an unfiltered reconciliation before --bin can be used\n",
+                .{id},
+            );
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        }
+    }
+    const prior_links: []const LinkEntry = if (prior_parsed) |p|
+        p.value.links
+    else if (legacy_candidate) |candidate|
+        candidate.parsed.value.links
+    else
+        &.{};
+
+    var planned_links = std.ArrayListUnmanaged(LinkEntry).empty;
+    defer planned_links.deinit(allocator);
+    try planned_links.ensureTotalCapacity(allocator, computed.links.len + prior_links.len);
+    for (computed.links) |desired| {
+        planned_links.appendAssumeCapacity(.{ .name = desired.name, .target = desired.target });
+    }
+    if (bin_filters.len > 0) {
+        for (prior_links) |old| {
+            var touched = false;
+            for (computed.links) |desired| {
+                if (std.mem.eql(u8, desired.name, old.name)) {
+                    touched = true;
+                    break;
+                }
+            }
+            if (!touched) planned_links.appendAssumeCapacity(old);
+        }
+    }
+    const manifest_body = try stringifyIdManifest(
+        allocator,
+        id,
+        record.path,
+        tool_path,
+        planned_links.items,
+    );
+    defer allocator.free(manifest_body);
+
+    if (try preflightLinkReconciliation(
+        io,
+        bin_dir,
+        computed.links,
+        prior_links,
+        bin_filters.len == 0,
+    )) |conflict| {
+        switch (conflict.kind) {
+            .unmanaged => try err_w.print(
+                "error: {s}/{s} is not owned by install id '{s}'; refusing to overwrite it\n",
+                .{ d.bin, conflict.name, id },
+            ),
+            .modified => try err_w.print(
+                "error: {s}/{s} differs from the target recorded for install id '{s}'; refusing destructive reconciliation\n",
+                .{ d.bin, conflict.name, id },
+            ),
+        }
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
 
     // Apply the desired set: add / no-op / replace / record conflicts.
-    var written = std.ArrayListUnmanaged(LinkEntry).empty;
-    defer written.deinit(allocator);
-    var any_explicit_failure = false;
-    var conflicts: usize = 0;
+    var applied = std.ArrayListUnmanaged(AppliedLink).empty;
+    defer applied.deinit(allocator);
+    try applied.ensureTotalCapacity(allocator, computed.links.len + prior_links.len);
+    var manifest_committed = false;
+    errdefer if (!manifest_committed) rollbackAppliedLinks(io, bin_dir, applied.items);
+    var action_log = std.Io.Writer.Allocating.init(allocator);
+    defer action_log.deinit();
+    const action_w = &action_log.writer;
 
     for (computed.links) |desired| {
-        const explicit = bin_filters.len > 0;
         const outcome = applyOneLink(io, bin_dir, desired, prior_links) catch |err| {
-            try err_w.print("warning: failed to link {s}: {t}\n", .{ desired.name, err });
-            if (explicit) any_explicit_failure = true;
-            continue;
+            try err_w.print("error: failed to link {s}: {t}\n", .{ desired.name, err });
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
         };
         switch (outcome) {
-            .created => try w.print("  linked   {s} -> {s}\n", .{ desired.name, desired.target }),
-            .replaced => try w.print("  updated  {s} -> {s}\n", .{ desired.name, desired.target }),
-            .unchanged => try w.print("  ok       {s} -> {s}\n", .{ desired.name, desired.target }),
+            .created => {
+                applied.appendAssumeCapacity(.{ .created = desired });
+                try action_w.print("  linked   {s} -> {s}\n", .{ desired.name, desired.target });
+            },
+            .replaced => {
+                applied.appendAssumeCapacity(.{ .replaced = .{
+                    .desired = desired,
+                    .prior = findPriorLink(prior_links, desired.name).?,
+                } });
+                try action_w.print("  updated  {s} -> {s}\n", .{ desired.name, desired.target });
+            },
+            .unchanged => try action_w.print("  ok       {s} -> {s}\n", .{ desired.name, desired.target }),
             .conflict => {
-                conflicts += 1;
-                if (explicit) {
-                    try err_w.print(
-                        "error: {s}/{s} already exists and is not a ghr-created link; refusing to overwrite\n",
-                        .{ d.bin, desired.name },
-                    );
-                    any_explicit_failure = true;
-                } else {
-                    try w.print(
-                        "  skipped  {s} ({s}/{s} already exists and is not a ghr-created link)\n",
-                        .{ desired.name, d.bin, desired.name },
-                    );
-                }
-                continue;
+                try err_w.print(
+                    "error: ownership of {s}/{s} changed during reconciliation; refusing to continue\n",
+                    .{ d.bin, desired.name },
+                );
+                try err_w.flush();
+                return LinkCmdError.LinkStepFailed;
             },
         }
-        try written.append(allocator, .{ .name = desired.name, .target = desired.target });
     }
 
     // Reconcile removals only when the user did not pass --bin filters.
@@ -772,65 +1361,157 @@ pub fn cmdLink(
             }
             if (still_desired) continue;
             const outcome = removeOwnedLink(io, bin_dir, old) catch |err| {
-                try err_w.print("warning: failed to remove stale link {s}: {t}\n", .{ old.name, err });
-                continue;
+                try err_w.print("error: failed to remove stale link {s}: {t}\n", .{ old.name, err });
+                try err_w.flush();
+                return LinkCmdError.LinkStepFailed;
             };
             switch (outcome) {
-                .removed => try w.print("  removed  {s} (no longer present in {s}/{s})\n", .{ old.name, owned.owner, owned.repo }),
+                .removed => {
+                    applied.appendAssumeCapacity(.{ .removed = old });
+                    try action_w.print("  removed  {s} (no longer owned by {s})\n", .{ old.name, id });
+                },
                 .missing => {}, // already gone, no message
-                .target_mismatch => try w.print(
-                    "  kept     {s} (live symlink target differs from manifest; leaving it alone)\n",
-                    .{old.name},
-                ),
+                .target_mismatch => {
+                    try err_w.print(
+                        "error: ownership of {s}/{s} changed during reconciliation; refusing to continue\n",
+                        .{ d.bin, old.name },
+                    );
+                    try err_w.flush();
+                    return LinkCmdError.LinkStepFailed;
+                },
             }
-        }
-    } else {
-        // Filtered mode: carry over prior entries that weren't touched so
-        // the persisted manifest still reflects what's actually linked.
-        for (prior_links) |old| {
-            var touched = false;
-            for (computed.links) |desired| {
-                if (std.mem.eql(u8, desired.name, old.name)) {
-                    touched = true;
-                    break;
-                }
-            }
-            if (touched) continue;
-            // Verify the link still exists and points where we recorded
-            // before keeping it in the manifest; otherwise drop it.
-            var lb: [Dir.max_path_bytes]u8 = undefined;
-            const n = bin_dir.readLink(io, old.name, &lb) catch continue;
-            if (!std.mem.eql(u8, lb[0..n], old.target)) continue;
-            try written.append(allocator, old);
         }
     }
 
-    // Write manifest atomically. If there are no live links, delete the
-    // manifest file outright.
-    if (written.items.len == 0) {
-        deleteManifest(allocator, io, environ, owned.owner, owned.repo) catch {};
-    } else {
-        try writeManifest(allocator, io, environ, owned.owner, owned.repo, .{
-            .source = tool_path,
-            .links = written.items,
-        });
+    try persistIdManifestBody(allocator, io, environ, id, manifest_body);
+    manifest_committed = true;
+    if (legacy_candidate) |candidate| {
+        Dir.deleteFileAbsolute(io, candidate.path) catch |err| {
+            try err_w.print(
+                "warning: imported '{s}' but could not remove legacy manifest {s}: {t}\n",
+                .{ id, candidate.path, err },
+            );
+        };
+    }
+    try w.writeAll(action_log.written());
+}
+
+const LinkConflictKind = enum { unmanaged, modified };
+
+const LinkConflict = struct {
+    name: []const u8,
+    kind: LinkConflictKind,
+};
+
+fn findPriorLink(prior_links: []const LinkEntry, name: []const u8) ?LinkEntry {
+    for (prior_links) |entry| {
+        if (std.mem.eql(u8, entry.name, name)) return entry;
+    }
+    return null;
+}
+
+/// Validate every live entry that reconciliation may replace or remove before
+/// the first mutation. A manifest proves ownership only while the live target
+/// still equals the recorded target.
+fn preflightLinkReconciliation(
+    io: Io,
+    bin_dir: Dir,
+    desired_links: []const DesiredLink,
+    prior_links: []const LinkEntry,
+    reconcile_stale: bool,
+) !?LinkConflict {
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    for (desired_links) |desired| {
+        if (bin_dir.readLink(io, desired.name, &link_buf)) |n| {
+            const prior = findPriorLink(prior_links, desired.name) orelse
+                return .{ .name = desired.name, .kind = .unmanaged };
+            if (!std.mem.eql(u8, link_buf[0..n], prior.target))
+                return .{ .name = desired.name, .kind = .modified };
+        } else |err| switch (err) {
+            error.FileNotFound => {
+                _ = bin_dir.statFile(io, desired.name, .{}) catch |stat_err| switch (stat_err) {
+                    error.FileNotFound => continue,
+                    else => return stat_err,
+                };
+                return .{ .name = desired.name, .kind = .unmanaged };
+            },
+            error.NotLink => return .{ .name = desired.name, .kind = .unmanaged },
+            else => return err,
+        }
     }
 
-    if (any_explicit_failure) {
-        try err_w.flush();
-        return LinkCmdError.LinkStepFailed;
+    if (!reconcile_stale) return null;
+    for (prior_links) |prior| {
+        var desired = false;
+        for (desired_links) |entry| {
+            if (std.mem.eql(u8, entry.name, prior.name)) {
+                desired = true;
+                break;
+            }
+        }
+        if (desired) continue;
+        if (bin_dir.readLink(io, prior.name, &link_buf)) |n| {
+            if (!std.mem.eql(u8, link_buf[0..n], prior.target))
+                return .{ .name = prior.name, .kind = .modified };
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            error.NotLink => return .{ .name = prior.name, .kind = .modified },
+            else => return err,
+        }
     }
+    return null;
 }
 
 const LinkOutcome = enum { created, replaced, unchanged, conflict };
 
+const AppliedLink = union(enum) {
+    created: DesiredLink,
+    replaced: struct {
+        desired: DesiredLink,
+        prior: LinkEntry,
+    },
+    removed: LinkEntry,
+};
+
+fn rollbackAppliedLinks(io: Io, bin_dir: Dir, applied: []const AppliedLink) void {
+    var i = applied.len;
+    while (i > 0) {
+        i -= 1;
+        switch (applied[i]) {
+            .created => |desired| {
+                var link_buf: [Dir.max_path_bytes]u8 = undefined;
+                const n = bin_dir.readLink(io, desired.name, &link_buf) catch continue;
+                if (std.mem.eql(u8, link_buf[0..n], desired.target))
+                    bin_dir.deleteFile(io, desired.name) catch {};
+            },
+            .replaced => |replacement| {
+                var link_buf: [Dir.max_path_bytes]u8 = undefined;
+                const n = bin_dir.readLink(io, replacement.desired.name, &link_buf) catch continue;
+                if (!std.mem.eql(u8, link_buf[0..n], replacement.desired.target)) continue;
+                bin_dir.deleteFile(io, replacement.desired.name) catch continue;
+                bin_dir.symLink(
+                    io,
+                    replacement.prior.target,
+                    replacement.prior.name,
+                    .{},
+                ) catch {};
+            },
+            .removed => |prior| {
+                var link_buf: [Dir.max_path_bytes]u8 = undefined;
+                if (bin_dir.readLink(io, prior.name, &link_buf)) |_| {
+                    continue;
+                } else |err| switch (err) {
+                    error.FileNotFound => bin_dir.symLink(io, prior.target, prior.name, .{}) catch {},
+                    else => {},
+                }
+            },
+        }
+    }
+}
+
 /// Apply one desired link in `bin_dir`. Considers an existing symlink
-/// ghr-owned only if a prior manifest had an entry with the same
-/// `name` — the recorded target may differ from the new target, so we
-/// can still update after a Windows-side reinstall moved the bin to a
-/// new relative path. A non-symlink (regular file, directory) or a
-/// symlink that was never in our manifest is reported as a conflict;
-/// the caller decides whether to warn-and-skip or fail.
+/// ghr-owned only if a prior manifest records both its name and its current
+/// target. A changed symlink is user-owned and must never be replaced.
 fn applyOneLink(
     io: Io,
     bin_dir: Dir,
@@ -840,29 +1521,26 @@ fn applyOneLink(
     var link_buf: [Dir.max_path_bytes]u8 = undefined;
     if (bin_dir.readLink(io, desired.name, &link_buf)) |n| {
         const current = link_buf[0..n];
+        const prior = findPriorLink(prior_links, desired.name) orelse return .conflict;
+        if (!std.mem.eql(u8, current, prior.target)) return .conflict;
         if (std.mem.eql(u8, current, desired.target)) return .unchanged;
-        // Owned by us if previously manifested under this name, regardless
-        // of the recorded target (lets us update after a Windows-side
-        // reinstall changed the bin's relative path).
-        var owned_by_us = false;
-        for (prior_links) |old| {
-            if (std.mem.eql(u8, old.name, desired.name)) {
-                owned_by_us = true;
-                break;
-            }
-        }
-        if (!owned_by_us) return .conflict;
-        bin_dir.deleteFile(io, desired.name) catch {};
-        try bin_dir.symLink(io, desired.target, desired.name, .{});
+        try bin_dir.deleteFile(io, desired.name);
+        bin_dir.symLink(io, desired.target, desired.name, .{}) catch |err| {
+            bin_dir.symLink(io, prior.target, prior.name, .{}) catch {};
+            return err;
+        };
         return .replaced;
     } else |err| switch (err) {
         error.FileNotFound => {
             // No symlink — but could be a regular file or directory.
-            if (bin_dir.statFile(io, desired.name, .{})) |_| {
-                return .conflict;
-            } else |_| {}
-            try bin_dir.symLink(io, desired.target, desired.name, .{});
-            return .created;
+            _ = bin_dir.statFile(io, desired.name, .{}) catch |stat_err| switch (stat_err) {
+                error.FileNotFound => {
+                    try bin_dir.symLink(io, desired.target, desired.name, .{});
+                    return .created;
+                },
+                else => return stat_err,
+            };
+            return .conflict;
         },
         // `readLink` of a non-symlink returns this on Linux.
         error.NotLink => return .conflict,
@@ -876,6 +1554,34 @@ const RemoveOutcome = enum {
     missing,
     target_mismatch,
 };
+
+fn linkWasRequested(entry: LinkEntry, filters: []const []const u8) bool {
+    if (filters.len == 0) return true;
+    for (filters) |filter| {
+        if (std.ascii.eqlIgnoreCase(filter, entry.name)) return true;
+    }
+    return false;
+}
+
+fn preflightUnlink(
+    io: Io,
+    bin_dir: Dir,
+    links: []const LinkEntry,
+    filters: []const []const u8,
+) !?[]const u8 {
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    for (links) |entry| {
+        if (!linkWasRequested(entry, filters)) continue;
+        if (bin_dir.readLink(io, entry.name, &link_buf)) |n| {
+            if (!std.mem.eql(u8, link_buf[0..n], entry.target)) return entry.name;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            error.NotLink => return entry.name,
+            else => return err,
+        }
+    }
+    return null;
+}
 
 /// Remove a manifested symlink, but only when its live target still
 /// matches what was recorded. Returns the outcome so the caller can
@@ -904,33 +1610,95 @@ pub fn cmdUnlink(
 ) !void {
     requireWsl(environ, err_w, "unlink") catch return LinkCmdError.LinkStepFailed;
 
-    const owned = release_mod.parseRepoSpecOwned(allocator, spec_str) catch {
-        try err_w.print("error: invalid spec '{s}', expected owner/repo\n", .{spec_str});
+    const id = install_request.canonicalizeId(allocator, spec_str) catch {
+        try err_w.print("error: invalid install id '{s}'\n", .{spec_str});
         try err_w.flush();
         return LinkCmdError.LinkStepFailed;
     };
-    defer owned.deinit();
+    defer allocator.free(id);
 
-    if (owned.tag != null) {
-        try err_w.print("error: 'ghr unlink' does not accept a tag\n", .{});
-        try err_w.flush();
-        return LinkCmdError.LinkStepFailed;
-    }
-
-    const manifest_abs = try manifestPath(allocator, environ, owned.owner, owned.repo);
+    const manifest_abs = try idManifestPath(allocator, environ, id);
     defer allocator.free(manifest_abs);
-    var parsed = readManifest(allocator, io, manifest_abs) catch |err| switch (err) {
-        error.InvalidManifest => null,
+    var parsed = readIdManifest(allocator, io, manifest_abs, id) catch |err| switch (err) {
+        error.InvalidManifest => {
+            try err_w.print("error: invalid ID manifest at {s}; refusing to unlink\n", .{manifest_abs});
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        },
         else => return err,
     };
     defer if (parsed) |*p| p.deinit();
 
-    const p = parsed orelse {
-        try err_w.print("error: no link manifest for {s}/{s}\n", .{ owned.owner, owned.repo });
-        try err_w.print("       (looked at {s})\n", .{manifest_abs});
-        try err_w.flush();
-        return LinkCmdError.LinkStepFailed;
-    };
+    var legacy_candidate: ?LegacyManifestCandidate = null;
+    defer if (legacy_candidate) |*candidate| candidate.deinit(allocator);
+
+    if (parsed == null) {
+        const win_tools = windowsToolsDirFromWsl(allocator, environ, io, err_w) catch
+            return LinkCmdError.LinkStepFailed;
+        defer allocator.free(win_tools);
+        var inventory = install_state.scan(allocator, io, win_tools, .{ .platform = .windows }) catch |err| {
+            try err_w.print("error: failed to read Windows install state under '{s}': {t}\n", .{ win_tools, err });
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        };
+        defer inventory.deinit(allocator);
+        const candidate_result = if (inventoryRecordById(&inventory, id)) |record| blk: {
+            if (record.status != .ok) {
+                try err_w.print(
+                    "error: install id '{s}' is {s} ({s}); refusing legacy manifest reconciliation\n",
+                    .{ id, @tagName(record.status), @tagName(record.reason) },
+                );
+                try err_w.flush();
+                return LinkCmdError.LinkStepFailed;
+            }
+            break :blk readLegacyManifestCandidate(
+                allocator,
+                io,
+                environ,
+                win_tools,
+                record,
+                id,
+            );
+        } else readLegacyManifestForId(
+            // A strict owner/repo manifest carries enough exact target state
+            // for safe teardown even after its Windows install was removed.
+            allocator,
+            io,
+            environ,
+            win_tools,
+            id,
+        );
+        legacy_candidate = candidate_result catch |err| switch (err) {
+            error.InvalidLegacyManifest => {
+                try err_w.print(
+                    "error: legacy link manifest for '{s}' does not match its install paths; refusing to unlink\n",
+                    .{id},
+                );
+                try err_w.flush();
+                return LinkCmdError.LinkStepFailed;
+            },
+            else => return err,
+        };
+        if (legacy_candidate == null) {
+            try err_w.print("error: no link manifest for install id '{s}'\n", .{id});
+            try err_w.print("       (looked at {s})\n", .{manifest_abs});
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        }
+        if (bin_filters.len > 0) {
+            try err_w.print(
+                "error: legacy link manifest for '{s}' requires an unfiltered unlink before --bin can be used\n",
+                .{id},
+            );
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
+        }
+    }
+
+    const active_manifest: Manifest = if (parsed) |p|
+        p.value
+    else
+        legacy_candidate.?.parsed.value;
 
     // Pre-validate: every explicitly-requested filter must match a
     // manifest entry. Bail out before touching the filesystem so a
@@ -939,7 +1707,7 @@ pub fn cmdUnlink(
         var any_unmatched = false;
         for (bin_filters) |f| {
             var matched = false;
-            for (p.value.links) |entry| {
+            for (active_manifest.links) |entry| {
                 if (std.ascii.eqlIgnoreCase(f, entry.name)) {
                     matched = true;
                     break;
@@ -952,7 +1720,7 @@ pub fn cmdUnlink(
         }
         if (any_unmatched) {
             try err_w.print("       available: ", .{});
-            for (p.value.links, 0..) |entry, i| {
+            for (active_manifest.links, 0..) |entry, i| {
                 if (i > 0) try err_w.print(", ", .{});
                 try err_w.print("{s}", .{entry.name});
             }
@@ -971,59 +1739,82 @@ pub fn cmdUnlink(
     };
     defer bin_dir.close(io);
 
-    var any_explicit_failure = false;
+    if (try preflightUnlink(io, bin_dir, active_manifest.links, bin_filters)) |name| {
+        try err_w.print(
+            "error: {s}/{s} differs from the recorded target for install id '{s}'; refusing destructive unlink\n",
+            .{ d.bin, name, id },
+        );
+        try err_w.flush();
+        return LinkCmdError.LinkStepFailed;
+    }
+
     var kept = std.ArrayListUnmanaged(LinkEntry).empty;
     defer kept.deinit(allocator);
+    try kept.ensureTotalCapacity(allocator, active_manifest.links.len);
+    for (active_manifest.links) |entry| {
+        if (!linkWasRequested(entry, bin_filters)) kept.appendAssumeCapacity(entry);
+    }
+    const next_manifest_body: ?[]u8 = if (parsed != null and kept.items.len > 0)
+        try stringifyIdManifest(
+            allocator,
+            id,
+            parsed.?.value.unit_path.?,
+            parsed.?.value.source,
+            kept.items,
+        )
+    else
+        null;
+    defer if (next_manifest_body) |body| allocator.free(body);
 
-    for (p.value.links) |entry| {
-        const explicit = bin_filters.len > 0;
-        if (explicit) {
-            var requested = false;
-            for (bin_filters) |f| {
-                if (std.ascii.eqlIgnoreCase(f, entry.name)) {
-                    requested = true;
-                    break;
-                }
-            }
-            if (!requested) {
-                try kept.append(allocator, entry);
-                continue;
-            }
-        }
+    var applied = std.ArrayListUnmanaged(AppliedLink).empty;
+    defer applied.deinit(allocator);
+    try applied.ensureTotalCapacity(allocator, active_manifest.links.len);
+    var manifest_committed = false;
+    errdefer if (!manifest_committed) rollbackAppliedLinks(io, bin_dir, applied.items);
+    var action_log = std.Io.Writer.Allocating.init(allocator);
+    defer action_log.deinit();
+    const action_w = &action_log.writer;
+
+    for (active_manifest.links) |entry| {
+        if (!linkWasRequested(entry, bin_filters)) continue;
 
         const outcome = removeOwnedLink(io, bin_dir, entry) catch |err| {
-            try err_w.print("warning: failed to unlink {s}: {t}\n", .{ entry.name, err });
-            if (explicit) any_explicit_failure = true;
-            try kept.append(allocator, entry);
-            continue;
+            try err_w.print("error: failed to unlink {s}: {t}\n", .{ entry.name, err });
+            try err_w.flush();
+            return LinkCmdError.LinkStepFailed;
         };
         switch (outcome) {
-            .removed => try w.print("  unlinked {s}\n", .{entry.name}),
-            .missing => try w.print("  ok       {s} (already absent)\n", .{entry.name}),
+            .removed => {
+                applied.appendAssumeCapacity(.{ .removed = entry });
+                try action_w.print("  unlinked {s}\n", .{entry.name});
+            },
+            .missing => try action_w.print("  ok       {s} (already absent)\n", .{entry.name}),
             .target_mismatch => {
                 try err_w.print(
-                    "warning: {s}/{s} no longer points where ghr recorded it; leaving it alone\n",
+                    "error: ownership of {s}/{s} changed during unlink; refusing to continue\n",
                     .{ d.bin, entry.name },
                 );
-                if (explicit) any_explicit_failure = true;
-                try kept.append(allocator, entry);
+                try err_w.flush();
+                return LinkCmdError.LinkStepFailed;
             },
         }
     }
 
-    if (kept.items.len == 0) {
-        deleteManifest(allocator, io, environ, owned.owner, owned.repo) catch {};
+    if (legacy_candidate) |candidate| {
+        try Dir.deleteFileAbsolute(io, candidate.path);
+    } else if (kept.items.len == 0) {
+        try deleteIdManifest(allocator, io, environ, id);
     } else {
-        try writeManifest(allocator, io, environ, owned.owner, owned.repo, .{
-            .source = p.value.source,
-            .links = kept.items,
-        });
+        try persistIdManifestBody(
+            allocator,
+            io,
+            environ,
+            id,
+            next_manifest_body.?,
+        );
     }
-
-    if (any_explicit_failure) {
-        try err_w.flush();
-        return LinkCmdError.LinkStepFailed;
-    }
+    manifest_committed = true;
+    try w.writeAll(action_log.written());
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,7 +1824,7 @@ pub fn cmdUnlink(
 // that already exists on the Windows `%PATH%`, not a Windows-side ghr
 // install. We resolve the path via `where.exe <name>.exe`, convert to
 // `/mnt/<drive>/...` with `wslpath -u`, and create a symlink in ghr's
-// bin dir just like the owner/repo flow.
+//   bin dir independently of install-ID linking.
 //
 // Bookkeeping lives in a separate manifest tree so the namespaces can't
 // collide with any real GitHub owner/repo:
@@ -1200,6 +1991,20 @@ fn writeBareExeManifest(
     source: []const u8,
     entry: LinkEntry,
 ) !void {
+    var body_writer = std.Io.Writer.Allocating.init(allocator);
+    defer body_writer.deinit();
+    const body_w = &body_writer.writer;
+    try body_w.print("{{\"kind\":\"wsl-path\",\"source\":\"", .{});
+    try writeJsonEscaped(body_w, source);
+    try body_w.print("\",\"links\":[{{\"name\":\"", .{});
+    try writeJsonEscaped(body_w, entry.name);
+    try body_w.print("\",\"target\":\"", .{});
+    try writeJsonEscaped(body_w, entry.target);
+    try body_w.print("\",\"target_kind\":\"", .{});
+    try writeJsonEscaped(body_w, entry.target_kind);
+    try body_w.print("\"}}]}}\n", .{});
+    if (body_writer.written().len > max_manifest_bytes) return error.ManifestTooLarge;
+
     const dir = try bareExeManifestDir(allocator, environ);
     defer allocator.free(dir);
     install.ensureDirAbsoluteRecursive(io, dir) catch {};
@@ -1214,19 +2019,7 @@ fn writeBareExeManifest(
     {
         var f = try Dir.createFileAbsolute(io, tmp_path, .{});
         defer f.close(io);
-        var wbuf: [4096]u8 = undefined;
-        var fw = f.writer(io, &wbuf);
-        const w = &fw.interface;
-        try w.print("{{\"kind\":\"wsl-path\",\"source\":\"", .{});
-        try writeJsonEscaped(w, source);
-        try w.print("\",\"links\":[{{\"name\":\"", .{});
-        try writeJsonEscaped(w, entry.name);
-        try w.print("\",\"target\":\"", .{});
-        try writeJsonEscaped(w, entry.target);
-        try w.print("\",\"target_kind\":\"", .{});
-        try writeJsonEscaped(w, entry.target_kind);
-        try w.print("\"}}]}}\n", .{});
-        try fw.end();
+        try f.writeStreamingAll(io, body_writer.written());
     }
 
     Dir.renameAbsolute(tmp_path, final_path, io) catch |err| {
@@ -1837,6 +2630,69 @@ fn removeOwnedWrapper(
 // Tests for the pure helpers.
 // ---------------------------------------------------------------------------
 
+fn testAbsoluteChild(
+    allocator: std.mem.Allocator,
+    base: []const u8,
+    child: []const u8,
+) ![]u8 {
+    return std.fs.path.join(allocator, &.{ base, child });
+}
+
+fn writeTestV2Unit(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tools: []const u8,
+    id: []const u8,
+    command_name: []const u8,
+    relative_target: []const u8,
+) !void {
+    const relative_unit = try install_state.encodeRelPath(allocator, id);
+    defer allocator.free(relative_unit);
+    const unit = try std.fs.path.join(allocator, &.{ tools, relative_unit });
+    defer allocator.free(unit);
+    try install.ensureDirAbsoluteRecursive(io, unit);
+
+    const target = try std.fs.path.join(allocator, &.{ unit, relative_target });
+    defer allocator.free(target);
+    if (std.fs.path.dirname(target)) |parent| try install.ensureDirAbsoluteRecursive(io, parent);
+    {
+        var file = try Dir.createFileAbsolute(io, target, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "test\n");
+    }
+
+    const body = try install_state_write.stringify(allocator, .{
+        .id = id,
+        .source = .{ .kind = .github, .owner = "cataggar", .repo = "zig", .tag = "v1" },
+        .resolved = .{ .tag = "v1", .asset = "zig.zip" },
+        .commands = &.{.{
+            .name = command_name,
+            .relative_target = relative_target,
+            .kind = .native,
+        }},
+        .verification = .{ .result = "none" },
+    }, .windows);
+    defer allocator.free(body);
+    const metadata = try std.fs.path.join(allocator, &.{ unit, install_state.metadata_file });
+    defer allocator.free(metadata);
+    var file = try Dir.createFileAbsolute(io, metadata, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
+}
+
+fn initLinkTestEnv(
+    env: *EnvironMap,
+    base: []const u8,
+    tools: []const u8,
+    bin: []const u8,
+) !void {
+    try env.put("WSL_INTEROP", "test");
+    try env.put("GHR_WIN_TOOLS_DIR", tools);
+    try env.put("GHR_BIN_DIR", bin);
+    try env.put("XDG_DATA_HOME", base);
+    try env.put("XDG_CACHE_HOME", base);
+}
+
 test "normalizeBinPathInPlace: replaces backslashes" {
     var buf = [_]u8{ 'b', 'i', 'n', '\\', 'f', 'o', 'o', '.', 'e', 'x', 'e' };
     normalizeBinPathInPlace(&buf);
@@ -1925,6 +2781,129 @@ test "manifest write/read round-trip" {
         "/mnt/c/Users/x/AppData/Roaming/ghr/data/tools/azuread/foo/azureauth.exe",
         parsed.value.links[0].target,
     );
+}
+
+test "ID manifest path is encoded and prefix-safe" {
+    const allocator = std.testing.allocator;
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", "/home/u/.local/share");
+
+    const parent = try idManifestPath(allocator, &env, "a");
+    defer allocator.free(parent);
+    const child = try idManifestPath(allocator, &env, "a/b");
+    defer allocator.free(child);
+
+    try std.testing.expect(std.mem.indexOf(u8, parent, "by-id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent, "u-a") != null);
+    try std.testing.expect(std.mem.endsWith(u8, parent, "_manifest.json"));
+    try std.testing.expect(std.mem.indexOf(u8, child, "u-a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, child, "u-b") != null);
+    try std.testing.expect(!std.mem.eql(u8, parent, child));
+    try std.testing.expectError(error.InvalidId, idManifestPath(allocator, &env, "../escape"));
+    try std.testing.expectError(error.InvalidId, idManifestPath(allocator, &env, "Upper"));
+}
+
+test "ID manifest write and strict read round-trip" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+
+    const links = [_]LinkEntry{.{
+        .name = "zigb",
+        .target = "/mnt/c/ghr/tools/_v2/units/u-zigb/_unit/zig.exe",
+    }};
+    try writeIdManifest(
+        allocator,
+        tio,
+        &env,
+        "zigb",
+        "_v2/units/u-zigb/_unit",
+        "/mnt/c/ghr/tools/_v2/units/u-zigb/_unit",
+        &links,
+    );
+
+    const path = try idManifestPath(allocator, &env, "zigb");
+    defer allocator.free(path);
+    const parsed = (try readIdManifest(allocator, tio, path, "zigb")).?;
+    defer parsed.deinit();
+    try std.testing.expectEqual(id_manifest_schema, parsed.value.schema.?);
+    try std.testing.expectEqual(id_manifest_layout, parsed.value.layout_generation.?);
+    try std.testing.expectEqualStrings(id_manifest_kind, parsed.value.kind);
+    try std.testing.expectEqualStrings("zigb", parsed.value.id.?);
+    try std.testing.expectEqualStrings("_v2/units/u-zigb/_unit", parsed.value.unit_path.?);
+    try std.testing.expectEqualStrings("zigb", parsed.value.links[0].name);
+    try std.testing.expectEqualStrings("symlink", parsed.value.links[0].target_kind);
+    try std.testing.expectError(
+        error.InvalidManifest,
+        readIdManifest(allocator, tio, path, "other"),
+    );
+}
+
+test "ID manifest larger than 64 KiB round-trips within shared bound" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &path_buf);
+    const base = path_buf[0..base_len];
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try env.put("XDG_DATA_HOME", base);
+
+    const links = try allocator.alloc(LinkEntry, 1000);
+    var initialized: usize = 0;
+    defer {
+        for (links[0..initialized]) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.target);
+        }
+        allocator.free(links);
+    }
+    for (links, 0..) |*entry, i| {
+        const name = try std.fmt.allocPrint(allocator, "tool-{d}", .{i});
+        const target = std.fmt.allocPrint(
+            allocator,
+            "/mnt/c/ghr/tools/_v2/units/u-tool/_unit/bin/{s}.exe",
+            .{name},
+        ) catch |err| {
+            allocator.free(name);
+            return err;
+        };
+        entry.* = .{ .name = name, .target = target };
+        initialized += 1;
+    }
+
+    const body = try stringifyIdManifest(
+        allocator,
+        "tool",
+        "_v2/units/u-tool/_unit",
+        "/mnt/c/ghr/tools/_v2/units/u-tool/_unit",
+        links,
+    );
+    defer allocator.free(body);
+    try std.testing.expect(body.len > 64 * 1024);
+    try std.testing.expect(body.len <= max_manifest_bytes);
+    try persistIdManifestBody(allocator, tio, &env, "tool", body);
+
+    const path = try idManifestPath(allocator, &env, "tool");
+    defer allocator.free(path);
+    const parsed = (try readIdManifest(allocator, tio, path, "tool")).?;
+    defer parsed.deinit();
+    try std.testing.expectEqual(links.len, parsed.value.links.len);
+    try std.testing.expectEqualStrings("tool-999", parsed.value.links[999].name);
 }
 
 test "readManifest returns null for missing file" {
@@ -2034,6 +3013,599 @@ test "computeDesiredLinks: duplicate filter doesn't duplicate link entry" {
     try std.testing.expectEqual(@as(usize, 1), c.links.len);
 }
 
+test "computeDesiredCommandLinks uses final names without suffix inference" {
+    const commands = [_]install_state.OwnedCommand{
+        .{
+            .name = "zigb",
+            .source_name = "zig",
+            .relative_target = "bin\\zig.exe",
+            .kind = "native",
+        },
+        .{
+            .name = "literal.exe",
+            .relative_target = "other.exe",
+            .kind = "native",
+        },
+    };
+    var c = try computeDesiredCommandLinks(
+        std.testing.allocator,
+        &commands,
+        "/mnt/c/tools/_v2/units/u-zigb/_unit",
+        &.{},
+    );
+    defer c.deinit();
+    try std.testing.expectEqual(@as(usize, 2), c.links.len);
+    try std.testing.expectEqualStrings("zigb", c.links[0].name);
+    try std.testing.expectEqualStrings(
+        "/mnt/c/tools/_v2/units/u-zigb/_unit/bin/zig.exe",
+        c.links[0].target,
+    );
+    try std.testing.expectEqualStrings("literal.exe", c.links[1].name);
+}
+
+test "computeDesiredCommandLinks refuses raw wasm modules" {
+    const commands = [_]install_state.OwnedCommand{.{
+        .name = "parser",
+        .relative_target = "parser.wasm",
+        .kind = "wasm",
+    }};
+    try std.testing.expectError(
+        DesiredError.UnsupportedCommandKind,
+        computeDesiredCommandLinks(
+            std.testing.allocator,
+            &commands,
+            "/mnt/c/tools/_v2/units/u-parser/_unit",
+            &.{},
+        ),
+    );
+}
+
+test "ID link manifests separate two releases from one repository" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+    try writeTestV2Unit(allocator, tio, tools, "zigb", "zigb", "zig.exe");
+    try writeTestV2Unit(allocator, tio, tools, "ziga", "ziga", "zig.exe");
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+
+    try cmdLinkAuto(allocator, tio, &env, "zigb", &.{}, false, false, &out.writer, &err_out.writer);
+    try cmdLinkAuto(allocator, tio, &env, "ziga", &.{}, false, false, &out.writer, &err_out.writer);
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    const zigb_len = try bin_dir.readLink(tio, "zigb", &target_buf);
+    try std.testing.expect(std.mem.endsWith(u8, target_buf[0..zigb_len], "u-zigb/_unit/zig.exe"));
+    const ziga_len = try bin_dir.readLink(tio, "ziga", &target_buf);
+    try std.testing.expect(std.mem.endsWith(u8, target_buf[0..ziga_len], "u-ziga/_unit/zig.exe"));
+
+    const zigb_manifest = try idManifestPath(allocator, &env, "zigb");
+    defer allocator.free(zigb_manifest);
+    const ziga_manifest = try idManifestPath(allocator, &env, "ziga");
+    defer allocator.free(ziga_manifest);
+    var zigb_parsed = (try readIdManifest(allocator, tio, zigb_manifest, "zigb")).?;
+    defer zigb_parsed.deinit();
+    var ziga_parsed = (try readIdManifest(allocator, tio, ziga_manifest, "ziga")).?;
+    defer ziga_parsed.deinit();
+
+    const zigb_rel = try install_state.encodeRelPath(allocator, "zigb");
+    defer allocator.free(zigb_rel);
+    const zigb_unit = try std.fs.path.join(allocator, &.{ tools, zigb_rel });
+    defer allocator.free(zigb_unit);
+    try Dir.cwd().deleteTree(tio, zigb_unit);
+    try cmdUnlinkAuto(allocator, tio, &env, "zigb", &.{}, false, false, &out.writer, &err_out.writer);
+    try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "zigb", &target_buf));
+    _ = try bin_dir.readLink(tio, "ziga", &target_buf);
+    try std.testing.expect(!try idManifestEntryExists(allocator, tio, &env, "zigb"));
+    try std.testing.expect(try idManifestEntryExists(allocator, tio, &env, "ziga"));
+}
+
+test "ID reconciliation refuses a modified owned link" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+    try writeTestV2Unit(allocator, tio, tools, "zigb", "zigb", "zig.exe");
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try cmdLink(allocator, tio, &env, "zigb", &.{}, &out.writer, &err_out.writer);
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    try bin_dir.deleteFile(tio, "zigb");
+    try bin_dir.symLink(tio, "/tmp/user-target.exe", "zigb", .{});
+    try std.testing.expectError(
+        LinkCmdError.LinkStepFailed,
+        cmdLink(allocator, tio, &env, "zigb", &.{}, &out.writer, &err_out.writer),
+    );
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    const target_len = try bin_dir.readLink(tio, "zigb", &target_buf);
+    try std.testing.expectEqualStrings("/tmp/user-target.exe", target_buf[0..target_len]);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "refusing destructive reconciliation") != null);
+}
+
+test "link lazily imports an unambiguous legacy manifest" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+    try writeTestV2Unit(allocator, tio, tools, "cataggar/zig", "zig", "zig.exe");
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    const old_source = try std.fs.path.join(allocator, &.{ tools, "Cataggar", "Zig" });
+    defer allocator.free(old_source);
+    const old_target = try std.fs.path.join(allocator, &.{ old_source, "zig.exe" });
+    defer allocator.free(old_target);
+    var legacy_links = [_]LinkEntry{.{ .name = "zig", .target = old_target }};
+    try writeManifest(allocator, tio, &env, "cataggar", "zig", .{
+        .source = old_source,
+        .links = &legacy_links,
+    });
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    try bin_dir.symLink(tio, old_target, "zig", .{});
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try cmdLink(allocator, tio, &env, "cataggar/zig", &.{}, &out.writer, &err_out.writer);
+
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    const target_len = try bin_dir.readLink(tio, "zig", &target_buf);
+    try std.testing.expect(std.mem.endsWith(u8, target_buf[0..target_len], "u-cataggar/u-zig/_unit/zig.exe"));
+    try std.testing.expect(try idManifestEntryExists(allocator, tio, &env, "cataggar/zig"));
+    const legacy_path = try manifestPath(allocator, &env, "cataggar", "zig");
+    defer allocator.free(legacy_path);
+    try std.testing.expect((try readManifest(allocator, tio, legacy_path)) == null);
+}
+
+test "modified legacy link blocks import without deleting legacy state" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+    try writeTestV2Unit(allocator, tio, tools, "cataggar/zig", "zig", "zig.exe");
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    const old_source = try std.fs.path.join(allocator, &.{ tools, "Cataggar", "Zig" });
+    defer allocator.free(old_source);
+    const old_target = try std.fs.path.join(allocator, &.{ old_source, "zig.exe" });
+    defer allocator.free(old_target);
+    var legacy_links = [_]LinkEntry{.{ .name = "zig", .target = old_target }};
+    try writeManifest(allocator, tio, &env, "cataggar", "zig", .{
+        .source = old_source,
+        .links = &legacy_links,
+    });
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    try bin_dir.symLink(tio, "/tmp/user-zig.exe", "zig", .{});
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try std.testing.expectError(
+        LinkCmdError.LinkStepFailed,
+        cmdLink(allocator, tio, &env, "cataggar/zig", &.{}, &out.writer, &err_out.writer),
+    );
+
+    try std.testing.expect(!try idManifestEntryExists(allocator, tio, &env, "cataggar/zig"));
+    const legacy_path = try manifestPath(allocator, &env, "cataggar", "zig");
+    defer allocator.free(legacy_path);
+    var legacy = (try readManifest(allocator, tio, legacy_path)).?;
+    legacy.deinit();
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    const target_len = try bin_dir.readLink(tio, "zig", &target_buf);
+    try std.testing.expectEqualStrings("/tmp/user-zig.exe", target_buf[0..target_len]);
+}
+
+test "legacy manifest can unlink after Windows install removal" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    const old_source = try std.fs.path.join(allocator, &.{ tools, "Cataggar", "Zig" });
+    defer allocator.free(old_source);
+    const old_target = try std.fs.path.join(allocator, &.{ old_source, "zig.exe" });
+    defer allocator.free(old_target);
+    var legacy_links = [_]LinkEntry{.{ .name = "zig", .target = old_target }};
+    try writeManifest(allocator, tio, &env, "cataggar", "zig", .{
+        .source = old_source,
+        .links = &legacy_links,
+    });
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    try bin_dir.symLink(tio, old_target, "zig", .{});
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try cmdUnlink(allocator, tio, &env, "cataggar/zig", &.{}, &out.writer, &err_out.writer);
+
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "zig", &target_buf));
+    const legacy_path = try manifestPath(allocator, &env, "cataggar", "zig");
+    defer allocator.free(legacy_path);
+    try std.testing.expect((try readManifest(allocator, tio, legacy_path)) == null);
+}
+
+test "filtered legacy unlink refuses partial manifest import" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    const old_source = try std.fs.path.join(allocator, &.{ tools, "cataggar", "tool" });
+    defer allocator.free(old_source);
+    const first_target = try std.fs.path.join(allocator, &.{ old_source, "first.exe" });
+    defer allocator.free(first_target);
+    const second_target = try std.fs.path.join(allocator, &.{ old_source, "second.exe" });
+    defer allocator.free(second_target);
+    var legacy_links = [_]LinkEntry{
+        .{ .name = "first", .target = first_target },
+        .{ .name = "second", .target = second_target },
+    };
+    try writeManifest(allocator, tio, &env, "cataggar", "tool", .{
+        .source = old_source,
+        .links = &legacy_links,
+    });
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    try bin_dir.symLink(tio, first_target, "first", .{});
+    try bin_dir.symLink(tio, second_target, "second", .{});
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try std.testing.expectError(
+        LinkCmdError.LinkStepFailed,
+        cmdUnlink(
+            allocator,
+            tio,
+            &env,
+            "cataggar/tool",
+            &.{"first"},
+            &out.writer,
+            &err_out.writer,
+        ),
+    );
+
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    _ = try bin_dir.readLink(tio, "first", &target_buf);
+    _ = try bin_dir.readLink(tio, "second", &target_buf);
+    try std.testing.expect(!try idManifestEntryExists(allocator, tio, &env, "cataggar/tool"));
+    const legacy_path = try manifestPath(allocator, &env, "cataggar", "tool");
+    defer allocator.free(legacy_path);
+    var legacy = (try readManifest(allocator, tio, legacy_path)).?;
+    legacy.deinit();
+}
+
+test "manifest write failure rolls back newly-created ID links" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+    try writeTestV2Unit(allocator, tio, tools, "zigb", "zigb", "zig.exe");
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    const manifest_dir = try idManifestDir(allocator, &env, "zigb");
+    defer allocator.free(manifest_dir);
+    try install.ensureDirAbsoluteRecursive(tio, manifest_dir);
+    const blocked_tmp = try std.fs.path.join(allocator, &.{ manifest_dir, id_manifest_file ++ ".tmp" });
+    defer allocator.free(blocked_tmp);
+    try install.ensureDirAbsoluteRecursive(tio, blocked_tmp);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try std.testing.expectError(
+        error.IsDir,
+        cmdLink(allocator, tio, &env, "zigb", &.{}, &out.writer, &err_out.writer),
+    );
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "zigb", &target_buf));
+}
+
+test "filtered ID unlink restores removed links when manifest write fails" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    const links = [_]LinkEntry{
+        .{ .name = "first", .target = "/tmp/first.exe" },
+        .{ .name = "second", .target = "/tmp/second.exe" },
+    };
+    try writeIdManifest(
+        allocator,
+        tio,
+        &env,
+        "tool",
+        "_v2/units/u-tool/_unit",
+        "/mnt/c/ghr/tools/_v2/units/u-tool/_unit",
+        &links,
+    );
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    for (links) |entry| try bin_dir.symLink(tio, entry.target, entry.name, .{});
+
+    const manifest_dir = try idManifestDir(allocator, &env, "tool");
+    defer allocator.free(manifest_dir);
+    const blocked_tmp = try std.fs.path.join(allocator, &.{ manifest_dir, id_manifest_file ++ ".tmp" });
+    defer allocator.free(blocked_tmp);
+    try install.ensureDirAbsoluteRecursive(tio, blocked_tmp);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try std.testing.expectError(
+        error.IsDir,
+        cmdUnlink(
+            allocator,
+            tio,
+            &env,
+            "tool",
+            &.{"first"},
+            &out.writer,
+            &err_out.writer,
+        ),
+    );
+
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    for (links) |entry| {
+        const target_len = try bin_dir.readLink(tio, entry.name, &target_buf);
+        try std.testing.expectEqualStrings(entry.target, target_buf[0..target_len]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    const manifest_path = try idManifestPath(allocator, &env, "tool");
+    defer allocator.free(manifest_path);
+    const parsed = (try readIdManifest(allocator, tio, manifest_path, "tool")).?;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.links.len);
+}
+
+test "full ID unlink restores links when manifest deletion fails" {
+    if (builtin.os.tag == .windows or !File.Permissions.has_executable_bit)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    const links = [_]LinkEntry{
+        .{ .name = "first", .target = "/tmp/first.exe" },
+        .{ .name = "second", .target = "/tmp/second.exe" },
+    };
+    try writeIdManifest(
+        allocator,
+        tio,
+        &env,
+        "tool",
+        "_v2/units/u-tool/_unit",
+        "/mnt/c/ghr/tools/_v2/units/u-tool/_unit",
+        &links,
+    );
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    for (links) |entry| try bin_dir.symLink(tio, entry.target, entry.name, .{});
+
+    const manifest_dir = try idManifestDir(allocator, &env, "tool");
+    defer allocator.free(manifest_dir);
+    var manifest_dir_handle = try Dir.openDirAbsolute(tio, manifest_dir, .{ .iterate = true });
+    defer manifest_dir_handle.close(tio);
+    try manifest_dir_handle.setPermissions(tio, @enumFromInt(0o500));
+    defer manifest_dir_handle.setPermissions(tio, @enumFromInt(0o700)) catch {};
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try std.testing.expectError(
+        error.AccessDenied,
+        cmdUnlink(allocator, tio, &env, "tool", &.{}, &out.writer, &err_out.writer),
+    );
+
+    var target_buf: [Dir.max_path_bytes]u8 = undefined;
+    for (links) |entry| {
+        const target_len = try bin_dir.readLink(tio, entry.name, &target_buf);
+        try std.testing.expectEqualStrings(entry.target, target_buf[0..target_len]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try std.testing.expect(try idManifestEntryExists(allocator, tio, &env, "tool"));
+}
+
+test "one-segment discovery failure refuses PATH fallback" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(tio, .{ .sub_path = "win-tools", .data = "not a directory" });
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+    try std.testing.expectError(
+        LinkCmdError.LinkStepFailed,
+        cmdLinkAuto(
+            allocator,
+            tio,
+            &env,
+            "git",
+            &.{},
+            false,
+            false,
+            &out.writer,
+            &err_out.writer,
+        ),
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        err_out.written(),
+        "cannot disambiguate 'git' as an install ID",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        err_out.written(),
+        "use --path only when Windows PATH mode is intended",
+    ) != null);
+}
+
 test "writeJsonEscaped: escapes control characters per RFC 8259" {
     const allocator = std.testing.allocator;
     var collected = std.Io.Writer.Allocating.init(allocator);
@@ -2045,121 +3617,6 @@ test "writeJsonEscaped: escapes control characters per RFC 8259" {
         "a\\nb\\tc\\\"d\\\\e\\u0001f",
         out,
     );
-}
-
-test "listInstalledSlugs: reports tools dir missing" {
-    const tio = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const base_len = try tmp.dir.realPath(tio, &path_buf);
-    const base = path_buf[0..base_len];
-
-    var nonexistent_buf: [Dir.max_path_bytes]u8 = undefined;
-    const nonexistent = try std.fmt.bufPrint(&nonexistent_buf, "{s}{c}nope", .{ base, std.fs.path.sep });
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const result = try listInstalledSlugs(arena.allocator(), tio, nonexistent);
-    try std.testing.expect(!result.present);
-    try std.testing.expectEqual(@as(usize, 0), result.slugs.len);
-}
-
-test "listInstalledSlugs: empty dir reports present with no slugs" {
-    const tio = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const base_len = try tmp.dir.realPath(tio, &path_buf);
-    const base = path_buf[0..base_len];
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const result = try listInstalledSlugs(arena.allocator(), tio, base);
-    try std.testing.expect(result.present);
-    try std.testing.expectEqual(@as(usize, 0), result.slugs.len);
-}
-
-test "listInstalledSlugs: lists owner/repo slugs and skips transaction dirs" {
-    const tio = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(tio, "azuread/microsoft-authentication-cli");
-    try tmp.dir.createDirPath(tio, "cataggar/ghr");
-    try tmp.dir.createDirPath(tio, "cataggar/ghr.old"); // tombstone
-    try tmp.dir.createDirPath(tio, "cataggar/.ghr.staging");
-    try tmp.dir.createDirPath(tio, "ctaggart/zig");
-    try tmp.dir.createDirPath(tio, "lonely-owner"); // owner with no repos
-
-    var path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const base_len = try tmp.dir.realPath(tio, &path_buf);
-    const base = path_buf[0..base_len];
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-
-    const result = try listInstalledSlugs(arena.allocator(), tio, base);
-    try std.testing.expect(result.present);
-    try std.testing.expectEqual(@as(usize, 3), result.slugs.len);
-    try std.testing.expectEqualStrings("azuread/microsoft-authentication-cli", result.slugs[0]);
-    try std.testing.expectEqualStrings("cataggar/ghr", result.slugs[1]);
-    try std.testing.expectEqualStrings("ctaggart/zig", result.slugs[2]);
-}
-
-test "writeNotInstalledError: lists siblings so typos are obvious" {
-    const tio = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(tio, "azuread/microsoft-authentication-cli");
-    try tmp.dir.createDirPath(tio, "ctaggart/zig");
-
-    var path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const base_len = try tmp.dir.realPath(tio, &path_buf);
-    const base = path_buf[0..base_len];
-
-    var out = std.Io.Writer.Allocating.init(allocator);
-    defer out.deinit();
-    try writeNotInstalledError(allocator, tio, &out.writer, base, "cataggar", "microsoft-authentication-cli");
-
-    const text = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, text, "error: cataggar/microsoft-authentication-cli is not installed on the Windows side\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "azuread/microsoft-authentication-cli") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "ctaggart/zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "run `ghr install cataggar/microsoft-authentication-cli` from Windows") != null);
-}
-
-test "writeNotInstalledError: distinguishes missing tools dir from empty" {
-    const tio = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const base_len = try tmp.dir.realPath(tio, &path_buf);
-    const base = path_buf[0..base_len];
-
-    var nonexistent_buf: [Dir.max_path_bytes]u8 = undefined;
-    const nonexistent = try std.fmt.bufPrint(&nonexistent_buf, "{s}{c}nope", .{ base, std.fs.path.sep });
-
-    var out1 = std.Io.Writer.Allocating.init(allocator);
-    defer out1.deinit();
-    try writeNotInstalledError(allocator, tio, &out1.writer, nonexistent, "x", "y");
-    try std.testing.expect(std.mem.indexOf(u8, out1.written(), "Windows tools dir does not exist") != null);
-
-    var out2 = std.Io.Writer.Allocating.init(allocator);
-    defer out2.deinit();
-    try writeNotInstalledError(allocator, tio, &out2.writer, base, "x", "y");
-    try std.testing.expect(std.mem.indexOf(u8, out2.written(), "Windows tools dir exists but is empty") != null);
 }
 
 test "isValidBareExeName: accepts plain names and .exe suffix" {

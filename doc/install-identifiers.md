@@ -545,6 +545,49 @@ Requirements:
 Bare Windows-PATH executable manifests remain a separate kind because they are
 not backed by a ghr install ID.
 
+The implemented ID manifest is stored at:
+
+```text
+<links>/by-id/u-<segment>/.../_manifest.json
+```
+
+It uses the same prefixed, slash-segment encoding principle as install state,
+so IDs such as `a` and `a/b` can coexist and raw IDs are never interpreted as
+paths. The payload records `schema: 2`, `layout_generation: 2`, `kind:
+"wsl-id"`, the canonical `id`, the inventory-relative `unit_path`, the
+diagnostic absolute `source`, and each owned link's exact name and target. The
+ID is the ownership key; `source` is never used to infer identity.
+
+`ghr link <id>` resolves exact command ownership from a Windows-platform
+inventory, so aliases remain aliases and are not re-derived from executable
+filenames. For the compatibility shorthand `ghr link <name>`, an existing
+one-segment ID or ID manifest takes precedence; otherwise the name retains its
+historical Windows-PATH meaning. `--id` and `--path` force either side of that
+ambiguity. Automatic disambiguation requires canonical Windows tools-directory
+discovery; if that lookup fails, it refuses the operation rather than guessing
+from the WSL username and requires explicit `--path` or
+`GHR_WIN_TOOLS_DIR`.
+
+Before replacing or retiring any link, reconciliation verifies that its live
+target still equals the target in the owning manifest. A changed link or an
+unmanaged entry blocks the operation before mutation. During lazy import, the
+new ID manifest is written only after links are reconciled; failure rolls link
+changes back, and the old owner/repo manifest is deleted only after the new
+manifest is durable. A legacy manifest can still be unlinked safely after its
+Windows install has been removed because its exact source and targets are
+validated directly; partial `--bin` operations are refused until legacy state
+has been fully reconciled.
+
+Legacy owner/repo validation preserves the actual casing recorded in the
+manifest while requiring its final two source components to case-fold to the
+canonical ID. This keeps pre-migration mixed-case installs recoverable without
+allowing a legacy manifest to claim targets outside the Windows tools root.
+
+Native Windows commands link directly to their installed executables. Wasm
+commands are refused rather than linked to raw `.wasm` bytes, which are not
+directly executable through WSL interop; a future WSL-aware wasm launcher can
+add that support without emitting broken links today.
+
 ## GitHub Actions and caches
 
 The install composite action currently parses `spec [minisign-key]` lines and
