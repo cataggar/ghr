@@ -340,6 +340,12 @@ pub fn classifyArg(arg: []const u8) !Classified {
 pub const Asset = struct {
     name: []const u8,
     browser_download_url: []const u8,
+    /// GitHub's numeric release-asset identifier. Recorded as durable,
+    /// non-sensitive provenance so an install can be identified by
+    /// repository/tag/asset identity even when the effective download URL is a
+    /// signed redirect that must never be persisted. `null` for fixtures and
+    /// responses that omit the field.
+    id: ?i64 = null,
     /// The `api.github.com/repos/<owner>/<repo>/releases/assets/<id>` URL.
     /// Unlike `browser_download_url`, this endpoint honors `Authorization`
     /// (with `Accept: application/octet-stream`) for private and
@@ -1292,7 +1298,7 @@ fn findChecksumAsset(assets: []const Asset, asset_name: []const u8) ?Asset {
 }
 
 /// Stream the file at `path` through SHA-256 and return the 32-byte digest.
-fn computeFileSha256(io: Io, path: []const u8) ![32]u8 {
+pub fn computeFileSha256(io: Io, path: []const u8) ![32]u8 {
     var file = try Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
     var read_buf: [64 * 1024]u8 = undefined;
@@ -3078,6 +3084,28 @@ test "findBestAsset selects cosign bare binary for Linux" {
         .arch = &.{ "x86_64", "x64", "amd64" },
     });
     try std.testing.expectEqualStrings("cosign-linux-amd64", best.name);
+}
+
+test "release JSON carries the numeric asset id used for durable provenance" {
+    const allocator = std.testing.allocator;
+    const json_body =
+        \\{"tag_name":"v1.0.0","assets":[{"id":220886623,"name":"app.tar.gz","browser_download_url":"https://example.com/app.tar.gz","url":"https://api.github.com/repos/o/r/releases/assets/220886623","digest":"sha256:abc"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(Release, allocator, json_body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const asset = parsed.value.assets[0];
+    try std.testing.expectEqual(@as(i64, 220886623), asset.id.?);
+    try std.testing.expectEqualStrings("sha256:abc", asset.digest.?);
+}
+
+test "an asset without an id parses with a null id" {
+    const allocator = std.testing.allocator;
+    const json_body =
+        \\{"tag_name":"v1.0.0","assets":[{"name":"app.tar.gz","browser_download_url":"https://example.com/app.tar.gz"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(Release, allocator, json_body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.assets[0].id == null);
 }
 
 test "ParsedRelease deinit frees all memory" {

@@ -9,6 +9,8 @@ const validate = @import("validate.zig");
 const minisign_cmd = @import("minisign_cmd.zig");
 const release_mod = @import("release.zig");
 const link = @import("link.zig");
+const install_state = @import("install_state.zig");
+const minisign = @import("minisign.zig");
 
 pub const version = build_options.version;
 
@@ -64,12 +66,34 @@ pub fn main(init: std.process.Init) !void {
     if (eql(cmd_str, "path")) {
         try cmdPath(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
-        if (args.next()) |arg| {
-            try stderr.interface.print("error: unexpected argument '{s}' for 'ghr list'\n", .{arg});
-            try stderr.interface.flush();
-            std.process.exit(1);
+        var format: ListFormat = .human;
+        while (args.next()) |arg| {
+            if (eql(arg, "--ids")) {
+                if (format == .json) {
+                    try stderr.interface.print("error: '--ids' and '--json' cannot be combined\n", .{});
+                    try stderr.interface.print("  hint: '--ids' prints bare ids; '--json' prints full records\n", .{});
+                    try stderr.interface.flush();
+                    std.process.exit(1);
+                }
+                format = .ids;
+            } else if (eql(arg, "--json")) {
+                if (format == .ids) {
+                    try stderr.interface.print("error: '--ids' and '--json' cannot be combined\n", .{});
+                    try stderr.interface.print("  hint: '--ids' prints bare ids; '--json' prints full records\n", .{});
+                    try stderr.interface.flush();
+                    std.process.exit(1);
+                }
+                format = .json;
+            } else {
+                try stderr.interface.print("error: unexpected argument '{s}' for 'ghr list'\n", .{arg});
+                try stderr.interface.flush();
+                std.process.exit(1);
+            }
         }
-        try cmdList(allocator, environ, io, &stdout.interface);
+        const damaged = try cmdList(allocator, environ, io, &stdout.interface, &stderr.interface, format);
+        try stdout.interface.flush();
+        try stderr.interface.flush();
+        if (damaged) std.process.exit(1);
     } else if (eql(cmd_str, "install")) {
         var debug = false;
         var no_auth = false;
@@ -81,8 +105,11 @@ pub fn main(init: std.process.Init) !void {
         var skip_authenticode = false;
         var keep_going = false;
         var minisign_pubkey: ?[]const u8 = null;
-        var entries: std.ArrayListUnmanaged(release_mod.SpecWithKey) = .empty;
-        defer entries.deinit(allocator);
+        // Positional tokens are handed to `install_request` verbatim: sources,
+        // quoted query tokens, and bare minisign keys are classified there so
+        // one grammar governs the whole invocation.
+        var tokens: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer tokens.deinit(allocator);
         var bin_filters: std.ArrayListUnmanaged([]const u8) = .empty;
         defer bin_filters.deinit(allocator);
         while (args.next()) |arg| {
@@ -110,6 +137,16 @@ pub fn main(init: std.process.Init) !void {
                     try stderr.interface.flush();
                     std.process.exit(1);
                 };
+                // Checked here so a malformed key fails before any download,
+                // and identically to a per-request `?minisign=` value.
+                if (!minisign.looksLikePubKey(v)) {
+                    try stderr.interface.print(
+                        "error: '--minisign' value is not a base64 minisign public key\n",
+                        .{},
+                    );
+                    try stderr.interface.flush();
+                    std.process.exit(1);
+                }
                 minisign_pubkey = v;
             } else if (eql(arg, "--bin")) {
                 const v = args.next() orelse {
@@ -119,31 +156,7 @@ pub fn main(init: std.process.Init) !void {
                 };
                 try bin_filters.append(allocator, v);
             } else {
-                switch (release_mod.classifySpecOrKey(arg, entries.items)) {
-                    .spec => |s| try entries.append(allocator, .{ .spec = s }),
-                    .key => |k| entries.items[entries.items.len - 1].key = k,
-                    .lone_key => {
-                        try stderr.interface.print(
-                            "error: positional minisign key '{s}' must follow a spec\n",
-                            .{arg},
-                        );
-                        try stderr.interface.print(
-                            "  hint: write `<owner/repo[@tag]> <pubkey>` (key attaches to the preceding spec)\n",
-                            .{},
-                        );
-                        try stderr.interface.flush();
-                        std.process.exit(1);
-                    },
-                    .double_key => {
-                        const last_spec = entries.items[entries.items.len - 1].spec;
-                        try stderr.interface.print(
-                            "error: spec '{s}' already has an inline minisign key; second key '{s}' is not allowed\n",
-                            .{ last_spec, arg },
-                        );
-                        try stderr.interface.flush();
-                        std.process.exit(1);
-                    },
-                }
+                try tokens.append(allocator, arg);
             }
         }
         const gates: release_mod.VerifyGates = .{
@@ -154,30 +167,56 @@ pub fn main(init: std.process.Init) !void {
             .skip_attestation = skip_attestation,
             .skip_authenticode = skip_authenticode,
         };
-        install.cmdInstallMany(
+        install.cmdInstallRequests(
             allocator,
             io,
             environ,
-            entries.items,
+            tokens.items,
             &stdout.interface,
             &stderr.interface,
-            debug,
-            no_auth,
-            gates,
-            minisign_pubkey,
-            bin_filters.items,
-            keep_going,
+            .{
+                .debug = debug,
+                .no_auth = no_auth,
+                .gates = gates,
+                .minisign_pubkey_b64 = minisign_pubkey,
+                .bin_filters = bin_filters.items,
+                .keep_going = keep_going,
+            },
         ) catch |err| switch (err) {
-            error.MissingInstallSpec, error.BinFilterRequiresSingleSpec => std.process.exit(1),
+            error.MissingInstallSpec,
+            error.BinFilterRequiresSingleSpec,
+            error.InvalidInstallRequest,
+            error.InstallPlanRejected,
+            error.InstallFailed,
+            => {
+                try stdout.interface.flush();
+                try stderr.interface.flush();
+                std.process.exit(1);
+            },
             else => return err,
         };
     } else if (eql(cmd_str, "uninstall")) {
         const spec = args.next() orelse {
-            try stderr.interface.print("error: 'ghr uninstall' requires <owner/repo>\n", .{});
+            try stderr.interface.print("error: 'ghr uninstall' requires <id>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
         };
-        try install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface);
+        if (args.next()) |arg| {
+            try stderr.interface.print("error: unexpected argument '{s}' for 'ghr uninstall'\n", .{arg});
+            try stderr.interface.flush();
+            std.process.exit(1);
+        }
+        install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface) catch |err| switch (err) {
+            error.UninstallTargetNotFound,
+            error.UninstallStateUnusable,
+            error.UninstallFailed,
+            => {
+                try stdout.interface.flush();
+                try stderr.interface.flush();
+                std.process.exit(1);
+            },
+            else => return err,
+        };
     } else if (eql(cmd_str, "download")) {
         try download.cmdDownload(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "link")) {
@@ -552,47 +591,70 @@ fn printPathDirectoryUsage(w: *Writer, subcommand: []const u8, description: []co
 
 fn printListUsage(w: *Writer) !void {
     try w.print(
-        \\ghr list - List installed tools
+        \\ghr list - Report installed units
         \\
         \\USAGE:
-        \\    ghr list
+        \\    ghr list [--ids | --json]
         \\
-        \\Prints each installed tool as 'owner/repo[@tag]', one per line.
-        \\When the install actually verified the asset with a minisign key
-        \\(inline or via --minisign), the pubkey is appended on the same line
-        \\so it is directly pasteable back as `ghr install <line>`.
+        \\The default output is a human report, not pasteable install arguments:
+        \\each line names the install id, whether the unit is v1 (legacy) or v2,
+        \\its status, its source and tag, and the commands it publishes.
+        \\
+        \\Conflicting, corrupt, and unsupported units are always shown, and
+        \\`ghr list` exits non-zero when any unit is not healthy.
         \\
         \\OPTIONS:
+        \\    --ids       Print one healthy canonical install id per line
+        \\    --json      Print deterministic records, including the reproducible
+        \\                install definition (source intent plus configuration)
+        \\                for v2 units; legacy v1 units report a null definition
         \\    -h, --help  Show this help
+        \\
+        \\`--ids` and `--json` cannot be combined: a bare id and a full
+        \\definition are not interchangeable.
         \\
     , .{});
 }
 
 fn printInstallUsage(w: *Writer) !void {
     try w.print(
-        \\ghr install - install one or more tools from GitHub releases
+        \\ghr install - install one or more tools by install id
         \\
         \\USAGE:
-        \\    ghr install <spec> [<minisign-pubkey>] [<spec> [<minisign-pubkey>] ...] [options]
+        \\    ghr install <source> ["?<query>"] [<minisign-pubkey>] [...] [options]
         \\
-        \\Each <spec> is one of:
+        \\Each <source> is one of:
         \\    owner/repo[@tag]              Auto-pick the best asset for this platform
         \\    owner/repo/file[@tag]         Install a specific asset by name
+        \\    https://github.com/.../download/<tag>/<file>
+        \\                                  A GitHub release download URL
+        \\    https://<host>/<path>/<file>  A direct URL; requires an explicit id
         \\
-        \\An optional minisign public key (56-char base64, starts with `RW` or
-        \\`RU`) immediately after a spec attaches to that spec only and
-        \\overrides `--minisign` for that one install. Otherwise the global
-        \\`--minisign <pubkey>` default applies to every spec.
+        \\An install id is the stable name used by list and uninstall. GitHub
+        \\sources derive `lowercase(owner)/lowercase(repo)`; a direct URL has no
+        \\repository identity and must set one explicitly.
         \\
-        \\Downloads the matching release asset(s), extracts each if needed,
-        \\and installs the resulting binaries into ghr's bin directory.
-        \\`--bin` filters links and metadata after extraction; archive contents
-        \\remain fully extracted in the tool directory.
-        \\Multi-spec invocations share a single HTTP client + auth context.
+        \\An optional quoted query token configures the source it follows:
+        \\    "?id=<id>"                    Explicit stable install id
+        \\    "?alias=<from>:<to>"          Publish command <from> as <to> (repeatable)
+        \\    "?minisign=<pubkey>"          Minisign key required for this source
+        \\Pairs split at their first `=`, are percent-decoded, and `+` stays a
+        \\literal plus. An id never renames a command by itself.
+        \\
+        \\An optional bare minisign public key (56-char base64, starts with `RW`
+        \\or `RU`) immediately after a source attaches to that source only and
+        \\overrides `--minisign` for it. Otherwise the global `--minisign
+        \\<pubkey>` default applies to every source that has no key.
+        \\
+        \\Installing an id that already exists replaces it transactionally: the
+        \\new unit and its complete command set appear together, or the previous
+        \\install is restored. Commands owned by another id, and bin entries ghr
+        \\does not manage, are reported before anything is changed.
         \\
         \\OPTIONS:
-        \\    --bin <name>            Link and record only this installed command (repeatable);
-        \\                            requires exactly one spec and is not supported for wasm modules
+        \\    --bin <name>            Publish and record only this discovered command
+        \\                            (repeatable, applied before aliases); requires
+        \\                            exactly one source and is not supported for wasm
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
         \\    --skip-verify           Skip every verification step (checksum, minisign, sigstore, attestation, authenticode)
@@ -601,36 +663,43 @@ fn printInstallUsage(w: *Writer) !void {
         \\    --skip-sigstore         Skip just the published .sigstore.json sidecar verification step
         \\    --skip-attestation      Skip just the GitHub-native artifact attestation verification step
         \\    --skip-authenticode     Skip just the Authenticode (Windows PE) verification step
-        \\    --minisign <pubkey>     Default minisign key, applied to specs without an inline key;
+        \\    --minisign <pubkey>     Default minisign key, applied to sources without a key;
         \\                            <pubkey> is a base64 minisign public key string
-        \\    --keep-going            Continue past per-spec failures; exit non-zero
-        \\                            with a summary at the end if any spec failed
+        \\    --keep-going            Continue past per-source resolution failures; the
+        \\                            surviving sources are still planned together and
+        \\                            the command exits non-zero with a summary
         \\    -h, --help              Show this help
+        \\
+        \\A direct URL publishes no GitHub digest, sigstore sidecar, or
+        \\attestation, so those steps report that they cannot run instead of
+        \\claiming success. With `--minisign`, a direct URL is verified against
+        \\the sibling `<url>.minisig`.
         \\
         \\EXAMPLES:
         \\    ghr install burntsushi/ripgrep@15.1.0
         \\    ghr install azuread/microsoft-authentication-cli --bin azureauth
         \\    ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
         \\    ghr install jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+        \\    ghr install cataggar/zig@zigb-0.16.1 "?id=zigb&alias=zig:zigb"
         \\
     , .{});
 }
 
 fn printUninstallUsage(w: *Writer) !void {
     try w.print(
-        \\ghr uninstall - remove an installed tool
+        \\ghr uninstall - remove one installed unit by id
         \\
         \\USAGE:
-        \\    ghr uninstall <owner/repo>
-        \\    ghr uninstall <owner/repo/wasm-stem>
+        \\    ghr uninstall <id>
         \\
-        \\Removes the installed tool's binaries from ghr's bin directory and
-        \\its tool storage directory.
+        \\<id> is a canonical install id, not a source spec or a path. GitHub
+        \\installs derive `owner/repo`, so existing `ghr uninstall owner/repo`
+        \\and `ghr uninstall owner/repo/<wasm-stem>` commands keep working.
         \\
-        \\A wasm release installs each module as its own unit. Pass
-        \\<owner/repo/wasm-stem> to remove a single module. Plain
-        \\<owner/repo> removes only the repo-level (archive) install and
-        \\leaves any wasm modules in place.
+        \\Exactly that id is removed: its commands, its app bundles, and its unit
+        \\directory. Prefixes are not recursive, so removing `owner/repo` leaves
+        \\`owner/repo/<module>` installed. Missing, conflicting, corrupt, and
+        \\unsupported state is reported instead of guessed at.
         \\
         \\OPTIONS:
         \\    -h, --help  Show this help
@@ -651,223 +720,491 @@ fn printVersionUsage(w: *Writer) !void {
     , .{});
 }
 
-fn cmdList(allocator: std.mem.Allocator, environ: *const std.process.Environ.Map, io: Io, w: *Writer) !void {
+/// Output shape for `ghr list`. The three forms are deliberately distinct:
+/// the default is a human report, `--ids` is a bare identity list for
+/// scripting, and `--json` is a machine-readable record set. A definition line
+/// and a bare id are never interchangeable, so no form may be mistaken for the
+/// other.
+const ListFormat = enum { human, ids, json };
+
+/// List installed units from the inventory reader. Returns true when any record
+/// is not healthy, so the caller can exit non-zero instead of silently
+/// presenting damaged state as installable.
+fn cmdList(
+    allocator: std.mem.Allocator,
+    environ: *const std.process.Environ.Map,
+    io: Io,
+    w: *Writer,
+    err_w: *Writer,
+    format: ListFormat,
+) !bool {
     const d = try Dirs.detect(allocator, environ);
     defer d.deinit();
 
-    var dir = Io.Dir.openDirAbsolute(io, d.tools, .{ .iterate = true }) catch {
-        try w.print("No tools installed.\n", .{});
-        return;
+    var inventory = install_state.scan(allocator, io, d.tools, .{}) catch |err| {
+        try err_w.print("error: failed to read install state under '{s}': {t}\n", .{ d.tools, err });
+        return true;
     };
-    defer dir.close(io);
+    defer inventory.deinit(allocator);
 
-    var lines: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (lines.items) |line| allocator.free(line);
-        lines.deinit(allocator);
+    var damaged = false;
+    for (inventory.records) |rec| {
+        if (rec.status != .ok) damaged = true;
     }
 
-    var iter = dir.iterate();
-    while (try iter.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        if (std.mem.endsWith(u8, entry.name, ".old") or
-            (std.mem.startsWith(u8, entry.name, ".") and std.mem.endsWith(u8, entry.name, ".staging"))) continue;
-        var owner_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
-        defer owner_dir.close(io);
-        var repo_iter = owner_dir.iterate();
-        while (try repo_iter.next(io)) |repo_entry| {
-            if (repo_entry.kind != .directory) continue;
-            if (std.mem.endsWith(u8, repo_entry.name, ".old") or
-                (std.mem.startsWith(u8, repo_entry.name, ".") and std.mem.endsWith(u8, repo_entry.name, ".staging"))) continue;
-
-            // Repo-level (archive / bare binary) install: `<owner>/<repo>/ghr.json`.
-            const repo_meta = readToolMeta(allocator, io, owner_dir, repo_entry.name);
-            defer if (repo_meta) |m| m.deinit(allocator);
-            if (repo_meta != null) {
-                const line = try formatToolLine(allocator, entry.name, repo_entry.name, repo_meta);
-                errdefer allocator.free(line);
-                try lines.append(allocator, line);
-            }
-
-            // Descend into per-module wasm units: `<owner>/<repo>/<stem>/ghr.json`.
-            var module_count: usize = 0;
-            if (owner_dir.openDir(io, repo_entry.name, .{ .iterate = true })) |*repo_dir| {
-                defer repo_dir.close(io);
-                var mod_iter = repo_dir.iterate();
-                while (try mod_iter.next(io)) |mod_entry| {
-                    if (mod_entry.kind != .directory) continue;
-                    if (std.mem.endsWith(u8, mod_entry.name, ".old") or
-                        (std.mem.startsWith(u8, mod_entry.name, ".") and std.mem.endsWith(u8, mod_entry.name, ".staging"))) continue;
-                    const mod_meta = readToolMeta(allocator, io, repo_dir.*, mod_entry.name);
-                    defer if (mod_meta) |m| m.deinit(allocator);
-                    if (mod_meta == null) continue;
-                    const combined = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_entry.name, mod_entry.name });
-                    defer allocator.free(combined);
-                    const line = try formatToolLine(allocator, entry.name, combined, mod_meta);
-                    errdefer allocator.free(line);
-                    try lines.append(allocator, line);
-                    module_count += 1;
-                }
-            } else |_| {}
-
-            // Preserve the old fallback: a repo dir with neither a repo-level
-            // manifest nor any module units still lists as a bare entry.
-            if (repo_meta == null and module_count == 0) {
-                const line = try formatToolLine(allocator, entry.name, repo_entry.name, null);
-                errdefer allocator.free(line);
-                try lines.append(allocator, line);
-            }
-        }
+    switch (format) {
+        .ids => try printListIds(inventory, w, err_w),
+        .json => try printListJson(inventory, w),
+        .human => try printListHuman(inventory, w),
     }
+    return damaged;
+}
 
-    if (lines.items.len == 0) {
+fn unitKindLabel(kind: install_state.UnitKind) []const u8 {
+    return switch (kind) {
+        .v1_repo => "v1",
+        .v1_wasm => "v1-wasm",
+        .v2 => "v2",
+        .unknown => "unknown",
+    };
+}
+
+fn printListHuman(inventory: install_state.Inventory, w: *Writer) !void {
+    if (inventory.records.len == 0) {
         try w.print("No tools installed.\n", .{});
         return;
     }
-
-    std.mem.sort([]u8, lines.items, {}, struct {
-        fn lt(_: void, a: []u8, b: []u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+    // Stated explicitly so a line is never mistaken for pasteable install
+    // arguments: an id can carry aliases, a selector, and configuration that a
+    // plain slug cannot express.
+    try w.print("installed units (report, not install arguments):\n", .{});
+    for (inventory.records) |rec| {
+        const id = rec.id orelse "<unknown id>";
+        try w.print("  {s}  [{s}] {t}", .{ id, unitKindLabel(rec.kind), rec.status });
+        if (rec.status != .ok) try w.print(" ({t})", .{rec.reason});
+        if (rec.source) |src| {
+            switch (src.kind) {
+                .github => try w.print("  source: github:{s}/{s}", .{
+                    src.owner orelse "?",
+                    src.repo orelse "?",
+                }),
+                .generic_url => try w.print("  source: url:{s}", .{src.url orelse "?"}),
+            }
+        } else if (rec.kind == .v1_repo or rec.kind == .v1_wasm) {
+            try w.print("  source: legacy:{s}", .{rec.path});
         }
-    }.lt);
+        const tag: ?[]const u8 = if (rec.resolved) |r| r.tag orelse rec.tag else rec.tag;
+        if (tag) |t| {
+            if (t.len > 0) try w.print("  tag: {s}", .{t});
+        }
+        if (rec.commands.len > 0) {
+            try w.print("  commands:", .{});
+            for (rec.commands) |cmd| try w.print(" {s}", .{cmd.name});
+        }
+        try w.print("\n", .{});
+    }
+    try w.print("\nrun 'ghr list --ids' for bare ids or 'ghr list --json' for definitions\n", .{});
+}
 
-    for (lines.items) |line| {
-        try w.print("{s}\n", .{line});
+fn printListIds(inventory: install_state.Inventory, w: *Writer, err_w: *Writer) !void {
+    for (inventory.records) |rec| {
+        if (rec.status != .ok) continue;
+        const id = rec.id orelse continue;
+        try w.print("{s}\n", .{id});
+    }
+    // A damaged record must never be silently dropped: `--ids` output feeds
+    // scripts that mutate state, so the caller is told and the exit code is
+    // non-zero.
+    for (inventory.records) |rec| {
+        if (rec.status == .ok) continue;
+        try err_w.print("error: {s}: {t} ({t}) at {s}\n", .{
+            rec.id orelse "<unknown id>",
+            rec.status,
+            rec.reason,
+            rec.path,
+        });
     }
 }
 
-/// Subset of `ghr.json` surfaced by `ghr list`. Owned strings.
-const ToolListMeta = struct {
-    tag: ?[]const u8 = null,
-    minisign: ?[]const u8 = null,
-
-    fn deinit(self: ToolListMeta, allocator: std.mem.Allocator) void {
-        if (self.tag) |t| allocator.free(t);
-        if (self.minisign) |k| allocator.free(k);
-    }
-};
-
-/// Read the `tag` and `minisign` fields from a tool's `ghr.json`.
-/// Returns `null` when the file is missing or malformed.
-fn readToolMeta(allocator: std.mem.Allocator, io: Io, owner_dir: Io.Dir, repo_name: []const u8) ?ToolListMeta {
-    var repo_dir = owner_dir.openDir(io, repo_name, .{}) catch return null;
-    defer repo_dir.close(io);
-
-    const json_bytes = repo_dir.readFileAlloc(io, "ghr.json", allocator, Io.Limit.limited(8192)) catch return null;
-    defer allocator.free(json_bytes);
-
-    const parsed = std.json.parseFromSlice(
-        struct {
-            tag: ?[]const u8 = null,
-            minisign: ?[]const u8 = null,
-        },
-        allocator,
-        json_bytes,
-        .{ .ignore_unknown_fields = true },
-    ) catch return null;
-    defer parsed.deinit();
-
-    var result: ToolListMeta = .{};
-    if (parsed.value.tag) |t| {
-        result.tag = allocator.dupe(u8, t) catch {
-            result.deinit(allocator);
-            return null;
-        };
-    }
-    if (parsed.value.minisign) |k| {
-        if (k.len > 0) {
-            result.minisign = allocator.dupe(u8, k) catch {
-                result.deinit(allocator);
-                return null;
-            };
+fn writeJsonString(w: *Writer, s: []const u8) !void {
+    try w.writeAll("\"");
+    for (s) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => {
+                if (c < 0x20 or c == 0x7f) {
+                    try w.print("\\u{x:0>4}", .{c});
+                } else {
+                    try w.writeByte(c);
+                }
+            },
         }
     }
-    return result;
+    try w.writeAll("\"");
 }
 
-/// Format a single `ghr list` line. The whole line is designed to be
-/// directly pasteable as arguments to `ghr install`, so the optional
-/// minisign pubkey is appended after a space (matching the per-spec
-/// positional inline-key form accepted by `ghr install`).
-///
-/// `owner` and `repo` are ASCII-lowercased so output is canonical even
-/// when the on-disk dir is still a pre-migration mixed-case name like
-/// `AzureAD/foo` (GitHub is case-insensitive on slugs; we standardize).
-/// `tag` is preserved verbatim — tags are case-sensitive on GitHub.
-fn formatToolLine(
-    allocator: std.mem.Allocator,
-    owner: []const u8,
-    repo: []const u8,
-    meta: ?ToolListMeta,
+fn writeJsonOptString(w: *Writer, value: ?[]const u8) !void {
+    if (value) |v| {
+        try writeJsonString(w, v);
+    } else {
+        try w.writeAll("null");
+    }
+}
+
+/// Deterministic machine-readable records. `definition` is the reproducible
+/// install definition: durable SOURCE INTENT plus effective configuration,
+/// never a resolved URL. A v1 record is explicitly legacy and its definition is
+/// null, because v1 metadata does not record the intent needed to rebuild one.
+fn printListJson(inventory: install_state.Inventory, w: *Writer) !void {
+    try w.print("{{\"schema\":1,\"form\":\"install-records\",\"units\":[", .{});
+    for (inventory.records, 0..) |rec, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"id\":");
+        try writeJsonOptString(w, rec.id);
+        try w.print(",\"kind\":\"{s}\",\"status\":\"{t}\",\"reason\":\"{t}\",\"legacy\":{},\"path\":", .{
+            unitKindLabel(rec.kind),
+            rec.status,
+            rec.reason,
+            rec.kind == .v1_repo or rec.kind == .v1_wasm,
+        });
+        try writeJsonString(w, rec.path);
+
+        try w.writeAll(",\"definition\":");
+        if (rec.source) |src| {
+            try w.writeAll("{\"source\":{\"kind\":");
+            try writeJsonString(w, switch (src.kind) {
+                .github => "github",
+                .generic_url => "generic_url",
+            });
+            try w.writeAll(",\"owner\":");
+            try writeJsonOptString(w, src.owner);
+            try w.writeAll(",\"repo\":");
+            try writeJsonOptString(w, src.repo);
+            try w.writeAll(",\"tag\":");
+            try writeJsonOptString(w, src.tag);
+            try w.writeAll(",\"asset_selector\":");
+            try writeJsonOptString(w, src.asset_selector);
+            try w.writeAll(",\"url\":");
+            try writeJsonOptString(w, src.url);
+            try w.writeAll("},\"config\":{\"aliases\":[");
+            if (rec.config) |cfg| {
+                for (cfg.aliases, 0..) |alias, ai| {
+                    if (ai > 0) try w.writeAll(",");
+                    try w.writeAll("{\"from\":");
+                    try writeJsonString(w, alias.from);
+                    try w.writeAll(",\"to\":");
+                    try writeJsonString(w, alias.to);
+                    try w.writeAll("}");
+                }
+            }
+            try w.writeAll("],\"selected_commands\":");
+            if (rec.config) |cfg| {
+                if (cfg.selected_commands) |sel| {
+                    try w.writeAll("[");
+                    for (sel, 0..) |c, si| {
+                        if (si > 0) try w.writeAll(",");
+                        try writeJsonString(w, c);
+                    }
+                    try w.writeAll("]");
+                } else try w.writeAll("null");
+            } else try w.writeAll("null");
+            try w.writeAll(",\"minisign\":");
+            if (rec.config) |cfg| {
+                try writeJsonOptString(w, cfg.minisign);
+            } else try w.writeAll("null");
+            try w.writeAll("}}");
+        } else {
+            try w.writeAll("null");
+        }
+
+        try w.writeAll(",\"resolved\":");
+        if (rec.resolved) |res| {
+            try w.writeAll("{\"tag\":");
+            try writeJsonOptString(w, res.tag);
+            try w.writeAll(",\"asset\":");
+            try writeJsonOptString(w, res.asset);
+            try w.writeAll(",\"api_asset_id\":");
+            if (res.api_asset_id) |id| {
+                try w.print("{d}", .{id});
+            } else try w.writeAll("null");
+            try w.writeAll(",\"download_url\":");
+            try writeJsonOptString(w, res.download_url);
+            try w.writeAll("}");
+        } else {
+            try w.writeAll("{\"tag\":");
+            try writeJsonOptString(w, rec.tag);
+            try w.writeAll(",\"asset\":");
+            try writeJsonOptString(w, rec.asset);
+            try w.writeAll(",\"api_asset_id\":null,\"download_url\":null}");
+        }
+
+        try w.writeAll(",\"commands\":[");
+        for (rec.commands, 0..) |cmd, ci| {
+            if (ci > 0) try w.writeAll(",");
+            try w.writeAll("{\"name\":");
+            try writeJsonString(w, cmd.name);
+            try w.writeAll(",\"relative_target\":");
+            try writeJsonString(w, cmd.relative_target);
+            try w.writeAll(",\"kind\":");
+            try writeJsonOptString(w, cmd.kind);
+            try w.writeAll("}");
+        }
+        try w.writeAll("],\"apps\":[");
+        for (rec.apps, 0..) |app, ai| {
+            if (ai > 0) try w.writeAll(",");
+            try writeJsonString(w, app);
+        }
+        try w.writeAll("],\"verified\":");
+        if (rec.verification) |v| {
+            try writeJsonOptString(w, v.result);
+        } else {
+            try writeJsonOptString(w, rec.verified);
+        }
+        try w.writeAll("}");
+    }
+    try w.print("]}}\n", .{});
+}
+
+// ---------------------------------------------------------------------------
+// `ghr list` output tests
+// ---------------------------------------------------------------------------
+
+const t_list_alloc = std.testing.allocator;
+
+fn tListRender(
+    records: []install_state.InventoryRecord,
+    format: ListFormat,
 ) ![]u8 {
-    const tag: ?[]const u8 = if (meta) |m| m.tag else null;
-    const key: ?[]const u8 = if (meta) |m| m.minisign else null;
-    var owner_buf: [256]u8 = undefined;
-    var repo_buf: [256]u8 = undefined;
-    const owner_lc = asciiLowerInto(&owner_buf, owner);
-    const repo_lc = asciiLowerInto(&repo_buf, repo);
-    if (tag) |t| {
-        if (key) |k| {
-            return std.fmt.allocPrint(allocator, "{s}/{s}@{s} {s}", .{ owner_lc, repo_lc, t, k });
-        }
-        return std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ owner_lc, repo_lc, t });
+    var out: Io.Writer.Allocating = .init(t_list_alloc);
+    errdefer out.deinit();
+    var errs: Io.Writer.Allocating = .init(t_list_alloc);
+    defer errs.deinit();
+    const inventory: install_state.Inventory = .{ .records = records };
+    switch (format) {
+        .human => try printListHuman(inventory, &out.writer),
+        .ids => try printListIds(inventory, &out.writer, &errs.writer),
+        .json => try printListJson(inventory, &out.writer),
     }
-    if (key) |k| {
-        return std.fmt.allocPrint(allocator, "{s}/{s} {s}", .{ owner_lc, repo_lc, k });
-    }
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner_lc, repo_lc });
+    var list = out.toArrayList();
+    return list.toOwnedSlice(t_list_alloc);
 }
 
-/// ASCII-lowercase `src` into the start of `dst`. Falls back to returning
-/// `src` verbatim when it doesn't fit (slug-length names always do in
-/// practice; this just keeps the helper allocation-free for the common
-/// case).
-fn asciiLowerInto(dst: []u8, src: []const u8) []const u8 {
-    if (src.len > dst.len) return src;
-    for (src, 0..) |c, i| dst[i] = std.ascii.toLower(c);
-    return dst[0..src.len];
+fn tListRenderIdsErr(records: []install_state.InventoryRecord) !struct { out: []u8, err: []u8 } {
+    var out: Io.Writer.Allocating = .init(t_list_alloc);
+    errdefer out.deinit();
+    var errs: Io.Writer.Allocating = .init(t_list_alloc);
+    errdefer errs.deinit();
+    const inventory: install_state.Inventory = .{ .records = records };
+    try printListIds(inventory, &out.writer, &errs.writer);
+    var out_list = out.toArrayList();
+    var err_list = errs.toArrayList();
+    return .{
+        .out = try out_list.toOwnedSlice(t_list_alloc),
+        .err = try err_list.toOwnedSlice(t_list_alloc),
+    };
 }
 
-test "formatToolLine: tag and key" {
-    const line = try formatToolLine(std.testing.allocator, "cataggar", "ghr", .{
-        .tag = "v0.3.0-dev.1",
-        .minisign = "RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0",
-    });
-    defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings(
-        "cataggar/ghr@v0.3.0-dev.1 RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0",
-        line,
-    );
+fn tV2Record() install_state.InventoryRecord {
+    return .{
+        .kind = .v2,
+        .status = .ok,
+        .reason = .none,
+        .path = "_v2/units/u-zigb/_unit",
+        .id = "zigb",
+        .source = .{
+            .kind = .github,
+            .owner = "cataggar",
+            .repo = "zig",
+            .tag = "zigb-0.16.1",
+        },
+        .config = .{ .aliases = &.{}, .selected_commands = null, .minisign = null },
+        .resolved = .{ .tag = "zigb-0.16.1", .asset = "zig.tar.xz", .api_asset_id = 7 },
+        .verification = .{ .result = "checksum" },
+    };
 }
 
-test "formatToolLine: tag without key" {
-    const line = try formatToolLine(std.testing.allocator, "BurntSushi", "ripgrep", .{
+fn tV1Record() install_state.InventoryRecord {
+    return .{
+        .kind = .v1_repo,
+        .status = .ok,
+        .reason = .none,
+        .path = "burntsushi/ripgrep",
+        .id = "burntsushi/ripgrep",
         .tag = "14.1.0",
-    });
-    defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings("burntsushi/ripgrep@14.1.0", line);
+    };
 }
 
-test "formatToolLine: no metadata" {
-    const line = try formatToolLine(std.testing.allocator, "foo", "bar", null);
-    defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings("foo/bar", line);
+test "list human output identifies id, kind, status, source, and commands" {
+    var commands = [_]install_state.OwnedCommand{
+        .{ .name = "zigb", .source_name = "zig", .relative_target = "bin/zig", .kind = "native" },
+    };
+    var v2 = tV2Record();
+    v2.commands = &commands;
+    var records = [_]install_state.InventoryRecord{v2};
+
+    const text = try tListRender(&records, .human);
+    defer t_list_alloc.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "zigb") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[v2]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "github:cataggar/zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "commands: zigb") != null);
+    // The human report must not masquerade as pasteable install arguments.
+    try std.testing.expect(std.mem.indexOf(u8, text, "report, not install arguments") != null);
 }
 
-test "formatToolLine: key without tag" {
-    const line = try formatToolLine(std.testing.allocator, "foo", "bar", .{
-        .minisign = "RWSXXXX",
-    });
-    defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings("foo/bar RWSXXXX", line);
+test "list human output marks legacy units and non-ok state" {
+    var broken: install_state.InventoryRecord = .{
+        .kind = .v2,
+        .status = .corrupt,
+        .reason = .malformed_json,
+        .path = "_v2/units/u-bad/_unit",
+        .id = "bad",
+    };
+    var records = [_]install_state.InventoryRecord{ tV1Record(), broken };
+
+    const text = try tListRender(&records, .human);
+    defer t_list_alloc.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[v1]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "legacy:burntsushi/ripgrep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "corrupt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "malformed_json") != null);
+    _ = &broken;
 }
 
-test "formatToolLine: lowercases mixed-case owner and repo, preserves tag" {
-    const line = try formatToolLine(std.testing.allocator, "AzureAD", "Microsoft-Authentication-CLI", .{
-        .tag = "0.9.6",
-    });
-    defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings("azuread/microsoft-authentication-cli@0.9.6", line);
+test "list of empty inventory is unambiguous" {
+    var records = [_]install_state.InventoryRecord{};
+    const text = try tListRender(&records, .human);
+    defer t_list_alloc.free(text);
+    try std.testing.expectEqualStrings("No tools installed.\n", text);
+
+    const ids = try tListRender(&records, .ids);
+    defer t_list_alloc.free(ids);
+    try std.testing.expectEqualStrings("", ids);
+
+    const json = try tListRender(&records, .json);
+    defer t_list_alloc.free(json);
+    try std.testing.expectEqualStrings("{\"schema\":1,\"form\":\"install-records\",\"units\":[]}\n", json);
+}
+
+test "list --ids prints healthy ids and reports damaged ones" {
+    const broken: install_state.InventoryRecord = .{
+        .kind = .v2,
+        .status = .conflict,
+        .reason = .duplicate_id,
+        .path = "_v2/units/u-bad/_unit",
+        .id = "bad",
+    };
+    var records = [_]install_state.InventoryRecord{ tV2Record(), broken, tV1Record() };
+
+    const result = try tListRenderIdsErr(&records);
+    defer t_list_alloc.free(result.out);
+    defer t_list_alloc.free(result.err);
+    try std.testing.expectEqualStrings("zigb\nburntsushi/ripgrep\n", result.out);
+    // A conflicted id must never appear in a list that invites mutation.
+    try std.testing.expect(std.mem.indexOf(u8, result.out, "bad\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err, "conflict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err, "duplicate_id") != null);
+}
+
+test "list --json separates source intent from resolved provenance" {
+    var commands = [_]install_state.OwnedCommand{
+        .{ .name = "zigb", .source_name = "zig", .relative_target = "bin/zig", .kind = "native" },
+    };
+    var aliases = [_]install_state.OwnedAlias{.{ .from = "zig", .to = "zigb" }};
+    var v2 = tV2Record();
+    v2.commands = &commands;
+    v2.config = .{ .aliases = &aliases, .selected_commands = null, .minisign = null };
+    v2.resolved = .{
+        .tag = "zigb-0.16.1",
+        .asset = "zig.tar.xz",
+        .api_asset_id = 7,
+        .download_url = "https://github.com/cataggar/zig/releases/download/zigb-0.16.1/zig.tar.xz",
+    };
+    var records = [_]install_state.InventoryRecord{v2};
+
+    const text = try tListRender(&records, .json);
+    defer t_list_alloc.free(text);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, t_list_alloc, text, .{});
+    defer parsed.deinit();
+    const unit = parsed.value.object.get("units").?.array.items[0];
+    try std.testing.expectEqualStrings("install-records", parsed.value.object.get("form").?.string);
+    try std.testing.expectEqualStrings("zigb", unit.object.get("id").?.string);
+    try std.testing.expectEqualStrings("v2", unit.object.get("kind").?.string);
+    try std.testing.expectEqual(false, unit.object.get("legacy").?.bool);
+
+    const definition = unit.object.get("definition").?.object;
+    const source = definition.get("source").?.object;
+    try std.testing.expectEqualStrings("github", source.get("kind").?.string);
+    try std.testing.expectEqualStrings("cataggar", source.get("owner").?.string);
+    // The reproducible definition uses source intent, never the resolved URL.
+    try std.testing.expect(source.get("url").? == .null);
+    try std.testing.expectEqualStrings(
+        "zigb",
+        definition.get("config").?.object.get("aliases").?.array.items[0].object.get("to").?.string,
+    );
+    // Provenance is reported separately.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        unit.object.get("resolved").?.object.get("download_url").?.string,
+        "releases/download",
+    ) != null);
+}
+
+test "list --json reports a legacy unit with a null definition" {
+    var records = [_]install_state.InventoryRecord{tV1Record()};
+    const text = try tListRender(&records, .json);
+    defer t_list_alloc.free(text);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, t_list_alloc, text, .{});
+    defer parsed.deinit();
+    const unit = parsed.value.object.get("units").?.array.items[0];
+    try std.testing.expectEqualStrings("v1", unit.object.get("kind").?.string);
+    try std.testing.expectEqual(true, unit.object.get("legacy").?.bool);
+    // v1 never records the intent needed to rebuild an install, so nothing is
+    // invented for it.
+    try std.testing.expect(unit.object.get("definition").? == .null);
+    try std.testing.expectEqualStrings("14.1.0", unit.object.get("resolved").?.object.get("tag").?.string);
+}
+
+test "list --json reports damaged units with their status and reason" {
+    const broken: install_state.InventoryRecord = .{
+        .kind = .v2,
+        .status = .unsupported,
+        .reason = .unsupported_schema,
+        .path = "_v2/units/u-future/_unit",
+        .id = "future",
+    };
+    var records = [_]install_state.InventoryRecord{broken};
+    const text = try tListRender(&records, .json);
+    defer t_list_alloc.free(text);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, t_list_alloc, text, .{});
+    defer parsed.deinit();
+    const unit = parsed.value.object.get("units").?.array.items[0];
+    try std.testing.expectEqualStrings("unsupported", unit.object.get("status").?.string);
+    try std.testing.expectEqualStrings("unsupported_schema", unit.object.get("reason").?.string);
+}
+
+test "list --json escapes control bytes in metadata values" {
+    var v2 = tV2Record();
+    v2.source = .{ .kind = .github, .owner = "o", .repo = "r", .tag = "v1\"x" };
+    var records = [_]install_state.InventoryRecord{v2};
+    const text = try tListRender(&records, .json);
+    defer t_list_alloc.free(text);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, t_list_alloc, text, .{});
+    defer parsed.deinit();
+    const unit = parsed.value.object.get("units").?.array.items[0];
+    try std.testing.expectEqualStrings(
+        "v1\"x",
+        unit.object.get("definition").?.object.get("source").?.object.get("tag").?.string,
+    );
 }
 
 fn printUsage(w: *Writer) !void {
@@ -878,9 +1215,9 @@ fn printUsage(w: *Writer) !void {
         \\    ghr <COMMAND> [OPTIONS]
         \\
         \\COMMANDS:
-        \\    list                                 List installed tools
-        \\    install <spec> [<spec> ...]          Install one or more tools from GitHub releases
-        \\    uninstall <owner/repo>               Remove an installed tool
+        \\    list [--ids|--json]                  Report installed units
+        \\    install <source> [<source> ...]      Install one or more tools by install id
+        \\    uninstall <id>                       Remove one installed unit by id
         \\    download <spec> [<spec> ...]         Download one or more release assets
         \\    link <owner/repo>|<name>             (WSL) Symlink Windows bins/PATH exes into ghr's bin dir
         \\    unlink <owner/repo>|<name>           (WSL) Remove ghr-created WSL symlinks
@@ -890,8 +1227,9 @@ fn printUsage(w: *Writer) !void {
         \\    minisign <SUBCOMMAND>                Sign release artifacts with a minisign key
         \\    version                              Print version and exit
         \\
-        \\Each <spec> is `owner/repo[@tag]` (auto-pick asset) or
-        \\`owner/repo/file[@tag]` (specific asset).
+        \\Each <source> is `owner/repo[@tag]` (auto-pick asset),
+        \\`owner/repo/file[@tag]` (specific asset), a GitHub release URL, or a
+        \\direct URL with an explicit `"?id=<id>"`.
         \\Run 'ghr <COMMAND> --help' to show help for a specific command.
         \\
         \\OPTIONS:
@@ -930,4 +1268,6 @@ test {
     _ = @import("install_request.zig");
     _ = @import("install_state.zig");
     _ = @import("command_plan.zig");
+    _ = @import("install_state_write.zig");
+    _ = @import("install_txn.zig");
 }

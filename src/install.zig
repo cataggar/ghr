@@ -6,6 +6,12 @@ const archive = @import("archive.zig");
 const auth = @import("auth.zig");
 const release_mod = @import("release.zig");
 const attestation = @import("attestation.zig");
+const minisign = @import("minisign.zig");
+const install_request = @import("install_request.zig");
+const install_state = @import("install_state.zig");
+const install_state_write = @import("install_state_write.zig");
+const install_txn = @import("install_txn.zig");
+const command_plan = @import("command_plan.zig");
 const version = @import("build_options").version;
 
 const Io = std.Io;
@@ -21,7 +27,6 @@ const isTransientStatus = http.isTransientStatus;
 
 const Asset = release_mod.Asset;
 const Spec = release_mod.RepoSpec;
-const parseSpec = release_mod.parseRepoSpec;
 const getRelease = release_mod.getRelease;
 const findBestAsset = release_mod.findBestAsset;
 const isInstallableAsset = release_mod.isInstallableAssetName;
@@ -956,98 +961,6 @@ fn scanAppBundle(
     }
 }
 
-/// Link or copy an executable to the bin directory.
-fn linkToBin(
-    allocator: std.mem.Allocator,
-    io: Io,
-    tool_dir_path: []const u8,
-    bin_dir: Dir,
-    exe_rel_path: []const u8,
-    w: *Writer,
-) !void {
-    // A `.wasm` module is not directly executable: install a shim launcher
-    // (embedded in ghr) plus a `<stem>.ghr` manifest that the shim loads at
-    // run time.
-    if (release_mod.isWasmAssetName(exe_rel_path)) {
-        return linkWasmToBin(allocator, io, tool_dir_path, bin_dir, exe_rel_path, w);
-    }
-
-    const exe_name = std.fs.path.basename(exe_rel_path);
-    var src_path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const src_path = std.fmt.bufPrint(&src_path_buf, "{s}{c}{s}", .{
-        tool_dir_path,
-        std.fs.path.sep,
-        exe_rel_path,
-    }) catch return error.PathTooLong;
-
-    if (builtin.os.tag == .windows) {
-        // Use an embedded shim .exe driven by a `<stem>.ghr` manifest instead
-        // of a .cmd wrapper. The shim is embedded in ghr at build time so it's
-        // always available, regardless of how ghr is installed (PyPI, GitHub
-        // release, etc.). This is the same technique used by npm and Scoop.
-        const shim_exe_bytes = @import("shim_exe").bytes;
-
-        const stem = windowsExeStem(exe_name);
-
-        // Write the `<stem>.ghr` manifest naming the native target. The shim
-        // reads this at run time; for a current shim it supersedes the legacy
-        // `.shim` file (which is reconciled further below).
-        var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
-        const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{stem}) catch return error.PathTooLong;
-        try writeNativeGhr(io, bin_dir, ghr_name, src_path);
-
-        // Remove any legacy `.cmd` wrapper from very old installs; the shim
-        // exe + `.ghr` manifest supersede it unconditionally. The legacy
-        // `.shim` is reconciled below, once we know whether the current shim
-        // exe was actually installed.
-        var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem})) |p| {
-            bin_dir.deleteFile(io, p) catch {};
-        } else |_| {}
-
-        // Write the embedded shim exe as <name>.exe
-        var name_buf: [Dir.max_path_bytes]u8 = undefined;
-        const shim_exe_name = windowsShimExeName(&name_buf, exe_name) catch return error.PathTooLong;
-        bin_dir.deleteFile(io, shim_exe_name) catch {
-            // On Windows a running shim exe cannot be deleted; rename it out of the way.
-            var old_name_buf: [Dir.max_path_bytes]u8 = undefined;
-            const old_name = std.fmt.bufPrint(&old_name_buf, "{s}.old", .{shim_exe_name}) catch return error.PathTooLong;
-            bin_dir.deleteFile(io, old_name) catch {};
-            bin_dir.rename(shim_exe_name, bin_dir, old_name, io) catch {};
-        };
-        const shim_replaced = if (bin_dir.createFile(io, shim_exe_name, .{})) |*exe_file| blk: {
-            defer exe_file.close(io);
-            exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
-            break :blk true;
-        } else |_| false;
-
-        // Reconcile the legacy `.shim` file now that we know whether the
-        // current shim exe was installed.
-        var legacy_shim_buf: [Dir.max_path_bytes]u8 = undefined;
-        const legacy_shim = std.fmt.bufPrint(&legacy_shim_buf, "{s}.shim", .{stem}) catch return error.PathTooLong;
-        if (shim_replaced) {
-            // The freshly written shim reads the `.ghr` manifest; drop any
-            // stale `.shim` from an older install.
-            bin_dir.deleteFile(io, legacy_shim) catch {};
-        } else {
-            // Self-update on Windows: the running shim exe is locked, so we
-            // could not install the current `.ghr`-aware shim. The shim that
-            // is still running may predate the `.ghr` format and only
-            // understand a legacy `.shim` file, so write that fallback
-            // pointing at the new target. A current shim prefers the `.ghr`
-            // manifest and ignores `.shim` when one is present, so this is
-            // safe for both old and new shims and prevents a broken command
-            // (`shim: cannot read <stem>.shim`) after a self-update.
-            writeLegacyShim(io, bin_dir, legacy_shim, src_path) catch {};
-        }
-    } else {
-        // Unix: symlink
-        bin_dir.deleteFile(io, exe_name) catch {};
-        try bin_dir.symLink(io, src_path, exe_name, .{});
-    }
-    try w.print("  linked {s}\n", .{exe_name});
-}
-
 /// Strip the trailing `.wasm` from a wasm asset basename to get the command
 /// stem (e.g. `hello.wasm` -> `hello`).
 fn wasmStem(wasm_rel_path: []const u8) []const u8 {
@@ -1120,109 +1033,6 @@ fn writeLegacyShim(io: Io, bin_dir: Dir, shim_name: []const u8, target_abs: []co
     const sw = &fw.interface;
     sw.print("{s}\n", .{target_abs}) catch return error.WriteFailed;
     fw.end() catch return error.WriteFailed;
-}
-
-/// Install the embedded shim launcher for a wasm module. Creates the launcher
-/// binary (`<stem>.exe` on Windows, `<stem>` on Unix) plus a `<stem>.ghr`
-/// manifest next to it. The manifest carries `targetWasm` (the absolute path
-/// to the installed wasm) along with the `runtime` / `runtimeArgs` copied from
-/// the release's `<wasm>.ghr`. No `.shim` file is written. Works identically on
-/// Windows, Linux, and macOS.
-fn linkWasmToBin(
-    allocator: std.mem.Allocator,
-    io: Io,
-    tool_dir_path: []const u8,
-    bin_dir: Dir,
-    wasm_rel_path: []const u8,
-    w: *Writer,
-) !void {
-    const shim_exe_bytes = @import("shim_exe").bytes;
-    const stem = wasmStem(wasm_rel_path);
-    const wasm_base = std.fs.path.basename(wasm_rel_path);
-
-    // Absolute path to the installed wasm (the shim's run-time target).
-    var src_path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const src_path = std.fmt.bufPrint(&src_path_buf, "{s}{c}{s}", .{
-        tool_dir_path,
-        std.fs.path.sep,
-        wasm_rel_path,
-    }) catch return error.PathTooLong;
-
-    // Read the release manifest staged in the tool dir to recover the
-    // runtime + runtimeArgs.
-    var tool_dir = Dir.openDirAbsolute(io, tool_dir_path, .{}) catch return error.CreateFailed;
-    defer tool_dir.close(io);
-    var manifest_name_buf: [Dir.max_path_bytes]u8 = undefined;
-    const manifest_name = std.fmt.bufPrint(&manifest_name_buf, "{s}.ghr", .{wasm_base}) catch return error.PathTooLong;
-    const raw = tool_dir.readFileAlloc(io, manifest_name, allocator, Io.Limit.limited(64 * 1024)) catch return error.CreateFailed;
-    defer allocator.free(raw);
-    const source = try allocator.dupeZ(u8, raw);
-    defer allocator.free(source);
-    const manifest = std.zon.parse.fromSliceAlloc(GhrManifest, allocator, source, null, .{
-        .ignore_unknown_fields = true,
-    }) catch return error.WriteFailed;
-    defer std.zon.parse.free(allocator, manifest);
-
-    // Write the bin-dir `<stem>.ghr` the shim reads at run time.
-    var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
-    const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{stem}) catch return error.PathTooLong;
-    bin_dir.deleteFile(io, ghr_name) catch {};
-    {
-        var ghr_file = bin_dir.createFile(io, ghr_name, .{}) catch return error.CreateFailed;
-        defer ghr_file.close(io);
-        var ghr_buf: [4096]u8 = undefined;
-        var ghr_w = ghr_file.writer(io, &ghr_buf);
-        const gw = &ghr_w.interface;
-        gw.print(".{{\n    .version = 1,\n    .targetWasm = \"", .{}) catch return error.WriteFailed;
-        writeZonEscaped(gw, src_path) catch return error.WriteFailed;
-        gw.print("\",\n    .runtime = \"", .{}) catch return error.WriteFailed;
-        writeZonEscaped(gw, manifest.runtime) catch return error.WriteFailed;
-        gw.print("\",\n    .runtimeArgs = .{{", .{}) catch return error.WriteFailed;
-        for (manifest.runtimeArgs, 0..) |arg, i| {
-            if (i > 0) gw.print(",", .{}) catch return error.WriteFailed;
-            gw.print(" \"", .{}) catch return error.WriteFailed;
-            writeZonEscaped(gw, arg) catch return error.WriteFailed;
-            gw.print("\"", .{}) catch return error.WriteFailed;
-        }
-        if (manifest.runtimeArgs.len > 0) gw.print(" ", .{}) catch return error.WriteFailed;
-        gw.print("}},\n}}\n", .{}) catch return error.WriteFailed;
-        ghr_w.end() catch return error.WriteFailed;
-    }
-
-    // Remove any legacy `.shim` from a previous install of this command.
-    var legacy_shim_buf: [Dir.max_path_bytes]u8 = undefined;
-    if (std.fmt.bufPrint(&legacy_shim_buf, "{s}.shim", .{stem})) |legacy_shim| {
-        bin_dir.deleteFile(io, legacy_shim) catch {};
-    } else |_| {}
-
-    // Launcher binary name: `<stem>.exe` on Windows, `<stem>` on Unix.
-    var launcher_name_buf: [Dir.max_path_bytes]u8 = undefined;
-    const launcher_name = if (builtin.os.tag == .windows)
-        std.fmt.bufPrint(&launcher_name_buf, "{s}.exe", .{stem}) catch return error.PathTooLong
-    else
-        stem;
-
-    bin_dir.deleteFile(io, launcher_name) catch {
-        // On Windows a running launcher cannot be deleted; rename it aside.
-        if (builtin.os.tag == .windows) {
-            var old_name_buf: [Dir.max_path_bytes]u8 = undefined;
-            const old_name = std.fmt.bufPrint(&old_name_buf, "{s}.old", .{launcher_name}) catch return error.PathTooLong;
-            bin_dir.deleteFile(io, old_name) catch {};
-            bin_dir.rename(launcher_name, bin_dir, old_name, io) catch {};
-        }
-    };
-
-    // `.executable_file` is a no-op on Windows but yields the +x bit on Unix,
-    // matching `stageBareExecutable`.
-    if (bin_dir.createFile(io, launcher_name, .{ .permissions = .executable_file })) |*exe_file| {
-        defer exe_file.close(io);
-        exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
-    } else |_| {
-        // Launcher is locked (e.g. concurrently running); the .ghr file is
-        // already updated, so the existing launcher keeps working.
-    }
-
-    try w.print("  linked {s}\n", .{launcher_name});
 }
 
 /// Remove the shim launcher + `<stem>.ghr` (and any legacy `.shim`) for a wasm
@@ -1429,66 +1239,84 @@ fn installAppBundles(
     environ: *const EnvironMap,
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
+    previous_tool_dir_path: ?[]const u8,
     w: *Writer,
 ) !void {
     if (app_paths.len == 0) return;
 
-    const home = environ.get("HOME") orelse return;
+    const home = environ.get("HOME") orelse return error.HomeNotFound;
     const apps_dir_path = try std.fmt.allocPrint(allocator, "{s}/Applications", .{home});
     defer allocator.free(apps_dir_path);
-    Dir.createDirAbsolute(io, apps_dir_path, .default_dir) catch {};
+    Dir.createDirAbsolute(io, apps_dir_path, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
 
-    var apps_dir = Dir.openDirAbsolute(io, apps_dir_path, .{}) catch return;
+    var apps_dir = try Dir.openDirAbsolute(io, apps_dir_path, .{});
     defer apps_dir.close(io);
 
     for (app_paths) |rel_path| {
         const app_name = std.fs.path.basename(rel_path);
-        const app_src = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path }) catch continue;
+        const app_src = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path });
         defer allocator.free(app_src);
 
         // If an existing app is present, only replace it if we own it (has our marker or is a legacy symlink)
-        const existing = apps_dir.statFile(io, app_name, .{}) catch null;
+        const existing = apps_dir.statFile(io, app_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
         if (existing) |_| {
-            if (isLegacyAppSymlink(allocator, io, apps_dir, app_name, tool_dir_path, rel_path)) {
-                apps_dir.deleteFile(io, app_name) catch continue;
-            } else if (isOwnedAppBundle(io, apps_dir, app_name, tool_dir_path)) {
-                apps_dir.deleteTree(io, app_name) catch continue;
+            const legacy_owned =
+                isLegacyAppSymlink(allocator, io, apps_dir, app_name, tool_dir_path, rel_path) or
+                (if (previous_tool_dir_path) |previous|
+                    isLegacyAppSymlink(allocator, io, apps_dir, app_name, previous, rel_path)
+                else
+                    false);
+            const marker_owned =
+                isOwnedAppBundle(io, apps_dir, app_name, tool_dir_path) or
+                (if (previous_tool_dir_path) |previous|
+                    isOwnedAppBundle(io, apps_dir, app_name, previous)
+                else
+                    false);
+            if (legacy_owned) {
+                try apps_dir.deleteFile(io, app_name);
+            } else if (marker_owned) {
+                try apps_dir.deleteTree(io, app_name);
             } else {
-                w.print("  skipped ~/Applications/{s} (not owned by ghr)\n", .{app_name}) catch {};
-                continue;
+                return error.AppOwnershipConflict;
             }
         }
 
         // Copy to a staging name, then rename for atomicity
-        const staging_name = std.fmt.allocPrint(allocator, ".ghr-staging-{s}", .{app_name}) catch continue;
+        const staging_name = try std.fmt.allocPrint(allocator, ".ghr-staging-{s}", .{app_name});
         defer allocator.free(staging_name);
         apps_dir.deleteTree(io, staging_name) catch {};
 
         // Open source .app directory
-        var src_dir = Dir.openDirAbsolute(io, app_src, .{ .iterate = true }) catch continue;
+        var src_dir = try Dir.openDirAbsolute(io, app_src, .{ .iterate = true });
         defer src_dir.close(io);
 
         // Create staging directory and copy
-        apps_dir.createDir(io, staging_name, .default_dir) catch continue;
-        var staging_dir = apps_dir.openDir(io, staging_name, .{}) catch continue;
+        try apps_dir.createDir(io, staging_name, .default_dir);
+        var staging_dir = try apps_dir.openDir(io, staging_name, .{});
         defer staging_dir.close(io);
 
-        copyDirRecursive(io, src_dir, staging_dir) catch {
+        copyDirRecursive(io, src_dir, staging_dir) catch |err| {
             apps_dir.deleteTree(io, staging_name) catch {};
-            continue;
+            return err;
         };
 
         // Write ownership marker (remove first in case archive contained one as a symlink)
         staging_dir.deleteFile(io, ghr_marker) catch {};
-        writeMarkerFile(io, staging_dir, tool_dir_path) catch {
+        writeMarkerFile(io, staging_dir, tool_dir_path) catch |err| {
             apps_dir.deleteTree(io, staging_name) catch {};
-            continue;
+            return err;
         };
 
         // Atomic rename into place
-        apps_dir.rename(staging_name, apps_dir, app_name, io) catch {
+        apps_dir.rename(staging_name, apps_dir, app_name, io) catch |err| {
             apps_dir.deleteTree(io, staging_name) catch {};
-            continue;
+            return err;
         };
 
         try w.print("  installed ~/Applications/{s}\n", .{app_name});
@@ -1503,14 +1331,17 @@ fn uninstallAppBundles(
     app_paths: []const []const u8,
     tool_dir_path: []const u8,
     w: *Writer,
-) void {
+) !void {
     if (app_paths.len == 0) return;
 
-    const home = environ.get("HOME") orelse return;
-    const apps_dir_path = std.fmt.allocPrint(allocator, "{s}/Applications", .{home}) catch return;
+    const home = environ.get("HOME") orelse return error.HomeNotFound;
+    const apps_dir_path = try std.fmt.allocPrint(allocator, "{s}/Applications", .{home});
     defer allocator.free(apps_dir_path);
 
-    var apps_dir = Dir.openDirAbsolute(io, apps_dir_path, .{}) catch return;
+    var apps_dir = Dir.openDirAbsolute(io, apps_dir_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
     defer apps_dir.close(io);
 
     for (app_paths) |rel_path| {
@@ -1518,15 +1349,15 @@ fn uninstallAppBundles(
 
         // Handle legacy symlinks from older ghr versions
         if (isLegacyAppSymlink(allocator, io, apps_dir, app_name, tool_dir_path, rel_path)) {
-            apps_dir.deleteFile(io, app_name) catch continue;
-            w.print("  uninstalled ~/Applications/{s}\n", .{app_name}) catch {};
+            try apps_dir.deleteFile(io, app_name);
+            try w.print("  uninstalled ~/Applications/{s}\n", .{app_name});
             continue;
         }
 
         if (!isOwnedAppBundle(io, apps_dir, app_name, tool_dir_path)) continue;
 
-        apps_dir.deleteTree(io, app_name) catch continue;
-        w.print("  uninstalled ~/Applications/{s}\n", .{app_name}) catch {};
+        try apps_dir.deleteTree(io, app_name);
+        try w.print("  uninstalled ~/Applications/{s}\n", .{app_name});
     }
 }
 
@@ -1537,12 +1368,12 @@ fn isOwnedAppBundle(io: Io, apps_dir: Dir, app_name: []const u8, tool_dir_path: 
     const marker_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ app_name, ghr_marker }) catch return false;
 
     // Verify marker is a regular file, not a symlink
-    const stat = apps_dir.statFile(io, marker_path, .{}) catch return false;
+    const stat = apps_dir.statFile(io, marker_path, .{ .follow_symlinks = false }) catch return false;
     if (stat.kind == .sym_link) return false;
 
     // Read and compare source path
     var content_buf: [Dir.max_path_bytes]u8 = undefined;
-    const file = apps_dir.openFile(io, marker_path, .{}) catch return false;
+    const file = apps_dir.openFile(io, marker_path, .{ .follow_symlinks = false }) catch return false;
     defer file.close(io);
     const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
     return std.mem.eql(u8, content_buf[0..len], tool_dir_path);
@@ -1728,7 +1559,7 @@ fn cleanupOldInstall(
 
     // Remove old app bundle copies (macOS)
     if (comptime builtin.os.tag.isDarwin()) {
-        uninstallAppBundles(allocator, io, environ, meta.parsed.value.apps, tool_path, w);
+        uninstallAppBundles(allocator, io, environ, meta.parsed.value.apps, tool_path, w) catch {};
     }
 }
 
@@ -1793,273 +1624,11 @@ fn shimPointsToToolDir(io: Io, bin_dir: Dir, shim_name: []const u8, tool_path: [
     return content.len == tool_path.len or content[tool_path.len] == '\\' or content[tool_path.len] == '/';
 }
 
-/// Remove bin entries from a previous install that are NOT present in the new install.
-/// Called after new bins are already linked so the active install is never broken.
-fn cleanupStaleBinEntries(
-    io: Io,
-    bin_dir: Dir,
-    old_bins: []const []const u8,
-    new_bins: []const []const u8,
-    old_tool_path: []const u8,
-    previous_tool_path: ?[]const u8,
-) void {
-    for (old_bins) |old_exe_rel| {
-        const old_name = std.fs.path.basename(old_exe_rel);
-        // Skip if this bin is also in the new install (already overwritten by linkToBin)
-        var dominated = false;
-        for (new_bins) |new_exe_rel| {
-            if (commandNamesEqual(
-                installedCommandName(new_exe_rel, builtin.os.tag == .windows),
-                installedCommandName(old_exe_rel, builtin.os.tag == .windows),
-                builtin.os.tag == .windows,
-            )) {
-                dominated = true;
-                break;
-            }
-        }
-        if (dominated) continue;
-        if (release_mod.isWasmAssetName(old_exe_rel)) {
-            cleanupWasmBinEntry(io, bin_dir, old_exe_rel, old_tool_path);
-            if (previous_tool_path) |previous| {
-                cleanupWasmBinEntry(io, bin_dir, old_exe_rel, previous);
-            }
-        } else if (builtin.os.tag == .windows) {
-            cleanupWindowsBinEntry(io, bin_dir, old_name, old_tool_path);
-            if (previous_tool_path) |previous| {
-                cleanupWindowsBinEntry(io, bin_dir, old_name, previous);
-            }
-        } else {
-            var link_buf: [Dir.max_path_bytes]u8 = undefined;
-            const len = bin_dir.readLink(io, old_name, &link_buf) catch continue;
-            const link_target = link_buf[0..len];
-            if (pathIsWithinTool(link_target, old_tool_path, false) or
-                (previous_tool_path != null and pathIsWithinTool(link_target, previous_tool_path.?, false)))
-            {
-                bin_dir.deleteFile(io, old_name) catch {};
-            }
-        }
-    }
-}
-
 fn pathIsWithinTool(path: []const u8, tool_path: []const u8, windows: bool) bool {
     return std.mem.startsWith(u8, path, tool_path) and
         (path.len == tool_path.len or
             path[tool_path.len] == '/' or
             (windows and path[tool_path.len] == '\\'));
-}
-
-/// Unlink every bin in `bins` that this unit (`unit_path`) owns. Handles
-/// wasm shim launchers, Windows shim exes, and Unix symlinks. Shared by the
-/// repo-unit and per-module uninstall paths.
-fn unlinkUnitBins(
-    io: Io,
-    bin_dir: Dir,
-    bins: []const []const u8,
-    unit_path: []const u8,
-    w: *Writer,
-) !void {
-    for (bins) |exe_rel| {
-        const exe_name = std.fs.path.basename(exe_rel);
-        if (release_mod.isWasmAssetName(exe_rel)) {
-            cleanupWasmBinEntry(io, bin_dir, exe_rel, unit_path);
-            try w.print("  unlinked {s}\n", .{wasmStem(exe_rel)});
-        } else if (builtin.os.tag == .windows) {
-            cleanupWindowsBinEntry(io, bin_dir, exe_name, unit_path);
-            try w.print("  unlinked {s}\n", .{exe_name});
-        } else {
-            var link_buf: [Dir.max_path_bytes]u8 = undefined;
-            const len = bin_dir.readLink(io, exe_name, &link_buf) catch continue;
-            const link_target = link_buf[0..len];
-            if (std.mem.startsWith(u8, link_target, unit_path) and
-                (link_target.len == unit_path.len or link_target[unit_path.len] == '/'))
-            {
-                bin_dir.deleteFile(io, exe_name) catch continue;
-                try w.print("  unlinked {s}\n", .{exe_name});
-            }
-        }
-    }
-}
-
-/// Parse a `ghr uninstall` argument into a repo spec plus an optional wasm
-/// module stem. `owner/repo` → whole repo; `owner/repo/<stem>` → one module.
-const UninstallTarget = struct {
-    repo_spec: []const u8,
-    module_stem: ?[]const u8,
-};
-
-fn parseUninstallSpec(spec_str: []const u8) UninstallTarget {
-    if (std.mem.indexOfScalar(u8, spec_str, '/')) |first| {
-        if (std.mem.indexOfScalarPos(u8, spec_str, first + 1, '/')) |second| {
-            return .{ .repo_spec = spec_str[0..second], .module_stem = spec_str[second + 1 ..] };
-        }
-    }
-    return .{ .repo_spec = spec_str, .module_stem = null };
-}
-
-pub fn cmdUninstall(
-    allocator: std.mem.Allocator,
-    io: Io,
-    environ: *const EnvironMap,
-    spec_str: []const u8,
-    w: *Writer,
-    err_w: *Writer,
-) !void {
-    // An optional trailing `/<stem>` selects a single wasm module unit
-    // (`<tools>/<owner>/<repo>/<stem>/`); otherwise the whole repo — its
-    // repo-level install plus every wasm module under it — is removed.
-    const target = parseUninstallSpec(spec_str);
-    const module_stem = target.module_stem;
-    const repo_spec_str = target.repo_spec;
-
-    const owned = release_mod.parseRepoSpecOwned(allocator, repo_spec_str) catch {
-        try err_w.print("error: invalid spec '{s}', expected owner/repo or owner/repo/<wasm-stem>\n", .{spec_str});
-        try err_w.flush();
-        std.process.exit(1);
-    };
-    defer owned.deinit();
-
-    if (module_stem) |stem| {
-        if (stem.len == 0 or std.mem.indexOfScalar(u8, stem, '/') != null) {
-            try err_w.print("error: invalid spec '{s}', expected owner/repo/<wasm-stem>\n", .{spec_str});
-            try err_w.flush();
-            std.process.exit(1);
-        }
-    }
-
-    const d = try Dirs.detect(allocator, environ);
-    defer d.deinit();
-
-    // Look up the on-disk path case-insensitively so a user can run
-    // `ghr uninstall azuread/foo` against an existing pre-migration
-    // `<tools>/AzureAD/foo` directory.
-    const tool_path = (try resolveInstalledToolPath(allocator, io, d.tools, owned.owner, owned.repo)) orelse {
-        try err_w.print("error: {s}/{s} is not installed\n", .{ owned.owner, owned.repo });
-        try err_w.flush();
-        std.process.exit(1);
-    };
-    defer allocator.free(tool_path);
-
-    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch null;
-    defer if (bin_dir) |*bd| bd.close(io);
-
-    // --- Single wasm module unit ---------------------------------------
-    if (module_stem) |stem| {
-        const module_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, stem });
-        defer allocator.free(module_path);
-
-        const mmeta = readMetadata(allocator, io, module_path) orelse {
-            try err_w.print("error: {s}/{s}/{s} is not installed\n", .{ owned.owner, owned.repo, stem });
-            try err_w.flush();
-            std.process.exit(1);
-        };
-        defer {
-            mmeta.parsed.deinit();
-            allocator.free(mmeta.body);
-        }
-
-        if (bin_dir) |bd| {
-            try unlinkUnitBins(io, bd, mmeta.parsed.value.bins, module_path, w);
-        }
-
-        deleteTreeAbsolute(io, module_path) catch {
-            try err_w.print("error: failed to remove {s}\n", .{module_path});
-            try err_w.flush();
-            std.process.exit(1);
-        };
-
-        // Best-effort: drop the now-empty repo dir (only succeeds when no
-        // repo-level install or sibling modules remain).
-        Dir.deleteDirAbsolute(io, tool_path) catch {};
-
-        try w.print("uninstalled {s}/{s}/{s}\n", .{ owned.owner, owned.repo, stem });
-        return;
-    }
-
-    // --- Whole repo: repo-level (archive) unit only -------------------
-    // Wasm modules under the repo are independent units and are NOT removed
-    // here; use `ghr uninstall <owner/repo/stem>` to remove one.
-    const meta = readMetadata(allocator, io, tool_path);
-    defer if (meta) |m| {
-        m.parsed.deinit();
-        allocator.free(m.body);
-    };
-
-    // Detect whether any wasm module units live under the repo so we can
-    // give a helpful message and preserve them while deleting.
-    var has_modules = false;
-    if (Dir.openDirAbsolute(io, tool_path, .{ .iterate = true })) |*rd| {
-        defer rd.close(io);
-        var it = rd.iterate();
-        while (it.next(io) catch null) |entry| {
-            if (entry.kind != .directory) continue;
-            if (isInstallTransactionDir(entry.name)) continue;
-            const mp = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, entry.name }) catch continue;
-            defer allocator.free(mp);
-            if (dirHasGhrJson(io, mp)) {
-                has_modules = true;
-                break;
-            }
-        }
-    } else |_| {}
-
-    const m = meta orelse {
-        if (has_modules) {
-            try err_w.print("error: {s}/{s} has no repo-level install; it only has wasm modules\n", .{ owned.owner, owned.repo });
-            try err_w.print("  remove a module with: ghr uninstall {s}/{s}/<wasm-stem>\n", .{ owned.owner, owned.repo });
-        } else {
-            try err_w.print("error: {s}/{s} is not installed\n", .{ owned.owner, owned.repo });
-        }
-        try err_w.flush();
-        std.process.exit(1);
-    };
-
-    if (bin_dir) |bd| {
-        try unlinkUnitBins(io, bd, m.parsed.value.bins, tool_path, w);
-    }
-    if (comptime builtin.os.tag.isDarwin()) {
-        uninstallAppBundles(allocator, io, environ, m.parsed.value.apps, tool_path, w);
-    }
-
-    // Remove repo-level content (the manifest + extracted archive files),
-    // preserving wasm module subdirs (child dirs with their own `ghr.json`).
-    const Entry = struct { name: []u8, is_dir: bool };
-    var to_delete: std.ArrayListUnmanaged(Entry) = .empty;
-    defer {
-        for (to_delete.items) |e| allocator.free(e.name);
-        to_delete.deinit(allocator);
-    }
-    if (Dir.openDirAbsolute(io, tool_path, .{ .iterate = true })) |*rd| {
-        defer rd.close(io);
-        var it = rd.iterate();
-        while (it.next(io) catch null) |entry| {
-            const is_dir = entry.kind == .directory;
-            if (is_dir and !isInstallTransactionDir(entry.name)) {
-                const mp = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, entry.name }) catch continue;
-                defer allocator.free(mp);
-                if (dirHasGhrJson(io, mp)) continue; // preserve module unit
-            }
-            const dup = allocator.dupe(u8, entry.name) catch continue;
-            to_delete.append(allocator, .{ .name = dup, .is_dir = is_dir }) catch {
-                allocator.free(dup);
-                continue;
-            };
-        }
-    } else |_| {}
-
-    for (to_delete.items) |e| {
-        var pb: [Dir.max_path_bytes]u8 = undefined;
-        const p = std.fmt.bufPrint(&pb, "{s}{c}{s}", .{ tool_path, std.fs.path.sep, e.name }) catch continue;
-        if (e.is_dir) {
-            deleteTreeAbsolute(io, p) catch {};
-        } else {
-            Dir.deleteFileAbsolute(io, p) catch {};
-        }
-    }
-
-    // Drop the repo dir only when nothing (no preserved module) remains.
-    Dir.deleteDirAbsolute(io, tool_path) catch {};
-
-    try w.print("uninstalled {s}/{s}\n", .{ owned.owner, owned.repo });
 }
 
 /// Per-install error signalling a single spec's install path failed after
@@ -2125,54 +1694,6 @@ fn dirHasGhrJson(io: Io, abs_dir: []const u8) bool {
     var f = dir.openFile(io, "ghr.json", .{}) catch return false;
     f.close(io);
     return true;
-}
-
-/// Copy wasm-module unit subdirs (child dirs containing their own `ghr.json`)
-/// from `repo_path` into `staging_path`. The source remains live until the
-/// completed staging tree is committed, so a failed archive replacement never
-/// removes independently installed modules. A collision with archive content
-/// is an explicit failure rather than silently dropping the module.
-fn preserveWasmModuleUnits(
-    io: Io,
-    repo_path: []const u8,
-    staging_path: []const u8,
-) !void {
-    var rd = try Dir.openDirAbsolute(io, repo_path, .{ .iterate = true });
-    defer rd.close(io);
-
-    var it = rd.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
-        if (isInstallTransactionDir(entry.name)) continue;
-
-        {
-            var source = try rd.openDir(io, entry.name, .{ .iterate = true });
-            defer source.close(io);
-            const is_unit = blk: {
-                var manifest = source.openFile(io, "ghr.json", .{}) catch break :blk false;
-                manifest.close(io);
-                break :blk true;
-            };
-            if (!is_unit) continue;
-
-            var db: [Dir.max_path_bytes]u8 = undefined;
-            const dst = try std.fmt.bufPrint(&db, "{s}{c}{s}", .{ staging_path, std.fs.path.sep, entry.name });
-
-            const destination_exists = directoryExists(io, dst) catch |err| {
-                if (err == error.InstallPathNotDirectory) return error.WasmModulePreservationCollision;
-                return err;
-            };
-            if (destination_exists) {
-                return error.WasmModulePreservationCollision;
-            }
-            try Dir.createDirAbsolute(io, dst, .default_dir);
-            errdefer deleteTreeAbsolute(io, dst) catch {};
-
-            var destination = try Dir.openDirAbsolute(io, dst, .{});
-            defer destination.close(io);
-            try copyDirRecursive(io, source, destination);
-        }
-    }
 }
 
 /// Result of `verifyDownloadedAsset`: the metadata label recorded in
@@ -2383,767 +1904,254 @@ fn verifyDownloadedAsset(
     return .{ .label = verified_label, .minisign_key = recorded_minisign_key };
 }
 
-/// Install one wasm module as its own unit at `<tools>/<owner>/<repo>/<stem>/`.
-///
-/// Unlike an archive install (whose unit is the whole repo), each wasm module
-/// is independent: it has its own `ghr.json`/tag and links a single shim named
-/// after the module stem. Installing one module never touches the repo-level
-/// install or sibling modules, so different releases of the same repo (e.g. a
-/// `wabt` archive and `petstore` wasm components) coexist. Returns the wasm
-/// stem (the linked command name) on success.
-fn installWasmModuleUnit(
-    ctx: *const InstallContext,
-    tag_name: []const u8,
-    assets: []const release_mod.Asset,
-    asset: release_mod.Asset,
-    owner_lower: []const u8,
-    repo_lower: []const u8,
-    minisign_pubkey_b64: ?[]const u8,
-    repository: ?attestation.Repository,
-) ![]const u8 {
-    const allocator = ctx.allocator;
-    const io = ctx.io;
-    const d = ctx.dirs;
-    const auth_header = ctx.auth_header;
-    const w = ctx.w;
-    const err_w = ctx.err_w;
-    const debug = ctx.debug;
-    const gates = ctx.gates;
+// ===========================================================================
+// ID-based install pipeline (PR 5)
+// ===========================================================================
+//
+// The pipeline has two strictly ordered halves:
+//
+//   1. RESOLUTION + STAGING. Every surviving request is resolved, downloaded,
+//      verified, and extracted inside the reserved `_v2/txn` namespace on the
+//      tools filesystem. A staging directory is transaction-private, never live
+//      state, and is removed when anything fails before commit.
+//   2. PLANNING + COMMIT. One `install_state.scan`, one
+//      `command_plan.snapshotBinDir`, and one `command_plan.planWithDiagnostic`
+//      cover the COMPLETE expanded invocation before the first live mutation.
+//      Only then is each unit committed through its own local transaction.
+//
+// `--keep-going` affects half 1 only: a request that fails to resolve is
+// reported and skipped. Plan rejection is global and commits nothing.
 
-    const debug_w: ?*Writer = if (debug) err_w else null;
-    const stem = wasmStem(asset.name);
+/// Inventory/plan/write platform for the local store. Named once so the
+/// reader, planner, and writer cannot drift apart.
+const host_platform: install_state.Platform = install_state.default_platform;
+const host_is_windows = builtin.os.tag == .windows;
 
-    // Pre-flight verification (fail before downloading when a `.minisig`
-    // sidecar is published but no key was supplied).
-    release_mod.preflightVerification(
-        assets,
-        asset.name,
-        gates,
-        minisign_pubkey_b64,
-        err_w,
-    ) catch return error.InstallStepFailed;
+/// Command-level options for one `ghr install` invocation.
+pub const InstallOptions = struct {
+    debug: bool = false,
+    no_auth: bool = false,
+    gates: release_mod.VerifyGates = .{},
+    /// Default minisign key applied to requests that carry no key of their own.
+    minisign_pubkey_b64: ?[]const u8 = null,
+    /// Repeatable `--bin` selection, applied before aliases. Requires exactly
+    /// one request.
+    bin_filters: []const []const u8 = &.{},
+    keep_going: bool = false,
+};
 
-    try w.print("downloading {s} ...\n", .{asset.name});
-    try w.flush();
+pub const InstallRunError = error{
+    InvalidInstallRequest,
+    InstallPlanRejected,
+    InstallFailed,
+};
 
-    ensureDirAbsoluteRecursive(io, d.cache) catch {};
+/// One request resolved and staged inside the transaction namespace. Every
+/// string it references lives in its own arena; the struct is heap-allocated so
+/// that arena's address stays stable while units accumulate.
+const StagedUnit = struct {
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    id: []const u8 = "",
+    /// Human label for progress and summary lines.
+    display: []const u8 = "",
+    paths: install_txn.Paths = undefined,
+    commands: []command_plan.Command = &.{},
+    aliases: []command_plan.Alias = &.{},
+    apps: []const []const u8 = &.{},
+    source: install_state_write.Source = .{ .kind = .github },
+    config: install_state_write.Config = .{},
+    resolved: install_state_write.Resolved = .{},
+    verification: install_state_write.Verification = .{ .result = "none" },
+    /// Serialized v2 metadata, built and validated after planning and before
+    /// the first commit.
+    metadata_body: []const u8 = "",
 
-    const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
-        d.cache, std.fs.path.sep, asset.name,
-    });
-    defer allocator.free(download_path);
-
-    const asset_dl = release_mod.assetDownload(asset, auth_header != null);
-    debugLog(debug_w, "debug: url: {s}\n", .{asset_dl.url});
-    http.downloadToFile(allocator, io, asset_dl.url, download_path, .{
-        .auth_header = auth_header,
-        .accept = asset_dl.accept,
-        .debug_w = debug_w,
-    }) catch |err| {
-        try err_w.print("error: download failed: {}\n", .{err});
-        try err_w.print("  url: {s}\n", .{asset_dl.url});
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    defer Dir.deleteFileAbsolute(io, download_path) catch {};
-
-    const vr = try verifyDownloadedAsset(ctx, assets, asset.name, download_path, minisign_pubkey_b64, repository, debug_w);
-
-    // Download + validate the companion `<wasm>.ghr` manifest.
-    const ghr_name = try std.fmt.allocPrint(allocator, "{s}.ghr", .{asset.name});
-    defer allocator.free(ghr_name);
-    const ghr_asset = release_mod.findGhrManifestAsset(assets, asset.name) orelse {
-        try err_w.print("error: wasm asset '{s}' has no companion '{s}.ghr' manifest in this release\n", .{ asset.name, asset.name });
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    const ghr_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_name });
-    defer allocator.free(ghr_path);
-    defer Dir.deleteFileAbsolute(io, ghr_path) catch {};
-    const ghr_dl = release_mod.assetDownload(ghr_asset, auth_header != null);
-    http.downloadToFile(allocator, io, ghr_dl.url, ghr_path, .{
-        .auth_header = auth_header,
-        .accept = ghr_dl.accept,
-        .debug_w = debug_w,
-    }) catch |err| {
-        try err_w.print("error: failed to download manifest '{s}': {t}\n", .{ ghr_asset.name, err });
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    validateGhrManifest(allocator, io, ghr_path, err_w) catch return error.InstallStepFailed;
-
-    // Stage the wasm + manifest beside the destination module, not in cache.
-    // This keeps the final rename on the tools filesystem even when the cache
-    // and data roots are separate mounts.
-    const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
-        d.tools, std.fs.path.sep, owner_lower, std.fs.path.sep, repo_lower,
-    });
-    defer allocator.free(repo_path);
-    const module_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ repo_path, std.fs.path.sep, stem });
-    defer allocator.free(module_path);
-    const staging_path = try stagingSiblingPath(allocator, repo_path, stem);
-    defer allocator.free(staging_path);
-    const backup_path = try backupSiblingPath(allocator, repo_path, stem);
-    defer allocator.free(backup_path);
-    const legacy_backup_path = try legacyBackupPath(allocator, module_path);
-    defer allocator.free(legacy_backup_path);
-
-    prepareStagingDir(io, repo_path, staging_path) catch |err| {
-        try reportStagingDirCreateError(err_w, staging_path, err);
-        return error.InstallStepFailed;
-    };
-    errdefer deleteTreeIfExists(io, staging_path) catch {};
-    {
-        var staging_dir = Dir.openDirAbsolute(io, staging_path, .{ .iterate = true }) catch |err| {
-            try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ staging_path, err });
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
-        defer staging_dir.close(io);
-        var cache_dir = Dir.openDirAbsolute(io, d.cache, .{}) catch |err| {
-            try err_w.print("error: failed to open cache dir '{s}': {t}\n", .{ d.cache, err });
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
-        defer cache_dir.close(io);
-        cache_dir.copyFile(asset.name, staging_dir, asset.name, io, .{}) catch |err| {
-            try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
-        cache_dir.copyFile(ghr_name, staging_dir, ghr_name, io, .{}) catch |err| {
-            try err_w.print("error: failed to stage manifest '{s}': {t}\n", .{ ghr_name, err });
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
-        writeMetadata(allocator, io, staging_dir, tag_name, asset.name, &.{asset.name}, &.{}, vr.label, vr.minisign_key) catch |err| {
-            try err_w.print("error: failed to write module metadata: {t}\n", .{err});
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
+    fn create(gpa: std.mem.Allocator) !*StagedUnit {
+        const self = try gpa.create(StagedUnit);
+        self.* = .{ .gpa = gpa, .arena = std.heap.ArenaAllocator.init(gpa) };
+        return self;
     }
 
-    recoverInstallBackups(io, module_path, backup_path, legacy_backup_path) catch |err| {
-        try err_w.print("error: failed to recover previous module install '{s}': {t}\n", .{ module_path, err });
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-
-    // Save old module metadata (for stale bin cleanup) before replacing it.
-    const old_meta = readMetadata(allocator, io, module_path);
-    defer if (old_meta) |m| {
-        m.parsed.deinit();
-        allocator.free(m.body);
-    };
-
-    const module_replace = replaceStagedDir(io, staging_path, module_path, backup_path) catch |err| {
-        try err_w.print(
-            "error: failed to replace module directory '{s}' with staging directory '{s}': {t}\n",
-            .{ module_path, staging_path, err },
-        );
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    switch (module_replace) {
-        .committed => {},
-        .backup_retained => |err| {
-            try err_w.print(
-                "warning: installed module '{s}', but retained backup '{s}' ({t})\n",
-                .{ module_path, backup_path, err },
-            );
-        },
+    fn alloc(self: *StagedUnit) std.mem.Allocator {
+        return self.arena.allocator();
     }
 
-    ensureDirAbsoluteRecursive(io, d.bin) catch {};
-    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
-        try err_w.print("error: failed to open bin directory '{s}': {t}\n", .{ d.bin, err });
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    defer bin_dir.close(io);
-
-    try w.print("linking executables:\n", .{});
-    linkToBin(allocator, io, module_path, bin_dir, asset.name, w) catch |err| {
-        try err_w.print("warning: failed to link {s}: {}\n", .{ asset.name, err });
-    };
-
-    // Clean up stale bin entries from a previous install of this module.
-    if (old_meta) |m| {
-        cleanupStaleBinEntries(io, bin_dir, m.parsed.value.bins, &.{asset.name}, module_path, null);
+    fn destroy(self: *StagedUnit) void {
+        self.arena.deinit();
+        self.gpa.destroy(self);
     }
+};
 
-    return stem;
+/// Convert a host-separator relative path into the portable form persisted in
+/// metadata and consumed by the planner.
+fn portableRel(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    return install_state_write.portableRelPath(allocator, raw);
 }
 
-/// Install a single spec using the shared `InstallContext`.
-///
-/// On any user-visible failure this prints a diagnostic via `ctx.err_w`
-/// and returns `error.InstallStepFailed`. Allocation / I/O errors that
-/// indicate environmental rather than per-spec problems propagate as
-/// their original error type.
-fn installOne(ctx: *const InstallContext, entry: release_mod.SpecWithKey) anyerror!void {
-    const allocator = ctx.allocator;
-    const io = ctx.io;
-    const environ = ctx.environ;
-    const d = ctx.dirs;
-    const auth_header = ctx.auth_header;
-    const w = ctx.w;
-    const err_w = ctx.err_w;
-    const debug = ctx.debug;
-    const gates = ctx.gates;
-    const spec_str = entry.spec;
-    // Effective minisign key: per-spec inline key overrides the global
-    // `--minisign` default for this one spec only.
-    const minisign_pubkey_b64: ?[]const u8 = entry.key orelse ctx.minisign_pubkey_b64;
-
-    const classified = release_mod.classifyArg(spec_str) catch {
-        try err_w.print("error: invalid argument '{s}'\n", .{spec_str});
-        try err_w.print("  expected: owner/repo[@tag] or owner/repo/file[@tag]\n", .{});
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-
-    var url_buf: ?release_mod.ParsedReleaseUrl = null;
-    defer if (url_buf) |*u| u.deinit(allocator);
-
-    var spec: Spec = undefined;
-    var requested_file: ?[]const u8 = null;
-
-    switch (classified) {
-        .repo_spec => |rs| spec = rs,
-        .file_spec => |fs| {
-            spec = .{ .owner = fs.owner, .repo = fs.repo, .tag = fs.tag };
-            requested_file = fs.file;
-        },
-        .url => |u| {
-            const parsed_opt = release_mod.parseGitHubReleaseUrl(allocator, u) catch {
-                try err_w.print("error: failed to parse URL '{s}'\n", .{u});
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-            const parsed = parsed_opt orelse {
-                try err_w.print("error: install only accepts github.com release-download URLs (got: {s})\n", .{u});
-                try err_w.print("  hint: use owner/repo[@tag] for auto-pick or owner/repo/file[@tag] for an explicit file\n", .{});
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-            url_buf = parsed;
-            spec = .{ .owner = parsed.owner, .repo = parsed.repo, .tag = parsed.tag };
-            requested_file = parsed.file;
-        },
-    }
-
-    try w.print("resolving {s}/{s}", .{ spec.owner, spec.repo });
-    if (spec.tag) |t| try w.print("@{s}", .{t});
-    try w.print(" ...\n", .{});
-    try w.flush();
-
-    // Canonical lowercase slug for on-disk paths (tools dir, cache dir,
-    // owner dir). GitHub is case-insensitive on slugs but Linux paths
-    // are not, so we standardize. The original mixed-case `spec.owner` /
-    // `spec.repo` are still used for the GitHub API call and for
-    // user-visible diagnostics.
-    const owner_lower = try asciiLowerDup(allocator, spec.owner);
-    defer allocator.free(owner_lower);
-    const repo_lower = try asciiLowerDup(allocator, spec.repo);
-    defer allocator.free(repo_lower);
-
-    // Get release info
-    var release = getRelease(allocator, ctx.client, spec.owner, spec.repo, spec.tag, auth_header) catch |err| {
-        switch (err) {
-            error.GitHubApiError => {
-                try err_w.print("error: release not found for {s}/{s}", .{ spec.owner, spec.repo });
-                if (spec.tag) |t| try err_w.print("@{s}", .{t});
-                try err_w.print("\n", .{});
-            },
-            else => try err_w.print("error: failed to fetch release: {}\n", .{err}),
-        }
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    defer release.deinit();
-
-    const tag_name = release.parsed.value.tag_name;
-    try w.print("found release {s}\n", .{tag_name});
-
-    // Build the list of primary assets to install.
-    //
-    //   - Explicit file filter (owner/repo/file or a release URL): exactly
-    //     the one matched asset.
-    //   - No filter, and the release publishes one or more wasm modules that
-    //     each ship a companion `<wasm>.ghr` manifest: install ALL of them,
-    //     so a single `ghr install owner/repo` brings in every wasm tool the
-    //     release ships (e.g. both `petstore` and `petstore-test`).
-    //   - Otherwise: a single platform auto-pick via findBestAsset.
-    var primary_assets: std.ArrayListUnmanaged(release_mod.Asset) = .empty;
-    defer primary_assets.deinit(allocator);
-    if (requested_file) |fname| {
-        const m = release_mod.findAssetByName(allocator, release.parsed.value.assets, fname) catch |err| {
-            try err_w.print("error: failed to match asset by name: {}\n", .{err});
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
-        switch (m) {
-            .one => |a| try primary_assets.append(allocator, a),
-            .none => {
-                try err_w.print("error: no asset matching '{s}' in {s}/{s}@{s}\n", .{ fname, spec.owner, spec.repo, tag_name });
-                try err_w.print("available assets:\n", .{});
-                for (release.parsed.value.assets) |a| {
-                    try err_w.print("  {s}\n", .{a.name});
-                }
-                try err_w.flush();
-                return error.InstallStepFailed;
-            },
-            .ambiguous => |list| {
-                defer allocator.free(list);
-                try err_w.print("error: '{s}' matches multiple assets in {s}/{s}@{s}:\n", .{ fname, spec.owner, spec.repo, tag_name });
-                for (list) |a| {
-                    try err_w.print("  {s}\n", .{a.name});
-                }
-                try err_w.flush();
-                return error.InstallStepFailed;
-            },
-        }
-    } else {
-        // No explicit filter: install every wasm module that ships a
-        // companion `.ghr` manifest. This is what makes a bare
-        // `ghr install owner/repo` pull in all of a release's wasm tools.
-        const wasm_mods = try release_mod.wasmModulesWithManifest(allocator, release.parsed.value.assets);
-        defer allocator.free(wasm_mods);
-        for (wasm_mods) |a| try primary_assets.append(allocator, a);
-        if (primary_assets.items.len == 0) {
-            const a = findBestAsset(release.parsed.value.assets) catch {
-                try err_w.print("error: no matching asset for this platform\n", .{});
-                try err_w.print("available assets:\n", .{});
-                for (release.parsed.value.assets) |av| {
-                    try err_w.print("  {s}\n", .{av.name});
-                }
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-            try primary_assets.append(allocator, a);
-        }
-    }
-
-    // Name used for user-facing messages and the `asset` field of ghr.json.
-    // When several wasm modules are installed together this is the first.
-    const primary_name = primary_assets.items[0].name;
-
-    // Wasm modules install as independent per-module units under
-    // `<tools>/<owner>/<repo>/<stem>/`, each with its own `ghr.json`/tag, so
-    // a `wabt` archive release and `petstore` wasm components from the same
-    // repo coexist instead of clobbering one shared repo dir. The selected
-    // assets are homogeneous (all wasm or a single non-wasm), so inspecting
-    // the first is sufficient.
-    if (release_mod.isWasmAssetName(primary_name)) {
-        if (ctx.bin_filters.len > 0) {
-            try err_w.print("error: '--bin' is not supported when installing wasm modules\n", .{});
-            try err_w.print("  hint: omit --bin; each wasm module installs its manifest-defined command\n", .{});
-            try err_w.flush();
-            return error.InstallStepFailed;
-        }
-        for (primary_assets.items) |asset| {
-            const stem = installWasmModuleUnit(
-                ctx,
-                tag_name,
-                release.parsed.value.assets,
-                asset,
-                owner_lower,
-                repo_lower,
-                minisign_pubkey_b64,
-                release_mod.canonicalRepository(release.parsed.value) orelse
-                    .{ .owner = spec.owner, .repo = spec.repo },
-            ) catch |err| switch (err) {
-                error.InstallStepFailed => return error.InstallStepFailed,
-                else => return err,
-            };
-            try w.print("installed {s}/{s}/{s}@{s}\n", .{ spec.owner, spec.repo, stem, tag_name });
-        }
-        try w.flush();
-        return;
-    }
-
-    // Stage archive content beside the destination repo, not in cache. This
-    // makes the final replacement a same-filesystem sibling rename.
-    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
-        d.tools, std.fs.path.sep, owner_lower,
-    });
-    defer allocator.free(owner_path);
-    const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
-        owner_path, std.fs.path.sep, repo_lower,
-    });
-    defer allocator.free(tool_path);
-    const staging_path = try stagingSiblingPath(allocator, owner_path, repo_lower);
-    defer allocator.free(staging_path);
-    const backup_path = try backupSiblingPath(allocator, owner_path, repo_lower);
-    defer allocator.free(backup_path);
-    const legacy_backup_path = try legacyBackupPath(allocator, tool_path);
-    defer allocator.free(legacy_backup_path);
-
-    prepareStagingDir(io, owner_path, staging_path) catch |err| {
-        try reportStagingDirCreateError(err_w, staging_path, err);
-        return error.InstallStepFailed;
-    };
-    errdefer deleteTreeIfExists(io, staging_path) catch {};
-    var staging_dir = Dir.openDirAbsolute(io, staging_path, .{ .iterate = true }) catch |err| {
-        try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ staging_path, err });
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    defer staging_dir.close(io);
-
-    // Executables to link, accumulated across every staged asset.
-    var exes: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (exes.items) |e| allocator.free(e);
-        exes.deinit(allocator);
-    }
-
-    // Verification label + minisign key recorded in ghr.json. Every primary
-    // asset is verified with the same gates/key, so the last asset's outcome
-    // (recorded here) reflects them all.
-    var verified_label: []const u8 = "none";
-    var recorded_minisign_key: ?[]const u8 = null;
-
-    // Downloaded release assets remain in cache even though extraction now
-    // stages beside the destination install.
-    ensureDirAbsoluteRecursive(io, d.cache) catch {};
-
-    for (primary_assets.items) |asset| {
-        // Pre-flight verification check: if a `.minisig` sidecar exists but
-        // the caller did not pass a minisign key (inline or `--minisign`), and
-        // is not using `--skip-verify` / `--skip-minisign`, abort BEFORE
-        // downloading. Mirrors the same check in cmdDownload.
-        release_mod.preflightVerification(
-            release.parsed.value.assets,
-            asset.name,
-            gates,
-            minisign_pubkey_b64,
-            err_w,
-        ) catch return error.InstallStepFailed;
-
-        try w.print("downloading {s} ...\n", .{asset.name});
-        try w.flush();
-
-        // Download to cache file
-        const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
-            d.cache, std.fs.path.sep, asset.name,
-        });
-        defer allocator.free(download_path);
-
-        const debug_w: ?*Writer = if (debug) err_w else null;
-
-        const asset_dl = release_mod.assetDownload(asset, auth_header != null);
-        debugLog(debug_w, "debug: ghr {s}\n", .{version});
-        debugLog(debug_w, "debug: auth: {s}\n", .{ctx.auth_resolved.source});
-        debugLog(debug_w, "debug: url: {s}\n", .{asset_dl.url});
-        debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
-
-        http.downloadToFile(allocator, io, asset_dl.url, download_path, .{
-            .auth_header = auth_header,
-            .accept = asset_dl.accept,
-            .debug_w = debug_w,
-        }) catch |err| {
-            try err_w.print("error: download failed: {}\n", .{err});
-            try err_w.print("  url: {s}\n", .{asset_dl.url});
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
-        defer Dir.deleteFileAbsolute(io, download_path) catch {};
-
-        // Get file size for display
-        {
-            const stat = Dir.openFileAbsolute(io, download_path, .{}) catch null;
-            if (stat) |f| {
-                defer f.close(io);
-                const size = f.length(io) catch 0;
-                if (size > 0) {
-                    try w.print("downloaded {d:.1} MB\n", .{@as(f64, @floatFromInt(size)) / 1024.0 / 1024.0});
-                }
-            }
-        }
-
-        const vr = try verifyDownloadedAsset(ctx, release.parsed.value.assets, asset.name, download_path, minisign_pubkey_b64, release_mod.canonicalRepository(release.parsed.value) orelse .{ .owner = spec.owner, .repo = spec.repo }, debug_w);
-        verified_label = vr.label;
-        recorded_minisign_key = vr.minisign_key;
-
-        // Extract
-        try w.print("extracting ...\n", .{});
-        try w.flush();
-
-        switch (archive.detectFormat(asset.name)) {
-            .zip, .tar_gz, .tar_xz, .deb => {
-                archive.extractAuto(allocator, io, staging_dir, download_path, 0) catch |err| {
-                    try err_w.print(
-                        "error: failed to extract '{s}' from '{s}' into '{s}': {t}\n",
-                        .{ asset.name, download_path, staging_path, err },
-                    );
-                    try err_w.flush();
-                    return error.InstallStepFailed;
-                };
-            },
-            .unknown => {
-                // Bare executable (e.g., cosign-windows-amd64.exe or cosign-linux-amd64).
-                // Derive the command name from the asset (e.g. `wash` from
-                // `wash-aarch64-unknown-linux-musl`) so the linked command is the
-                // natural tool name. Falls back to repo when the pattern doesn't
-                // fit (e.g. `cosign-linux-amd64` -> `cosign`).
-                const exe_name = try deriveBareBinaryName(
-                    allocator,
-                    asset.name,
-                    spec.repo,
-                    builtin.os.tag == .windows,
-                );
-                defer allocator.free(exe_name);
-
-                stageBareExecutable(allocator, io, d.cache, asset.name, staging_dir, exe_name) catch |err| {
-                    try err_w.print(
-                        "error: failed to stage bare executable '{s}' from '{s}' into '{s}' as '{s}': {t}\n",
-                        .{ asset.name, d.cache, staging_path, exe_name, err },
-                    );
-                    try err_w.flush();
-                    return error.InstallStepFailed;
-                };
-            },
-        }
-
-        // Find executables. For wasm, the single "executable" is the wasm module
-        // itself; `linkToBin` recognizes the `.wasm` extension and installs the
-        // shim launcher rather than a symlink/native shim.
-        const prefer_deb_shims = archive.detectFormat(asset.name) == .deb and hasDebShims(io, staging_dir);
-        if (prefer_deb_shims) {
-            exes = findDebExecutables(allocator, io, staging_dir) catch |err| {
-                try err_w.print(
-                    "error: failed to scan staging dir '{s}' for executables: {t}\n",
-                    .{ staging_path, err },
-                );
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-        } else {
-            exes = findExecutables(allocator, io, staging_dir) catch |err| {
-                try err_w.print(
-                    "error: failed to scan staging dir '{s}' for executables: {t}\n",
-                    .{ staging_path, err },
-                );
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-        }
-    }
-
-    // Collapse same-named binaries bundled for multiple architectures down to
-    // the host-arch copy so linking can't land on a foreign-arch build (#123).
-    dedupeExecutablesByHostArch(allocator, &exes);
-
-    filterExecutables(
-        allocator,
-        &exes,
-        ctx.bin_filters,
-        builtin.os.tag == .windows,
-        err_w,
-    ) catch |err| switch (err) {
-        error.UnmatchedBinFilter => {
-            try err_w.flush();
-            return error.InstallStepFailed;
-        },
-        else => return err,
-    };
-
-    if (exes.items.len == 0) {
-        try err_w.print("error: no executables found in archive\n", .{});
-        try err_w.print("  selected asset: {s}\n", .{primary_name});
-        try err_w.print("  other installable assets in this release:\n", .{});
-        var listed: u32 = 0;
-        for (release.parsed.value.assets) |a| {
-            if (std.mem.eql(u8, a.name, primary_name)) continue;
-            if (!isInstallableAsset(a.name)) continue;
-            try err_w.print("    {s}\n", .{a.name});
-            listed += 1;
-        }
-        if (listed == 0) {
-            try err_w.print("    (none)\n", .{});
-        }
-        try err_w.flush();
-        return error.InstallStepFailed;
-    }
-
-    // Find .app bundles (macOS)
-    var apps: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (comptime builtin.os.tag.isDarwin()) {
-        apps = try findAppBundles(allocator, io, staging_dir);
-    }
-    defer {
-        for (apps.items) |a| allocator.free(a);
-        apps.deinit(allocator);
-    }
-
-    const bins_slice = exes.items;
-    const apps_slice = apps.items;
-    writeMetadata(allocator, io, staging_dir, tag_name, primary_name, bins_slice, apps_slice, verified_label, recorded_minisign_key) catch |err| {
-        try err_w.print("error: failed to write tool metadata: {t}\n", .{err});
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-
-    var previous_tool_path: ?[]const u8 = null;
-    defer if (previous_tool_path) |path| allocator.free(path);
-
-    // Opportunistic case-migration: a pre-migration install of the same
-    // repo may live at a mixed-case path (e.g. `<tools>/AzureAD/foo`).
-    // If found, rename it to the canonical lowercase path when necessary.
-    // On a case-insensitive filesystem the canonical spelling may already
-    // alias the same directory; retain the resolved spelling for stale-link
-    // ownership checks without renaming. A genuinely distinct canonical
-    // collision is never claimed as the same install.
-    if (try resolveInstalledToolPath(allocator, io, d.tools, owner_lower, repo_lower)) |existing| {
-        defer allocator.free(existing);
-        switch (existingToolPathAction(io, existing, tool_path)) {
-            .none, .collision => {},
-            .retain_alias => {
-                previous_tool_path = try allocator.dupe(u8, existing);
-            },
-            .rename => {
-                // Ensure the canonical owner dir exists at the right
-                // casing before moving the repo dir into it.
-                const canon_owner_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
-                    d.tools, std.fs.path.sep, owner_lower,
-                });
-                defer allocator.free(canon_owner_path);
-                ensureDirAbsoluteRecursive(io, d.tools) catch {};
-                Dir.createDirAbsolute(io, canon_owner_path, .default_dir) catch {};
-
-                previous_tool_path = try renameInstalledToolDir(allocator, io, existing, tool_path);
-
-                // Best-effort: remove the now-empty mixed-case owner dir
-                // (only succeeds when there are no other repos under it).
-                if (std.fs.path.dirname(existing)) |old_owner_path| {
-                    if (!std.mem.eql(u8, old_owner_path, canon_owner_path)) {
-                        Dir.deleteDirAbsolute(io, old_owner_path) catch {};
-                    }
-                }
-            },
-        }
-    }
-
-    recoverInstallBackups(io, tool_path, backup_path, legacy_backup_path) catch |err| {
-        try err_w.print("error: failed to recover previous tool install '{s}': {t}\n", .{ tool_path, err });
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-
-    // Save old metadata before touching anything (for stale bin cleanup after install)
-    const old_meta = readMetadata(allocator, io, tool_path);
-    defer if (old_meta) |m| {
-        m.parsed.deinit();
-        allocator.free(m.body);
-    };
-
-    if (try directoryExists(io, tool_path)) {
-        // Preserve independently-installed wasm module units under this repo
-        // so replacing the repo-level (archive) install doesn't delete them.
-        preserveWasmModuleUnits(io, tool_path, staging_path) catch |err| {
-            try err_w.print("error: failed to preserve wasm modules while replacing '{s}': {t}\n", .{ tool_path, err });
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
-    }
-
-    const tool_replace = replaceStagedDir(io, staging_path, tool_path, backup_path) catch |err| {
-        try err_w.print(
-            "error: failed to replace tool directory '{s}' with staging directory '{s}': {t}\n",
-            .{ tool_path, staging_path, err },
-        );
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    switch (tool_replace) {
-        .committed => {},
-        .backup_retained => |err| {
-            try err_w.print(
-                "warning: installed tool '{s}', but retained backup '{s}' ({t})\n",
-                .{ tool_path, backup_path, err },
-            );
-        },
-    }
-
-    // Create bin dir and link executables. The bin directory normally lives
-    // under `~/.local/bin`; on a fresh install neither `.local` nor `.local/bin`
-    // may exist yet, so create the full ancestor chain before opening.
-    ensureDirAbsoluteRecursive(io, d.bin) catch {};
-    var bin_dir = Dir.openDirAbsolute(io, d.bin, .{}) catch |err| {
-        try err_w.print(
-            "error: failed to open bin directory '{s}': {t}\n",
-            .{ d.bin, err },
-        );
-        try err_w.flush();
-        return error.InstallStepFailed;
-    };
-    defer bin_dir.close(io);
-
-    try w.print("linking executables:\n", .{});
-    for (exes.items) |exe_name| {
-        linkToBin(allocator, io, tool_path, bin_dir, exe_name, w) catch |err| {
-            try err_w.print("warning: failed to link {s}: {}\n", .{ exe_name, err });
-        };
-    }
-
-    // Clean up stale bin entries from old install that aren't in the new one
-    if (old_meta) |m| {
-        cleanupStaleBinEntries(io, bin_dir, m.parsed.value.bins, exes.items, tool_path, previous_tool_path);
-    }
-
-    // On macOS, copy .app bundles into ~/Applications for Spotlight discovery
-    if (comptime builtin.os.tag.isDarwin()) {
-        installAppBundles(allocator, io, environ, apps_slice, tool_path, w) catch |err| {
-            try err_w.print("warning: failed to install .app bundle: {}\n", .{err});
-        };
-    }
-
-    try w.print("installed {s}/{s}@{s}\n", .{ spec.owner, spec.repo, tag_name });
+/// Convert a portable relative path back into the host separator for building
+/// absolute filesystem paths.
+fn hostRelInto(buf: []u8, rel: []const u8) ![]const u8 {
+    if (rel.len > buf.len) return error.PathTooLong;
+    for (rel, 0..) |c, i| buf[i] = if (c == '/') std.fs.path.sep else c;
+    return buf[0..rel.len];
 }
 
-/// Install one or more release specs in a single invocation. Builds the
-/// shared HTTP client + auth context + `Dirs.detect` result once and
-/// reuses them across every spec.
-///
-/// Each entry is a spec plus an optional inline minisign pubkey. The
-/// effective key for a spec is `entry.key orelse minisign_pubkey_b64`
-/// (the inline override beats the global default for that one spec).
-///
-/// `keep_going` controls failure semantics:
-///   - `false` (default for `ghr install`): on the first per-spec
-///     failure, exit the process with status 1. The current spec's
-///     diagnostic has already been printed by `installOne`.
-///   - `true` (`--keep-going`): continue past per-spec failures,
-///     attempt every spec, and exit non-zero with a summary line if
-///     any spec failed.
-pub fn cmdInstallMany(
+fn commandKindFor(rel_target: []const u8) command_plan.Kind {
+    return if (install_state.isWasmTarget(rel_target)) .wasm else .native;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/// Report a request-parse failure. Source tokens are echoed because they are
+/// the user's own spec; query tokens and their values never are, because a
+/// value may be minisign or other key-like material. Failing query fields are
+/// identified by name and position only.
+fn reportRequestParseError(
+    err_w: *Writer,
+    err: anyerror,
+    diagnostic: install_request.Diagnostic,
+    tokens: []const []const u8,
+) !void {
+    const position: ?usize = diagnostic.token_index;
+    const field = diagnostic.fieldName();
+    const echo_source = diagnostic.field == .source and position != null and
+        position.? < tokens.len;
+
+    try err_w.print("error: invalid install request", .{});
+    if (position) |i| try err_w.print(" (argument {d})", .{i + 1});
+    if (field) |name| {
+        if (diagnostic.field != .source) try err_w.print(" field '{s}'", .{name});
+    }
+    if (diagnostic.pair_index) |pi| try err_w.print(" pair {d}", .{pi + 1});
+    try err_w.print(": {t}\n", .{err});
+    if (echo_source) try err_w.print("  argument: {s}\n", .{tokens[position.?]});
+
+    switch (err) {
+        error.GenericUrlRequiresExplicitId => try err_w.print(
+            "  hint: a non-GitHub URL has no repository identity; add a quoted \"?id=<name>\"\n",
+            .{},
+        ),
+        error.LoneQueryToken, error.DuplicateQueryToken, error.QueryAfterBareKey => try err_w.print(
+            "  hint: quote the query token and place it directly after its source, e.g. \"?id=<id>&alias=<from>:<to>\"\n",
+            .{},
+        ),
+        error.LoneBareKey, error.DoubleBareKey => try err_w.print(
+            "  hint: a bare minisign key attaches to the preceding source only\n",
+            .{},
+        ),
+        else => {},
+    }
+    try err_w.flush();
+}
+
+/// Report a rejected invocation plan. Nothing has been mutated at this point,
+/// and nothing will be.
+fn reportPlanError(
+    err_w: *Writer,
+    err: anyerror,
+    diag: command_plan.Diagnostic,
+    inventory: install_state.Inventory,
+) !void {
+    try err_w.print("error: refusing to install: {t}\n", .{err});
+    if (diag.id.len > 0) try err_w.print("  id: {s}\n", .{diag.id.slice()});
+    if (diag.name.len > 0) try err_w.print("  name: {s}\n", .{diag.name.slice()});
+    if (diag.artifact.len > 0) try err_w.print("  bin entry: {s}\n", .{diag.artifact.slice()});
+    if (diag.owner_id.len > 0) try err_w.print("  already owned by: {s}\n", .{diag.owner_id.slice()});
+    if (diag.entry_kind) |k| try err_w.print("  entry kind: {t}\n", .{k});
+    if (diag.record_index) |ri| {
+        if (ri < inventory.records.len) {
+            const rec = inventory.records[ri];
+            try err_w.print("  install state: {s} ({t}/{t})\n", .{
+                rec.path,
+                rec.status,
+                rec.reason,
+            });
+        }
+    }
+    switch (err) {
+        error.InventoryNotOk,
+        error.InventoryIdMissing,
+        error.InventoryInvalidId,
+        error.InventoryDuplicateId,
+        error.InventoryInvalidCommand,
+        error.InventoryUnknownKind,
+        error.InventoryKindMismatch,
+        error.InventoryAmbiguousArtifact,
+        => try err_w.print(
+            "  hint: install state must be healthy before ghr may change it; inspect with 'ghr list --json'\n",
+            .{},
+        ),
+        error.UnmanagedArtifact => try err_w.print(
+            "  hint: that bin entry is not managed by ghr; move it aside or choose another command name\n",
+            .{},
+        ),
+        error.ArtifactOwnedByOtherId => try err_w.print(
+            "  hint: uninstall the owning id, or publish this command under a different name with alias=\n",
+            .{},
+        ),
+        else => {},
+    }
+    try err_w.print("  no install state was changed\n", .{});
+    try err_w.flush();
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Install every request in one invocation.
+pub fn cmdInstallRequests(
     allocator: std.mem.Allocator,
     io: Io,
     environ: *const EnvironMap,
-    entries: []const release_mod.SpecWithKey,
+    tokens: []const []const u8,
     w: *Writer,
     err_w: *Writer,
-    debug: bool,
-    no_auth: bool,
-    gates: release_mod.VerifyGates,
-    minisign_pubkey_b64: ?[]const u8,
-    bin_filters: []const []const u8,
-    keep_going: bool,
+    options: InstallOptions,
 ) !void {
-    try validateInstallOptions(entries.len, bin_filters, err_w);
+    if (tokens.len == 0) {
+        try validateInstallOptions(0, options.bin_filters, err_w);
+        return error.MissingInstallSpec;
+    }
+
+    var diagnostic: install_request.Diagnostic = .{};
+    var parsed = install_request.parseWithDiagnostic(allocator, tokens, &diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try reportRequestParseError(err_w, err, diagnostic, tokens);
+            return error.InvalidInstallRequest;
+        },
+    };
+    defer parsed.deinit();
+
+    try validateInstallOptions(parsed.items.len, options.bin_filters, err_w);
+    {
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(allocator);
+        for (parsed.items, 0..) |request, i| {
+            if ((try seen.getOrPut(allocator, request.id)).found_existing) {
+                try err_w.print(
+                    "error: install request {d} repeats id '{s}' in the same invocation\n",
+                    .{ i + 1, request.id },
+                );
+                try err_w.print("  no install state was changed\n", .{});
+                try err_w.flush();
+                return error.InvalidInstallRequest;
+            }
+        }
+    }
 
     const dirs = try Dirs.detect(allocator, environ);
     defer dirs.deinit();
 
-    // Resolve auth token: env vars first, then `gh auth token` as fallback.
-    const auth_resolved = auth.resolveGithubToken(allocator, io, environ, no_auth);
+    const auth_resolved = auth.resolveGithubToken(allocator, io, environ, options.no_auth);
     defer auth_resolved.deinit(allocator);
     const auth_header = try auth.bearerHeader(allocator, auth_resolved);
     defer if (auth_header) |h| allocator.free(h);
 
-    // One HTTP client per invocation, reused across all specs.
     var client: std.http.Client = .{
         .allocator = allocator,
         .io = io,
@@ -3161,76 +2169,4060 @@ pub fn cmdInstallMany(
         .auth_header = auth_header,
         .w = w,
         .err_w = err_w,
-        .debug = debug,
-        .no_auth = no_auth,
-        .gates = gates,
-        .minisign_pubkey_b64 = minisign_pubkey_b64,
-        .bin_filters = bin_filters,
+        .debug = options.debug,
+        .no_auth = options.no_auth,
+        .gates = options.gates,
+        .minisign_pubkey_b64 = options.minisign_pubkey_b64,
+        .bin_filters = options.bin_filters,
     };
 
-    var failed_specs: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer failed_specs.deinit(allocator);
+    // Finish or roll back whatever a previous run left behind BEFORE any
+    // command is touched, so recovery never races publication.
+    recoverPendingTransactions(&ctx) catch |err| {
+        try err_w.print("error: could not recover a pending install transaction: {t}\n", .{err});
+        try err_w.print("  no install state was changed\n", .{});
+        try err_w.flush();
+        return error.InstallFailed;
+    };
 
-    for (entries, 0..) |entry, i| {
-        if (entries.len > 1) {
-            try w.print("[{d}/{d}] {s}\n", .{ i + 1, entries.len, entry.spec });
+    var units: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+    defer {
+        for (units.items) |u| u.destroy();
+        units.deinit(allocator);
+    }
+    errdefer discardStaging(allocator, io, units.items);
+
+    var failed: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer failed.deinit(allocator);
+
+    for (parsed.items, 0..) |request, i| {
+        const token = tokens[request.original_tokens.source];
+        if (parsed.items.len > 1) {
+            try w.print("[{d}/{d}] {s}\n", .{ i + 1, parsed.items.len, token });
             try w.flush();
         }
-        installOne(&ctx, entry) catch |err| switch (err) {
+        stageRequest(&ctx, request, &units) catch |err| switch (err) {
             error.InstallStepFailed => {
-                try failed_specs.append(allocator, entry.spec);
-                if (!keep_going) std.process.exit(1);
-                try err_w.print("note: --keep-going, continuing past failure for {s}\n", .{entry.spec});
+                try failed.append(allocator, token);
+                if (!options.keep_going) return error.InstallFailed;
+                try err_w.print("note: --keep-going, continuing past failure for {s}\n", .{token});
                 try err_w.flush();
             },
             else => return err,
         };
     }
 
-    if (entries.len > 1) {
-        const ok = entries.len - failed_specs.items.len;
-        try w.print("installed {d}/{d}", .{ ok, entries.len });
-        if (failed_specs.items.len > 0) {
+    if (units.items.len > 0) try planAndCommit(&ctx, units.items);
+
+    if (parsed.items.len > 1) {
+        const ok = parsed.items.len - failed.items.len;
+        try w.print("installed {d}/{d}", .{ ok, parsed.items.len });
+        if (failed.items.len > 0) {
             try w.print(", failed:", .{});
-            for (failed_specs.items) |s| try w.print(" {s}", .{s});
+            for (failed.items) |s| try w.print(" {s}", .{s});
         }
         try w.print("\n", .{});
         try w.flush();
     }
 
-    if (failed_specs.items.len > 0) std.process.exit(1);
+    if (failed.items.len > 0) return error.InstallFailed;
 }
 
-/// Single-spec install wrapper retained for backwards compatibility with
-/// older callers. Delegates to `cmdInstallMany`.
-pub fn cmdInstall(
+/// Drop the transactions of units that never reached live state.
+///
+/// A transaction whose journal has advanced past `staged` has already moved a
+/// directory or published a command, and its journal and backup are the only
+/// record of that. Those are left for recovery; only purely staged work is
+/// reclaimed here. A committed unit has no journal left, so this is a no-op
+/// for it.
+fn discardStaging(allocator: std.mem.Allocator, io: Io, units: []const *StagedUnit) void {
+    for (units) |u| discardStagedUnit(allocator, io, u);
+}
+
+/// Discard only a transaction proven not to have touched live state. Failure to
+/// read its journal is a reason to preserve it, never permission to delete a
+/// possible backup.
+fn discardStagedUnit(allocator: std.mem.Allocator, io: Io, unit: *StagedUnit) void {
+    var owned_opt = install_txn.readJournal(allocator, io, unit.paths.journal) catch return;
+    if (owned_opt) |*owned| {
+        defer owned.deinit();
+        if (owned.journal.op == .uninstall or
+            @intFromEnum(owned.journal.phase) >= @intFromEnum(install_txn.Phase.swapping))
+            return;
+    } else if (install_txn.directoryExists(io, unit.paths.backup) catch return) {
+        return;
+    }
+    install_txn.discardTransaction(io, unit.paths) catch {};
+}
+
+// ---------------------------------------------------------------------------
+// Resolution + staging
+// ---------------------------------------------------------------------------
+
+fn stageRequest(
+    ctx: *const InstallContext,
+    request: install_request.InstallRequest,
+    out: *std.ArrayListUnmanaged(*StagedUnit),
+) !void {
+    const allocator = ctx.allocator;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+    // A per-request key wins over the command-level default for this request
+    // only; the parser already rejected two keys on one request.
+    const minisign_pubkey_b64: ?[]const u8 = request.config.minisign orelse ctx.minisign_pubkey_b64;
+
+    var url_buf: ?release_mod.ParsedReleaseUrl = null;
+    defer if (url_buf) |*u| u.deinit(allocator);
+
+    var spec: Spec = undefined;
+    var requested_file: ?[]const u8 = null;
+
+    switch (request.source) {
+        .github_repo => |rs| spec = rs,
+        .github_file => |fs| {
+            spec = .{ .owner = fs.owner, .repo = fs.repo, .tag = fs.tag };
+            requested_file = fs.file;
+        },
+        .github_release_url => |u| {
+            const parsed_opt = release_mod.parseGitHubReleaseUrl(allocator, u) catch {
+                try err_w.print("error: failed to parse URL '{s}'\n", .{u});
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
+            const parsed = parsed_opt orelse {
+                try err_w.print("error: '{s}' is not a github.com release-download URL\n", .{u});
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
+            url_buf = parsed;
+            spec = .{ .owner = parsed.owner, .repo = parsed.repo, .tag = parsed.tag };
+            requested_file = parsed.file;
+        },
+        .generic_url => |u| return stageGenericUrlRequest(ctx, request, u, minisign_pubkey_b64, out),
+    }
+
+    try w.print("resolving {s}/{s}", .{ spec.owner, spec.repo });
+    if (spec.tag) |t| try w.print("@{s}", .{t});
+    try w.print(" ...\n", .{});
+    try w.flush();
+
+    var release = getRelease(allocator, ctx.client, spec.owner, spec.repo, spec.tag, ctx.auth_header) catch |err| {
+        switch (err) {
+            error.GitHubApiError => {
+                try err_w.print("error: release not found for {s}/{s}", .{ spec.owner, spec.repo });
+                if (spec.tag) |t| try err_w.print("@{s}", .{t});
+                try err_w.print("\n", .{});
+            },
+            else => try err_w.print("error: failed to fetch release: {}\n", .{err}),
+        }
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer release.deinit();
+
+    const tag_name = release.parsed.value.tag_name;
+    try w.print("found release {s}\n", .{tag_name});
+
+    var primary_assets: std.ArrayListUnmanaged(release_mod.Asset) = .empty;
+    defer primary_assets.deinit(allocator);
+    try selectPrimaryAssets(ctx, spec, release.parsed.value, requested_file, tag_name, &primary_assets);
+
+    const repository: attestation.Repository = release_mod.canonicalRepository(release.parsed.value) orelse
+        .{ .owner = spec.owner, .repo = spec.repo };
+
+    if (release_mod.isWasmAssetName(primary_assets.items[0].name)) {
+        if (ctx.bin_filters.len > 0) {
+            try err_w.print("error: '--bin' is not supported when installing wasm modules\n", .{});
+            try err_w.print("  hint: omit --bin; each wasm module installs its manifest-defined command\n", .{});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        }
+        for (primary_assets.items) |asset| {
+            try stageWasmUnit(
+                ctx,
+                request,
+                spec,
+                tag_name,
+                release.parsed.value.assets,
+                asset,
+                minisign_pubkey_b64,
+                repository,
+                out,
+            );
+        }
+        return;
+    }
+
+    try stageArchiveUnit(
+        ctx,
+        request,
+        spec,
+        requested_file,
+        tag_name,
+        release.parsed.value.assets,
+        primary_assets.items,
+        minisign_pubkey_b64,
+        repository,
+        out,
+    );
+}
+
+/// Build the list of assets one GitHub request installs, exactly as the
+/// pre-ID installer did: an explicit file selector, else every wasm module that
+/// ships a companion `.ghr` manifest, else one platform auto-pick.
+fn selectPrimaryAssets(
+    ctx: *const InstallContext,
+    spec: Spec,
+    release: release_mod.Release,
+    requested_file: ?[]const u8,
+    tag_name: []const u8,
+    out: *std.ArrayListUnmanaged(release_mod.Asset),
+) !void {
+    const allocator = ctx.allocator;
+    const err_w = ctx.err_w;
+
+    if (requested_file) |fname| {
+        const m = release_mod.findAssetByName(allocator, release.assets, fname) catch |err| {
+            try err_w.print("error: failed to match asset by name: {}\n", .{err});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        switch (m) {
+            .one => |a| try out.append(allocator, a),
+            .none => {
+                try err_w.print("error: no asset matching '{s}' in {s}/{s}@{s}\n", .{
+                    fname, spec.owner, spec.repo, tag_name,
+                });
+                try err_w.print("available assets:\n", .{});
+                for (release.assets) |a| try err_w.print("  {s}\n", .{a.name});
+                try err_w.flush();
+                return error.InstallStepFailed;
+            },
+            .ambiguous => |list| {
+                defer allocator.free(list);
+                try err_w.print("error: '{s}' matches multiple assets in {s}/{s}@{s}:\n", .{
+                    fname, spec.owner, spec.repo, tag_name,
+                });
+                for (list) |a| try err_w.print("  {s}\n", .{a.name});
+                try err_w.flush();
+                return error.InstallStepFailed;
+            },
+        }
+        return;
+    }
+
+    const wasm_mods = try release_mod.wasmModulesWithManifest(allocator, release.assets);
+    defer allocator.free(wasm_mods);
+    for (wasm_mods) |a| try out.append(allocator, a);
+    if (out.items.len > 0) return;
+
+    const a = findBestAsset(release.assets) catch {
+        try err_w.print("error: no matching asset for this platform\n", .{});
+        try err_w.print("available assets:\n", .{});
+        for (release.assets) |av| try err_w.print("  {s}\n", .{av.name});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    try out.append(allocator, a);
+}
+
+/// Non-sensitive provenance for one resolved GitHub asset. A signed or
+/// credential-bearing effective URL is never persisted; the asset is then
+/// identified by repository/tag/name/`api_asset_id`/digest instead.
+fn resolvedFromAsset(
+    a: std.mem.Allocator,
+    tag_name: []const u8,
+    asset: release_mod.Asset,
+) !install_state_write.Resolved {
+    var resolved: install_state_write.Resolved = .{
+        .tag = try a.dupe(u8, tag_name),
+        .asset = try a.dupe(u8, asset.name),
+        .api_asset_id = if (asset.id) |id| (if (id > 0) id else null) else null,
+    };
+    if (asset.browser_download_url.len > 0 and
+        install_state_write.isPersistableUrl(asset.browser_download_url))
+    {
+        resolved.download_url = try a.dupe(u8, asset.browser_download_url);
+    }
+    if (asset.digest) |d| {
+        if (std.mem.indexOfScalar(u8, d, ':')) |cut| {
+            const algorithm = d[0..cut];
+            const value = d[cut + 1 ..];
+            if (algorithm.len > 0 and value.len > 0 and install_state.isBoundedMetaString(value)) {
+                resolved.digest = .{
+                    .algorithm = try a.dupe(u8, algorithm),
+                    .value = try a.dupe(u8, value),
+                };
+            }
+        }
+    }
+    return resolved;
+}
+
+fn policyFromGates(gates: release_mod.VerifyGates) install_state_write.VerificationPolicy {
+    return .{
+        .skip_verify = gates.skip_verify,
+        .skip_checksum = gates.skip_checksum,
+        .skip_minisign = gates.skip_minisign,
+        .skip_sigstore = gates.skip_sigstore,
+        .skip_attestation = gates.skip_attestation,
+        .skip_authenticode = gates.skip_authenticode,
+    };
+}
+
+/// Copy the request's durable configuration into the unit's arena.
+fn fillConfig(
+    unit: *StagedUnit,
+    request: install_request.InstallRequest,
+    minisign_pubkey_b64: ?[]const u8,
+    gates: release_mod.VerifyGates,
+    bin_filters: []const []const u8,
+) !void {
+    const a = unit.alloc();
+
+    const aliases = try a.alloc(command_plan.Alias, request.config.aliases.len);
+    const meta_aliases = try a.alloc(install_state_write.Alias, request.config.aliases.len);
+    for (request.config.aliases, 0..) |alias, i| {
+        const from = try a.dupe(u8, alias.source);
+        const to = try a.dupe(u8, alias.published);
+        aliases[i] = .{ .source = from, .published = to };
+        meta_aliases[i] = .{ .from = from, .to = to };
+    }
+    unit.aliases = aliases;
+
+    var selected: ?[]const []const u8 = null;
+    if (bin_filters.len > 0) {
+        const copy = try a.alloc([]const u8, bin_filters.len);
+        for (bin_filters, 0..) |f, i| copy[i] = try a.dupe(u8, f);
+        selected = copy;
+    }
+
+    unit.config = .{
+        .aliases = meta_aliases,
+        .selected_commands = selected,
+        .minisign = if (minisign_pubkey_b64) |k| try a.dupe(u8, k) else null,
+        .verification_policy = policyFromGates(gates),
+    };
+}
+
+/// Create the transaction paths and an empty staging directory for `id`.
+fn beginStaging(ctx: *const InstallContext, unit: *StagedUnit, id: []const u8) !void {
+    const a = unit.alloc();
+    unit.id = try a.dupe(u8, id);
+    unit.paths = install_txn.paths(a, ctx.dirs.tools, unit.id, host_platform) catch |err| {
+        try ctx.err_w.print("error: install id '{s}' cannot be stored: {t}\n", .{ id, err });
+        try ctx.err_w.flush();
+        return error.InstallStepFailed;
+    };
+
+    var pending = install_txn.readJournal(ctx.allocator, ctx.io, unit.paths.journal) catch |err| {
+        try ctx.err_w.print("error: cannot inspect the pending transaction for '{s}': {t}\n", .{ id, err });
+        try ctx.err_w.print("  no existing transaction was changed\n", .{});
+        try ctx.err_w.flush();
+        return error.InstallStepFailed;
+    };
+    if (pending) |*owned| {
+        defer owned.deinit();
+        try ctx.err_w.print("error: install id '{s}' has an unfinished transaction\n", .{id});
+        try ctx.err_w.print("  run any ghr command to retry recovery before installing this id\n", .{});
+        try ctx.err_w.flush();
+        return error.InstallStepFailed;
+    }
+    if (install_txn.directoryExists(ctx.io, unit.paths.backup) catch |err| {
+        try ctx.err_w.print("error: cannot inspect the pending backup for '{s}': {t}\n", .{ id, err });
+        try ctx.err_w.flush();
+        return error.InstallStepFailed;
+    }) {
+        try ctx.err_w.print("error: install id '{s}' has an unjournaled transaction backup\n", .{id});
+        try ctx.err_w.print("  refusing to overwrite the only possible copy of the previous install\n", .{});
+        try ctx.err_w.flush();
+        return error.InstallStepFailed;
+    }
+
+    install_txn.prepareStage(ctx.io, unit.paths) catch |err| {
+        try reportStagingDirCreateError(ctx.err_w, unit.paths.stage, err);
+        return error.InstallStepFailed;
+    };
+    // Journal the staging directory immediately. Resolution can be interrupted
+    // (a long download, a failed verification, a killed process), and a staged
+    // tree with no journal would be litter nothing could safely reclaim. A
+    // `prepared` journal names nothing live, so recovery simply discards it.
+    install_txn.writeJournal(ctx.io, unit.paths, ctx.allocator, .{
+        .op = .install,
+        .id = unit.id,
+        .unit_path = unit.paths.unit,
+        .stage_path = unit.paths.stage,
+        .backup_path = unit.paths.backup,
+        .phase = .prepared,
+    }) catch |err| {
+        try ctx.err_w.print("error: failed to journal the install transaction: {t}\n", .{err});
+        try ctx.err_w.flush();
+        install_txn.discardTransaction(ctx.io, unit.paths) catch {};
+        return error.InstallStepFailed;
+    };
+}
+
+fn ensureInvocationIdAvailable(
+    err_w: *Writer,
+    staged: []const *StagedUnit,
+    id: []const u8,
+) !void {
+    for (staged) |unit| {
+        if (!std.mem.eql(u8, unit.id, id)) continue;
+        try err_w.print("error: expanded install id '{s}' occurs more than once in this invocation\n", .{id});
+        try err_w.print("  no install state was changed\n", .{});
+        try err_w.flush();
+        return error.InstallPlanRejected;
+    }
+}
+
+/// Discover the commands and app bundles a staged tree publishes, apply the
+/// `--bin` selection (which is pre-alias), and record them on the unit.
+fn discoverStagedCommands(
+    ctx: *const InstallContext,
+    unit: *StagedUnit,
+    stage_dir: Dir,
+    prefer_deb_shims: bool,
+    primary_name: []const u8,
+    assets: []const release_mod.Asset,
+) !void {
+    const allocator = ctx.allocator;
+    const a = unit.alloc();
+    const err_w = ctx.err_w;
+
+    var exes = (if (prefer_deb_shims)
+        findDebExecutables(allocator, ctx.io, stage_dir)
+    else
+        findExecutables(allocator, ctx.io, stage_dir)) catch |err| {
+        try err_w.print("error: failed to scan staging dir '{s}' for executables: {t}\n", .{
+            unit.paths.stage, err,
+        });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer {
+        for (exes.items) |e| allocator.free(e);
+        exes.deinit(allocator);
+    }
+
+    dedupeExecutablesByHostArch(allocator, &exes);
+    filterExecutables(allocator, &exes, ctx.bin_filters, host_is_windows, err_w) catch |err| switch (err) {
+        error.UnmatchedBinFilter => {
+            try err_w.flush();
+            return error.InstallStepFailed;
+        },
+        else => return err,
+    };
+
+    if (exes.items.len == 0) {
+        try err_w.print("error: no executables found in archive\n", .{});
+        try err_w.print("  selected asset: {s}\n", .{primary_name});
+        try err_w.print("  other installable assets in this release:\n", .{});
+        var listed: u32 = 0;
+        for (assets) |asset| {
+            if (std.mem.eql(u8, asset.name, primary_name)) continue;
+            if (!isInstallableAsset(asset.name)) continue;
+            try err_w.print("    {s}\n", .{asset.name});
+            listed += 1;
+        }
+        if (listed == 0) try err_w.print("    (none)\n", .{});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    }
+
+    const commands = try a.alloc(command_plan.Command, exes.items.len);
+    for (exes.items, 0..) |rel, i| {
+        const portable = try portableRel(a, rel);
+        commands[i] = .{ .relative_target = portable, .kind = commandKindFor(portable) };
+    }
+    unit.commands = commands;
+
+    if (comptime builtin.os.tag.isDarwin()) {
+        var apps = try findAppBundles(allocator, ctx.io, stage_dir);
+        defer {
+            for (apps.items) |app| allocator.free(app);
+            apps.deinit(allocator);
+        }
+        const owned = try a.alloc([]const u8, apps.items.len);
+        for (apps.items, 0..) |app, i| owned[i] = try portableRel(a, app);
+        unit.apps = owned;
+    }
+}
+
+fn stageArchiveUnit(
+    ctx: *const InstallContext,
+    request: install_request.InstallRequest,
+    spec: Spec,
+    requested_file: ?[]const u8,
+    tag_name: []const u8,
+    assets: []const release_mod.Asset,
+    primary_assets: []const release_mod.Asset,
+    minisign_pubkey_b64: ?[]const u8,
+    repository: attestation.Repository,
+    out: *std.ArrayListUnmanaged(*StagedUnit),
+) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const d = ctx.dirs;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+    const debug_w: ?*Writer = if (ctx.debug) err_w else null;
+
+    const unit = try StagedUnit.create(allocator);
+    var keep = false;
+    defer if (!keep) unit.destroy();
+    const a = unit.alloc();
+
+    try ensureInvocationIdAvailable(err_w, out.items, request.id);
+    try beginStaging(ctx, unit, request.id);
+    errdefer discardStagedUnit(allocator, io, unit);
+
+    var stage_dir = Dir.openDirAbsolute(io, unit.paths.stage, .{ .iterate = true }) catch |err| {
+        try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ unit.paths.stage, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer stage_dir.close(io);
+
+    ensureDirAbsoluteRecursive(io, d.cache) catch {};
+
+    var verified_label: []const u8 = "none";
+    var recorded_minisign_key: ?[]const u8 = null;
+    var prefer_deb_shims = false;
+
+    for (primary_assets) |asset| {
+        release_mod.preflightVerification(assets, asset.name, ctx.gates, minisign_pubkey_b64, err_w) catch
+            return error.InstallStepFailed;
+
+        try w.print("downloading {s} ...\n", .{asset.name});
+        try w.flush();
+
+        const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+            d.cache, std.fs.path.sep, asset.name,
+        });
+        defer allocator.free(download_path);
+
+        const asset_dl = release_mod.assetDownload(asset, ctx.auth_header != null);
+        debugLog(debug_w, "debug: ghr {s}\n", .{version});
+        debugLog(debug_w, "debug: auth: {s}\n", .{ctx.auth_resolved.source});
+        debugLog(debug_w, "debug: url: {s}\n", .{asset_dl.url});
+        debugLog(debug_w, "debug: cache: {s}\n", .{download_path});
+
+        http.downloadToFile(allocator, io, asset_dl.url, download_path, .{
+            .auth_header = ctx.auth_header,
+            .accept = asset_dl.accept,
+            .debug_w = debug_w,
+        }) catch |err| {
+            try err_w.print("error: download failed: {}\n", .{err});
+            try err_w.print("  url: {s}\n", .{asset_dl.url});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer Dir.deleteFileAbsolute(io, download_path) catch {};
+
+        {
+            const stat = Dir.openFileAbsolute(io, download_path, .{}) catch null;
+            if (stat) |f| {
+                defer f.close(io);
+                const size = f.length(io) catch 0;
+                if (size > 0) {
+                    try w.print("downloaded {d:.1} MB\n", .{@as(f64, @floatFromInt(size)) / 1024.0 / 1024.0});
+                }
+            }
+        }
+
+        const vr = try verifyDownloadedAsset(
+            ctx,
+            assets,
+            asset.name,
+            download_path,
+            minisign_pubkey_b64,
+            repository,
+            debug_w,
+        );
+        verified_label = vr.label;
+        recorded_minisign_key = vr.minisign_key;
+
+        try w.print("extracting ...\n", .{});
+        try w.flush();
+
+        switch (archive.detectFormat(asset.name)) {
+            .zip, .tar_gz, .tar_xz, .deb => {
+                archive.extractAuto(allocator, io, stage_dir, download_path, 0) catch |err| {
+                    try err_w.print(
+                        "error: failed to extract '{s}' from '{s}' into '{s}': {t}\n",
+                        .{ asset.name, download_path, unit.paths.stage, err },
+                    );
+                    try err_w.flush();
+                    return error.InstallStepFailed;
+                };
+            },
+            .unknown => {
+                const exe_name = try deriveBareBinaryName(allocator, asset.name, spec.repo, host_is_windows);
+                defer allocator.free(exe_name);
+                stageBareExecutable(allocator, io, d.cache, asset.name, stage_dir, exe_name) catch |err| {
+                    try err_w.print(
+                        "error: failed to stage bare executable '{s}' from '{s}' into '{s}' as '{s}': {t}\n",
+                        .{ asset.name, d.cache, unit.paths.stage, exe_name, err },
+                    );
+                    try err_w.flush();
+                    return error.InstallStepFailed;
+                };
+            },
+        }
+        prefer_deb_shims = archive.detectFormat(asset.name) == .deb and hasDebShims(io, stage_dir);
+    }
+
+    const primary_name = primary_assets[0].name;
+    try discoverStagedCommands(ctx, unit, stage_dir, prefer_deb_shims, primary_name, assets);
+
+    unit.source = .{
+        .kind = .github,
+        .owner = try a.dupe(u8, spec.owner),
+        .repo = try a.dupe(u8, spec.repo),
+        .tag = if (spec.tag) |t| try a.dupe(u8, t) else null,
+        .asset_selector = if (requested_file) |f| try a.dupe(u8, f) else null,
+    };
+    try fillConfig(unit, request, minisign_pubkey_b64, ctx.gates, ctx.bin_filters);
+    unit.resolved = try resolvedFromAsset(a, tag_name, primary_assets[0]);
+    unit.verification = .{
+        .result = try a.dupe(u8, verified_label),
+        .minisign = if (recorded_minisign_key) |k| try a.dupe(u8, k) else null,
+    };
+    unit.display = try std.fmt.allocPrint(a, "{s}@{s}", .{ unit.id, tag_name });
+
+    try out.append(allocator, unit);
+    keep = true;
+}
+
+fn stageWasmUnit(
+    ctx: *const InstallContext,
+    request: install_request.InstallRequest,
+    spec: Spec,
+    tag_name: []const u8,
+    assets: []const release_mod.Asset,
+    asset: release_mod.Asset,
+    minisign_pubkey_b64: ?[]const u8,
+    repository: attestation.Repository,
+    out: *std.ArrayListUnmanaged(*StagedUnit),
+) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const d = ctx.dirs;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+    const debug_w: ?*Writer = if (ctx.debug) err_w else null;
+
+    const unit = try StagedUnit.create(allocator);
+    var keep = false;
+    defer if (!keep) unit.destroy();
+    const a = unit.alloc();
+
+    // Each wasm module is its own unit under the request's ID. The stem must be
+    // a single canonical ID segment; anything else is rejected before staging.
+    const stem = wasmStem(asset.name);
+    const canonical_stem = install_request.canonicalizeId(a, stem) catch {
+        try err_w.print("error: wasm module '{s}' has no usable install id segment\n", .{asset.name});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    if (std.mem.indexOfScalar(u8, canonical_stem, '/') != null) {
+        try err_w.print("error: wasm module '{s}' expands to an unsafe install id\n", .{asset.name});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    }
+    const child_id = try std.fmt.allocPrint(a, "{s}/{s}", .{ request.id, canonical_stem });
+
+    release_mod.preflightVerification(assets, asset.name, ctx.gates, minisign_pubkey_b64, err_w) catch
+        return error.InstallStepFailed;
+
+    try ensureInvocationIdAvailable(err_w, out.items, child_id);
+    try beginStaging(ctx, unit, child_id);
+    errdefer discardStagedUnit(allocator, io, unit);
+
+    try w.print("downloading {s} ...\n", .{asset.name});
+    try w.flush();
+
+    ensureDirAbsoluteRecursive(io, d.cache) catch {};
+
+    const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        d.cache, std.fs.path.sep, asset.name,
+    });
+    defer allocator.free(download_path);
+
+    const asset_dl = release_mod.assetDownload(asset, ctx.auth_header != null);
+    debugLog(debug_w, "debug: url: {s}\n", .{asset_dl.url});
+    http.downloadToFile(allocator, io, asset_dl.url, download_path, .{
+        .auth_header = ctx.auth_header,
+        .accept = asset_dl.accept,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: download failed: {}\n", .{err});
+        try err_w.print("  url: {s}\n", .{asset_dl.url});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer Dir.deleteFileAbsolute(io, download_path) catch {};
+
+    const vr = try verifyDownloadedAsset(
+        ctx,
+        assets,
+        asset.name,
+        download_path,
+        minisign_pubkey_b64,
+        repository,
+        debug_w,
+    );
+
+    const ghr_name = try std.fmt.allocPrint(allocator, "{s}.ghr", .{asset.name});
+    defer allocator.free(ghr_name);
+    const ghr_asset = release_mod.findGhrManifestAsset(assets, asset.name) orelse {
+        try err_w.print(
+            "error: wasm asset '{s}' has no companion '{s}.ghr' manifest in this release\n",
+            .{ asset.name, asset.name },
+        );
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    const ghr_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_name });
+    defer allocator.free(ghr_path);
+    defer Dir.deleteFileAbsolute(io, ghr_path) catch {};
+    const ghr_dl = release_mod.assetDownload(ghr_asset, ctx.auth_header != null);
+    http.downloadToFile(allocator, io, ghr_dl.url, ghr_path, .{
+        .auth_header = ctx.auth_header,
+        .accept = ghr_dl.accept,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: failed to download manifest '{s}': {t}\n", .{ ghr_asset.name, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    validateGhrManifest(allocator, io, ghr_path, err_w) catch return error.InstallStepFailed;
+
+    {
+        var stage_dir = Dir.openDirAbsolute(io, unit.paths.stage, .{ .iterate = true }) catch |err| {
+            try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ unit.paths.stage, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer stage_dir.close(io);
+        var cache_dir = Dir.openDirAbsolute(io, d.cache, .{}) catch |err| {
+            try err_w.print("error: failed to open cache dir '{s}': {t}\n", .{ d.cache, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer cache_dir.close(io);
+        cache_dir.copyFile(asset.name, stage_dir, asset.name, io, .{}) catch |err| {
+            try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        cache_dir.copyFile(ghr_name, stage_dir, ghr_name, io, .{}) catch |err| {
+            try err_w.print("error: failed to stage manifest '{s}': {t}\n", .{ ghr_name, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+    }
+
+    const target = try a.dupe(u8, asset.name);
+    const commands = try a.alloc(command_plan.Command, 1);
+    commands[0] = .{ .relative_target = target, .kind = .wasm };
+    unit.commands = commands;
+
+    unit.source = .{
+        .kind = .github,
+        .owner = try a.dupe(u8, spec.owner),
+        .repo = try a.dupe(u8, spec.repo),
+        .tag = if (spec.tag) |t| try a.dupe(u8, t) else null,
+        .asset_selector = try a.dupe(u8, asset.name),
+    };
+    try fillConfig(unit, request, minisign_pubkey_b64, ctx.gates, &.{});
+    unit.resolved = try resolvedFromAsset(a, tag_name, asset);
+    unit.verification = .{
+        .result = try a.dupe(u8, vr.label),
+        .minisign = if (vr.minisign_key) |k| try a.dupe(u8, k) else null,
+    };
+    unit.display = try std.fmt.allocPrint(a, "{s}@{s}", .{ unit.id, tag_name });
+
+    try out.append(allocator, unit);
+    keep = true;
+}
+
+// ---------------------------------------------------------------------------
+// Generic (non-GitHub) URL sources
+// ---------------------------------------------------------------------------
+
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Derive the asset file name a generic URL downloads, from the LAST path
+/// segment only. The segment is percent-decoded, then it must be a safe
+/// portable file name: no separators, traversal, control bytes, or reserved
+/// device names survive this.
+fn genericUrlAssetName(a: std.mem.Allocator, url: []const u8) ![]const u8 {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidGenericUrl;
+    var rest = url[scheme_end + 3 ..];
+    if (std.mem.indexOfAny(u8, rest, "?#")) |cut| rest = rest[0..cut];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidGenericUrl;
+    const path = rest[slash + 1 ..];
+    if (path.len == 0) return error.InvalidGenericUrl;
+    const last = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
+    if (last.len == 0 or last.len > 255) return error.InvalidGenericUrl;
+
+    var decoded: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < last.len) {
+        if (last[i] == '%') {
+            if (i + 2 >= last.len) return error.InvalidGenericUrl;
+            const hi = hexNibble(last[i + 1]) orelse return error.InvalidGenericUrl;
+            const lo = hexNibble(last[i + 2]) orelse return error.InvalidGenericUrl;
+            try decoded.append(a, (hi << 4) | lo);
+            i += 3;
+        } else {
+            try decoded.append(a, last[i]);
+            i += 1;
+        }
+    }
+    const name = try decoded.toOwnedSlice(a);
+    if (!install_state.isSafePortableRelPath(name)) return error.InvalidGenericUrl;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return error.InvalidGenericUrl;
+    return name;
+}
+
+/// Verify a generic-URL download. ghr never claims a verification it did not
+/// perform: a generic URL publishes no GitHub digest, no sigstore sidecar, and
+/// no attestation, so those verifiers report that they cannot run instead of
+/// contributing an outcome. A supplied minisign key MUST verify against the
+/// sibling `<url>.minisig`, or the install fails.
+fn verifyGenericUrlAsset(
+    ctx: *const InstallContext,
+    url: []const u8,
+    asset_name: []const u8,
+    download_path: []const u8,
+    minisign_pubkey_b64: ?[]const u8,
+    debug_w: ?*Writer,
+) !VerifyResult {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+
+    if (ctx.gates.skip_verify) {
+        try w.print("note: verification skipped (--skip-verify)\n", .{});
+        return .{ .label = "skipped", .minisign_key = null };
+    }
+
+    var outcomes: std.ArrayListUnmanaged(release_mod.VerifyOutcome) = .empty;
+    defer outcomes.deinit(allocator);
+    var recorded_key: ?[]const u8 = null;
+
+    if (!ctx.gates.shouldSkip(.checksum)) {
+        try w.print(
+            "note: '{s}' is a direct URL; ghr has no published checksum to verify against\n",
+            .{asset_name},
+        );
+    }
+
+    if (minisign_pubkey_b64) |key_b64| {
+        if (ctx.gates.skip_minisign) {
+            try w.print("note: minisign verification skipped (--skip-minisign)\n", .{});
+        } else {
+            try verifyGenericUrlMinisign(ctx, url, asset_name, download_path, key_b64, debug_w);
+            try outcomes.append(allocator, .minisign_verified);
+            recorded_key = key_b64;
+        }
+    }
+
+    if (!ctx.gates.shouldSkip(.authenticode)) {
+        const ac = release_mod.verifyDownloadedAssetAuthenticode(
+            allocator,
+            io,
+            download_path,
+            debug_w,
+            w,
+            err_w,
+        ) catch |err| {
+            try err_w.print("error: authenticode verification failed: {s}\n", .{@errorName(err)});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        try outcomes.append(allocator, ac);
+    }
+
+    if (!ctx.gates.shouldSkip(.sigstore)) {
+        try w.print("note: sigstore sidecars are not resolvable for a direct URL\n", .{});
+    }
+    if (!ctx.gates.shouldSkip(.attestation)) {
+        try w.print("note: GitHub attestations are not resolvable for a direct URL\n", .{});
+    }
+
+    const best = release_mod.strongestOutcome(outcomes.items);
+    const label = release_mod.outcomeLabel(best) orelse blk: {
+        try w.print("note: download is unverified (direct URL with no verifiable material)\n", .{});
+        break :blk "none";
+    };
+    try w.flush();
+    return .{ .label = label, .minisign_key = recorded_key };
+}
+
+/// Verify `download_path` against `<url>.minisig`. The sidecar location is the
+/// deterministic sibling of the download URL; a URL carrying a query string has
+/// no unambiguous sibling and is refused rather than guessed at.
+fn verifyGenericUrlMinisign(
+    ctx: *const InstallContext,
+    url: []const u8,
+    asset_name: []const u8,
+    download_path: []const u8,
+    key_b64: []const u8,
+    debug_w: ?*Writer,
+) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+
+    if (std.mem.indexOfAny(u8, url, "?#") != null) {
+        try err_w.print(
+            "error: cannot locate a minisign sidecar for a URL carrying a query string\n",
+            .{},
+        );
+        try err_w.print("  hint: publish '<url>.minisig' beside a plain URL, or drop --minisign\n", .{});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    }
+
+    const pk = minisign.parsePublicKey(key_b64) catch |err| {
+        try err_w.print("error: minisign value is not a valid public key ({s})\n", .{@errorName(err)});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+
+    const sidecar_url = try std.fmt.allocPrint(allocator, "{s}.minisig", .{url});
+    defer allocator.free(sidecar_url);
+    const sidecar_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}.minisig", .{
+        ctx.dirs.cache, std.fs.path.sep, asset_name,
+    });
+    defer allocator.free(sidecar_path);
+    defer Dir.deleteFileAbsolute(io, sidecar_path) catch {};
+
+    // A direct URL is not a GitHub endpoint: never send the GitHub token.
+    http.downloadToFile(allocator, io, sidecar_url, sidecar_path, .{
+        .auth_header = null,
+        .accept = null,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: failed to download minisign sidecar '{s}': {t}\n", .{ sidecar_url, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+
+    const sidecar_bytes = blk: {
+        var dir = Dir.openDirAbsolute(io, ctx.dirs.cache, .{}) catch |err| {
+            try err_w.print("error: failed to open cache dir: {t}\n", .{err});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer dir.close(io);
+        break :blk dir.readFileAlloc(
+            io,
+            std.fs.path.basename(sidecar_path),
+            allocator,
+            Io.Limit.limited(64 * 1024),
+        ) catch |err| {
+            try err_w.print("error: failed to read minisign sidecar: {t}\n", .{err});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+    };
+    defer allocator.free(sidecar_bytes);
+
+    const sig = minisign.parseSignature(sidecar_bytes) catch |err| {
+        try err_w.print("error: failed to parse minisign sidecar: {s}\n", .{@errorName(err)});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    minisign.verifyKeyId(pk, sig) catch {
+        try err_w.print("error: minisign key id mismatch for '{s}'\n", .{asset_name});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    var file = Dir.openFileAbsolute(io, download_path, .{}) catch |err| {
+        try err_w.print("error: failed to open '{s}': {t}\n", .{ download_path, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer file.close(io);
+    minisign.verifyArtifact(io, file, pk, sig) catch |err| {
+        try err_w.print(
+            "error: minisign artifact signature does not verify for '{s}': {s}\n",
+            .{ asset_name, @errorName(err) },
+        );
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    minisign.verifyGlobal(pk, sig) catch |err| {
+        try err_w.print(
+            "error: minisign trusted-comment signature does not verify for '{s}': {s}\n",
+            .{ asset_name, @errorName(err) },
+        );
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    var key_hex: [16]u8 = undefined;
+    minisign.keyIdToHex(pk.key_id, &key_hex);
+    try w.print("verified minisign: key {s}\n", .{&key_hex});
+    try w.flush();
+}
+
+fn stageGenericUrlRequest(
+    ctx: *const InstallContext,
+    request: install_request.InstallRequest,
+    url: []const u8,
+    minisign_pubkey_b64: ?[]const u8,
+    out: *std.ArrayListUnmanaged(*StagedUnit),
+) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const d = ctx.dirs;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+    const debug_w: ?*Writer = if (ctx.debug) err_w else null;
+
+    // Provenance for a direct URL IS the URL, so a URL that cannot be persisted
+    // (userinfo, signed query parameters, expiry) is refused outright rather
+    // than installed with invented provenance.
+    if (!install_state_write.isPersistableUrl(url)) {
+        try err_w.print("error: refusing to install from a URL that cannot be recorded as provenance\n", .{});
+        try err_w.print(
+            "  hint: the URL carries credentials, an expiry, or a signature; download it first and install the file\n",
+            .{},
+        );
+        try err_w.flush();
+        return error.InstallStepFailed;
+    }
+
+    const unit = try StagedUnit.create(allocator);
+    var keep = false;
+    defer if (!keep) unit.destroy();
+    const a = unit.alloc();
+
+    const asset_name = genericUrlAssetName(a, url) catch {
+        try err_w.print("error: cannot derive a safe file name from '{s}'\n", .{url});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+
+    try ensureInvocationIdAvailable(err_w, out.items, request.id);
+    try beginStaging(ctx, unit, request.id);
+    errdefer discardStagedUnit(allocator, io, unit);
+
+    var stage_dir = Dir.openDirAbsolute(io, unit.paths.stage, .{ .iterate = true }) catch |err| {
+        try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ unit.paths.stage, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer stage_dir.close(io);
+
+    ensureDirAbsoluteRecursive(io, d.cache) catch {};
+    const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        d.cache, std.fs.path.sep, asset_name,
+    });
+    defer allocator.free(download_path);
+
+    try w.print("downloading {s} ...\n", .{url});
+    try w.flush();
+    // Never send GitHub credentials to a host ghr does not control.
+    http.downloadToFile(allocator, io, url, download_path, .{
+        .auth_header = null,
+        .accept = null,
+        .debug_w = debug_w,
+    }) catch |err| {
+        try err_w.print("error: download failed: {}\n", .{err});
+        try err_w.print("  url: {s}\n", .{url});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    defer Dir.deleteFileAbsolute(io, download_path) catch {};
+
+    const vr = try verifyGenericUrlAsset(ctx, url, asset_name, download_path, minisign_pubkey_b64, debug_w);
+
+    const digest = release_mod.computeFileSha256(io, download_path) catch |err| {
+        try err_w.print("error: failed to digest '{s}': {t}\n", .{ download_path, err });
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    const digest_hex = try std.fmt.allocPrint(a, "{x}", .{&digest});
+
+    try w.print("extracting ...\n", .{});
+    try w.flush();
+    switch (archive.detectFormat(asset_name)) {
+        .zip, .tar_gz, .tar_xz, .deb => {
+            archive.extractAuto(allocator, io, stage_dir, download_path, 0) catch |err| {
+                try err_w.print("error: failed to extract '{s}': {t}\n", .{ asset_name, err });
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
+        },
+        .unknown => {
+            const exe_name = try deriveBareBinaryName(
+                allocator,
+                asset_name,
+                std.fs.path.basename(unit.id),
+                host_is_windows,
+            );
+            defer allocator.free(exe_name);
+            stageBareExecutable(allocator, io, d.cache, asset_name, stage_dir, exe_name) catch |err| {
+                try err_w.print("error: failed to stage bare executable '{s}': {t}\n", .{ asset_name, err });
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
+        },
+    }
+
+    const prefer_deb_shims = archive.detectFormat(asset_name) == .deb and hasDebShims(io, stage_dir);
+    try discoverStagedCommands(ctx, unit, stage_dir, prefer_deb_shims, asset_name, &.{});
+
+    unit.source = .{ .kind = .generic_url, .url = try a.dupe(u8, url) };
+    try fillConfig(unit, request, minisign_pubkey_b64, ctx.gates, ctx.bin_filters);
+    unit.resolved = .{
+        .asset = try a.dupe(u8, asset_name),
+        .download_url = try a.dupe(u8, url),
+        .digest = .{ .algorithm = try a.dupe(u8, "sha256"), .value = digest_hex },
+    };
+    unit.verification = .{
+        .result = try a.dupe(u8, vr.label),
+        .minisign = if (vr.minisign_key) |k| try a.dupe(u8, k) else null,
+    };
+    unit.display = try a.dupe(u8, unit.id);
+
+    try out.append(allocator, unit);
+    keep = true;
+}
+
+// ---------------------------------------------------------------------------
+// Planning
+// ---------------------------------------------------------------------------
+
+fn planAndCommit(ctx: *const InstallContext, units: []const *StagedUnit) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const d = ctx.dirs;
+    const err_w = ctx.err_w;
+
+    var inventory = install_state.scan(allocator, io, d.tools, .{ .platform = host_platform }) catch |err| {
+        try err_w.print("error: failed to read install state under '{s}': {t}\n", .{ d.tools, err });
+        try err_w.print("  no install state was changed\n", .{});
+        try err_w.flush();
+        return error.InstallFailed;
+    };
+    defer inventory.deinit(allocator);
+
+    ensureDirAbsoluteRecursive(io, d.bin) catch {};
+    var snapshot = command_plan.snapshotBinDir(allocator, io, d.bin) catch |err| {
+        try err_w.print("error: failed to read the bin directory '{s}': {t}\n", .{ d.bin, err });
+        try err_w.print("  no install state was changed\n", .{});
+        try err_w.flush();
+        return error.InstallFailed;
+    };
+    defer snapshot.deinit();
+
+    const plan_units = try allocator.alloc(command_plan.Unit, units.len);
+    defer allocator.free(plan_units);
+    for (units, 0..) |u, i| {
+        plan_units[i] = .{ .id = u.id, .commands = u.commands, .aliases = u.aliases };
+    }
+
+    var diag: command_plan.Diagnostic = .{};
+    var plan = command_plan.planWithDiagnostic(
+        allocator,
+        plan_units,
+        inventory,
+        snapshot.entries,
+        .{ .platform = host_platform },
+        &diag,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try reportPlanError(err_w, err, diag, inventory);
+            return error.InstallPlanRejected;
+        },
+    };
+    defer plan.deinit();
+
+    if (comptime builtin.os.tag.isDarwin()) {
+        preflightAppBundles(ctx, units, inventory) catch |err| {
+            try err_w.print("error: .app bundle publication is not safe: {t}\n", .{err});
+            try err_w.print("  no install state was changed\n", .{});
+            try err_w.flush();
+            return error.InstallPlanRejected;
+        };
+    }
+
+    // Build and validate every record BEFORE the first live change, so a
+    // metadata that the reader would reject can never leave a half-mutated
+    // invocation behind.
+    for (units) |u| buildUnitMetadata(ctx, u, plan) catch |err| switch (err) {
+        error.InstallStepFailed => return error.InstallFailed,
+        else => return err,
+    };
+
+    for (units) |u| {
+        commitUnit(ctx, u, plan, inventory) catch |err| switch (err) {
+            error.InstallStepFailed => return error.InstallFailed,
+            else => return err,
+        };
+    }
+}
+
+fn preflightAppBundles(
+    ctx: *const InstallContext,
+    units: []const *StagedUnit,
+    inventory: install_state.Inventory,
+) !void {
+    var arena_inst = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+
+    var claimed: std.StringHashMapUnmanaged(void) = .empty;
+    const home = ctx.environ.get("HOME") orelse {
+        for (units) |unit| if (unit.apps.len > 0) return error.HomeNotFound;
+        return;
+    };
+    const apps_path = try std.fmt.allocPrint(a, "{s}/Applications", .{home});
+    var apps_dir_opt: ?Dir = Dir.openDirAbsolute(ctx.io, apps_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (apps_dir_opt) |*dir| dir.close(ctx.io);
+
+    for (units) |unit| {
+        const previous = findRecord(inventory, unit.id);
+        const previous_path = if (previous) |rec|
+            try recordAbsPath(a, ctx.dirs.tools, rec.path)
+        else
+            null;
+
+        for (unit.apps) |rel_path| {
+            const app_name = std.fs.path.basename(rel_path);
+            const key = try a.dupe(u8, app_name);
+            for (key) |*c| c.* = std.ascii.toLower(c.*);
+            if ((try claimed.getOrPut(a, key)).found_existing)
+                return error.DuplicateAppBundle;
+
+            const apps_dir = apps_dir_opt orelse continue;
+            _ = apps_dir.statFile(ctx.io, app_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+
+            const owner = previous_path orelse return error.AppOwnershipConflict;
+            if (isLegacyAppSymlink(ctx.allocator, ctx.io, apps_dir, app_name, owner, rel_path))
+                continue;
+            if (isOwnedAppBundle(ctx.io, apps_dir, app_name, owner)) continue;
+            return error.AppOwnershipConflict;
+        }
+    }
+}
+
+fn buildUnitMetadata(ctx: *const InstallContext, unit: *StagedUnit, plan: command_plan.Plan) !void {
+    const a = unit.alloc();
+    var cmds: std.ArrayListUnmanaged(install_state_write.Command) = .empty;
+    for (plan.commands) |pc| {
+        if (!std.mem.eql(u8, pc.id, unit.id)) continue;
+        try cmds.append(a, .{
+            .name = pc.final_name,
+            .source_name = pc.source_name,
+            .relative_target = pc.relative_target,
+            .kind = switch (pc.kind) {
+                .native => .native,
+                .wasm => .wasm,
+            },
+        });
+    }
+
+    const meta: install_state_write.Metadata = .{
+        .id = unit.id,
+        .source = unit.source,
+        .config = unit.config,
+        .resolved = unit.resolved,
+        .commands = cmds.items,
+        .apps = unit.apps,
+        .verification = unit.verification,
+    };
+    unit.metadata_body = install_state_write.stringify(a, meta, host_platform) catch |err| {
+        try ctx.err_w.print("error: refusing to record install metadata for '{s}': {t}\n", .{ unit.id, err });
+        try ctx.err_w.print("  no install state was changed\n", .{});
+        try ctx.err_w.flush();
+        return error.InstallStepFailed;
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Commit
+// ---------------------------------------------------------------------------
+
+fn findRecord(inventory: install_state.Inventory, id: []const u8) ?install_state.InventoryRecord {
+    for (inventory.records) |rec| {
+        const rid = rec.id orelse continue;
+        if (std.mem.eql(u8, rid, id)) return rec;
+    }
+    return null;
+}
+
+/// Absolute path of an inventory record, rebuilt from the tools-relative path
+/// the reader recorded (never from user input).
+fn recordAbsPath(a: std.mem.Allocator, tools_dir: []const u8, rel: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(a, tools_dir);
+    try out.append(a, std.fs.path.sep);
+    for (rel) |c| try out.append(a, if (c == '/') std.fs.path.sep else c);
+    return out.toOwnedSlice(a);
+}
+
+/// True when the previous definition of this ID already published the same
+/// command name and kind. Only then may a locked Windows launcher be retained.
+fn previousPublishedSame(previous: ?install_state.InventoryRecord, pc: command_plan.PlannedCommand) bool {
+    const rec = previous orelse return false;
+    for (rec.commands) |cmd| {
+        const kind: command_plan.Kind = if (install_state.isWasmTarget(cmd.relative_target)) .wasm else .native;
+        if (kind != pc.kind) continue;
+        const equal = if (host_platform == .windows)
+            std.ascii.eqlIgnoreCase(cmd.name, pc.final_name)
+        else
+            std.mem.eql(u8, cmd.name, pc.final_name);
+        if (equal) return true;
+    }
+    return false;
+}
+
+fn commitUnit(
+    ctx: *const InstallContext,
+    unit: *StagedUnit,
+    plan: command_plan.Plan,
+    inventory: install_state.Inventory,
+) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+    const a = unit.alloc();
+    const p = unit.paths;
+
+    const previous = findRecord(inventory, unit.id);
+    const previous_path: ?[]const u8 = if (previous) |rec|
+        try recordAbsPath(a, ctx.dirs.tools, rec.path)
+    else
+        null;
+    const legacy: ?struct { path: []const u8, kind: install_txn.LegacyKind } = if (previous) |rec|
+        switch (rec.kind) {
+            .v1_repo => .{ .path = previous_path.?, .kind = .v1_repo },
+            .v1_wasm => .{ .path = previous_path.?, .kind = .v1_wasm },
+            else => null,
+        }
+    else
+        null;
+
+    // Journal exactly the artifacts this transaction may touch.
+    var publish: std.ArrayListUnmanaged([]const u8) = .empty;
+    var cleanup: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (plan.commands) |pc| {
+        if (!std.mem.eql(u8, pc.id, unit.id)) continue;
+        for (pc.publish) |name| try publish.append(a, name);
+        for (pc.cleanup) |name| try cleanup.append(a, name);
+    }
+    var stale: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (plan.stale) |sc| {
+        if (!std.mem.eql(u8, sc.id, unit.id)) continue;
+        for (sc.remove) |name| try stale.append(a, name);
+    }
+
+    var journal: install_txn.Journal = .{
+        .op = .install,
+        .id = unit.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = publish.items,
+        .cleanup = cleanup.items,
+        .stale = stale.items,
+        .apps = unit.apps,
+        .had_previous = previous != null,
+        .legacy_path = if (legacy) |l| l.path else null,
+        .legacy_kind = if (legacy) |l| l.kind else null,
+        .phase = .staged,
+    };
+
+    // Metadata is written into transaction staging, never into live state.
+    {
+        var stage_dir = Dir.openDirAbsolute(io, p.stage, .{}) catch |err| {
+            try err_w.print("error: failed to open staging dir '{s}': {t}\n", .{ p.stage, err });
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer stage_dir.close(io);
+        var file = stage_dir.createFile(io, install_state.metadata_file, .{}) catch |err| {
+            try err_w.print("error: failed to write install metadata: {t}\n", .{err});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        defer file.close(io);
+        file.writeStreamingAll(io, unit.metadata_body) catch |err| {
+            try err_w.print("error: failed to write install metadata: {t}\n", .{err});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        };
+        file.sync(io) catch {};
+    }
+
+    install_txn.writeJournal(io, p, allocator, journal) catch |err| {
+        try err_w.print("error: failed to journal the install transaction: {t}\n", .{err});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+
+    journal.phase = .swapping;
+    install_txn.writeJournal(io, p, allocator, journal) catch |err| {
+        try err_w.print("error: failed to journal the install transaction: {t}\n", .{err});
+        try err_w.flush();
+        return error.InstallStepFailed;
+    };
+    install_txn.swapUnit(io, p, .{}) catch |err| {
+        try err_w.print("error: failed to publish the unit directory '{s}': {t}\n", .{ p.unit, err });
+        if (err == error.InstallRollbackFailed) {
+            // The previous unit was moved aside and could not be put back. Its
+            // only copy is the transaction backup, so the journal and backup
+            // MUST survive for recovery to restore them.
+            try err_w.print(
+                "  the previous install is preserved at '{s}'; run any ghr command to retry recovery\n",
+                .{p.backup},
+            );
+            try err_w.flush();
+            return error.InstallStepFailed;
+        }
+        try err_w.flush();
+        install_txn.discardTransaction(io, p) catch {};
+        return error.InstallStepFailed;
+    };
+
+    // From here on a journal-write failure is tolerated: recovery combines the
+    // recorded phase with the observed unit/stage/backup presence, and every
+    // later phase classifies identically to `.swapping` once the unit is live,
+    // so a stale phase still recovers correctly.
+    journal.phase = .publishing;
+    install_txn.writeJournal(io, p, allocator, journal) catch {};
+
+    ensureDirAbsoluteRecursive(io, ctx.dirs.bin) catch {};
+    var bin_dir = Dir.openDirAbsolute(io, ctx.dirs.bin, .{}) catch |err| {
+        try err_w.print("error: failed to open bin directory '{s}': {t}\n", .{ ctx.dirs.bin, err });
+        try err_w.flush();
+        try rollbackCommit(ctx, unit, plan, previous, previous_path, journal);
+        return error.InstallStepFailed;
+    };
+    defer bin_dir.close(io);
+
+    try w.print("linking executables:\n", .{});
+    publishUnitCommands(ctx, bin_dir, unit, plan, previous) catch |err| {
+        try err_w.print("error: failed to publish commands for '{s}': {t}\n", .{ unit.id, err });
+        try err_w.flush();
+        try rollbackCommit(ctx, unit, plan, previous, previous_path, journal);
+        return error.InstallStepFailed;
+    };
+
+    if (comptime builtin.os.tag.isDarwin()) {
+        installAppBundles(allocator, io, ctx.environ, unit.apps, p.unit, previous_path, w) catch |err| {
+            try err_w.print("error: failed to install .app bundle for '{s}': {t}\n", .{ unit.id, err });
+            try err_w.flush();
+            try rollbackCommit(ctx, unit, plan, previous, previous_path, journal);
+            return error.InstallStepFailed;
+        };
+    }
+
+    journal.phase = .retiring;
+    install_txn.writeJournal(io, p, allocator, journal) catch {};
+
+    removeStaleCommands(ctx, bin_dir, unit, plan, previous_path);
+    if (legacy) |l| retireLegacyUnit(ctx, l.path, l.kind);
+
+    journal.phase = .complete;
+    install_txn.writeJournal(io, p, allocator, journal) catch {};
+    install_txn.discardTransaction(io, p) catch {};
+
+    try w.print("installed {s}\n", .{unit.display});
+    try w.flush();
+}
+
+/// Restore the previous unit and its command set after a synchronous failure
+/// during publication. Publication failures are never warnings.
+fn rollbackCommit(
+    ctx: *const InstallContext,
+    unit: *StagedUnit,
+    plan: command_plan.Plan,
+    previous: ?install_state.InventoryRecord,
+    previous_path: ?[]const u8,
+    journal_in: install_txn.Journal,
+) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const err_w = ctx.err_w;
+    const p = unit.paths;
+
+    // Make rollback intent durable before changing the live unit. Recovery of
+    // this phase never applies the failed install's stale/legacy retirement.
+    var journal = journal_in;
+    journal.phase = .rolled_back;
+    install_txn.writeJournal(io, p, allocator, journal) catch |err| {
+        try err_w.print("error: failed to journal rollback for '{s}': {t}\n", .{ unit.id, err });
+        try err_w.print("  run any ghr command to finish transaction recovery\n", .{});
+        try err_w.flush();
+        return;
+    };
+
+    // Remove exactly what this transaction wrote, and nothing else.
+    if (Dir.openDirAbsolute(io, ctx.dirs.bin, .{})) |*bin_dir_| {
+        var bin_dir = bin_dir_.*;
+        defer bin_dir.close(io);
+        for (plan.commands) |pc| {
+            if (!std.mem.eql(u8, pc.id, unit.id)) continue;
+            for (pc.publish) |name| bin_dir.deleteFile(io, name) catch {};
+        }
+    } else |_| {}
+
+    if (comptime builtin.os.tag.isDarwin()) {
+        try uninstallAppBundles(allocator, io, ctx.environ, unit.apps, p.unit, ctx.w);
+    }
+
+    const prev = previous orelse {
+        // The ID had no previous unit, so remove the one this transaction
+        // published rather than leaving it half-live.
+        deleteTreeIfExists(io, p.unit) catch |err| {
+            try err_w.print("error: rollback could not remove failed unit '{s}': {t}\n", .{ p.unit, err });
+            try err_w.print("  run any ghr command to retry recovery\n", .{});
+            try err_w.flush();
+            return;
+        };
+        install_txn.discardTransaction(io, p) catch {};
+        return;
+    };
+
+    if (prev.kind == .v2) {
+        // The previous unit is in the transaction backup; it must be live again
+        // BEFORE its commands are republished, or they would point at the
+        // replacement that just failed.
+        install_txn.restoreUnit(io, p, .{}) catch |err| {
+            try err_w.print(
+                "error: rollback failed: could not restore '{s}' from '{s}': {t}\n",
+                .{ p.unit, p.backup, err },
+            );
+            try err_w.print("  run any ghr command to retry recovery\n", .{});
+            try err_w.flush();
+            return;
+        };
+        republishInBin(ctx, prev, p.unit);
+        if (comptime builtin.os.tag.isDarwin()) {
+            installAppBundles(allocator, io, ctx.environ, prev.apps, p.unit, null, ctx.w) catch {};
+        }
+    } else {
+        // A legacy unit was never moved, so its content is still live; only its
+        // commands may have been overwritten.
+        republishInBin(ctx, prev, previous_path orelse p.unit);
+        if (comptime builtin.os.tag.isDarwin()) {
+            installAppBundles(
+                allocator,
+                io,
+                ctx.environ,
+                prev.apps,
+                previous_path orelse p.unit,
+                null,
+                ctx.w,
+            ) catch {};
+        }
+        deleteTreeIfExists(io, p.unit) catch |err| {
+            try err_w.print("error: rollback could not remove failed unit '{s}': {t}\n", .{ p.unit, err });
+            try err_w.print("  the legacy install remains live; run any ghr command to retry recovery\n", .{});
+            try err_w.flush();
+            return;
+        };
+    }
+    install_txn.discardTransaction(io, p) catch {};
+}
+
+fn republishInBin(ctx: *const InstallContext, record: install_state.InventoryRecord, unit_path: []const u8) void {
+    var bin_dir = Dir.openDirAbsolute(ctx.io, ctx.dirs.bin, .{}) catch return;
+    defer bin_dir.close(ctx.io);
+    republishRecordCommands(ctx, bin_dir, record, unit_path);
+}
+
+/// Explicit fault-injection seam for the commit path. Production never writes
+/// to it; tests set it to reproduce a publication failure at a chosen point so
+/// rollback is exercised by real code rather than by a mock.
+const CommitFaults = struct {
+    /// Fail after this many commands have been published.
+    fail_publish_after: ?usize = null,
+};
+var commit_faults: CommitFaults = .{};
+
+fn publishUnitCommands(
+    ctx: *const InstallContext,
+    bin_dir: Dir,
+    unit: *StagedUnit,
+    plan: command_plan.Plan,
+    previous: ?install_state.InventoryRecord,
+) !void {
+    var published: usize = 0;
+    for (plan.commands) |pc| {
+        if (!std.mem.eql(u8, pc.id, unit.id)) continue;
+        if (builtin.is_test) {
+            if (commit_faults.fail_publish_after) |limit| {
+                if (published == limit) return error.InjectedPublishFailure;
+            }
+        }
+        published += 1;
+        try publishCommand(
+            ctx.allocator,
+            ctx.io,
+            unit.paths.unit,
+            bin_dir,
+            pc.final_name,
+            pc.relative_target,
+            pc.kind,
+            previousPublishedSame(previous, pc),
+        );
+        try ctx.w.print("  linked {s}\n", .{pc.final_name});
+    }
+    try ctx.w.flush();
+}
+
+/// Re-publish a record's commands from its own metadata. Used by rollback and
+/// by crash recovery; both need to make the live bin directory agree with the
+/// unit that is actually installed.
+fn republishRecordCommands(
+    ctx: *const InstallContext,
+    bin_dir: Dir,
+    record: install_state.InventoryRecord,
+    unit_path: []const u8,
+) void {
+    for (record.commands) |cmd| {
+        const kind: command_plan.Kind = if (install_state.isWasmTarget(cmd.relative_target)) .wasm else .native;
+        publishCommand(
+            ctx.allocator,
+            ctx.io,
+            unit_path,
+            bin_dir,
+            cmd.name,
+            cmd.relative_target,
+            kind,
+            true,
+        ) catch {};
+    }
+}
+
+/// Remove the same-ID artifacts a previous definition owned and the new one
+/// does not. `command_plan` produces intent only: each entry's live symlink or
+/// manifest must still prove this ID owns it before anything is unlinked.
+fn removeStaleCommands(
+    ctx: *const InstallContext,
+    bin_dir: Dir,
+    unit: *StagedUnit,
+    plan: command_plan.Plan,
+    previous_path: ?[]const u8,
+) void {
+    const io = ctx.io;
+    for (plan.stale) |sc| {
+        if (!std.mem.eql(u8, sc.id, unit.id)) continue;
+        var owned = commandArtifactIsOwned(io, bin_dir, sc.name, sc.kind, unit.paths.unit);
+        if (!owned) {
+            if (previous_path) |prev| {
+                owned = commandArtifactIsOwned(io, bin_dir, sc.name, sc.kind, prev);
+            }
+        }
+        if (!owned) continue;
+        for (sc.remove) |name| bin_dir.deleteFile(io, name) catch {};
+    }
+}
+
+/// Revalidate that a live bin entry really belongs to `unit_path` before it is
+/// removed. A symlink must resolve inside the unit; a shim must be described by
+/// a `.ghr` or legacy `.shim` that points inside it. Anything else -- another
+/// ID's artifact, a user's own file, a modified link -- is left alone.
+fn commandArtifactIsOwned(
+    io: Io,
+    bin_dir: Dir,
+    name: []const u8,
+    kind: command_plan.Kind,
+    unit_path: []const u8,
+) bool {
+    if (kind == .native and !host_is_windows) {
+        var link_buf: [Dir.max_path_bytes]u8 = undefined;
+        const len = bin_dir.readLink(io, name, &link_buf) catch return false;
+        return pathIsWithinTool(link_buf[0..len], unit_path, false);
+    }
+
+    const stem = if (host_is_windows and kind == .native) windowsExeStem(name) else name;
+    var ghr_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&ghr_buf, "{s}.ghr", .{stem})) |ghr_name| {
+        if (binGhrPointsToToolDir(io, bin_dir, ghr_name, unit_path)) return true;
+    } else |_| {}
+    var shim_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&shim_buf, "{s}.shim", .{stem})) |shim_name| {
+        if (shimPointsToToolDir(io, bin_dir, shim_name, unit_path)) return true;
+    } else |_| {}
+    return false;
+}
+
+/// Retire a legacy v1 unit AFTER the v2 unit and its commands are durable.
+/// Independently installed nested wasm units are preserved: only repo-level
+/// content is removed, and the repo directory itself survives while it still
+/// holds a child unit.
+fn retireLegacyUnit(ctx: *const InstallContext, legacy_path: []const u8, kind: install_txn.LegacyKind) void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+
+    switch (kind) {
+        .v1_wasm => {
+            deleteTreeAbsolute(io, legacy_path) catch {};
+            if (std.fs.path.dirname(legacy_path)) |parent| Dir.deleteDirAbsolute(io, parent) catch {};
+        },
+        .v1_repo => {
+            var rd = Dir.openDirAbsolute(io, legacy_path, .{ .iterate = true }) catch return;
+            var entries: std.ArrayListUnmanaged(struct { name: []u8, is_dir: bool }) = .empty;
+            defer {
+                for (entries.items) |e| allocator.free(e.name);
+                entries.deinit(allocator);
+            }
+            {
+                defer rd.close(io);
+                var it = rd.iterate();
+                while (it.next(io) catch null) |entry| {
+                    const is_dir = entry.kind == .directory;
+                    if (is_dir and !isInstallTransactionDir(entry.name)) {
+                        const child = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+                            legacy_path, std.fs.path.sep, entry.name,
+                        }) catch continue;
+                        defer allocator.free(child);
+                        // A child unit is an independent install; never remove it.
+                        if (dirHasGhrJson(io, child)) continue;
+                    }
+                    const dup = allocator.dupe(u8, entry.name) catch continue;
+                    entries.append(allocator, .{ .name = dup, .is_dir = is_dir }) catch {
+                        allocator.free(dup);
+                        continue;
+                    };
+                }
+            }
+            for (entries.items) |e| {
+                var pb: [Dir.max_path_bytes]u8 = undefined;
+                const child = std.fmt.bufPrint(&pb, "{s}{c}{s}", .{
+                    legacy_path, std.fs.path.sep, e.name,
+                }) catch continue;
+                if (e.is_dir) {
+                    deleteTreeAbsolute(io, child) catch {};
+                } else {
+                    Dir.deleteFileAbsolute(io, child) catch {};
+                }
+            }
+            // Only succeeds when no preserved child unit remains.
+            Dir.deleteDirAbsolute(io, legacy_path) catch {};
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Crash recovery
+// ---------------------------------------------------------------------------
+
+/// Finish or roll back every transaction a previous run left behind. Runs
+/// before any command is touched. Every step revalidates identity and
+/// ownership: a journal that does not describe the transaction directory it
+/// sits in is reported and left alone rather than acted on.
+fn recoverPendingTransactions(ctx: *const InstallContext) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const err_w = ctx.err_w;
+
+    var pending = install_txn.scanPending(allocator, io, ctx.dirs.tools, host_platform) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer pending.deinit();
+
+    for (pending.items) |entry| {
+        if (entry.id.len == 0) {
+            try err_w.print(
+                "warning: ignoring an unrecognizable install transaction at '{s}'\n",
+                .{entry.root},
+            );
+            try err_w.flush();
+            continue;
+        }
+        recoverOneTransaction(ctx, entry.id) catch |err| {
+            try err_w.print(
+                "warning: could not recover the install transaction for '{s}': {t}\n",
+                .{ entry.id, err },
+            );
+            try err_w.flush();
+        };
+    }
+}
+
+/// A journal's `legacy_path` drives a recursive delete, so it is the one field
+/// that must be proven to name this transaction's own legacy unit before
+/// recovery acts on it. The path must live directly under the tools directory,
+/// have exactly the depth its kind implies, and lowercase to the journal's
+/// canonical ID -- which permits a pre-migration mixed-case directory such as
+/// `AzureAD/foo` while rejecting anything else.
+fn legacyPathMatchesId(
+    tools_dir: []const u8,
+    legacy_path: []const u8,
+    kind: install_txn.LegacyKind,
+    id: []const u8,
+) bool {
+    if (legacy_path.len <= tools_dir.len + 1) return false;
+    if (!std.mem.startsWith(u8, legacy_path, tools_dir)) return false;
+    const sep = legacy_path[tools_dir.len];
+    if (sep != std.fs.path.sep and sep != '/') return false;
+    const rest = legacy_path[tools_dir.len + 1 ..];
+
+    const want_segments: usize = switch (kind) {
+        .v1_repo => 2,
+        .v1_wasm => 3,
+    };
+
+    var lowered: [install_state.max_id_bytes]u8 = undefined;
+    if (rest.len > lowered.len) return false;
+    var segments: usize = 1;
+    for (rest, 0..) |c, i| {
+        if (c == std.fs.path.sep or c == '/') {
+            segments += 1;
+            lowered[i] = '/';
+        } else {
+            lowered[i] = std.ascii.toLower(c);
+        }
+    }
+    if (segments != want_segments) return false;
+    return std.mem.eql(u8, lowered[0..rest.len], id);
+}
+
+fn recoverOneTransaction(ctx: *const InstallContext, id: []const u8) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+
+    var p = try install_txn.paths(allocator, ctx.dirs.tools, id, host_platform);
+    defer p.deinit();
+
+    var owned = (try install_txn.readJournal(allocator, io, p.journal)) orelse return;
+    defer owned.deinit();
+    const journal = owned.journal;
+    try install_txn.validateAgainstPaths(journal, p);
+    if (journal.legacy_path) |legacy_path| {
+        const kind = journal.legacy_kind orelse return error.JournalMalformed;
+        if (!legacyPathMatchesId(ctx.dirs.tools, legacy_path, kind, journal.id))
+            return error.JournalInvalidPath;
+    }
+
+    const present = try install_txn.presence(io, p);
+    switch (install_txn.classifyRecovery(journal.op, journal.phase, present)) {
+        .rollback => {
+            try install_txn.discardTransaction(io, p);
+        },
+        .restore_backup => {
+            try install_txn.restoreUnit(io, p, .{});
+            try republishFromUnit(ctx, p, journal);
+            try install_txn.discardTransaction(io, p);
+        },
+        .finish_swap => {
+            try install_txn.finishSwap(io, p, .{});
+            try republishFromUnit(ctx, p, journal);
+            try finishRetirement(ctx, p, journal);
+            try install_txn.discardTransaction(io, p);
+        },
+        .republish => {
+            try republishFromUnit(ctx, p, journal);
+            try finishRetirement(ctx, p, journal);
+            try install_txn.discardTransaction(io, p);
+        },
+        .finish_removal => {
+            try finishRemoval(ctx, p, journal);
+            try install_txn.discardTransaction(io, p);
+        },
+        .finish_rollback => {
+            try finishRollback(ctx, p, journal);
+            try install_txn.discardTransaction(io, p);
+        },
+    }
+}
+
+/// Re-publish commands from the metadata that is actually live. The unit is
+/// addressed by the journal's canonical ID through the same reversible
+/// encoding the writer used, so recovery can never publish another unit's
+/// commands -- and a mid-flight migration, where the legacy unit and its v2
+/// replacement deliberately share one ID, does not make the unit unreadable.
+///
+/// This fails CLOSED. If the unit is missing or not a healthy v2 record, the
+/// caller must not go on to retire a legacy unit or drop the journal.
+fn republishFromUnit(ctx: *const InstallContext, p: install_txn.Paths, journal: install_txn.Journal) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+
+    var record = (try install_state.readUnitById(
+        allocator,
+        io,
+        ctx.dirs.tools,
+        journal.id,
+        .{ .platform = host_platform },
+    )) orelse return error.RecoveryUnitMissing;
+    defer record.deinit(allocator);
+    if (record.kind != .v2 or record.status != .ok) return error.RecoveryUnitUnusable;
+
+    ensureDirAbsoluteRecursive(io, ctx.dirs.bin) catch {};
+    var bin_dir = try Dir.openDirAbsolute(io, ctx.dirs.bin, .{});
+    defer bin_dir.close(io);
+    republishRecordCommands(ctx, bin_dir, record, p.unit);
+    if (comptime builtin.os.tag.isDarwin()) {
+        try installAppBundles(
+            allocator,
+            io,
+            ctx.environ,
+            record.apps,
+            p.unit,
+            journal.legacy_path,
+            ctx.w,
+        );
+    }
+}
+
+/// Complete the parts of a commit that follow publication: stale artifacts the
+/// journal recorded, and the legacy unit a migration was retiring.
+fn finishRetirement(ctx: *const InstallContext, p: install_txn.Paths, journal: install_txn.Journal) !void {
+    const io = ctx.io;
+    if (journal.stale.len > 0) {
+        if (Dir.openDirAbsolute(io, ctx.dirs.bin, .{})) |*bin_dir_| {
+            var bin_dir = bin_dir_.*;
+            defer bin_dir.close(io);
+            for (journal.stale) |name| {
+                if (artifactBelongsToUnit(io, bin_dir, name, p.unit, journal.legacy_path)) {
+                    bin_dir.deleteFile(io, name) catch {};
+                }
+            }
+        } else |_| {}
+    }
+    if (journal.legacy_path) |legacy_path| {
+        if (journal.legacy_kind) |kind| retireLegacyUnit(ctx, legacy_path, kind);
+    }
+}
+
+/// Finish an interrupted uninstall exactly as the journal recorded it.
+fn finishRemoval(ctx: *const InstallContext, p: install_txn.Paths, journal: install_txn.Journal) !void {
+    const io = ctx.io;
+    if (Dir.openDirAbsolute(io, ctx.dirs.bin, .{})) |*bin_dir_| {
+        var bin_dir = bin_dir_.*;
+        defer bin_dir.close(io);
+        for (journal.stale) |name| {
+            if (artifactBelongsToUnit(io, bin_dir, name, p.unit, journal.legacy_path)) {
+                bin_dir.deleteFile(io, name) catch {};
+            }
+        }
+    } else |_| {}
+    if (comptime builtin.os.tag.isDarwin()) {
+        try uninstallAppBundles(
+            ctx.allocator,
+            io,
+            ctx.environ,
+            journal.apps,
+            journal.legacy_path orelse p.unit,
+            ctx.w,
+        );
+    }
+    if (journal.legacy_path) |legacy_path| {
+        if (journal.legacy_kind) |kind| retireLegacyUnit(ctx, legacy_path, kind);
+    } else {
+        try deleteTreeIfExists(io, p.unit);
+        pruneEncodedParents(io, ctx.dirs.tools, p.unit);
+    }
+}
+
+/// Complete a rollback whose intent was made durable before the live unit was
+/// restored. This path never consumes the failed install's stale or legacy
+/// retirement lists.
+fn finishRollback(ctx: *const InstallContext, p: install_txn.Paths, journal: install_txn.Journal) !void {
+    const io = ctx.io;
+    if (Dir.openDirAbsolute(io, ctx.dirs.bin, .{})) |*bin_dir_| {
+        var bin_dir = bin_dir_.*;
+        defer bin_dir.close(io);
+        for (journal.publish) |name| {
+            if (artifactBelongsToUnit(io, bin_dir, name, p.unit, null))
+                bin_dir.deleteFile(io, name) catch {};
+        }
+        for (journal.cleanup) |name| {
+            if (artifactBelongsToUnit(io, bin_dir, name, p.unit, null))
+                bin_dir.deleteFile(io, name) catch {};
+        }
+    } else |_| {}
+    if (comptime builtin.os.tag.isDarwin()) {
+        try uninstallAppBundles(ctx.allocator, io, ctx.environ, journal.apps, p.unit, ctx.w);
+    }
+
+    if (!journal.had_previous) {
+        try deleteTreeIfExists(io, p.unit);
+        return;
+    }
+
+    if (journal.legacy_path) |legacy_path| {
+        // The v1 unit was never moved. Remove the failed v2 unit, then recover
+        // the legacy record after the duplicate-ID conflict has disappeared.
+        try deleteTreeIfExists(io, p.unit);
+        try republishLegacyUnit(ctx, journal, legacy_path);
+        return;
+    }
+
+    if (try install_txn.directoryExists(io, p.backup)) {
+        try install_txn.restoreUnit(io, p, .{});
+    }
+    try republishFromUnit(ctx, p, journal);
+}
+
+fn republishLegacyUnit(
+    ctx: *const InstallContext,
+    journal: install_txn.Journal,
+    legacy_path: []const u8,
+) !void {
+    var inventory = try install_state.scan(
+        ctx.allocator,
+        ctx.io,
+        ctx.dirs.tools,
+        .{ .platform = host_platform },
+    );
+    defer inventory.deinit(ctx.allocator);
+
+    const record = findRecord(inventory, journal.id) orelse return error.RecoveryUnitMissing;
+    if (record.status != .ok) return error.RecoveryUnitUnusable;
+    const expected_kind: install_state.UnitKind = switch (journal.legacy_kind orelse
+        return error.JournalMalformed) {
+        .v1_repo => .v1_repo,
+        .v1_wasm => .v1_wasm,
+    };
+    if (record.kind != expected_kind) return error.RecoveryUnitUnusable;
+
+    const actual_path = try recordAbsPath(ctx.allocator, ctx.dirs.tools, record.path);
+    defer ctx.allocator.free(actual_path);
+    if (!std.mem.eql(u8, actual_path, legacy_path)) return error.JournalInvalidPath;
+
+    ensureDirAbsoluteRecursive(ctx.io, ctx.dirs.bin) catch {};
+    var bin_dir = try Dir.openDirAbsolute(ctx.io, ctx.dirs.bin, .{});
+    defer bin_dir.close(ctx.io);
+    republishRecordCommands(ctx, bin_dir, record, legacy_path);
+    if (comptime builtin.os.tag.isDarwin()) {
+        try installAppBundles(
+            ctx.allocator,
+            ctx.io,
+            ctx.environ,
+            record.apps,
+            legacy_path,
+            null,
+            ctx.w,
+        );
+    }
+}
+
+/// Recovery-time ownership check for a bare artifact name. A `.ghr`/`.shim`
+/// companion or a symlink must still point inside one of this ID's own unit
+/// paths; a plain companion file (`.cmd`, `.old`) is removed only when a
+/// sibling proves ownership.
+fn artifactBelongsToUnit(
+    io: Io,
+    bin_dir: Dir,
+    name: []const u8,
+    unit_path: []const u8,
+    legacy_path: ?[]const u8,
+) bool {
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (bin_dir.readLink(io, name, &link_buf)) |len| {
+        const target = link_buf[0..len];
+        if (pathIsWithinTool(target, unit_path, host_is_windows)) return true;
+        if (legacy_path) |legacy| return pathIsWithinTool(target, legacy, host_is_windows);
+        return false;
+    } else |_| {}
+
+    const stem = stripKnownArtifactSuffix(name);
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, "{s}.ghr", .{stem})) |ghr_name| {
+        if (binGhrPointsToToolDir(io, bin_dir, ghr_name, unit_path)) return true;
+        if (legacy_path) |legacy| {
+            if (binGhrPointsToToolDir(io, bin_dir, ghr_name, legacy)) return true;
+        }
+    } else |_| {}
+    var shim_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&shim_buf, "{s}.shim", .{stem})) |shim_name| {
+        if (shimPointsToToolDir(io, bin_dir, shim_name, unit_path)) return true;
+        if (legacy_path) |legacy| {
+            if (shimPointsToToolDir(io, bin_dir, shim_name, legacy)) return true;
+        }
+    } else |_| {}
+    return false;
+}
+
+fn stripKnownArtifactSuffix(name: []const u8) []const u8 {
+    const suffixes = [_][]const u8{ ".exe.old", ".exe", ".ghr", ".cmd", ".shim", ".old" };
+    for (suffixes) |suffix| {
+        if (name.len > suffix.len and std.ascii.endsWithIgnoreCase(name, suffix))
+            return name[0 .. name.len - suffix.len];
+    }
+    return name;
+}
+
+/// Remove the now-empty encoded directories above a deleted unit, stopping at
+/// the units root. `deleteDir` only succeeds on an empty directory, so a parent
+/// that still holds a sibling or child unit is never touched.
+fn pruneEncodedParents(io: Io, tools_dir: []const u8, unit_path: []const u8) void {
+    var units_root_buf: [Dir.max_path_bytes]u8 = undefined;
+    const units_root = std.fmt.bufPrint(&units_root_buf, "{s}{c}{s}{c}{s}", .{
+        tools_dir,
+        std.fs.path.sep,
+        install_state.v2_namespace,
+        std.fs.path.sep,
+        install_state.v2_units_dir,
+    }) catch return;
+    install_txn.pruneEmptyParents(io, units_root, unit_path);
+}
+
+/// Publish one planned command into the bin directory under its EXACT final
+/// name. The final name comes from the invocation plan (an alias when one
+/// applied) and is never re-derived here.
+///
+/// `allow_locked_launcher` is true only for a same-ID replacement whose
+/// previous definition already published this command. On Windows a running
+/// shim exe cannot be replaced; in that one case the compatible launcher is
+/// retained while its `.ghr` (and legacy `.shim`) target is updated. For a new
+/// or renamed command a launcher that cannot be written is a failure, not a
+/// warning.
+fn publishCommand(
+    allocator: std.mem.Allocator,
+    io: Io,
+    unit_path: []const u8,
+    bin_dir: Dir,
+    final_name: []const u8,
+    relative_target: []const u8,
+    kind: command_plan.Kind,
+    allow_locked_launcher: bool,
+) !void {
+    var host_rel_buf: [Dir.max_path_bytes]u8 = undefined;
+    const host_rel = try hostRelInto(&host_rel_buf, relative_target);
+
+    var src_path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const src_path = std.fmt.bufPrint(&src_path_buf, "{s}{c}{s}", .{
+        unit_path,
+        std.fs.path.sep,
+        host_rel,
+    }) catch return error.PathTooLong;
+
+    return switch (kind) {
+        .wasm => publishWasmCommand(
+            allocator,
+            io,
+            unit_path,
+            bin_dir,
+            final_name,
+            host_rel,
+            src_path,
+            allow_locked_launcher,
+        ),
+        .native => publishNativeCommand(io, bin_dir, final_name, src_path, allow_locked_launcher),
+    };
+}
+
+fn publishNativeCommand(
+    io: Io,
+    bin_dir: Dir,
+    final_name: []const u8,
+    src_path: []const u8,
+    allow_locked_launcher: bool,
+) !void {
+    if (builtin.os.tag != .windows) {
+        bin_dir.deleteFile(io, final_name) catch {};
+        try bin_dir.symLink(io, src_path, final_name, .{});
+        return;
+    }
+
+    // Windows: an embedded shim exe plus a `<stem>.ghr` manifest naming the
+    // native target, exactly as `command_plan.artifactsFor` describes.
+    const shim_exe_bytes = @import("shim_exe").bytes;
+    const stem = windowsExeStem(final_name);
+
+    var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{stem}) catch return error.PathTooLong;
+    try writeNativeGhr(io, bin_dir, ghr_name, src_path);
+
+    var cmd_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&cmd_name_buf, "{s}.cmd", .{stem})) |p| {
+        bin_dir.deleteFile(io, p) catch {};
+    } else |_| {}
+
+    var name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const shim_exe_name = windowsShimExeName(&name_buf, final_name) catch return error.PathTooLong;
+    bin_dir.deleteFile(io, shim_exe_name) catch {
+        // A running shim exe cannot be deleted; rename it out of the way.
+        var old_name_buf: [Dir.max_path_bytes]u8 = undefined;
+        const old_name = std.fmt.bufPrint(&old_name_buf, "{s}.old", .{shim_exe_name}) catch
+            return error.PathTooLong;
+        bin_dir.deleteFile(io, old_name) catch {};
+        bin_dir.rename(shim_exe_name, bin_dir, old_name, io) catch {};
+    };
+    const shim_replaced = if (bin_dir.createFile(io, shim_exe_name, .{})) |*exe_file| blk: {
+        defer exe_file.close(io);
+        exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
+        break :blk true;
+    } else |_| false;
+
+    var legacy_shim_buf: [Dir.max_path_bytes]u8 = undefined;
+    const legacy_shim = std.fmt.bufPrint(&legacy_shim_buf, "{s}.shim", .{stem}) catch
+        return error.PathTooLong;
+    if (shim_replaced) {
+        bin_dir.deleteFile(io, legacy_shim) catch {};
+        return;
+    }
+    if (!allow_locked_launcher) return error.CommandLauncherLocked;
+    // Self-update: the still-running shim may predate the `.ghr` format, so
+    // write the legacy `.shim` fallback pointing at the new target. A current
+    // shim prefers `.ghr` and ignores this file.
+    writeLegacyShim(io, bin_dir, legacy_shim, src_path) catch {};
+}
+
+fn publishWasmCommand(
+    allocator: std.mem.Allocator,
+    io: Io,
+    unit_path: []const u8,
+    bin_dir: Dir,
+    final_name: []const u8,
+    host_rel: []const u8,
+    src_path: []const u8,
+    allow_locked_launcher: bool,
+) !void {
+    const shim_exe_bytes = @import("shim_exe").bytes;
+
+    // The release ships `<wasm>.ghr` beside the module; it carries the runtime
+    // and its arguments.
+    var tool_dir = Dir.openDirAbsolute(io, unit_path, .{}) catch return error.CreateFailed;
+    defer tool_dir.close(io);
+    var manifest_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const manifest_name = std.fmt.bufPrint(&manifest_name_buf, "{s}.ghr", .{host_rel}) catch
+        return error.PathTooLong;
+    const raw = tool_dir.readFileAlloc(io, manifest_name, allocator, Io.Limit.limited(64 * 1024)) catch
+        return error.CreateFailed;
+    defer allocator.free(raw);
+    const source = try allocator.dupeZ(u8, raw);
+    defer allocator.free(source);
+    const manifest = std.zon.parse.fromSliceAlloc(GhrManifest, allocator, source, null, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.WriteFailed;
+    defer std.zon.parse.free(allocator, manifest);
+
+    var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{final_name}) catch
+        return error.PathTooLong;
+    bin_dir.deleteFile(io, ghr_name) catch {};
+    {
+        var ghr_file = bin_dir.createFile(io, ghr_name, .{}) catch return error.CreateFailed;
+        defer ghr_file.close(io);
+        var ghr_buf: [4096]u8 = undefined;
+        var ghr_w = ghr_file.writer(io, &ghr_buf);
+        const gw = &ghr_w.interface;
+        gw.print(".{{\n    .version = 1,\n    .targetWasm = \"", .{}) catch return error.WriteFailed;
+        writeZonEscaped(gw, src_path) catch return error.WriteFailed;
+        gw.print("\",\n    .runtime = \"", .{}) catch return error.WriteFailed;
+        writeZonEscaped(gw, manifest.runtime) catch return error.WriteFailed;
+        gw.print("\",\n    .runtimeArgs = .{{", .{}) catch return error.WriteFailed;
+        for (manifest.runtimeArgs, 0..) |arg, i| {
+            if (i > 0) gw.print(",", .{}) catch return error.WriteFailed;
+            gw.print(" \"", .{}) catch return error.WriteFailed;
+            writeZonEscaped(gw, arg) catch return error.WriteFailed;
+            gw.print("\"", .{}) catch return error.WriteFailed;
+        }
+        if (manifest.runtimeArgs.len > 0) gw.print(" ", .{}) catch return error.WriteFailed;
+        gw.print("}},\n}}\n", .{}) catch return error.WriteFailed;
+        ghr_w.end() catch return error.WriteFailed;
+    }
+
+    var legacy_shim_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (std.fmt.bufPrint(&legacy_shim_buf, "{s}.shim", .{final_name})) |legacy_shim| {
+        bin_dir.deleteFile(io, legacy_shim) catch {};
+    } else |_| {}
+
+    var launcher_name_buf: [Dir.max_path_bytes]u8 = undefined;
+    const launcher_name = if (builtin.os.tag == .windows)
+        std.fmt.bufPrint(&launcher_name_buf, "{s}.exe", .{final_name}) catch return error.PathTooLong
+    else
+        final_name;
+
+    bin_dir.deleteFile(io, launcher_name) catch {
+        if (builtin.os.tag == .windows) {
+            var old_name_buf: [Dir.max_path_bytes]u8 = undefined;
+            const old_name = std.fmt.bufPrint(&old_name_buf, "{s}.old", .{launcher_name}) catch
+                return error.PathTooLong;
+            bin_dir.deleteFile(io, old_name) catch {};
+            bin_dir.rename(launcher_name, bin_dir, old_name, io) catch {};
+        }
+    };
+
+    // `.executable_file` is a no-op on Windows but yields the +x bit on Unix.
+    if (bin_dir.createFile(io, launcher_name, .{ .permissions = .executable_file })) |*exe_file| {
+        defer exe_file.close(io);
+        exe_file.writeStreamingAll(io, shim_exe_bytes) catch return error.WriteFailed;
+    } else |_| {
+        if (!allow_locked_launcher) return error.CommandLauncherLocked;
+        // The existing launcher is locked but compatible; its `.ghr` above now
+        // names the new target, so the command keeps working.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Uninstall by canonical ID
+// ---------------------------------------------------------------------------
+
+pub const UninstallError = error{
+    UninstallTargetNotFound,
+    UninstallStateUnusable,
+    UninstallFailed,
+};
+
+/// Remove exactly one canonical install ID.
+///
+/// The ID is resolved ONLY through the inventory: no deletion target is ever
+/// constructed from the argument. Prefixes are not recursive -- removing
+/// `owner/repo` never touches `owner/repo/module`. Old `owner/repo[/stem]`
+/// arguments keep working because they canonicalize to the same legacy IDs.
+pub fn cmdUninstall(
     allocator: std.mem.Allocator,
     io: Io,
     environ: *const EnvironMap,
     spec_str: []const u8,
     w: *Writer,
     err_w: *Writer,
-    debug: bool,
-    no_auth: bool,
-    skip_verify: bool,
-    minisign_pubkey_b64: ?[]const u8,
 ) !void {
-    const entries: [1]release_mod.SpecWithKey = .{.{ .spec = spec_str }};
-    const gates: release_mod.VerifyGates = .{ .skip_verify = skip_verify };
-    return cmdInstallMany(
-        allocator,
-        io,
-        environ,
-        entries[0..],
-        w,
-        err_w,
-        debug,
-        no_auth,
-        gates,
-        minisign_pubkey_b64,
-        &.{},
-        false,
+    const d = try Dirs.detect(allocator, environ);
+    defer d.deinit();
+
+    const ctx = InstallContext{
+        .allocator = allocator,
+        .io = io,
+        .environ = environ,
+        .dirs = d,
+        .client = undefined,
+        .auth_resolved = .{ .token = null, .owns_token = false, .source = "none" },
+        .auth_header = null,
+        .w = w,
+        .err_w = err_w,
+        .debug = false,
+        .no_auth = true,
+        .gates = .{},
+        .minisign_pubkey_b64 = null,
+        .bin_filters = &.{},
+    };
+    return uninstallUnit(&ctx, spec_str);
+}
+
+/// Uninstall against an already-resolved context. Split out so the transaction
+/// can be driven against a test store without going through directory
+/// detection.
+fn uninstallUnit(ctx: *const InstallContext, spec_str: []const u8) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const d = ctx.dirs;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
+
+    const canonical = install_request.canonicalizeId(allocator, spec_str) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try err_w.print("error: '{s}' is not a valid install id ({t})\n", .{ spec_str, err });
+            try err_w.print("  hint: ids are lowercase, slash-separated, e.g. owner/repo or a custom id\n", .{});
+            try err_w.print("  hint: list installed ids with 'ghr list --ids'\n", .{});
+            try err_w.flush();
+            return error.UninstallTargetNotFound;
+        },
+    };
+    defer allocator.free(canonical);
+
+    recoverPendingTransactions(ctx) catch |err| {
+        try err_w.print("error: could not recover a pending install transaction: {t}\n", .{err});
+        try err_w.flush();
+        return error.UninstallFailed;
+    };
+
+    var inventory = install_state.scan(allocator, io, d.tools, .{ .platform = host_platform }) catch |err| {
+        try err_w.print("error: failed to read install state under '{s}': {t}\n", .{ d.tools, err });
+        try err_w.flush();
+        return error.UninstallStateUnusable;
+    };
+    defer inventory.deinit(allocator);
+
+    // Ownership must be knowable globally before anything is removed: a
+    // damaged record anywhere can claim commands, so a damaged inventory fails
+    // closed instead of guessing.
+    var target: ?install_state.InventoryRecord = null;
+    for (inventory.records) |rec| {
+        if (rec.status != .ok) {
+            const id_text = rec.id orelse "<unknown id>";
+            try err_w.print("error: install state is not healthy; refusing to change it\n", .{});
+            try err_w.print("  {s}: {s} ({t}/{t})\n", .{ id_text, rec.path, rec.status, rec.reason });
+            try err_w.print("  hint: inspect with 'ghr list --json'\n", .{});
+            try err_w.flush();
+            return error.UninstallStateUnusable;
+        }
+        const rid = rec.id orelse continue;
+        if (std.mem.eql(u8, rid, canonical)) target = rec;
+    }
+
+    const record = target orelse {
+        try err_w.print("error: '{s}' is not installed\n", .{canonical});
+        try err_w.print("  hint: list installed ids with 'ghr list --ids'\n", .{});
+        try err_w.flush();
+        return error.UninstallTargetNotFound;
+    };
+
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+
+    const p = install_txn.paths(a, d.tools, canonical, host_platform) catch |err| {
+        try err_w.print("error: cannot address install id '{s}': {t}\n", .{ canonical, err });
+        try err_w.flush();
+        return error.UninstallFailed;
+    };
+    const unit_path = try recordAbsPath(a, d.tools, record.path);
+
+    // Every artifact this unit's commands own, expanded exactly as the planner
+    // would. Removal still revalidates each one against live state.
+    var artifacts: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (record.commands) |cmd| {
+        const kind: command_plan.Kind = if (install_state.isWasmTarget(cmd.relative_target)) .wasm else .native;
+        const family = try command_plan.artifactsFor(a, cmd.name, kind, host_platform);
+        for (family) |name| try artifacts.append(a, name);
+    }
+
+    const legacy_kind: ?install_txn.LegacyKind = switch (record.kind) {
+        .v1_repo => .v1_repo,
+        .v1_wasm => .v1_wasm,
+        else => null,
+    };
+
+    install_txn.ensureDirAbsolute(io, p.root) catch |err| {
+        try err_w.print("error: failed to prepare the uninstall transaction: {t}\n", .{err});
+        try err_w.flush();
+        return error.UninstallFailed;
+    };
+    const journal: install_txn.Journal = .{
+        .op = .uninstall,
+        .id = canonical,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .stale = artifacts.items,
+        .apps = record.apps,
+        .had_previous = true,
+        .legacy_path = if (legacy_kind != null) unit_path else null,
+        .legacy_kind = legacy_kind,
+        .phase = .retiring,
+    };
+    install_txn.writeJournal(io, p, allocator, journal) catch |err| {
+        try err_w.print("error: failed to journal the uninstall transaction: {t}\n", .{err});
+        try err_w.flush();
+        install_txn.discardTransaction(io, p) catch {};
+        return error.UninstallFailed;
+    };
+
+    if (Dir.openDirAbsolute(io, d.bin, .{})) |*bin_dir_| {
+        var bin_dir = bin_dir_.*;
+        defer bin_dir.close(io);
+        for (record.commands) |cmd| {
+            const kind: command_plan.Kind = if (install_state.isWasmTarget(cmd.relative_target)) .wasm else .native;
+            if (!commandArtifactIsOwned(io, bin_dir, cmd.name, kind, unit_path)) continue;
+            const family = try command_plan.artifactsFor(a, cmd.name, kind, host_platform);
+            for (family) |name| bin_dir.deleteFile(io, name) catch {};
+            try w.print("  unlinked {s}\n", .{cmd.name});
+        }
+    } else |_| {}
+
+    if (comptime builtin.os.tag.isDarwin()) {
+        try uninstallAppBundles(allocator, io, ctx.environ, record.apps, unit_path, w);
+    }
+
+    if (legacy_kind) |kind| {
+        retireLegacyUnit(ctx, unit_path, kind);
+    } else {
+        deleteTreeIfExists(io, unit_path) catch |err| {
+            try err_w.print("error: failed to remove '{s}': {t}\n", .{ unit_path, err });
+            try err_w.flush();
+            return error.UninstallFailed;
+        };
+        pruneEncodedParents(io, d.tools, unit_path);
+    }
+
+    install_txn.discardTransaction(io, p) catch {};
+    try w.print("uninstalled {s}\n", .{canonical});
+    try w.flush();
+}
+
+// ===========================================================================
+// Activation tests: staging, planning, commit, recovery, migration, uninstall
+// ===========================================================================
+//
+// These exercise the real commit path. Resolution/download is the only part
+// stubbed out: a unit is staged on disk exactly as a download would leave it,
+// then planning and commit run unmodified.
+
+const t_alloc = std.testing.allocator;
+
+/// A throwaway tools/bin/cache tree plus captured output, so every test drives
+/// the same code the CLI does.
+const TestStore = struct {
+    tmp: std.testing.TmpDir,
+    base: []u8,
+    dirs: Dirs,
+    out: Io.Writer.Allocating,
+    err: Io.Writer.Allocating,
+    environ: std.process.Environ.Map,
+    client: std.http.Client,
+
+    fn init() !TestStore {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var buf: [Dir.max_path_bytes]u8 = undefined;
+        const len = try tmp.dir.realPath(std.testing.io, &buf);
+        const base = try t_alloc.dupe(u8, buf[0..len]);
+        errdefer t_alloc.free(base);
+
+        const bin = try std.fmt.allocPrint(t_alloc, "{s}{c}bin", .{ base, std.fs.path.sep });
+        errdefer t_alloc.free(bin);
+        const tools = try std.fmt.allocPrint(t_alloc, "{s}{c}tools", .{ base, std.fs.path.sep });
+        errdefer t_alloc.free(tools);
+        const cache = try std.fmt.allocPrint(t_alloc, "{s}{c}cache", .{ base, std.fs.path.sep });
+        errdefer t_alloc.free(cache);
+        try ensureDirAbsoluteRecursive(std.testing.io, bin);
+        try ensureDirAbsoluteRecursive(std.testing.io, tools);
+        try ensureDirAbsoluteRecursive(std.testing.io, cache);
+
+        return .{
+            .tmp = tmp,
+            .base = base,
+            .dirs = .{ .bin = bin, .tools = tools, .cache = cache, .allocator = t_alloc },
+            .out = .init(t_alloc),
+            .err = .init(t_alloc),
+            .environ = try std.testing.environ.createMap(t_alloc),
+            .client = .{ .allocator = t_alloc, .io = std.testing.io },
+        };
+    }
+
+    fn deinit(self: *TestStore) void {
+        self.environ.deinit();
+        self.out.deinit();
+        self.err.deinit();
+        self.dirs.deinit();
+        t_alloc.free(self.base);
+        self.tmp.cleanup();
+    }
+
+    fn ctx(self: *TestStore) InstallContext {
+        return .{
+            .allocator = t_alloc,
+            .io = std.testing.io,
+            .environ = &self.environ,
+            .dirs = self.dirs,
+            .client = &self.client,
+            .auth_resolved = .{ .token = null, .owns_token = false, .source = "none" },
+            .auth_header = null,
+            .w = &self.out.writer,
+            .err_w = &self.err.writer,
+            .debug = false,
+            .no_auth = true,
+            .gates = .{},
+            .minisign_pubkey_b64 = null,
+            .bin_filters = &.{},
+        };
+    }
+
+    fn errText(self: *TestStore) []const u8 {
+        return self.err.writer.buffered();
+    }
+
+    fn binPath(self: *TestStore, a: std.mem.Allocator, name: []const u8) ![]u8 {
+        return std.fmt.allocPrint(a, "{s}{c}{s}", .{ self.dirs.bin, std.fs.path.sep, name });
+    }
+
+    fn toolsPath(self: *TestStore, a: std.mem.Allocator, rel: []const u8) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.appendSlice(a, self.dirs.tools);
+        try out.append(a, std.fs.path.sep);
+        for (rel) |c| try out.append(a, if (c == '/') std.fs.path.sep else c);
+        return out.toOwnedSlice(a);
+    }
+
+    fn binEntryExists(self: *TestStore, name: []const u8) bool {
+        var d = Dir.openDirAbsolute(std.testing.io, self.dirs.bin, .{}) catch return false;
+        defer d.close(std.testing.io);
+        _ = d.statFile(std.testing.io, name, .{ .follow_symlinks = false }) catch return false;
+        return true;
+    }
+};
+
+/// Stage a unit exactly as a completed download+extract would leave it: an
+/// executable per requested command inside the transaction staging directory.
+fn tStageUnit(
+    ctx: *const InstallContext,
+    id: []const u8,
+    targets: []const []const u8,
+    aliases: []const command_plan.Alias,
+) !*StagedUnit {
+    const unit = try StagedUnit.create(t_alloc);
+    errdefer unit.destroy();
+    const a = unit.alloc();
+    try beginStaging(ctx, unit, id);
+
+    var stage_dir = try Dir.openDirAbsolute(ctx.io, unit.paths.stage, .{ .iterate = true });
+    defer stage_dir.close(ctx.io);
+
+    const commands = try a.alloc(command_plan.Command, targets.len);
+    for (targets, 0..) |target, i| {
+        if (std.fs.path.dirname(target)) |parent| try stage_dir.createDirPath(ctx.io, parent);
+        var f = try stage_dir.createFile(ctx.io, target, .{ .permissions = .executable_file });
+        defer f.close(ctx.io);
+        try f.writeStreamingAll(ctx.io, "#!/bin/sh\nexit 0\n");
+        commands[i] = .{
+            .relative_target = try a.dupe(u8, target),
+            .kind = commandKindFor(target),
+        };
+    }
+    unit.commands = commands;
+
+    const owned_aliases = try a.alloc(command_plan.Alias, aliases.len);
+    const meta_aliases = try a.alloc(install_state_write.Alias, aliases.len);
+    for (aliases, 0..) |alias, i| {
+        const from = try a.dupe(u8, alias.source);
+        const to = try a.dupe(u8, alias.published);
+        owned_aliases[i] = .{ .source = from, .published = to };
+        meta_aliases[i] = .{ .from = from, .to = to };
+    }
+    unit.aliases = owned_aliases;
+
+    unit.source = .{
+        .kind = .github,
+        .owner = try a.dupe(u8, "example"),
+        .repo = try a.dupe(u8, "tool"),
+        .tag = try a.dupe(u8, "v1"),
+    };
+    unit.config = .{ .aliases = meta_aliases, .verification_policy = .{} };
+    unit.resolved = .{
+        .tag = try a.dupe(u8, "v1"),
+        .asset = try a.dupe(u8, "tool.tar.gz"),
+        .api_asset_id = 1234,
+    };
+    unit.verification = .{ .result = try a.dupe(u8, "none") };
+    unit.display = try a.dupe(u8, id);
+    return unit;
+}
+
+fn tCommit(ctx: *const InstallContext, units: []const *StagedUnit) !void {
+    return planAndCommit(ctx, units);
+}
+
+fn tWriteLegacyUnit(
+    ctx: *const InstallContext,
+    rel_dir: []const u8,
+    bins: []const []const u8,
+) !void {
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    try out.appendSlice(a, ctx.dirs.tools);
+    try out.append(a, std.fs.path.sep);
+    for (rel_dir) |c| try out.append(a, if (c == '/') std.fs.path.sep else c);
+    const dir_path = out.items;
+    try ensureDirAbsoluteRecursive(ctx.io, dir_path);
+
+    var dir = try Dir.openDirAbsolute(ctx.io, dir_path, .{});
+    defer dir.close(ctx.io);
+    for (bins) |bin| {
+        if (std.fs.path.dirname(bin)) |parent| try dir.createDirPath(ctx.io, parent);
+        var f = try dir.createFile(ctx.io, bin, .{ .permissions = .executable_file });
+        defer f.close(ctx.io);
+        try f.writeStreamingAll(ctx.io, "#!/bin/sh\nexit 0\n");
+    }
+    try writeMetadata(t_alloc, ctx.io, dir, "v0", "legacy.tar.gz", bins, &.{}, "none", null);
+}
+
+fn tScan(ctx: *const InstallContext) !install_state.Inventory {
+    return install_state.scan(t_alloc, ctx.io, ctx.dirs.tools, .{ .platform = host_platform });
+}
+
+fn tFindRecord(inv: install_state.Inventory, id: []const u8) ?install_state.InventoryRecord {
+    return findRecord(inv, id);
+}
+
+test "app publication adopts a legacy marker and records the v2 unit" {
+    var store = try TestStore.init();
+    defer store.deinit();
+    try store.environ.put("HOME", store.base);
+    const ctx = store.ctx();
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    var p = try install_txn.paths(a, ctx.dirs.tools, "example/tool", host_platform);
+    defer p.deinit();
+    const legacy = try store.toolsPath(a, "example/tool");
+
+    const source_contents = try std.fmt.allocPrint(a, "{s}/Foo.app/Contents", .{p.unit});
+    try ensureDirAbsoluteRecursive(ctx.io, source_contents);
+    const source_file = try std.fmt.allocPrint(a, "{s}/payload", .{source_contents});
+    var payload = try Dir.createFileAbsolute(ctx.io, source_file, .{});
+    payload.close(ctx.io);
+
+    const installed_contents = try std.fmt.allocPrint(a, "{s}/Applications/Foo.app/Contents", .{store.base});
+    try ensureDirAbsoluteRecursive(ctx.io, installed_contents);
+    const old_marker = try std.fmt.allocPrint(a, "{s}/.ghr-source", .{installed_contents});
+    var marker = try Dir.createFileAbsolute(ctx.io, old_marker, .{});
+    try marker.writeStreamingAll(ctx.io, legacy);
+    marker.close(ctx.io);
+
+    try installAppBundles(
+        t_alloc,
+        ctx.io,
+        ctx.environ,
+        &.{"Foo.app"},
+        p.unit,
+        legacy,
+        ctx.w,
     );
+
+    var apps_dir = try Dir.openDirAbsolute(ctx.io, store.base, .{});
+    defer apps_dir.close(ctx.io);
+    const adopted = try apps_dir.readFileAlloc(
+        ctx.io,
+        "Applications/Foo.app/Contents/.ghr-source",
+        a,
+        Io.Limit.limited(Dir.max_path_bytes),
+    );
+    try std.testing.expectEqualStrings(p.unit, adopted);
+}
+
+test "fresh install commits a v2 unit, its metadata, and its commands" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    const rec = inv.records[0];
+    try std.testing.expectEqual(install_state.Status.ok, rec.status);
+    try std.testing.expectEqual(install_state.UnitKind.v2, rec.kind);
+    try std.testing.expectEqualStrings("example/tool", rec.id.?);
+    try std.testing.expectEqualStrings("tool", rec.commands[0].name);
+    try std.testing.expect(store.binEntryExists("tool"));
+
+    // The transaction namespace is fully cleaned up after a commit.
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const txn = try store.toolsPath(arena_inst.allocator(), "_v2/txn/u-example");
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, txn)));
+}
+
+test "an alias publishes the exact requested name and never renames by id" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "zigb", &.{"bin/zig"}, &.{.{ .source = "zig", .published = "zigb" }});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    try std.testing.expect(store.binEntryExists("zigb"));
+    try std.testing.expect(!store.binEntryExists("zig"));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    const rec = tFindRecord(inv, "zigb").?;
+    try std.testing.expectEqualStrings("zigb", rec.commands[0].name);
+    try std.testing.expectEqualStrings("zig", rec.commands[0].source_name.?);
+    try std.testing.expectEqualStrings("bin/zig", rec.commands[0].relative_target);
+}
+
+test "two ids from one repository coexist" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const a = try tStageUnit(&ctx, "ziga", &.{"bin/zig"}, &.{.{ .source = "zig", .published = "ziga" }});
+    defer a.destroy();
+    const b = try tStageUnit(&ctx, "zigb", &.{"bin/zig"}, &.{.{ .source = "zig", .published = "zigb" }});
+    defer b.destroy();
+    try tCommit(&ctx, &.{ a, b });
+
+    try std.testing.expect(store.binEntryExists("ziga"));
+    try std.testing.expect(store.binEntryExists("zigb"));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 2), inv.records.len);
+    try std.testing.expect(tFindRecord(inv, "ziga") != null);
+    try std.testing.expect(tFindRecord(inv, "zigb") != null);
+}
+
+test "a duplicate command inside one invocation is rejected without mutation" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const a = try tStageUnit(&ctx, "one", &.{"bin/tool"}, &.{});
+    defer a.destroy();
+    const b = try tStageUnit(&ctx, "two", &.{"bin/tool"}, &.{});
+    defer b.destroy();
+    try std.testing.expectError(error.InstallPlanRejected, tCommit(&ctx, &.{ a, b }));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 0), inv.records.len);
+    try std.testing.expect(!store.binEntryExists("tool"));
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "no install state was changed") != null);
+}
+
+test "a command owned by another id blocks the whole invocation" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const first = try tStageUnit(&ctx, "one", &.{"bin/tool"}, &.{});
+    defer first.destroy();
+    try tCommit(&ctx, &.{first});
+
+    const second = try tStageUnit(&ctx, "two", &.{"bin/tool"}, &.{});
+    defer second.destroy();
+    const third = try tStageUnit(&ctx, "three", &.{"bin/other"}, &.{});
+    defer third.destroy();
+    try std.testing.expectError(error.InstallPlanRejected, tCommit(&ctx, &.{ second, third }));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    // The unrelated unit in the same invocation is not committed either.
+    try std.testing.expect(!store.binEntryExists("other"));
+}
+
+test "an unmanaged bin entry blocks installation" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const foreign = try store.binPath(arena_inst.allocator(), "tool");
+    (try Dir.createFileAbsolute(ctx.io, foreign, .{})).close(ctx.io);
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try std.testing.expectError(error.InstallPlanRejected, tCommit(&ctx, &.{unit}));
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "UnmanagedArtifact") != null);
+}
+
+test "same-id replacement retires stale commands and keeps the new set" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const first = try tStageUnit(&ctx, "example/tool", &.{ "bin/tool", "bin/extra" }, &.{});
+    defer first.destroy();
+    try tCommit(&ctx, &.{first});
+    try std.testing.expect(store.binEntryExists("tool"));
+    try std.testing.expect(store.binEntryExists("extra"));
+
+    const second = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer second.destroy();
+    try tCommit(&ctx, &.{second});
+
+    try std.testing.expect(store.binEntryExists("tool"));
+    try std.testing.expect(!store.binEntryExists("extra"));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    try std.testing.expectEqual(@as(usize, 1), inv.records[0].commands.len);
+}
+
+test "stale removal leaves an entry that no longer belongs to the id" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const first = try tStageUnit(&ctx, "example/tool", &.{ "bin/tool", "bin/extra" }, &.{});
+    defer first.destroy();
+    try tCommit(&ctx, &.{first});
+
+    // Someone replaced the published command with their own file. The plan
+    // still wants to retire it, but revalidation must refuse.
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const extra = try store.binPath(arena_inst.allocator(), "extra");
+    try Dir.deleteFileAbsolute(ctx.io, extra);
+    (try Dir.createFileAbsolute(ctx.io, extra, .{})).close(ctx.io);
+
+    const second = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer second.destroy();
+    try tCommit(&ctx, &.{second});
+    try std.testing.expect(store.binEntryExists("extra"));
+}
+
+test "a publication failure restores the previous unit and its commands" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const first = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer first.destroy();
+    try tCommit(&ctx, &.{first});
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const marker = try store.toolsPath(
+        arena_inst.allocator(),
+        "_v2/units/u-example/u-tool/_unit/first-generation",
+    );
+    (try Dir.createFileAbsolute(ctx.io, marker, .{})).close(ctx.io);
+
+    const second = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer second.destroy();
+    commit_faults = .{ .fail_publish_after = 0 };
+    defer commit_faults = .{};
+    try std.testing.expectError(error.InstallFailed, tCommit(&ctx, &.{second}));
+
+    // The previous unit is live again, with its content and its command.
+    var f = try Dir.openFileAbsolute(ctx.io, marker, .{});
+    f.close(ctx.io);
+    try std.testing.expect(store.binEntryExists("tool"));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    try std.testing.expectEqual(install_state.Status.ok, inv.records[0].status);
+}
+
+test "a publication failure on a fresh install leaves no unit behind" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    commit_faults = .{ .fail_publish_after = 0 };
+    defer commit_faults = .{};
+    try std.testing.expectError(error.InstallFailed, tCommit(&ctx, &.{unit}));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 0), inv.records.len);
+    try std.testing.expect(!store.binEntryExists("tool"));
+}
+
+test "rolled-back recovery never retires the restored unit's commands" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{ "bin/tool", "bin/extra" }, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    const p = unit.paths;
+    try install_txn.ensureDirAbsolute(ctx.io, p.root);
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .stale = &.{"extra"},
+        .had_previous = true,
+        .phase = .rolled_back,
+    });
+
+    try recoverPendingTransactions(&ctx);
+    try std.testing.expect(store.binEntryExists("tool"));
+    try std.testing.expect(store.binEntryExists("extra"));
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, p.root)));
+}
+
+test "rolled-back recovery removes a failed fresh unit" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    const p = unit.paths;
+    try install_txn.ensureDirAbsolute(ctx.io, p.root);
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = &.{"tool"},
+        .had_previous = false,
+        .phase = .rolled_back,
+    });
+
+    try recoverPendingTransactions(&ctx);
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, p.unit)));
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, p.root)));
+    try std.testing.expect(!store.binEntryExists("tool"));
+}
+
+test "staging never overwrites an unfinished transaction or its backup" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    var existing = try install_txn.paths(t_alloc, ctx.dirs.tools, "example/tool", host_platform);
+    defer existing.deinit();
+    try install_txn.ensureDirAbsolute(ctx.io, existing.backup);
+    try install_txn.writeJournal(ctx.io, existing, t_alloc, .{
+        .op = .install,
+        .id = existing.id,
+        .unit_path = existing.unit,
+        .stage_path = existing.stage,
+        .backup_path = existing.backup,
+        .had_previous = true,
+        .phase = .publishing,
+    });
+
+    const unit = try StagedUnit.create(t_alloc);
+    defer unit.destroy();
+    try std.testing.expectError(error.InstallStepFailed, beginStaging(&ctx, unit, "example/tool"));
+    try std.testing.expect(try install_txn.directoryExists(ctx.io, existing.backup));
+
+    var owned = (try install_txn.readJournal(t_alloc, ctx.io, existing.journal)).?;
+    defer owned.deinit();
+    try std.testing.expectEqual(install_txn.Phase.publishing, owned.journal.phase);
+
+    // Generic error cleanup uses the same fail-closed guard.
+    discardStagedUnit(t_alloc, ctx.io, unit);
+    try std.testing.expect(try install_txn.directoryExists(ctx.io, existing.backup));
+    var preserved = (try install_txn.readJournal(t_alloc, ctx.io, existing.journal)).?;
+    defer preserved.deinit();
+}
+
+test "an interrupted commit before the swap is rolled back" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    const p = unit.paths;
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = &.{"tool"},
+        .phase = .staged,
+    });
+
+    try recoverPendingTransactions(&ctx);
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, p.stage)));
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, p.unit)));
+    try std.testing.expect(!store.binEntryExists("tool"));
+}
+
+test "an interrupted commit between the two renames is completed" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    const p = unit.paths;
+
+    // Write the metadata the interrupted commit would already have staged.
+    {
+        var stage_dir = try Dir.openDirAbsolute(ctx.io, p.stage, .{});
+        defer stage_dir.close(ctx.io);
+        try install_state_write.writeUnitMetadata(t_alloc, ctx.io, stage_dir, .{
+            .id = p.id,
+            .source = .{ .kind = .github, .owner = "example", .repo = "tool", .tag = "v1" },
+            .resolved = .{ .tag = "v1", .asset = "tool.tar.gz" },
+            .commands = &.{.{ .name = "tool", .relative_target = "bin/tool", .kind = .native }},
+            .verification = .{ .result = "none" },
+        }, host_platform);
+    }
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = &.{"tool"},
+        .phase = .swapping,
+    });
+
+    try recoverPendingTransactions(&ctx);
+    try std.testing.expect(try install_txn.directoryExists(ctx.io, p.unit));
+    try std.testing.expect(store.binEntryExists("tool"));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    try std.testing.expectEqual(install_state.Status.ok, inv.records[0].status);
+}
+
+test "an interrupted commit after the swap republishes missing commands" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    // Simulate a crash after the unit went live but before publication
+    // finished: remove the command and replay the journal.
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const link_path = try store.binPath(arena_inst.allocator(), "tool");
+    try Dir.deleteFileAbsolute(ctx.io, link_path);
+
+    const p = unit.paths;
+    try install_txn.ensureDirAbsolute(ctx.io, p.root);
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = &.{"tool"},
+        .phase = .publishing,
+    });
+
+    try recoverPendingTransactions(&ctx);
+    try std.testing.expect(store.binEntryExists("tool"));
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, p.root)));
+}
+
+test "recovery refuses a journal that does not describe its own directory" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    var p = try install_txn.paths(t_alloc, ctx.dirs.tools, "example/tool", host_platform);
+    defer p.deinit();
+    try install_txn.ensureDirAbsolute(ctx.io, p.root);
+    // A journal claiming another id must never make recovery touch this unit.
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .uninstall,
+        .id = "someone/else",
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .stale = &.{"tool"},
+        .phase = .retiring,
+    });
+
+    try recoverPendingTransactions(&ctx);
+    try std.testing.expect(store.binEntryExists("tool"));
+    try std.testing.expect(try install_txn.directoryExists(ctx.io, p.unit));
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "could not recover") != null);
+}
+
+test "installing over one healthy legacy unit migrates it and keeps nested wasm siblings" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    try tWriteLegacyUnit(&ctx, "example/tool", &.{"legacy-tool"});
+    try tWriteLegacyUnit(&ctx, "example/tool/mod", &.{"mod.wasm"});
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const legacy_target = try store.toolsPath(a, "example/tool/legacy-tool");
+    const legacy_link = try store.binPath(a, "legacy-tool");
+    {
+        var bin = try Dir.openDirAbsolute(ctx.io, ctx.dirs.bin, .{});
+        defer bin.close(ctx.io);
+        try bin.symLink(ctx.io, legacy_target, "legacy-tool", .{});
+    }
+    try std.testing.expect(store.binEntryExists("legacy-tool"));
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    const migrated = tFindRecord(inv, "example/tool").?;
+    try std.testing.expectEqual(install_state.UnitKind.v2, migrated.kind);
+    // The independently installed nested wasm unit survives the migration.
+    const child = tFindRecord(inv, "example/tool/mod").?;
+    try std.testing.expectEqual(install_state.UnitKind.v1_wasm, child.kind);
+
+    // The legacy repo-level content is gone, its command retired, and the new
+    // command is live.
+    try std.testing.expect(!fileExistsAbsolute(ctx.io, legacy_target));
+    try std.testing.expect(!store.binEntryExists("legacy-tool"));
+    _ = legacy_link;
+    try std.testing.expect(store.binEntryExists("tool"));
+}
+
+test "a legacy unit and a v2 unit sharing an id refuse mutation" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+    try tWriteLegacyUnit(&ctx, "example/tool", &.{"legacy-tool"});
+
+    const again = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer again.destroy();
+    try std.testing.expectError(error.InstallPlanRejected, tCommit(&ctx, &.{again}));
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "Inventory") != null);
+}
+
+test "corrupt metadata anywhere blocks install and uninstall" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const other = try store.toolsPath(a, "_v2/units/u-broken/_unit");
+    try ensureDirAbsoluteRecursive(ctx.io, other);
+    const meta = try std.fmt.allocPrint(a, "{s}{c}ghr.json", .{ other, std.fs.path.sep });
+    {
+        var f = try Dir.createFileAbsolute(ctx.io, meta, .{});
+        defer f.close(ctx.io);
+        try f.writeStreamingAll(ctx.io, "{ not json");
+    }
+
+    const again = try tStageUnit(&ctx, "example/two", &.{"bin/two"}, &.{});
+    defer again.destroy();
+    try std.testing.expectError(error.InstallPlanRejected, tCommit(&ctx, &.{again}));
+
+    try std.testing.expectError(
+        error.UninstallStateUnusable,
+        uninstallUnit(&ctx, "example/tool"),
+    );
+    // Nothing was removed while state was unusable.
+    try std.testing.expect(store.binEntryExists("tool"));
+}
+
+fn fileExistsAbsolute(io: Io, path: []const u8) bool {
+    var f = Dir.openFileAbsolute(io, path, .{}) catch return false;
+    f.close(io);
+    return true;
+}
+
+test "uninstall removes exactly one id and is not recursive over prefixes" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    var ctx = store.ctx();
+
+    const parent = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer parent.destroy();
+    const child = try tStageUnit(&ctx, "example/tool/mod", &.{"bin/mod"}, &.{});
+    defer child.destroy();
+    try tCommit(&ctx, &.{ parent, child });
+
+    try uninstallUnit(&ctx, "example/tool");
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    try std.testing.expectEqualStrings("example/tool/mod", inv.records[0].id.?);
+    try std.testing.expect(!store.binEntryExists("tool"));
+    try std.testing.expect(store.binEntryExists("mod"));
+}
+
+test "uninstall accepts a mixed-case argument that canonicalizes to the id" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    try uninstallUnit(&ctx, "Example/Tool");
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 0), inv.records.len);
+}
+
+test "uninstall fails closed when two records claim one command" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const keeper = try tStageUnit(&ctx, "keeper", &.{"bin/shared"}, &.{});
+    defer keeper.destroy();
+    const other = try tStageUnit(&ctx, "other", &.{"bin/other"}, &.{});
+    defer other.destroy();
+    try tCommit(&ctx, &.{ keeper, other });
+
+    // Tamper with one record so two ids claim `shared`. Ownership is no longer
+    // decidable, so no mutation may happen at all.
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const other_unit = try store.toolsPath(arena_inst.allocator(), "_v2/units/u-other/_unit");
+    {
+        var dir = try Dir.openDirAbsolute(ctx.io, other_unit, .{});
+        defer dir.close(ctx.io);
+        try install_state_write.writeUnitMetadata(t_alloc, ctx.io, dir, .{
+            .id = "other",
+            .source = .{ .kind = .github, .owner = "example", .repo = "tool", .tag = "v1" },
+            .resolved = .{ .tag = "v1", .asset = "tool.tar.gz" },
+            .commands = &.{.{ .name = "shared", .relative_target = "bin/other", .kind = .native }},
+            .verification = .{ .result = "none" },
+        }, host_platform);
+    }
+
+    try std.testing.expectError(error.UninstallStateUnusable, uninstallUnit(&ctx, "other"));
+    try std.testing.expect(store.binEntryExists("shared"));
+    try std.testing.expect(store.binEntryExists("other"));
+}
+
+test "uninstall leaves a command entry that no longer points into the unit" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    // The user repointed the published command at something of their own.
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const link = try store.binPath(arena_inst.allocator(), "tool");
+    try Dir.deleteFileAbsolute(ctx.io, link);
+    {
+        var bin = try Dir.openDirAbsolute(ctx.io, ctx.dirs.bin, .{});
+        defer bin.close(ctx.io);
+        try bin.symLink(ctx.io, "/usr/bin/true", "tool", .{});
+    }
+
+    try uninstallUnit(&ctx, "example/tool");
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 0), inv.records.len);
+    // The modified entry is not ghr's to remove.
+    try std.testing.expect(store.binEntryExists("tool"));
+}
+
+test "uninstalling a legacy repo unit preserves its nested wasm units" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    try tWriteLegacyUnit(&ctx, "example/tool", &.{"legacy-tool"});
+    try tWriteLegacyUnit(&ctx, "example/tool/mod", &.{"mod.wasm"});
+
+    try uninstallUnit(&ctx, "example/tool");
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    try std.testing.expectEqualStrings("example/tool/mod", inv.records[0].id.?);
+}
+
+test "uninstall reports a missing id without touching anything" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    try std.testing.expectError(
+        error.UninstallTargetNotFound,
+        uninstallUnit(&ctx, "example/absent"),
+    );
+    try std.testing.expect(store.binEntryExists("tool"));
+}
+
+test "uninstall rejects an argument that is not a valid id" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    try std.testing.expectError(
+        error.UninstallTargetNotFound,
+        uninstallUnit(&store.ctx(), "../escape"),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "is not a valid install id") != null);
+}
+
+test "an interrupted uninstall is finished, never resurrected" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    const p = unit.paths;
+    try install_txn.ensureDirAbsolute(ctx.io, p.root);
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .uninstall,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .stale = &.{"tool"},
+        .phase = .retiring,
+    });
+
+    try recoverPendingTransactions(&ctx);
+    try std.testing.expect(!store.binEntryExists("tool"));
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, p.unit)));
+}
+
+/// Stage a wasm module unit the way a release does: the module plus the
+/// companion `<module>.ghr` manifest that carries its runtime.
+fn tStageWasmUnit(ctx: *const InstallContext, id: []const u8, module: []const u8) !*StagedUnit {
+    const unit = try StagedUnit.create(t_alloc);
+    errdefer unit.destroy();
+    const a = unit.alloc();
+    try beginStaging(ctx, unit, id);
+
+    var stage_dir = try Dir.openDirAbsolute(ctx.io, unit.paths.stage, .{ .iterate = true });
+    defer stage_dir.close(ctx.io);
+    {
+        var f = try stage_dir.createFile(ctx.io, module, .{});
+        defer f.close(ctx.io);
+        try f.writeStreamingAll(ctx.io, "\x00asm");
+    }
+    {
+        const manifest_name = try std.fmt.allocPrint(a, "{s}.ghr", .{module});
+        var f = try stage_dir.createFile(ctx.io, manifest_name, .{});
+        defer f.close(ctx.io);
+        try f.writeStreamingAll(ctx.io,
+            \\.{
+            \\    .version = 1,
+            \\    .runtime = "wasmtime",
+            \\    .runtimeArgs = .{ "--dir=." },
+            \\}
+        );
+    }
+
+    const commands = try a.alloc(command_plan.Command, 1);
+    commands[0] = .{ .relative_target = try a.dupe(u8, module), .kind = .wasm };
+    unit.commands = commands;
+    unit.source = .{
+        .kind = .github,
+        .owner = try a.dupe(u8, "example"),
+        .repo = try a.dupe(u8, "tools"),
+        .tag = try a.dupe(u8, "v1"),
+        .asset_selector = try a.dupe(u8, module),
+    };
+    unit.config = .{ .verification_policy = .{} };
+    unit.resolved = .{ .tag = try a.dupe(u8, "v1"), .asset = try a.dupe(u8, module) };
+    unit.verification = .{ .result = try a.dupe(u8, "none") };
+    unit.display = try a.dupe(u8, id);
+    return unit;
+}
+
+test "a wasm module publishes a launcher plus its runtime manifest" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageWasmUnit(&ctx, "example/tools/parser", "parser.wasm");
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    try std.testing.expect(store.binEntryExists("parser"));
+    try std.testing.expect(store.binEntryExists("parser.ghr"));
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    var bin = try Dir.openDirAbsolute(ctx.io, ctx.dirs.bin, .{});
+    defer bin.close(ctx.io);
+    const manifest = try bin.readFileAlloc(ctx.io, "parser.ghr", a, Io.Limit.limited(4096));
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "targetWasm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "wasmtime") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "u-parser") != null);
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    const rec = tFindRecord(inv, "example/tools/parser").?;
+    try std.testing.expectEqualStrings("wasm", rec.commands[0].kind.?);
+    try std.testing.expectEqualStrings("parser.wasm", rec.commands[0].relative_target);
+}
+
+test "an archive id and its wasm child ids are independent units" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const archive_unit = try tStageUnit(&ctx, "example/tools", &.{"bin/tools"}, &.{});
+    defer archive_unit.destroy();
+    const module = try tStageWasmUnit(&ctx, "example/tools/parser", "parser.wasm");
+    defer module.destroy();
+    try tCommit(&ctx, &.{ archive_unit, module });
+
+    // Replacing the archive must not disturb the module.
+    const replacement = try tStageUnit(&ctx, "example/tools", &.{"bin/tools"}, &.{});
+    defer replacement.destroy();
+    try tCommit(&ctx, &.{replacement});
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 2), inv.records.len);
+    try std.testing.expect(tFindRecord(inv, "example/tools") != null);
+    try std.testing.expect(tFindRecord(inv, "example/tools/parser") != null);
+    try std.testing.expect(store.binEntryExists("tools"));
+    try std.testing.expect(store.binEntryExists("parser"));
+    try std.testing.expect(store.binEntryExists("parser.ghr"));
+
+    // Removing one wasm child touches neither the archive nor its siblings.
+    try uninstallUnit(&ctx, "example/tools/parser");
+    try std.testing.expect(!store.binEntryExists("parser"));
+    try std.testing.expect(!store.binEntryExists("parser.ghr"));
+    try std.testing.expect(store.binEntryExists("tools"));
+
+    var inv2 = try tScan(&ctx);
+    defer inv2.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv2.records.len);
+    try std.testing.expectEqualStrings("example/tools", inv2.records[0].id.?);
+}
+
+test "an interrupted migration republishes before the legacy unit is retired" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    // A legacy unit and its in-flight v2 replacement deliberately share one
+    // canonical id. A whole-store scan sees that as a duplicate-id conflict, so
+    // recovery must address the v2 unit directly instead.
+    try tWriteLegacyUnit(&ctx, "example/tool", &.{"legacy-tool"});
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    const p = unit.paths;
+    {
+        var stage_dir = try Dir.openDirAbsolute(ctx.io, p.stage, .{});
+        defer stage_dir.close(ctx.io);
+        try install_state_write.writeUnitMetadata(t_alloc, ctx.io, stage_dir, .{
+            .id = p.id,
+            .source = .{ .kind = .github, .owner = "example", .repo = "tool", .tag = "v1" },
+            .resolved = .{ .tag = "v1", .asset = "tool.tar.gz" },
+            .commands = &.{.{ .name = "tool", .relative_target = "bin/tool", .kind = .native }},
+            .verification = .{ .result = "none" },
+        }, host_platform);
+    }
+    try install_txn.swapUnit(ctx.io, p, .{});
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const legacy_dir = try store.toolsPath(arena_inst.allocator(), "example/tool");
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = &.{"tool"},
+        .legacy_path = legacy_dir,
+        .legacy_kind = .v1_repo,
+        .phase = .publishing,
+    });
+
+    try recoverPendingTransactions(&ctx);
+
+    // The command is published AND the legacy unit is retired -- never one
+    // without the other.
+    try std.testing.expect(store.binEntryExists("tool"));
+    const legacy_meta = try store.toolsPath(arena_inst.allocator(), "example/tool/ghr.json");
+    try std.testing.expect(!fileExistsAbsolute(ctx.io, legacy_meta));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    try std.testing.expectEqual(install_state.UnitKind.v2, inv.records[0].kind);
+}
+
+test "recovery keeps a legacy unit when the replacement unit is unreadable" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    try tWriteLegacyUnit(&ctx, "example/tool", &.{"legacy-tool"});
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    const p = unit.paths;
+    // The staged unit never received its metadata, so the v2 record cannot be
+    // read back. Retiring the legacy unit here would destroy the only install.
+    try install_txn.swapUnit(ctx.io, p, .{});
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const legacy_dir = try store.toolsPath(arena_inst.allocator(), "example/tool");
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = &.{"tool"},
+        .legacy_path = legacy_dir,
+        .legacy_kind = .v1_repo,
+        .phase = .publishing,
+    });
+
+    try recoverPendingTransactions(&ctx);
+
+    const legacy_meta = try store.toolsPath(arena_inst.allocator(), "example/tool/ghr.json");
+    try std.testing.expect(fileExistsAbsolute(ctx.io, legacy_meta));
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "could not recover") != null);
+}
+
+test "recovery refuses a journal whose legacy path is not this id's legacy unit" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const outsider = try std.fmt.allocPrint(a, "{s}{c}outsider", .{ store.base, std.fs.path.sep });
+    try ensureDirAbsoluteRecursive(ctx.io, outsider);
+    const canary = try std.fmt.allocPrint(a, "{s}{c}keep-me", .{ outsider, std.fs.path.sep });
+    (try Dir.createFileAbsolute(ctx.io, canary, .{})).close(ctx.io);
+
+    const p = unit.paths;
+    try install_txn.ensureDirAbsolute(ctx.io, p.root);
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .uninstall,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .legacy_path = outsider,
+        .legacy_kind = .v1_wasm,
+        .phase = .retiring,
+    });
+
+    try recoverPendingTransactions(&ctx);
+    // A path outside this id's legacy layout is never deleted.
+    try std.testing.expect(fileExistsAbsolute(ctx.io, canary));
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "could not recover") != null);
+}
+
+test "legacy path validation accepts a pre-migration mixed-case directory" {
+    try std.testing.expect(legacyPathMatchesId("/tools", "/tools/AzureAD/Foo", .v1_repo, "azuread/foo"));
+    try std.testing.expect(legacyPathMatchesId("/tools", "/tools/o/r/mod", .v1_wasm, "o/r/mod"));
+    // Wrong depth for the kind.
+    try std.testing.expect(!legacyPathMatchesId("/tools", "/tools/o/r", .v1_wasm, "o/r"));
+    try std.testing.expect(!legacyPathMatchesId("/tools", "/tools/o/r/mod", .v1_repo, "o/r/mod"));
+    // A different id, an escape, and a path outside the tool store.
+    try std.testing.expect(!legacyPathMatchesId("/tools", "/tools/o/other", .v1_repo, "o/r"));
+    try std.testing.expect(!legacyPathMatchesId("/tools", "/etc/passwd", .v1_repo, "o/r"));
+    try std.testing.expect(!legacyPathMatchesId("/tools", "/tools", .v1_repo, "o/r"));
+    try std.testing.expect(!legacyPathMatchesId("/tools", "/toolsx/o/r", .v1_repo, "o/r"));
+}
+
+test "a failed invocation keeps the transaction that still holds live state" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const first = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer first.destroy();
+    try tCommit(&ctx, &.{first});
+
+    // Simulate a transaction that already swapped the unit and could not roll
+    // back: its journal and backup are the only copy of the previous install.
+    const p = first.paths;
+    try install_txn.ensureDirAbsolute(ctx.io, p.backup);
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const backup_marker = try std.fmt.allocPrint(
+        arena_inst.allocator(),
+        "{s}{c}previous",
+        .{ p.backup, std.fs.path.sep },
+    );
+    (try Dir.createFileAbsolute(ctx.io, backup_marker, .{})).close(ctx.io);
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = &.{"tool"},
+        .phase = .publishing,
+    });
+
+    discardStaging(t_alloc, ctx.io, &.{first});
+    try std.testing.expect(fileExistsAbsolute(ctx.io, backup_marker));
+    try std.testing.expect(fileExistsAbsolute(ctx.io, p.journal));
+
+    // A purely staged transaction is still reclaimed.
+    const second = try tStageUnit(&ctx, "example/other", &.{"bin/other"}, &.{});
+    defer second.destroy();
+    discardStaging(t_alloc, ctx.io, &.{second});
+    try std.testing.expect(!(try install_txn.directoryExists(ctx.io, second.paths.root)));
+}
+
+test "invalid recorded configuration fails the install as a typed install error" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    // A key-shaped value that the metadata validator rejects must surface as a
+    // handled install failure, not as an unmapped error out of main.
+    unit.config.minisign = "not-a-minisign-key";
+
+    try std.testing.expectError(error.InstallFailed, tCommit(&ctx, &.{unit}));
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 0), inv.records.len);
+    try std.testing.expect(!store.binEntryExists("tool"));
+}
+
+test "generic url asset names are derived safely" {
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+
+    try std.testing.expectEqualStrings(
+        "tool.tar.gz",
+        try genericUrlAssetName(a, "https://example.com/dl/tool.tar.gz"),
+    );
+    try std.testing.expectEqualStrings(
+        "tool.tar.gz",
+        try genericUrlAssetName(a, "https://example.com/dl/tool.tar.gz?v=2"),
+    );
+    try std.testing.expectEqualStrings(
+        "a b.zip",
+        try genericUrlAssetName(a, "https://example.com/a%20b.zip"),
+    );
+    try std.testing.expectError(
+        error.InvalidGenericUrl,
+        genericUrlAssetName(a, "https://example.com/dl/"),
+    );
+    try std.testing.expectError(
+        error.InvalidGenericUrl,
+        genericUrlAssetName(a, "https://example.com/%2e%2e%2fetc%2fpasswd"),
+    );
+    try std.testing.expectError(
+        error.InvalidGenericUrl,
+        genericUrlAssetName(a, "https://example.com/x/%2e%2e"),
+    );
+    try std.testing.expectError(error.InvalidGenericUrl, genericUrlAssetName(a, "https://example.com"));
+}
+
+test "resolved provenance omits a url that cannot be persisted" {
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+
+    const signed = try resolvedFromAsset(a, "v1", .{
+        .name = "tool.tgz",
+        .browser_download_url = "https://objects.example.com/tool.tgz?X-Amz-Signature=deadbeef",
+        .id = 99,
+        .digest = "sha256:abc123",
+    });
+    try std.testing.expect(signed.download_url == null);
+    try std.testing.expectEqual(@as(i64, 99), signed.api_asset_id.?);
+    try std.testing.expectEqualStrings("sha256", signed.digest.?.algorithm);
+    try std.testing.expectEqualStrings("abc123", signed.digest.?.value);
+
+    const stable = try resolvedFromAsset(a, "v1", .{
+        .name = "tool.tgz",
+        .browser_download_url = "https://github.com/o/r/releases/download/v1/tool.tgz",
+    });
+    try std.testing.expectEqualStrings(
+        "https://github.com/o/r/releases/download/v1/tool.tgz",
+        stable.download_url.?,
+    );
+    try std.testing.expect(stable.api_asset_id == null);
+}
+
+test "a request without its own key inherits the command-level minisign default" {
+    var parsed = try install_request.parse(t_alloc, &.{ "owner/repo", "example/other" });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.items.len);
+    try std.testing.expect(parsed.items[0].config.minisign == null);
+
+    const default_key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    const effective = parsed.items[0].config.minisign orelse default_key;
+    try std.testing.expectEqualStrings(default_key, effective);
+}
+
+test "every legacy positional install form still parses" {
+    const key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    var parsed = try install_request.parse(t_alloc, &.{
+        "owner/repo",
+        "owner/repo@v1",
+        "owner/repo/file.tar.gz@v1",
+        "https://github.com/owner/repo/releases/download/v1/file.tar.gz",
+        "jedisct1/minisign@0.12",
+        key,
+    });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 5), parsed.items.len);
+    try std.testing.expectEqualStrings("owner/repo", parsed.items[0].id);
+    try std.testing.expectEqualStrings("owner/repo", parsed.items[2].id);
+    try std.testing.expectEqualStrings("owner/repo", parsed.items[3].id);
+    try std.testing.expectEqualStrings("jedisct1/minisign", parsed.items[4].id);
+    try std.testing.expectEqualStrings(key, parsed.items[4].config.minisign.?);
+}
+
+test "staged relative targets are recorded portably" {
+    var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    const portable = try portableRel(a, "bin\\sub\\tool.exe");
+    try std.testing.expectEqualStrings("bin/sub/tool.exe", portable);
+
+    var buf: [64]u8 = undefined;
+    const host = try hostRelInto(&buf, "bin/sub/tool");
+    if (host_is_windows) {
+        try std.testing.expectEqualStrings("bin\\sub\\tool", host);
+    } else {
+        try std.testing.expectEqualStrings("bin/sub/tool", host);
+    }
+}
+
+test "windows locked-launcher fallback is only allowed for a same-id replacement" {
+    var record_commands = [_]install_state.OwnedCommand{
+        .{ .name = "tool", .relative_target = "bin/tool", .kind = "native" },
+    };
+    const record: install_state.InventoryRecord = .{
+        .kind = .v2,
+        .status = .ok,
+        .reason = .none,
+        .path = "_v2/units/u-x/_unit",
+        .id = "x",
+        .commands = &record_commands,
+    };
+    try std.testing.expect(previousPublishedSame(record, .{
+        .id = "x",
+        .source_name = "tool",
+        .final_name = "tool",
+        .relative_target = "bin/tool",
+        .kind = .native,
+        .publish = &.{},
+        .cleanup = &.{},
+    }));
+    // A renamed command is a NEW command: its launcher must be writable.
+    try std.testing.expect(!previousPublishedSame(record, .{
+        .id = "x",
+        .source_name = "tool",
+        .final_name = "tool2",
+        .relative_target = "bin/tool",
+        .kind = .native,
+        .publish = &.{},
+        .cleanup = &.{},
+    }));
+    // A kind change is also a new artifact family.
+    try std.testing.expect(!previousPublishedSame(record, .{
+        .id = "x",
+        .source_name = "tool",
+        .final_name = "tool",
+        .relative_target = "tool.wasm",
+        .kind = .wasm,
+        .publish = &.{},
+        .cleanup = &.{},
+    }));
+    try std.testing.expect(!previousPublishedSame(null, .{
+        .id = "x",
+        .source_name = "tool",
+        .final_name = "tool",
+        .relative_target = "bin/tool",
+        .kind = .native,
+        .publish = &.{},
+        .cleanup = &.{},
+    }));
+}
+
+test "recovery artifact ownership never matches an unrelated entry" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    var bin_dir = try Dir.openDirAbsolute(ctx.io, ctx.dirs.bin, .{});
+    defer bin_dir.close(ctx.io);
+    try std.testing.expect(artifactBelongsToUnit(ctx.io, bin_dir, "tool", unit.paths.unit, null));
+    try std.testing.expect(!artifactBelongsToUnit(ctx.io, bin_dir, "tool", "/somewhere/else", null));
+    try std.testing.expect(!artifactBelongsToUnit(ctx.io, bin_dir, "absent", unit.paths.unit, null));
+}
+
+test "install refuses a lone query token before any work happens" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    try std.testing.expectError(error.InvalidInstallRequest, cmdInstallRequests(
+        t_alloc,
+        std.testing.io,
+        &store.environ,
+        &.{"?id=x"},
+        &store.out.writer,
+        &store.err.writer,
+        .{},
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "LoneQueryToken") != null);
+    // The failing value is never echoed.
+    try std.testing.expect(std.mem.indexOf(u8, store.errText(), "?id=x") == null);
+}
+
+test "install rejects --bin with more than one source before staging" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    try std.testing.expectError(error.BinFilterRequiresSingleSpec, cmdInstallRequests(
+        t_alloc,
+        std.testing.io,
+        &store.environ,
+        &.{ "owner/repo", "owner/other" },
+        &store.out.writer,
+        &store.err.writer,
+        .{ .bin_filters = &.{"tool"} },
+    ));
+}
+
+test "install with no source reports the missing spec" {
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    try std.testing.expectError(error.MissingInstallSpec, cmdInstallRequests(
+        t_alloc,
+        std.testing.io,
+        &store.environ,
+        &.{},
+        &store.out.writer,
+        &store.err.writer,
+        .{},
+    ));
+}
+
+test "committed metadata records the selection and aliases durably" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{.{ .source = "tool", .published = "t2" }});
+    defer unit.destroy();
+    const a = unit.alloc();
+    const selection = try a.alloc([]const u8, 1);
+    selection[0] = try a.dupe(u8, "tool");
+    unit.config.selected_commands = selection;
+    try tCommit(&ctx, &.{unit});
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    const rec = tFindRecord(inv, "example/tool").?;
+    try std.testing.expectEqualStrings("t2", rec.commands[0].name);
+    try std.testing.expectEqualStrings("tool", rec.config.?.selected_commands.?[0]);
+    try std.testing.expectEqualStrings("tool", rec.config.?.aliases[0].from);
+    try std.testing.expectEqualStrings("t2", rec.config.?.aliases[0].to);
+}
+
+test "commit survives allocation failure without leaving live state behind" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+
+    // A failing allocator during planning must abort before any mutation.
+    var failing = std.testing.FailingAllocator.init(t_alloc, .{ .fail_index = 0 });
+    var oom_ctx = ctx;
+    oom_ctx.allocator = failing.allocator();
+    const result = planAndCommit(&oom_ctx, &.{unit});
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 0), inv.records.len);
+    try std.testing.expect(!store.binEntryExists("tool"));
 }
 
 test "wasmStem strips the .wasm extension from the basename" {
@@ -3365,120 +6357,6 @@ test "filterExecutables reports every unmatched filter and available command nam
             "  hint: pass the installed command name shown above, not an archive path\n",
         message,
     );
-}
-
-test "cleanupStaleBinEntries removes excluded owned links and preserves selected links" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const tio = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDir(tio, "bin", .default_dir);
-    try tmp.dir.createDir(tio, "tool", .default_dir);
-
-    var root_buf: [Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(tio, &root_buf);
-    const root = root_buf[0..root_len];
-    var tool_buf: [Dir.max_path_bytes]u8 = undefined;
-    const tool_path = try std.fmt.bufPrint(&tool_buf, "{s}{c}tool", .{ root, std.fs.path.sep });
-    var alpha_target_buf: [Dir.max_path_bytes]u8 = undefined;
-    const alpha_target = try std.fmt.bufPrint(&alpha_target_buf, "{s}{c}alpha", .{ tool_path, std.fs.path.sep });
-    var beta_target_buf: [Dir.max_path_bytes]u8 = undefined;
-    const beta_target = try std.fmt.bufPrint(&beta_target_buf, "{s}{c}beta", .{ tool_path, std.fs.path.sep });
-    try tmp.dir.symLink(tio, alpha_target, "bin/alpha", .{});
-    try tmp.dir.symLink(tio, beta_target, "bin/beta", .{});
-
-    var bin_dir = try tmp.dir.openDir(tio, "bin", .{});
-    defer bin_dir.close(tio);
-    cleanupStaleBinEntries(tio, bin_dir, &.{ "alpha", "beta" }, &.{"alpha"}, tool_path, null);
-
-    var link_buf: [Dir.max_path_bytes]u8 = undefined;
-    const alpha_len = try bin_dir.readLink(tio, "alpha", &link_buf);
-    try std.testing.expectEqualStrings(alpha_target, link_buf[0..alpha_len]);
-    try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "beta", &link_buf));
-}
-
-test "stale cleanup accepts the prior mixed-case tool path after migration" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const allocator = std.testing.allocator;
-    const tio = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(tio, "tools/AzureAD/repo");
-    try tmp.dir.createDir(tio, "bin", .default_dir);
-
-    var old_dir = try tmp.dir.openDir(tio, "tools/AzureAD/repo", .{});
-    defer old_dir.close(tio);
-    try writeMetadata(
-        allocator,
-        tio,
-        old_dir,
-        "v1",
-        "tool.zip",
-        &.{ "alpha", "beta", "foreign" },
-        &.{},
-        "checksum",
-        null,
-    );
-
-    var root_buf: [Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(tio, &root_buf);
-    const root = root_buf[0..root_len];
-    var tools_buf: [Dir.max_path_bytes]u8 = undefined;
-    const tools_path = try std.fmt.bufPrint(&tools_buf, "{s}{c}tools", .{ root, std.fs.path.sep });
-    const resolved = (try resolveInstalledToolPath(allocator, tio, tools_path, "azuread", "repo")).?;
-    defer allocator.free(resolved);
-
-    try tmp.dir.createDirPath(tio, "tools/azuread");
-    var canonical_buf: [Dir.max_path_bytes]u8 = undefined;
-    const canonical_path = try std.fmt.bufPrint(&canonical_buf, "{s}{c}azuread{c}repo", .{
-        tools_path,
-        std.fs.path.sep,
-        std.fs.path.sep,
-    });
-    try std.testing.expectEqual(
-        ExistingToolPathAction.rename,
-        existingToolPathAction(tio, resolved, canonical_path),
-    );
-    var alpha_old_buf: [Dir.max_path_bytes]u8 = undefined;
-    const alpha_old = try std.fmt.bufPrint(&alpha_old_buf, "{s}{c}alpha", .{ resolved, std.fs.path.sep });
-    var beta_old_buf: [Dir.max_path_bytes]u8 = undefined;
-    const beta_old = try std.fmt.bufPrint(&beta_old_buf, "{s}{c}beta", .{ resolved, std.fs.path.sep });
-    var foreign_buf: [Dir.max_path_bytes]u8 = undefined;
-    const foreign_target = try std.fmt.bufPrint(&foreign_buf, "{s}-unrelated{c}foreign", .{ resolved, std.fs.path.sep });
-    try tmp.dir.symLink(tio, alpha_old, "bin/alpha", .{});
-    try tmp.dir.symLink(tio, beta_old, "bin/beta", .{});
-    try tmp.dir.symLink(tio, foreign_target, "bin/foreign", .{});
-
-    const previous_path = (try renameInstalledToolDir(allocator, tio, resolved, canonical_path)).?;
-    defer allocator.free(previous_path);
-    const old_meta = readMetadata(allocator, tio, canonical_path).?;
-    defer old_meta.parsed.deinit();
-    defer allocator.free(old_meta.body);
-
-    var bin_dir = try tmp.dir.openDir(tio, "bin", .{});
-    defer bin_dir.close(tio);
-    bin_dir.deleteFile(tio, "alpha") catch {};
-    var alpha_new_buf: [Dir.max_path_bytes]u8 = undefined;
-    const alpha_new = try std.fmt.bufPrint(&alpha_new_buf, "{s}{c}alpha", .{ canonical_path, std.fs.path.sep });
-    try bin_dir.symLink(tio, alpha_new, "alpha", .{});
-
-    cleanupStaleBinEntries(
-        tio,
-        bin_dir,
-        old_meta.parsed.value.bins,
-        &.{"alpha"},
-        canonical_path,
-        previous_path,
-    );
-
-    var link_buf: [Dir.max_path_bytes]u8 = undefined;
-    const alpha_len = try bin_dir.readLink(tio, "alpha", &link_buf);
-    try std.testing.expectEqualStrings(alpha_new, link_buf[0..alpha_len]);
-    try std.testing.expectError(error.FileNotFound, bin_dir.readLink(tio, "beta", &link_buf));
-    const foreign_len = try bin_dir.readLink(tio, "foreign", &link_buf);
-    try std.testing.expectEqualStrings(foreign_target, link_buf[0..foreign_len]);
 }
 
 test "existing tool path action retains aliases but rejects collisions" {
@@ -4991,76 +7869,6 @@ test "resolveInstalledToolPath: tools_dir missing returns null" {
     const nonexistent = try std.fmt.bufPrint(&nonexistent_buf, "{s}{c}nope", .{ base, std.fs.path.sep });
 
     try std.testing.expect(try resolveInstalledToolPath(allocator, tio, nonexistent, "owner", "repo") == null);
-}
-
-test "parseUninstallSpec: repo only" {
-    const t = parseUninstallSpec("cataggar/wabt");
-    try std.testing.expectEqualStrings("cataggar/wabt", t.repo_spec);
-    try std.testing.expect(t.module_stem == null);
-}
-
-test "parseUninstallSpec: repo with module stem" {
-    const t = parseUninstallSpec("cataggar/wabt/petstore-test");
-    try std.testing.expectEqualStrings("cataggar/wabt", t.repo_spec);
-    try std.testing.expectEqualStrings("petstore-test", t.module_stem.?);
-}
-
-test "parseUninstallSpec: bare name (no slash)" {
-    const t = parseUninstallSpec("wabt");
-    try std.testing.expectEqualStrings("wabt", t.repo_spec);
-    try std.testing.expect(t.module_stem == null);
-}
-
-test "preserveWasmModuleUnits copies modules without mutating the live install" {
-    const tio = std.testing.io;
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [Dir.max_path_bytes]u8 = undefined;
-    const base_len = try tmp.dir.realPath(tio, &path_buf);
-    const base = path_buf[0..base_len];
-
-    // Repo dir with a repo-level ghr.json, an archive content subdir (no
-    // ghr.json), and two wasm module units (each with a ghr.json).
-    try tmp.dir.createDirPath(tio, "repo");
-    try tmp.dir.createDirPath(tio, "repo/archive-content");
-    try tmp.dir.createDirPath(tio, "repo/petstore");
-    try tmp.dir.createDirPath(tio, "repo/petstore-test");
-    try tmp.dir.createDirPath(tio, "staging");
-    {
-        var f = try tmp.dir.createFile(tio, "repo/ghr.json", .{});
-        f.close(tio);
-    }
-    {
-        var f = try tmp.dir.createFile(tio, "repo/petstore/ghr.json", .{});
-        f.close(tio);
-    }
-    {
-        var f = try tmp.dir.createFile(tio, "repo/petstore-test/ghr.json", .{});
-        f.close(tio);
-    }
-    try tmp.dir.writeFile(tio, .{ .sub_path = "repo/petstore/module.wasm", .data = "wasm" });
-
-    const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ base, std.fs.path.sep });
-    defer allocator.free(repo_path);
-    const staging_path = try std.fmt.allocPrint(allocator, "{s}{c}staging", .{ base, std.fs.path.sep });
-    defer allocator.free(staging_path);
-
-    try preserveWasmModuleUnits(tio, repo_path, staging_path);
-
-    // Modules are copied into the completed staging tree.
-    try std.testing.expect(tmp.dir.access(tio, "staging/petstore/ghr.json", .{}) != error.FileNotFound);
-    try std.testing.expect(tmp.dir.access(tio, "staging/petstore-test/ghr.json", .{}) != error.FileNotFound);
-    const copied = try tmp.dir.readFileAlloc(tio, "staging/petstore/module.wasm", allocator, Io.Limit.limited(16));
-    defer allocator.free(copied);
-    try std.testing.expectEqualStrings("wasm", copied);
-    // The original module paths remain live until the staging tree commits.
-    try std.testing.expect(tmp.dir.access(tio, "repo/petstore", .{}) != error.FileNotFound);
-    try std.testing.expect(tmp.dir.access(tio, "repo/petstore-test", .{}) != error.FileNotFound);
-    // Repo-level manifest and archive content left untouched.
-    try std.testing.expect(tmp.dir.access(tio, "repo/ghr.json", .{}) != error.FileNotFound);
-    try std.testing.expect(tmp.dir.access(tio, "repo/archive-content", .{}) != error.FileNotFound);
 }
 
 test "caseRenameDir: leaf-case-only rename uses temp dance" {
