@@ -94,10 +94,11 @@ derived ID migrates one unambiguous legacy unit only after the replacement is
 durable. Use an ID-capable ghr for later mutations; older releases do not
 understand v2 install state.
 
-For archive assets, `ghr install` exposes executable candidates from the
-shallowest directory level containing any executables. It searches deeper only
-when no shallower candidates exist, so nested-only package layouts still work
-without putting executable-looking firmware or data files on `PATH`.
+For `.zip`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.zst`, `.tzst`, and
+`.deb` assets, `ghr install` exposes executable candidates from the shallowest
+directory level containing any executables. It searches deeper only when no
+shallower candidates exist, so nested-only package layouts still work without
+putting executable-looking firmware or data files on `PATH`.
 
 ## Filtering installed binaries
 

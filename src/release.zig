@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const archive = @import("archive.zig");
 const http = @import("http.zig");
 const sigstore = @import("sigstore.zig");
 const minisign = @import("minisign.zig");
@@ -634,10 +635,7 @@ fn containsIgnoreCaseBounded(haystack: []const u8, needle: []const u8) bool {
 /// Returns true if the asset looks installable: archives, Windows .exe, wasm
 /// modules, or bare binaries (extensionless files common in Go/Rust releases).
 fn isInstallableAsset(name: []const u8) bool {
-    if (std.mem.endsWith(u8, name, ".zip")) return true;
-    if (std.mem.endsWith(u8, name, ".tar.gz")) return true;
-    if (std.mem.endsWith(u8, name, ".tgz")) return true;
-    if (std.mem.endsWith(u8, name, ".tar.xz")) return true;
+    if (archive.detectFormat(name) != .unknown) return true;
     if (name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe")) return true;
     if (std.mem.endsWith(u8, name, ".wasm")) return true;
     const non_installable = [_][]const u8{
@@ -840,11 +838,10 @@ fn linuxPortabilityBonus(name: []const u8, plat_os: []const []const u8) i32 {
 
 /// Bonus for archive formats (portable, pre-packaged) over bare binaries.
 fn archiveFormatBonus(name: []const u8) i32 {
-    if (std.mem.endsWith(u8, name, ".tar.gz") or
-        std.mem.endsWith(u8, name, ".tgz") or
-        std.mem.endsWith(u8, name, ".tar.xz") or
-        std.mem.endsWith(u8, name, ".zip")) return 1;
-    return 0;
+    return switch (archive.detectFormat(name)) {
+        .zip, .tar_gz, .tar_xz, .tar_zst => 1,
+        .deb, .unknown => 0,
+    };
 }
 
 /// On Linux, reward the asset built for the host's C library. Rust target
@@ -2748,6 +2745,9 @@ test "isInstallableAsset" {
     try std.testing.expect(isInstallableAsset("foo.tar.gz"));
     try std.testing.expect(isInstallableAsset("foo.tgz"));
     try std.testing.expect(isInstallableAsset("foo.tar.xz"));
+    try std.testing.expect(isInstallableAsset("foo.tar.zst"));
+    try std.testing.expect(isInstallableAsset("foo.tzst"));
+    try std.testing.expect(isInstallableAsset("foo.TAR.ZST"));
     try std.testing.expect(isInstallableAsset("foo.deb"));
     try std.testing.expect(isInstallableAsset("cosign-windows-amd64.exe"));
     try std.testing.expect(isInstallableAsset("tool.exe"));
@@ -2763,6 +2763,18 @@ test "isInstallableAsset" {
     // wasm modules are installable; the companion `.ghr` manifest is not.
     try std.testing.expect(isInstallableAsset("hello.wasm"));
     try std.testing.expect(!isInstallableAsset("hello.wasm.ghr"));
+}
+
+test "findBestAsset prefers tar.zst over a bare binary" {
+    const assets = [_]Asset{
+        .{ .name = "tool-linux-amd64", .browser_download_url = "" },
+        .{ .name = "tool-linux-amd64.tar.zst", .browser_download_url = "" },
+    };
+    const best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = &.{ "amd64", "x86_64" },
+    });
+    try std.testing.expectEqualStrings("tool-linux-amd64.tar.zst", best.name);
 }
 
 test "isWasmAssetName and findGhrManifestAsset" {
