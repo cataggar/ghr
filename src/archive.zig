@@ -45,6 +45,28 @@ pub fn extractTarXz(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *
     try std.tar.extract(io, dest_dir, &xz_decompress.reader, .{ .strip_components = strip_components });
 }
 
+fn extractTarZstReader(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dest_dir: Dir,
+    reader: *std.Io.Reader,
+    strip_components: u32,
+) !void {
+    const zstd_buf = try allocator.alloc(
+        u8,
+        std.compress.zstd.default_window_len + std.compress.zstd.block_size_max,
+    );
+    defer allocator.free(zstd_buf);
+    var zstd_stream = std.compress.zstd.Decompress.init(reader, zstd_buf, .{});
+    try std.tar.extract(io, dest_dir, &zstd_stream.reader, .{ .strip_components = strip_components });
+}
+
+pub fn extractTarZst(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *File, strip_components: u32) !void {
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_buf);
+    try extractTarZstReader(allocator, io, dest_dir, &file_reader.interface, strip_components);
+}
+
 fn parseDebMember(bytes: []const u8, member_name: []const u8) ![]const u8 {
     if (!std.mem.startsWith(u8, bytes, "!<arch>\n")) return error.InvalidDebArchive;
 
@@ -83,18 +105,16 @@ pub fn extractDeb(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *Fi
     var file_buf: [8192]u8 = undefined;
     var file_reader = file.reader(io, &file_buf);
     try file_reader.interface.readSliceAll(bytes);
-
     const data = try parseDebMember(bytes, "data.tar.zst");
     var in: std.Io.Reader = .fixed(data);
-    var zstd_buf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
-    var zstd_stream = std.compress.zstd.Decompress.init(&in, &zstd_buf, .{});
-    try std.tar.extract(io, dest_dir, &zstd_stream.reader, .{});
+    try extractTarZstReader(allocator, io, dest_dir, &in, 0);
 }
 
 pub const Format = enum {
     zip,
     tar_gz,
     tar_xz,
+    tar_zst,
     deb,
     unknown,
 };
@@ -105,6 +125,7 @@ pub fn detectFormat(name: []const u8) Format {
     if (endsWithIgnoreCase(name, ".zip")) return .zip;
     if (endsWithIgnoreCase(name, ".tar.gz") or endsWithIgnoreCase(name, ".tgz")) return .tar_gz;
     if (endsWithIgnoreCase(name, ".tar.xz") or endsWithIgnoreCase(name, ".txz")) return .tar_xz;
+    if (endsWithIgnoreCase(name, ".tar.zst") or endsWithIgnoreCase(name, ".tzst")) return .tar_zst;
     if (endsWithIgnoreCase(name, ".deb")) return .deb;
     return .unknown;
 }
@@ -135,6 +156,7 @@ pub fn extractAuto(
         .zip => try extractZip(io, dest_dir, &file),
         .tar_gz => try extractTarGz(io, dest_dir, &file, strip_components),
         .tar_xz => try extractTarXz(allocator, io, dest_dir, &file, strip_components),
+        .tar_zst => try extractTarZst(allocator, io, dest_dir, &file, strip_components),
         .deb => try extractDeb(allocator, io, dest_dir, &file),
         .unknown => return error.UnknownArchiveFormat,
     }
@@ -148,6 +170,9 @@ test "detectFormat recognises common archive suffixes" {
     try std.testing.expectEqual(Format.tar_gz, detectFormat("foo.TGZ"));
     try std.testing.expectEqual(Format.tar_xz, detectFormat("foo.tar.xz"));
     try std.testing.expectEqual(Format.tar_xz, detectFormat("foo.txz"));
+    try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.tar.zst"));
+    try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.tzst"));
+    try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.TAR.ZST"));
     try std.testing.expectEqual(Format.deb, detectFormat("foo.deb"));
     try std.testing.expectEqual(Format.deb, detectFormat("FOO.DEB"));
     try std.testing.expectEqual(Format.unknown, detectFormat("foo.exe"));
@@ -237,6 +262,39 @@ fn createTestTarXz(tmp: *std.testing.TmpDir, names: []const []const u8, contents
     return try tmp.dir.openFile(tio, "archive.tar.xz", .{});
 }
 
+fn createTestTarZst(tmp: *std.testing.TmpDir, names: []const []const u8, contents: []const []const u8) !File {
+    const tio = std.testing.io;
+    for (names, contents) |name, content| {
+        if (std.fs.path.dirname(name)) |parent| {
+            tmp.dir.createDirPath(tio, parent) catch {};
+        }
+        var f = try tmp.dir.createFile(tio, name, .{ .permissions = .executable_file });
+        try f.writeStreamingAll(tio, content);
+        f.close(tio);
+    }
+
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
+    defer argv.deinit(std.testing.allocator);
+    try argv.appendSlice(std.testing.allocator, &.{ "tar", "--zstd", "-cf", "archive.tar.zst" });
+    try argv.appendSlice(std.testing.allocator, names);
+
+    var child = std.process.spawn(tio, .{
+        .argv = argv.items,
+        .cwd = .{ .dir = tmp.dir },
+    }) catch return error.SkipZigTest;
+    const term = child.wait(tio) catch return error.SkipZigTest;
+    if (term != .exited or term.exited != 0) return error.SkipZigTest;
+
+    for (names) |name| {
+        tmp.dir.deleteFile(tio, name) catch {};
+        if (std.fs.path.dirname(name)) |parent| {
+            tmp.dir.deleteDir(tio, parent) catch {};
+        }
+    }
+
+    return try tmp.dir.openFile(tio, "archive.tar.zst", .{});
+}
+
 test "extractTarGz extracts files with correct contents" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -295,6 +353,35 @@ test "extractTarXz extracts files with correct contents" {
     const content = try tmp.dir.readFileAlloc(std.testing.io, "myapp/README.md", std.testing.allocator, Io.Limit.limited(256));
     defer std.testing.allocator.free(content);
     try std.testing.expectEqualStrings("readme\n", content);
+}
+
+test "extractAuto handles tar.zst archives and strips components" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try createTestTarZst(
+        &tmp,
+        &.{ "wrap/bin/tool", "wrap/README.md" },
+        &.{ "#!/bin/sh\necho hello\n", "readme\n" },
+    );
+    file.close(std.testing.io);
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const archive_len = try tmp.dir.realPathFile(std.testing.io, "archive.tar.zst", &path_buf);
+    const archive_abs = path_buf[0..archive_len];
+
+    try extractAuto(std.testing.allocator, std.testing.io, tmp.dir, archive_abs, 1);
+
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "bin/tool", .{})).kind == .file);
+    const content = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "README.md",
+        std.testing.allocator,
+        Io.Limit.limited(256),
+    );
+    defer std.testing.allocator.free(content);
+    try std.testing.expectEqualStrings("readme\n", content);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "wrap", .{}));
 }
 
 test "extractAuto dispatches on filename and strips components" {

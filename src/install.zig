@@ -2963,21 +2963,11 @@ fn stageArchiveUnit(
         verified_label = vr.label;
         recorded_minisign_key = vr.minisign_key;
 
-        try w.print("extracting ...\n", .{});
-        try w.flush();
-
-        switch (archive.detectFormat(asset.name)) {
-            .zip, .tar_gz, .tar_xz, .deb => {
-                archive.extractAuto(allocator, io, stage_dir, download_path, 0) catch |err| {
-                    try err_w.print(
-                        "error: failed to extract '{s}' from '{s}' into '{s}': {t}\n",
-                        .{ asset.name, download_path, unit.paths.stage, err },
-                    );
-                    try err_w.flush();
-                    return error.InstallStepFailed;
-                };
-            },
+        const format = archive.detectFormat(asset.name);
+        switch (format) {
             .unknown => {
+                try w.print("staging ...\n", .{});
+                try w.flush();
                 const exe_name = try deriveBareBinaryName(allocator, asset.name, spec.repo, host_is_windows);
                 defer allocator.free(exe_name);
                 stageBareExecutable(allocator, io, d.cache, asset.name, stage_dir, exe_name) catch |err| {
@@ -2989,8 +2979,20 @@ fn stageArchiveUnit(
                     return error.InstallStepFailed;
                 };
             },
+            else => {
+                try w.print("extracting ...\n", .{});
+                try w.flush();
+                archive.extractAuto(allocator, io, stage_dir, download_path, 0) catch |err| {
+                    try err_w.print(
+                        "error: failed to extract '{s}' from '{s}' into '{s}': {t}\n",
+                        .{ asset.name, download_path, unit.paths.stage, err },
+                    );
+                    try err_w.flush();
+                    return error.InstallStepFailed;
+                };
+            },
         }
-        prefer_deb_shims = archive.detectFormat(asset.name) == .deb and hasDebShims(io, stage_dir);
+        prefer_deb_shims = format == .deb and hasDebShims(io, stage_dir);
     }
 
     const primary_name = primary_assets[0].name;
@@ -3479,17 +3481,11 @@ fn stageGenericUrlRequest(
     };
     const digest_hex = try std.fmt.allocPrint(a, "{x}", .{&digest});
 
-    try w.print("extracting ...\n", .{});
-    try w.flush();
-    switch (archive.detectFormat(asset_name)) {
-        .zip, .tar_gz, .tar_xz, .deb => {
-            archive.extractAuto(allocator, io, stage_dir, download_path, 0) catch |err| {
-                try err_w.print("error: failed to extract '{s}': {t}\n", .{ asset_name, err });
-                try err_w.flush();
-                return error.InstallStepFailed;
-            };
-        },
+    const format = archive.detectFormat(asset_name);
+    switch (format) {
         .unknown => {
+            try w.print("staging ...\n", .{});
+            try w.flush();
             const exe_name = try deriveBareBinaryName(
                 allocator,
                 asset_name,
@@ -3503,9 +3499,18 @@ fn stageGenericUrlRequest(
                 return error.InstallStepFailed;
             };
         },
+        else => {
+            try w.print("extracting ...\n", .{});
+            try w.flush();
+            archive.extractAuto(allocator, io, stage_dir, download_path, 0) catch |err| {
+                try err_w.print("error: failed to extract '{s}': {t}\n", .{ asset_name, err });
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
+        },
     }
 
-    const prefer_deb_shims = archive.detectFormat(asset_name) == .deb and hasDebShims(io, stage_dir);
+    const prefer_deb_shims = format == .deb and hasDebShims(io, stage_dir);
     try discoverStagedCommands(ctx, unit, stage_dir, prefer_deb_shims, asset_name, &.{});
 
     unit.source = .{ .kind = .generic_url, .url = try a.dupe(u8, url) };
