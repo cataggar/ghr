@@ -16,6 +16,13 @@ nothing over GitHub's built-in asset digest (added 2025-06-03), which ghr
 verifies for free. Independent provenance is covered by the sigstore and
 minisign signatures above.
 
+The first-party [`actions/setup`](../actions/setup/README.md) bootstrap does
+not ask an unverified `ghr` binary to verify itself. Its bundled Node
+implementation requires the GitHub asset digest plus either cryptographically
+verified GitHub artifact provenance or an explicitly supplied trusted SHA-256,
+then safely extracts and cross-checks the binary's version and target before
+adding it to `PATH`.
+
 `ghr install cataggar/ghr@<tag>` verifies the sigstore bundle
 automatically, prints the leaf certificate's SAN (the release-workflow
 URL) and OIDC issuer

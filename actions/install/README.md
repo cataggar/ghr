@@ -20,10 +20,14 @@ scalar. A bare inline key remains compatible and overrides the action-level
 `minisign:` default. Empty lines and `#` comments are ignored.
 
 The action ships in the same git repository as `ghr` and shares its release
-stream: a tag like `v0.8.0` pins **both** the action body and the
-`ghr-bin` PyPI package the action installs. Pick the tag from
+stream: a tag like `v0.8.0` pins **both** the action body and the verified
+static `ghr` release the action bootstraps. Pick the tag from
 [the releases page](https://github.com/cataggar/ghr/releases); pin to a
-specific commit SHA for full reproducibility.
+specific commit SHA and set `ghr-version` for full reproducibility.
+
+The bootstrap uses the runner-provided Node 24 action runtime. It works in bare
+Ubuntu and Debian job containers without Python, `pipx`, `curl`, `gh`, or
+package-manager setup.
 
 A cache-hit on subsequent runs restores the complete tool, command, cache, and
 transaction state and skips installation. The ID-capable CLI parses and hashes
@@ -47,7 +51,10 @@ predates stable-ID cache fingerprints.
 | `skip-attestation`  | `false`                  | Skip just GitHub artifact attestation verification, which is looked up by digest rather than published as a release asset. |
 | `skip-authenticode` | `false`                  | Skip just the Authenticode (Windows PE) verification step. |
 | `keep-going`        | `false`                  | Continue past per-spec failures; exit non-zero with a summary if any spec failed. |
-| `ghr-version`       | _(derived from action ref)_ | Override the `ghr-bin` version installed. Default: derived from the action's git ref (e.g. `@v0.8.0` -> `ghr-bin==0.8.0`). Pass `latest` to install the latest from PyPI. |
+| `ghr-version`       | _(exact action tags only)_  | Exact static CLI release. Commit, branch, and floating-tag action refs must set it; ranges and `latest` are rejected. |
+| `ghr-sha256`        | _(empty)_                   | Optional independently trusted SHA-256 for the selected ghr archive; it must also match GitHub's asset digest. |
+| `ghr-token`         | `github.token`              | Used only for ghr release and provenance API requests. Downstream installs still use `GH_TOKEN`/`GITHUB_TOKEN` from env. |
+| `ghr-cache`         | `true`                      | Cache and reverify the exact static ghr archive separately from the installed-tools cache. |
 
 ## Outputs
 
@@ -57,7 +64,9 @@ predates stable-ID cache fingerprints.
 
 ## What it does
 
-1. `pipx install ghr-bin` (pre-installed on GitHub-hosted runners).
+1. Resolves one exact static ghr release and verifies its GitHub digest plus
+   Sigstore provenance (or an explicit trusted SHA-256), then safely extracts
+   it below `$RUNNER_TEMP`.
 2. Sets `GHR_TOOL_DIR`, `GHR_BIN_DIR`, `GHR_CACHE_DIR` to user-writable
    subdirectories of `$RUNNER_TEMP`, and prepends `GHR_BIN_DIR` to
    `$GITHUB_PATH`.
@@ -150,7 +159,16 @@ unattested artifact. Set `skip-attestation: 'true'` to opt out deliberately.
 ## Pinning
 
 The action shares git tags with the `ghr` CLI: `@v0.8.0` references the
-action body **and** pins `ghr-bin` (via the `ghr-version` input default)
-to the matching release. To explicitly pin the installed binary to a
-different release, pass `ghr-version:`. For full reproducibility, pin to
-a commit SHA: `cataggar/ghr/actions/install@<sha> # v0.8.0`.
+action body and selects the matching static release. For full reproducibility,
+pin the action to a commit SHA and supply the CLI version independently:
+
+```yaml
+- uses: cataggar/ghr/actions/install@<sha> # reviewed action commit
+  with:
+    ghr-version: v0.8.0
+    tools: BurntSushi/ripgrep@14.1.1
+```
+
+Commit, branch, major-tag, range, and `latest` references never silently select
+the latest CLI. The action requires Actions runner 2.336.0 or newer for exact
+same-repository action composition.

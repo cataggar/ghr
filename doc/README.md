@@ -33,6 +33,7 @@ Download one or more GitHub release assets, optionally extracting archives; see
 
 Cache installed tools or downloaded assets in workflows; see
 [Caching in GitHub Actions](github-actions.md),
+[`actions/setup`](../actions/setup/README.md),
 [`actions/install`](../actions/install/README.md), and
 [`actions/download`](../actions/download/README.md).
 

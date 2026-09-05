@@ -1,0 +1,33 @@
+{
+  "name": "@cataggar/ghr-setup-action",
+  "version": "0.8.0",
+  "private": true,
+  "description": "Install and verify an exact static ghr release",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test --test-concurrency=1 lib/__tests__/*.test.js",
+    "bundle": "ncc build src/main.ts -o dist/main --minify --license licenses.txt && ncc build src/post.ts -o dist/post --minify --license licenses.txt"
+  },
+  "dependencies": {
+    "@actions/core": "3.0.1",
+    "@sigstore/bundle": "5.0.0",
+    "@sigstore/protobuf-specs": "0.5.2",
+    "@sigstore/tuf": "5.0.0",
+    "@sigstore/verify": "4.1.2",
+    "semver": "7.8.5",
+    "undici": "8.10.2",
+    "yauzl": "3.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "@types/semver": "7.8.0",
+    "@types/yauzl": "2.10.3",
+    "@vercel/ncc": "0.45.0",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": "^24.15.0"
+  }
+}

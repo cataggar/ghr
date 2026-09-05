@@ -6,7 +6,162 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  attestations: read
+
 jobs:
+  setup-action-unit:
+    name: Setup action unit and bundle checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.20.0
+
+      - name: Test and reproduce setup action bundles
+        run: |
+          npm --prefix actions/setup ci
+          npm --prefix actions/setup audit --audit-level=moderate
+          npm --prefix actions/setup test
+          npm --prefix actions/setup run bundle
+          git diff --exit-code -- actions/setup/dist
+
+  setup-action-native:
+    name: Setup action native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-musl-x64
+          - os: macos-15
+            target: macos-arm64
+          - os: windows-latest
+            target: windows-x64
+    steps:
+      - name: Bootstrap exact static ghr release
+        id: setup
+        uses: $/actions/setup
+        with:
+          ghr-version: v0.8.0-dev.1
+          cache: 'false'
+
+      - name: Validate setup outputs and executable
+        shell: bash
+        env:
+          GHR_PATH: ${{ steps.setup.outputs.ghr-path }}
+          GHR_VERSION: ${{ steps.setup.outputs.ghr-version }}
+          EXPECTED_TARGET: ${{ matrix.target }}
+          TARGET: ${{ steps.setup.outputs.target }}
+        run: |
+          set -euo pipefail
+          test -f "$GHR_PATH"
+          test "$GHR_VERSION" = v0.8.0-dev.1
+          test "$TARGET" = "$EXPECTED_TARGET"
+          test "$("$GHR_PATH" version)" = 0.8.0-dev.1
+          ghr version
+
+  action-hosted-linux:
+    name: First-party actions on hosted Linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download with statically bootstrapped ghr
+        id: download
+        uses: $/actions/download
+        with:
+          ghr-version: v0.8.0-dev.1
+          ghr-cache: 'false'
+          cache: 'false'
+          tools: cataggar/ghr/ghr-0.8.0-dev.1-linux-musl-x64.tar.gz@v0.8.0-dev.1
+          minisign: RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+
+      - name: Validate downloaded release archive
+        env:
+          DEST: ${{ steps.download.outputs.dest }}
+        run: |
+          test -f "$DEST/ghr-0.8.0-dev.1-linux-musl-x64.tar.gz"
+
+      - name: Install with statically bootstrapped ghr
+        uses: $/actions/install
+        with:
+          ghr-version: v0.8.0-dev.1
+          ghr-cache: 'false'
+          cache: 'false'
+          tools: >-
+            cataggar/ghr@v0.8.0-dev.1
+            RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+
+      - name: Validate installed command
+        run: |
+          test "$(ghr version)" = 0.8.0-dev.1
+
+  action-bare-container:
+    name: First-party actions in ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:24.04
+          - debian:bookworm-slim
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Confirm optional host tools are absent
+        shell: sh
+        run: |
+          ! command -v python3
+          ! command -v pip
+          ! command -v pipx
+          ! command -v curl
+          ! command -v gh
+
+      - name: Download with statically bootstrapped ghr
+        id: download
+        uses: $/actions/download
+        with:
+          ghr-version: v0.8.0-dev.1
+          ghr-cache: 'false'
+          cache: 'false'
+          tools: cataggar/ghr/ghr-0.8.0-dev.1-linux-musl-x64.tar.gz@v0.8.0-dev.1
+          minisign: RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+
+      - name: Validate downloaded release archive
+        shell: sh
+        env:
+          DEST: ${{ steps.download.outputs.dest }}
+        run: |
+          test -f "$DEST/ghr-0.8.0-dev.1-linux-musl-x64.tar.gz"
+
+      - name: Install with statically bootstrapped ghr
+        uses: $/actions/install
+        with:
+          ghr-version: v0.8.0-dev.1
+          ghr-cache: 'false'
+          cache: 'false'
+          tools: >-
+            cataggar/ghr@v0.8.0-dev.1
+            RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+
+      - name: Validate installed command
+        shell: sh
+        run: |
+          test "$(ghr version)" = 0.8.0-dev.1
+
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-22.04

@@ -11,8 +11,8 @@ static binary that picks the right asset for your OS and architecture.
 Supports verifying with [minisign](https://jedisct1.github.io/minisign/),
 [sigstore](https://sigstore.dev/),
 [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/verify-attestations-offline),
-and checksums. Install it on a GitHub-hosted runner with
-`pipx install ghr-bin`.
+and checksums. Install it locally with `pipx install ghr-bin`, or use the first-party static
+bootstrap in GitHub Actions.
 
 ## Usage
 
@@ -103,12 +103,15 @@ For workflows, install several tools in one cached step:
 ```
 
 The action shares git tags with the `ghr` CLI — pinning `@v0.8.0` pins
-both the action body and the `ghr-bin` binary. Pick the latest tag from
+both the action body and the verified static binary. The bootstrap uses the
+runner's maintained Node action runtime, so it also works inside bare Ubuntu
+and Debian job containers without Python or `pipx`. Pick the latest tag from
 [the releases page](https://github.com/cataggar/ghr/releases).
 
 See
 [`actions/install`](https://github.com/cataggar/ghr/blob/main/actions/install/README.md),
 [`actions/download`](https://github.com/cataggar/ghr/blob/main/actions/download/README.md),
+[`actions/setup`](https://github.com/cataggar/ghr/blob/main/actions/setup/README.md),
 and
 [Caching in GitHub Actions](https://github.com/cataggar/ghr/blob/main/doc/github-actions.md)
 for details.

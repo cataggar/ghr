@@ -1,21 +1,22 @@
 # Caching in GitHub Actions
 
-Running `pipx install ghr-bin && ghr install <tool>` from scratch on every
-workflow run pays the download + extraction cost each time. Caching the
-tool directory across runs reduces a warm install to a near-instant
-restore.
+The first-party actions bootstrap an exact static `ghr` release with the
+runner-provided Node action runtime, then cache downloaded or installed tools
+under user-writable `$RUNNER_TEMP` paths. They do not require Python, `pipx`,
+`curl`, `gh`, or package-manager setup.
 
-The pattern is the same one
-[pipx users settled on](https://github.com/pypa/pipx/discussions/1051) —
-override the on-disk locations to a user-writable path (so
-`actions/cache` can write back to it without `sudo`), then key the cache
-on the sorted list of tools + `ghr` version.
+GitHub-hosted runner images include many convenience tools, including `pipx`.
+A job-level `container:` supplies a different user space and does not inherit
+those hosted-image packages. Do not assume a tool listed on the hosted runner
+image is available in an arbitrary Ubuntu or Debian container.
 
 ## Recommended: composite actions
 
 This repository ships two composite actions that wrap the dance below
 end-to-end:
 
+- [`cataggar/ghr/actions/setup`](../actions/setup/README.md) —
+  install one exact, independently verified static CLI release.
 - [`cataggar/ghr/actions/install`](../actions/install/README.md) —
   install one or more tools with cross-run caching.
 - [`cataggar/ghr/actions/download`](../actions/download/README.md) —
@@ -48,13 +49,27 @@ action-level `minisign:` default:
 
 The actions ship in this same repository, so their git tags are the
 same as `ghr`'s — pinning `@v0.8.0` pins both the action body and the
-`ghr-bin` binary the action installs. Pick the latest tag from
+static binary the action verifies. Pick the latest tag from
 [the releases page](https://github.com/cataggar/ghr/releases).
 
-## Hand-rolled recipe (`ghr install`)
+For a reviewed commit pin, select the CLI release separately:
 
-If you'd rather wire it up yourself — for instance to share a cache step
-with other tools in the same job:
+```yaml
+- uses: cataggar/ghr/actions/install@<reviewed-commit-sha>
+  with:
+    ghr-version: v0.8.0
+    tools: sharkdp/fd@v10.2.0
+```
+
+An explicit exact version always wins. Commit, branch, floating-tag, range, and
+`latest` action refs cannot imply a CLI version and fail if `ghr-version` is
+omitted. The composite actions use GitHub's exact-commit `$/actions/setup`
+self-reference and require Actions runner 2.336.0 or newer.
+
+## Manual development recipe (`ghr install`)
+
+If Python and `pipx` are already available in a development environment, a
+manual recipe remains possible:
 
 ```yaml
 - run: pipx install ghr-bin
@@ -115,8 +130,13 @@ that cannot produce this fingerprint.
   round-trip — verification happens at install time, not on restore.
 - Windows shims are regular files (the runtime resolves them through
   PATH) and survive the cache round-trip cleanly.
-- `pipx install ghr-bin` is cheap (single static binary). Caching it
-  separately isn't worth the complexity.
+- The setup cache is independent from the installed-tool cache. Its exact key
+  includes the setup-cache schema, normalized target, release tag, and archive
+  digest. Every restore is rehashed, safely re-extracted, compared with the
+  authenticated archive, and version/target checked before execution.
+- The default bootstrap requires GitHub release provenance. Grant
+  `contents: read` and `attestations: read`, or supply an independently trusted
+  `ghr-sha256` that also matches GitHub's asset digest.
 
 ## Caching `ghr download`
 

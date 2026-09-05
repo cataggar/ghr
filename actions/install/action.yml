@@ -81,14 +81,31 @@ inputs:
     default: 'false'
   ghr-version:
     description: >-
-      Override the `ghr-bin` version installed via pipx. By default the
-      action installs the `ghr-bin` version matching its own git ref —
-      e.g. when pinned at `@v0.8.0` it installs `ghr-bin==0.8.0`. Pass
-      this input to override (e.g. `latest`, or a specific version).
-      When set to `latest`, the literal value `latest` is interpreted as
-      "no version pin" (pipx installs whatever PyPI considers latest).
+      Exact ghr release tag or version. By default an exact action tag such as
+      `@v0.8.0` selects the matching CLI release. Commit-, branch-, and
+      floating-tag pins must set this input explicitly; `latest` and version
+      ranges are rejected.
     required: false
     default: ''
+  ghr-sha256:
+    description: >-
+      Optional independently trusted SHA-256 for the selected ghr release
+      archive. It must also match GitHub's release-asset digest. When omitted,
+      GitHub release provenance is verified cryptographically with Sigstore.
+    required: false
+    default: ''
+  ghr-token:
+    description: >-
+      Token used only to resolve and verify the ghr release. The downstream
+      install command continues to use GH_TOKEN or GITHUB_TOKEN from env.
+    required: false
+    default: ${{ github.server_url == 'https://github.com' && github.token || '' }}
+  ghr-cache:
+    description: >-
+      Cache the exact verified ghr archive and installation. This is separate
+      from the installed-tools cache controlled by `cache`.
+    required: false
+    default: 'true'
 
 outputs:
   cache-hit:
@@ -100,31 +117,14 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Install ghr-bin via pipx
-      shell: bash
-      env:
-        INPUT_VERSION: ${{ inputs.ghr-version }}
-        ACTION_REF: ${{ github.action_ref }}
-      run: |
-        set -euo pipefail
-        # Resolution order:
-        #   1. explicit `ghr-version:` input (literal "latest" means "no pin")
-        #   2. derived from $GITHUB_ACTION_REF if it looks like a semver tag
-        #      (e.g. `v0.8.0` -> `0.8.0`)
-        #   3. fall back to latest on PyPI
-        resolved=""
-        if [[ -n "${INPUT_VERSION}" ]]; then
-          if [[ "${INPUT_VERSION}" != "latest" ]]; then
-            resolved="${INPUT_VERSION}"
-          fi
-        elif [[ "${ACTION_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
-          resolved="${ACTION_REF#v}"
-        fi
-        if [[ -n "${resolved}" ]]; then
-          pipx install "ghr-bin==${resolved}"
-        else
-          pipx install ghr-bin
-        fi
+    - name: Setup verified ghr
+      id: setup-ghr
+      uses: $/actions/setup
+      with:
+        ghr-version: ${{ inputs.ghr-version || github.action_ref }}
+        sha256: ${{ inputs.ghr-sha256 }}
+        token: ${{ inputs.ghr-token }}
+        cache: ${{ inputs.ghr-cache }}
 
     - name: Point ghr at a cacheable directory
       id: ghr-dirs
