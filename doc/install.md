@@ -1,10 +1,10 @@
 # Install
 
-It can be installed with pipx (great for CI), uv, pip, winget, Homebrew, or
+It can be installed with pipx, uv, pip, winget, Homebrew, or
 downloaded straight from a GitHub release.
 
 ```sh
-# pipx (recommended for one-shot use in GitHub Actions and other CI)
+# pipx
 pipx install ghr-bin
 
 # uv
@@ -25,11 +25,15 @@ It is installed through a custom tap (`cataggar/ghr/ghr`) because the short
 name `ghr` collides with another formula in the default Homebrew tap — see
 [issue #46](https://github.com/cataggar/ghr/issues/46) for context.
 
-`pipx install ghr-bin` works the same on Ubuntu, macOS and Windows runners in
-GitHub Actions, so it is a one-line way to put `ghr` on `PATH` in a workflow
-step. The other commands above are equally usable in CI; pipx is highlighted
-because it isolates the install without polluting the global Python
-environment.
+`pipx` is preinstalled on GitHub-hosted runner images, but a job-level
+`container:` replaces that user space and does not inherit hosted-image tools.
+Official Ubuntu, Debian slim, and Python containers do not promise `pipx`.
+Use the first-party [`actions/setup`](../actions/setup/README.md),
+[`actions/install`](../actions/install/README.md), or
+[`actions/download`](../actions/download/README.md) action for a verified
+static bootstrap that does not require Python or a package manager. A manual
+`pipx install` remains useful in development environments where Python tooling
+is already present.
 
 ## Examples
 

@@ -1,0 +1,50 @@
+name: Setup ghr
+description: Install one exact, cryptographically verified static ghr release
+author: cataggar/ghr contributors
+
+branding:
+  icon: download-cloud
+  color: gray-dark
+
+inputs:
+  ghr-version:
+    description: >-
+      Exact ghr release tag or version (for example, v0.8.0). When omitted,
+      the action derives it only from an exact vMAJOR.MINOR.PATCH action ref.
+    required: false
+    default: ''
+  sha256:
+    description: >-
+      Optional independently trusted SHA-256 for the selected archive. It must
+      also match the GitHub release-asset digest. When omitted, GitHub release
+      provenance is verified cryptographically with Sigstore.
+    required: false
+    default: ''
+  token:
+    description: >-
+      Token used only for GitHub release and attestation API requests. Public
+      anonymous access is supported with lower rate limits.
+    required: false
+    default: ${{ github.server_url == 'https://github.com' && github.token || '' }}
+  cache:
+    description: >-
+      Cache the exact verified CLI archive and installation. Exact cache hits
+      are rehashed before use.
+    required: false
+    default: 'true'
+
+outputs:
+  ghr-path:
+    description: Absolute path to the verified ghr executable
+  ghr-version:
+    description: Canonical exact release tag, including the leading v
+  target:
+    description: Normalized release target
+  cache-hit:
+    description: "'true' only when an exact CLI cache entry was restored and reverified"
+
+runs:
+  using: node24
+  main: dist/main/index.js
+  post: dist/post/index.js
+  post-if: success()
