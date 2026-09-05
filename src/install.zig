@@ -2378,6 +2378,7 @@ pub fn cmdInstallRequests(
         .write_buffer_size = http_write_buffer_size,
     };
     defer client.deinit();
+    try http.configureClientCaBundle(&client);
 
     const ctx = InstallContext{
         .allocator = allocator,

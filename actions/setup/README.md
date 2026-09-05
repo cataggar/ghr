@@ -55,6 +55,14 @@ for this derivation. An explicit `ghr-version` always wins.
 
 Only the installation's `bin/` directory is added to `PATH`.
 
+Bare Linux images often omit the `ca-certificates` package as well as Python.
+When none of Zig's standard Linux CA bundle paths contains a bundle, the action
+serializes the maintained Node 24 TLS roots beneath `$RUNNER_TEMP` and exports
+that file as `SSL_CERT_FILE` for the static CLI. Existing system trust is never
+replaced. Releases before `v0.8.0`, which cannot read that variable directly,
+also need a compatibility link at `/etc/ssl/certs/ca-certificates.crt`; creating
+it requires the usual root user in a bare job container.
+
 ## Verification and trust
 
 The action resolves the release by exact tag and selects exactly one archive

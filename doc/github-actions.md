@@ -5,6 +5,13 @@ runner-provided Node action runtime, then cache downloaded or installed tools
 under user-writable `$RUNNER_TEMP` paths. They do not require Python, `pipx`,
 `curl`, `gh`, or package-manager setup.
 
+Official minimal Linux images can also omit `ca-certificates`. If no standard
+Linux CA bundle exists, `actions/setup` materializes the runner's maintained
+Node 24 TLS roots under `$RUNNER_TEMP` and exports `SSL_CERT_FILE` for `ghr`.
+Existing system trust is left untouched. Releases before `v0.8.0` also need a
+compatibility link at Zig's standard CA location, so bootstrapping those older
+versions in a bare non-root container requires a preinstalled CA bundle.
+
 GitHub-hosted runner images include many convenience tools, including `pipx`.
 A job-level `container:` supplies a different user space and does not inherit
 those hosted-image packages. Do not assume a tool listed on the hosted runner

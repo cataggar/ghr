@@ -1653,6 +1653,7 @@ pub fn verifyDownloadedAssetAttestation(
 
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
+    try http.configureClientCaBundle(&client);
 
     const result = attestation.lookup(
         &client,
