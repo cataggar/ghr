@@ -7,6 +7,7 @@ import {
   publishArchive,
   verifyCachedInstallation,
 } from './archive.js';
+import { configureCaTrust } from './ca.js';
 import {
   STATE_ARCHIVE_DIGEST,
   STATE_ARCHIVE_FORMAT,
@@ -53,12 +54,14 @@ export interface RuntimeEnvironment {
   runnerTemp: string;
   githubServerURL: string;
   githubAPIURL: string;
+  sslCertFile: string;
   processPlatform: NodeJS.Platform;
   processArch: NodeJS.Architecture;
 }
 
 export interface ActionIO {
   addPath(path: string): void;
+  exportVariable(name: string, value: string): void;
   info(message: string): void;
   warning(message: string): void;
   setOutput(name: string, value: string): void;
@@ -86,6 +89,13 @@ export interface SetupServices {
   ): Promise<void>;
   cache: CacheAdapter;
   verifyExecutable: InstallationRunner;
+  configureCaTrust(
+    runnerTemp: string,
+    processPlatform: NodeJS.Platform,
+    version: string,
+    configuredBundlePath: string,
+    io: ActionIO,
+  ): Promise<void>;
 }
 
 export interface SetupResult {
@@ -97,6 +107,7 @@ export interface SetupResult {
 
 export const defaultActionIO: ActionIO = {
   addPath: (value) => core.addPath(value),
+  exportVariable: (name, value) => core.exportVariable(name, value),
   info: (message) => core.info(message),
   warning: (message) => core.warning(message),
   setOutput: (name, value) => core.setOutput(name, value),
@@ -109,6 +120,7 @@ export const defaultServices: SetupServices = {
   verifyProvenance: verifyReleaseProvenance,
   cache: defaultCacheAdapter,
   verifyExecutable,
+  configureCaTrust,
 };
 
 function validateRuntime(environment: RuntimeEnvironment): string {
@@ -323,6 +335,14 @@ export async function setup(
     }
   }
 
+  await services.configureCaTrust(
+    runnerTemp,
+    environment.processPlatform,
+    version.version,
+    environment.sslCertFile,
+    io,
+  );
+
   if (
     cacheEnabled &&
     !cacheHit &&
@@ -366,6 +386,7 @@ export function readRuntimeEnvironment(): RuntimeEnvironment {
     runnerTemp: process.env.RUNNER_TEMP ?? '',
     githubServerURL: process.env.GITHUB_SERVER_URL ?? '',
     githubAPIURL: process.env.GITHUB_API_URL ?? '',
+    sslCertFile: process.env.SSL_CERT_FILE ?? '',
     processPlatform: process.platform,
     processArch: process.arch,
   };

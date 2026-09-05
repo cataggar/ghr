@@ -236,6 +236,7 @@ pub fn cmdDownloadMany(
         .write_buffer_size = http.http_write_buffer_size,
     };
     defer client.deinit();
+    try http.configureClientCaBundle(&client);
 
     const ctx = DownloadContext{
         .allocator = allocator,

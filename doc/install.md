@@ -35,6 +35,11 @@ static bootstrap that does not require Python or a package manager. A manual
 `pipx install` remains useful in development environments where Python tooling
 is already present.
 
+For HTTPS on a minimal system without a conventional CA bundle, set
+`SSL_CERT_FILE` to the absolute path of a nonempty PEM root bundle. The
+first-party setup action supplies this automatically from the maintained Node
+24 runtime when a bare Linux image has no system trust store.
+
 ## Examples
 
 ```sh

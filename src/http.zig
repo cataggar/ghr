@@ -5,6 +5,34 @@ const Io = std.Io;
 const Dir = Io.Dir;
 const File = Io.File;
 const Writer = Io.Writer;
+const EnvironMap = std.process.Environ.Map;
+
+var process_ca_bundle_path: ?[]const u8 = null;
+
+/// Capture the conventional OpenSSL CA override once at process startup.
+/// Zig 0.16 only scans fixed system paths, so clients must load this file
+/// explicitly for package-less Linux containers.
+pub fn configureProcessCaBundle(environ: *const EnvironMap) void {
+    process_ca_bundle_path = environ.get("SSL_CERT_FILE");
+}
+
+pub fn configureClientCaBundle(client: *std.http.Client) !void {
+    const bundle_path = process_ca_bundle_path orelse return;
+    if (bundle_path.len == 0 or !Dir.path.isAbsolute(bundle_path)) {
+        return error.InvalidCaBundlePath;
+    }
+    const now = Io.Clock.real.now(client.io);
+    try client.ca_bundle.addCertsFromFilePathAbsolute(
+        client.allocator,
+        client.io,
+        now,
+        bundle_path,
+    );
+    if (client.ca_bundle.map.count() == 0) {
+        return error.CertificateBundleEmpty;
+    }
+    client.now = now;
+}
 
 /// HTTP write buffer size for download clients. GitHub release downloads redirect
 /// to CDN URLs with long signed query strings (~900 bytes). The default
@@ -74,6 +102,7 @@ pub fn downloadToFile(
             .write_buffer_size = http_write_buffer_size,
         };
         defer client.deinit();
+        try configureClientCaBundle(&client);
 
         // Initial-request headers: Authorization (github hosts only) and an
         // optional Accept override. Both are dropped before following any
@@ -156,6 +185,7 @@ pub fn downloadToFile(
             .write_buffer_size = http_write_buffer_size,
         };
         defer cdn_client.deinit();
+        try configureClientCaBundle(&cdn_client);
 
         const cdn_uri = std.Uri.parse(redirect_url) catch {
             debugLog(opts.debug_w, "  invalid redirect URL\n", .{});

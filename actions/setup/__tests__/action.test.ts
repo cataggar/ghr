@@ -34,6 +34,7 @@ function runtime(runnerTemp: string) {
     runnerTemp,
     githubServerURL: 'https://github.com',
     githubAPIURL: 'https://api.github.com',
+    sslCertFile: '',
     processPlatform: 'linux' as const,
     processArch: 'x64' as const,
   };
@@ -42,18 +43,24 @@ function runtime(runnerTemp: string) {
 function captureIO(): {
   io: ActionIO;
   outputs: Record<string, string>;
+  variables: Record<string, string>;
   paths: string[];
   states: Record<string, string>;
 } {
   const outputs: Record<string, string> = {};
+  const variables: Record<string, string> = {};
   const paths: string[] = [];
   const states: Record<string, string> = {};
   return {
     outputs,
+    variables,
     paths,
     states,
     io: {
       addPath: (value) => paths.push(value),
+      exportVariable: (name, value) => {
+        variables[name] = value;
+      },
       info: () => {},
       warning: () => {},
       setOutput: (name, value) => {
@@ -93,6 +100,7 @@ function services(
     verifyProvenance: async () => {},
     cache: noCache(),
     verifyExecutable: async () => {},
+    configureCaTrust: async () => {},
     ...overrides,
   };
 }
@@ -183,6 +191,36 @@ test('trusted SHA and executable mismatches emit no success outputs', async () =
     assert.deepEqual(captured.outputs, {});
     assert.deepEqual(captured.paths, []);
   }
+});
+
+test('missing Linux CA trust emits no success state or outputs', async () => {
+  const captured = captureIO();
+  await assert.rejects(
+    setup(
+      {
+        ghrVersion: 'v1.2.3',
+        sha256: digest,
+        token: '',
+        cache: 'true',
+      },
+      runtime(path.join(testRoot, 'ca-trust-failure')),
+      captured.io,
+      services(releaseClient(), {
+        cache: {
+          isFeatureAvailable: () => true,
+          restoreCache: async () => undefined,
+          saveCache: async () => 1,
+        },
+        configureCaTrust: async () => {
+          throw new Error('CA trust unavailable');
+        },
+      }),
+    ),
+    /CA trust unavailable/,
+  );
+  assert.deepEqual(captured.outputs, {});
+  assert.deepEqual(captured.paths, []);
+  assert.deepEqual(captured.states, {});
 });
 
 test('tampered exact cache fails without downloading around corruption', async () => {

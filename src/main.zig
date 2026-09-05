@@ -11,6 +11,7 @@ const release_mod = @import("release.zig");
 const link = @import("link.zig");
 const install_state = @import("install_state.zig");
 const minisign = @import("minisign.zig");
+const http = @import("http.zig");
 
 pub const version = build_options.version;
 
@@ -25,6 +26,7 @@ pub fn main(init: std.process.Init) !void {
     // https://codeberg.org/ziglang/zig/issues/35371 (milestone 0.17.0).
     const io = dns.wrap(init.io);
     const environ = init.environ_map;
+    http.configureProcessCaBundle(environ);
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout = Io.File.stdout().writer(io, &stdout_buf);
@@ -1281,6 +1283,9 @@ fn printUsage(w: *Writer) !void {
         \\`owner/repo/file[@tag]` (specific asset), a GitHub release URL, or a
         \\direct URL with an explicit `"?id=<id>"`.
         \\Run 'ghr <COMMAND> --help' to show help for a specific command.
+        \\
+        \\ENVIRONMENT:
+        \\    SSL_CERT_FILE           Absolute path to a PEM CA bundle for HTTPS
         \\
         \\OPTIONS:
         \\    -h, --help              Show this help
