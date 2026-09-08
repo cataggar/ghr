@@ -417,10 +417,14 @@ pub fn resolveInstalledToolPath(
 fn looksLikePosixExecutable(io: Io, dir: Dir, name: []const u8) bool {
     var f = dir.openFile(io, name, .{}) catch return false;
     defer f.close(io);
+    return fileLooksLikePosixExecutable(io, f) catch false;
+}
+
+fn fileLooksLikePosixExecutable(io: Io, f: File) !bool {
     var head: [4]u8 = undefined;
     var buf: [4]u8 = undefined;
     var reader = f.reader(io, &buf);
-    const n = reader.interface.readSliceShort(&head) catch return false;
+    const n = try reader.interface.readSliceShort(&head);
     if (n >= 2 and head[0] == '#' and head[1] == '!') return true;
     if (n < 4) return false;
     if (std.mem.eql(u8, &head, "\x7fELF")) return true;
@@ -434,21 +438,6 @@ fn looksLikePosixExecutable(io: Io, dir: Dir, name: []const u8) bool {
     };
     for (macho_magics) |m| if (std.mem.eql(u8, &head, &m)) return true;
     return false;
-}
-
-/// Add the executable bit (0o111) to a file's existing permissions. No-op on
-/// platforms without a Unix-style mode (Windows, WASI). Errors are swallowed:
-/// the worst case is that `findExecutables` ignores the file, matching the
-/// pre-existing behavior.
-fn addExecutableBit(io: Io, dir: Dir, name: []const u8) void {
-    if (comptime !File.Permissions.has_executable_bit) return;
-    var f = dir.openFile(io, name, .{}) catch return;
-    defer f.close(io);
-    const st = f.stat(io) catch return;
-    const mode = @as(u32, @intFromEnum(st.permissions));
-    if (mode & 0o111 != 0) return;
-    const new_perms: File.Permissions = @enumFromInt(mode | 0o111);
-    f.setPermissions(io, new_perms) catch {};
 }
 
 /// Returns true if `name` is macOS archive cruft: an AppleDouble companion
@@ -476,6 +465,105 @@ fn isLibraryDir(name: []const u8) bool {
     if (std.mem.eql(u8, name, "Frameworks")) return true;
     if (std.mem.eql(u8, name, "PlugIns")) return true;
     return false;
+}
+
+/// Resolve components from the extraction root without letting the OS follow
+/// links. In particular, `..` must be evaluated AFTER expanding a link, and
+/// must never pop beyond the root. Directory links are resolved only as part
+/// of an explicit candidate's target, never queued for recursive discovery.
+fn isExecutableTarget(allocator: std.mem.Allocator, io: Io, root: Dir, relative_path: []const u8, windows: bool) !bool {
+    var parents: std.ArrayListUnmanaged(Dir) = .empty;
+    defer {
+        for (parents.items) |parent| parent.close(io);
+        parents.deinit(allocator);
+    }
+    var pending = try allocator.dupe(u8, relative_path);
+    defer allocator.free(pending);
+    var remaining: []const u8 = pending;
+    var links: usize = 0;
+    var components: usize = 0;
+    const separators = if (builtin.os.tag == .windows) "/\\" else "/";
+
+    while (remaining.len > 0) {
+        components += 1;
+        if (components > Dir.max_path_bytes) return false;
+        const end = std.mem.indexOfAny(u8, remaining, separators) orelse remaining.len;
+        const name = remaining[0..end];
+        const needs_directory = end < remaining.len;
+        remaining = if (needs_directory) remaining[end + 1 ..] else "";
+        if (name.len == 0 or std.mem.eql(u8, name, ".")) continue;
+        if (std.mem.eql(u8, name, "..")) {
+            const parent = parents.pop() orelse return false;
+            parent.close(io);
+            continue;
+        }
+
+        const parent = if (parents.items.len > 0) parents.items[parents.items.len - 1] else root;
+        const stat = try parent.statFile(io, name, .{ .follow_symlinks = false });
+        switch (stat.kind) {
+            .sym_link => {
+                links += 1;
+                if (links > 40) return false;
+                var target_buf: [Dir.max_path_bytes]u8 = undefined;
+                const len = try parent.readLink(io, name, &target_buf);
+                const target = target_buf[0..len];
+                if (target.len == 0 or std.fs.path.isAbsolute(target) or
+                    (builtin.os.tag == .windows and target.len >= 2 and target[1] == ':'))
+                    return false;
+                if (target.len + remaining.len + 1 > Dir.max_path_bytes) return false;
+                const expanded = if (needs_directory)
+                    try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ target, std.fs.path.sep, remaining })
+                else
+                    try allocator.dupe(u8, target);
+                allocator.free(pending);
+                pending = expanded;
+                remaining = pending;
+            },
+            .directory => {
+                if (!needs_directory) return false;
+                const child = try parent.openDir(io, name, .{ .follow_symlinks = false });
+                parents.append(allocator, child) catch |err| {
+                    child.close(io);
+                    return err;
+                };
+            },
+            .file => {
+                if (needs_directory or isSharedLibrary(name) or isAppleArchiveCruft(name)) return false;
+                if (windows) return true;
+                if (@as(u32, @intFromEnum(stat.permissions)) & 0o111 != 0) return true;
+                const file = parent.openFile(io, name, .{ .follow_symlinks = false, .allow_directory = false }) catch |err| switch (err) {
+                    error.AccessDenied, error.PermissionDenied => return false,
+                    else => return err,
+                };
+                defer file.close(io);
+                const opened_stat = try file.stat(io);
+                if (opened_stat.kind != .file or !try fileLooksLikePosixExecutable(io, file)) return false;
+                // ZIP mode recovery acts on the opened, contained target, not
+                // on the alias path, which is kept for command publication.
+                if (comptime File.Permissions.has_executable_bit)
+                    try file.setPermissions(io, @enumFromInt(@as(u32, @intFromEnum(opened_stat.permissions)) | 0o111));
+                return true;
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
+
+fn isExecutableCandidate(
+    allocator: std.mem.Allocator,
+    io: Io,
+    root: Dir,
+    relative_path: []const u8,
+    windows: bool,
+) !bool {
+    const name = std.fs.path.basename(relative_path);
+    if (isSharedLibrary(name) or isAppleArchiveCruft(name)) return false;
+    if (windows and !hasWindowsExeSuffix(name)) return false;
+    return isExecutableTarget(allocator, io, root, relative_path, windows) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.SymLinkLoop, error.NameTooLong => return false,
+        else => return err,
+    };
 }
 
 /// Returns the length of `tok` if `haystack` starts with it (case-insensitive)
@@ -640,13 +728,14 @@ fn findExecutablesForPlatform(
         for (current.items) |prefix| {
             var opened: ?Dir = null;
             if (prefix.len > 0) {
-                opened = dir.openDir(io, prefix, .{ .iterate = true }) catch continue;
+                opened = dir.openDir(io, prefix, .{ .iterate = true, .follow_symlinks = false }) catch continue;
             }
             defer if (opened) |*d| d.close(io);
 
             try scanExecutableLevel(
                 allocator,
                 io,
+                dir,
                 opened orelse dir,
                 &result,
                 &next,
@@ -840,6 +929,7 @@ fn hasDebShims(io: Io, dir: Dir) bool {
 fn scanExecutableLevel(
     allocator: std.mem.Allocator,
     io: Io,
+    root: Dir,
     dir: Dir,
     result: *std.ArrayListUnmanaged([]const u8),
     next: *std.ArrayListUnmanaged([]const u8),
@@ -861,7 +951,7 @@ fn scanExecutableLevel(
             if (isMacAppBundle(io, dir, entry.name)) {
                 // Treat the bundle as a candidate at this level while only
                 // inspecting its Contents/MacOS directory for launchers.
-                scanAppBundle(allocator, io, dir, entry.name, result, rel_name, windows) catch |err| {
+                scanAppBundle(allocator, io, root, dir, entry.name, result, rel_name, windows) catch |err| {
                     allocator.free(rel_name);
                     return err;
                 };
@@ -875,27 +965,10 @@ fn scanExecutableLevel(
                     return err;
                 };
             }
-        } else if (entry.kind == .file) {
-            if (isSharedLibrary(entry.name)) {
+        } else if (entry.kind == .file or entry.kind == .sym_link) {
+            const is_exe = isExecutableCandidate(allocator, io, root, rel_name, windows) catch |err| {
                 allocator.free(rel_name);
-                continue;
-            }
-            const is_exe = if (windows)
-                hasWindowsExeSuffix(entry.name)
-            else blk: {
-                const stat = dir.statFile(io, entry.name, .{}) catch {
-                    allocator.free(rel_name);
-                    continue;
-                };
-                if ((@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0)
-                    break :blk true;
-                // Fallback: zip archives drop Unix mode bits. If the file's
-                // magic bytes identify it as a native executable, chmod +x
-                // and treat it as installable.
-                if (!looksLikePosixExecutable(io, dir, entry.name))
-                    break :blk false;
-                addExecutableBit(io, dir, entry.name);
-                break :blk true;
+                return err;
             };
             if (is_exe) {
                 result.append(allocator, rel_name) catch |err| {
@@ -915,9 +988,12 @@ fn scanExecutableLevel(
 fn isMacAppBundle(io: Io, parent: Dir, name: []const u8) bool {
     if (!std.mem.endsWith(u8, name, ".app")) return false;
     // Verify it has the expected bundle structure
-    var app_dir = parent.openDir(io, name, .{}) catch return false;
+    var app_dir = parent.openDir(io, name, .{ .follow_symlinks = false }) catch return false;
     defer app_dir.close(io);
-    app_dir.access(io, "Contents/MacOS", .{}) catch return false;
+    var contents_dir = app_dir.openDir(io, "Contents", .{ .follow_symlinks = false }) catch return false;
+    defer contents_dir.close(io);
+    var macos_dir = contents_dir.openDir(io, "MacOS", .{ .follow_symlinks = false }) catch return false;
+    defer macos_dir.close(io);
     return true;
 }
 
@@ -925,15 +1001,24 @@ fn isMacAppBundle(io: Io, parent: Dir, name: []const u8) bool {
 fn scanAppBundle(
     allocator: std.mem.Allocator,
     io: Io,
+    root: Dir,
     parent: Dir,
     app_name: []const u8,
     result: *std.ArrayListUnmanaged([]const u8),
     app_prefix: []const u8,
     windows: bool,
 ) !void {
-    const macos_rel = try std.fmt.allocPrint(allocator, "{s}/Contents/MacOS", .{app_name});
-    defer allocator.free(macos_rel);
-    var macos_dir = parent.openDir(io, macos_rel, .{ .iterate = true }) catch return;
+    var app_dir = try parent.openDir(io, app_name, .{ .follow_symlinks = false });
+    defer app_dir.close(io);
+    var contents_dir = app_dir.openDir(io, "Contents", .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.SymLinkLoop => return,
+        else => return err,
+    };
+    defer contents_dir.close(io);
+    var macos_dir = contents_dir.openDir(io, "MacOS", .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.SymLinkLoop => return,
+        else => return err,
+    };
     defer macos_dir.close(io);
 
     const prefix = try std.fmt.allocPrint(allocator, "{s}/Contents/MacOS", .{app_prefix});
@@ -941,22 +1026,19 @@ fn scanAppBundle(
 
     var iter = macos_dir.iterate();
     while (try iter.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (isSharedLibrary(entry.name)) continue;
-        const is_exe = if (windows)
-            hasWindowsExeSuffix(entry.name)
-        else blk: {
-            const stat = macos_dir.statFile(io, entry.name, .{}) catch continue;
-            if ((@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0)
-                break :blk true;
-            if (!looksLikePosixExecutable(io, macos_dir, entry.name))
-                break :blk false;
-            addExecutableBit(io, macos_dir, entry.name);
-            break :blk true;
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        const rel_name = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name });
+        const is_exe = isExecutableCandidate(allocator, io, root, rel_name, windows) catch |err| {
+            allocator.free(rel_name);
+            return err;
         };
         if (is_exe) {
-            const rel_name = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name });
-            try result.append(allocator, rel_name);
+            result.append(allocator, rel_name) catch |err| {
+                allocator.free(rel_name);
+                return err;
+            };
+        } else {
+            allocator.free(rel_name);
         }
     }
 }
@@ -5055,6 +5137,157 @@ fn tCommit(ctx: *const InstallContext, units: []const *StagedUnit) !void {
     return planAndCommit(ctx, units);
 }
 
+fn tStageSymlinkUnit(ctx: *const InstallContext, id: []const u8, aliases: []const command_plan.Alias) !*StagedUnit {
+    const unit = try tStageUnit(ctx, id, &.{"bin/tool"}, aliases);
+    errdefer unit.destroy();
+    var stage = try Dir.openDirAbsolute(ctx.io, unit.paths.stage, .{ .iterate = true });
+    defer stage.close(ctx.io);
+    {
+        var tool = try stage.createFile(ctx.io, "bin/tool", .{ .permissions = .executable_file });
+        defer tool.close(ctx.io);
+        try tool.writeStreamingAll(ctx.io, "#!/bin/sh\nprintf '%s\\n' \"${0##*/}\"\n");
+    }
+    try stage.symLink(ctx.io, "tool", "bin/alias", .{});
+    try stage.symLink(ctx.io, "alias", "bin/chain", .{});
+    try discoverStagedCommands(ctx, unit, stage, false, "tool.tar.gz", &.{});
+    const selected = try unit.alloc().alloc([]const u8, ctx.bin_filters.len);
+    for (ctx.bin_filters, 0..) |filter, i| selected[i] = try unit.alloc().dupe(u8, filter);
+    unit.config.selected_commands = selected;
+    return unit;
+}
+
+fn tExpectCommandOutput(store: *TestStore, name: []const u8) !void {
+    const path = try store.binPath(t_alloc, name);
+    defer t_alloc.free(path);
+    const result = try std.process.run(t_alloc, std.testing.io, .{
+        .argv = &.{path},
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(256),
+    });
+    defer t_alloc.free(result.stdout);
+    defer t_alloc.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqualStrings(name, std.mem.trimEnd(u8, result.stdout, "\n"));
+}
+
+test "executable symlink aliases preserve names, metadata, and package links after publication" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+    const unit = try tStageSymlinkUnit(&ctx, "example/tool", &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    const record = tFindRecord(inv, "example/tool").?;
+    try std.testing.expectEqual(@as(usize, 3), record.commands.len);
+    var installed = try Dir.openDirAbsolute(ctx.io, unit.paths.unit, .{});
+    defer installed.close(ctx.io);
+    for (record.commands) |cmd| {
+        const expected = try std.fmt.allocPrint(t_alloc, "bin/{s}", .{cmd.name});
+        defer t_alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, cmd.relative_target);
+        try tExpectCommandOutput(&store, cmd.name);
+    }
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const alias_len = try installed.readLink(ctx.io, "bin/alias", &buf);
+    try std.testing.expectEqualStrings("tool", buf[0..alias_len]);
+    const chain_len = try installed.readLink(ctx.io, "bin/chain", &buf);
+    try std.testing.expectEqualStrings("alias", buf[0..chain_len]);
+}
+
+test "executable symlink aliases participate in filtering, renaming, replacement, and uninstall" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    var ctx = store.ctx();
+    const first = try tStageSymlinkUnit(&ctx, "example/tool", &.{});
+    defer first.destroy();
+    try tCommit(&ctx, &.{first});
+
+    ctx.bin_filters = &.{"alias"};
+    const second = try tStageSymlinkUnit(&ctx, "example/tool", &.{.{ .source = "alias", .published = "renamed" }});
+    defer second.destroy();
+    try tCommit(&ctx, &.{second});
+    try std.testing.expect(!store.binEntryExists("tool"));
+    try std.testing.expect(!store.binEntryExists("alias"));
+    try std.testing.expect(!store.binEntryExists("chain"));
+    try tExpectCommandOutput(&store, "renamed");
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    const record = tFindRecord(inv, "example/tool").?;
+    try std.testing.expectEqual(@as(usize, 1), record.commands.len);
+    try std.testing.expectEqualStrings("renamed", record.commands[0].name);
+    try std.testing.expectEqualStrings("bin/alias", record.commands[0].relative_target);
+    try std.testing.expectEqualStrings("alias", record.config.?.selected_commands.?[0]);
+    try uninstallUnit(&ctx, "example/tool");
+    try std.testing.expect(!store.binEntryExists("renamed"));
+    try std.testing.expect(!(try directoryExists(ctx.io, second.paths.unit)));
+}
+
+test "executable symlink aliases reject cross-id ownership collisions" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    var ctx = store.ctx();
+    const first = try tStageSymlinkUnit(&ctx, "example/tool", &.{});
+    defer first.destroy();
+    try tCommit(&ctx, &.{first});
+
+    ctx.bin_filters = &.{"alias"};
+    const second = try tStageSymlinkUnit(&ctx, "other", &.{});
+    defer second.destroy();
+    try std.testing.expectError(error.InstallPlanRejected, tCommit(&ctx, &.{second}));
+    try tExpectCommandOutput(&store, "alias");
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+}
+
+test "executable symlink aliases survive rollback and interrupted publication recovery" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+    const first = try tStageSymlinkUnit(&ctx, "example/tool", &.{});
+    defer first.destroy();
+    try tCommit(&ctx, &.{first});
+
+    const second = try tStageUnit(&ctx, "example/tool", &.{"bin/new"}, &.{});
+    defer second.destroy();
+    commit_faults = .{ .fail_publish_after = 0 };
+    defer commit_faults = .{};
+    try std.testing.expectError(error.InstallFailed, tCommit(&ctx, &.{second}));
+    commit_faults = .{};
+    try tExpectCommandOutput(&store, "alias");
+    try tExpectCommandOutput(&store, "chain");
+    try std.testing.expect(!store.binEntryExists("new"));
+
+    const path = try store.binPath(t_alloc, "alias");
+    defer t_alloc.free(path);
+    try Dir.deleteFileAbsolute(ctx.io, path);
+    const p = first.paths;
+    try install_txn.ensureDirAbsolute(ctx.io, p.root);
+    try install_txn.writeJournal(ctx.io, p, t_alloc, .{
+        .op = .install,
+        .id = p.id,
+        .unit_path = p.unit,
+        .stage_path = p.stage,
+        .backup_path = p.backup,
+        .publish = &.{ "tool", "alias", "chain" },
+        .phase = .publishing,
+    });
+    try recoverPendingTransactions(&ctx);
+    try tExpectCommandOutput(&store, "alias");
+    try uninstallUnit(&ctx, "example/tool");
+    for ([_][]const u8{ "tool", "alias", "chain" }) |name|
+        try std.testing.expect(!store.binEntryExists(name));
+}
+
 fn tWriteLegacyUnit(
     ctx: *const InstallContext,
     rel_dir: []const u8,
@@ -7088,6 +7321,198 @@ test "findExecutables discovers nested executables" {
 
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("bin/tool", exes.items[0]);
+}
+
+fn tScanSymlinkFixture(allocator: std.mem.Allocator, dir: Dir) !void {
+    var exes = try findExecutables(allocator, std.testing.io, dir);
+    defer deinitPathList(allocator, &exes);
+    try std.testing.expectEqual(@as(usize, 3), exes.items.len);
+    for ([_][]const u8{ "bin/tool", "bin/alias", "bin/chain" }) |expected| {
+        var found = false;
+        for (exes.items) |path| {
+            if (std.mem.eql(u8, expected, path)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "executable symlink discovery keeps sibling aliases and chains under allocation failure" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "bin");
+    (try tmp.dir.createFile(std.testing.io, "bin/tool", .{ .permissions = .executable_file })).close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "tool", "bin/alias", .{});
+    try tmp.dir.symLink(std.testing.io, "./alias", "bin/chain", .{});
+    try tScanSymlinkFixture(t_alloc, tmp.dir);
+    try std.testing.checkAllAllocationFailures(t_alloc, tScanSymlinkFixture, .{tmp.dir});
+}
+
+test "executable symlink aliases survive tar extraction before discovery" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.createDirPath(io, "payload/bin");
+    try tmp.dir.createDirPath(io, "extracted");
+    (try tmp.dir.createFile(io, "payload/bin/tool", .{ .permissions = .executable_file })).close(io);
+    try tmp.dir.symLink(io, "tool", "payload/bin/alias", .{});
+    try tmp.dir.symLink(io, "alias", "payload/bin/chain", .{});
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "tar", "czf", "archive.tar.gz", "-C", "payload", "bin" },
+        .cwd = .{ .dir = tmp.dir },
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, try child.wait(io));
+    var file = try tmp.dir.openFile(io, "archive.tar.gz", .{});
+    defer file.close(io);
+    var extracted = try tmp.dir.openDir(io, "extracted", .{ .iterate = true });
+    defer extracted.close(io);
+    try archive.extractTarGz(io, extracted, &file, 0);
+    try tScanSymlinkFixture(t_alloc, extracted);
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const len = try extracted.readLink(io, "bin/alias", &buf);
+    try std.testing.expectEqualStrings("tool", buf[0..len]);
+}
+
+test "executable symlink discovery resolves parent paths after directory links and recovers target mode" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "payload/deep");
+    var target = try tmp.dir.createFile(std.testing.io, "payload/tool", .{});
+    try target.writeStreamingAll(std.testing.io, "#!/bin/sh\nexit 0\n");
+    target.close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "payload/deep", "directory", .{});
+    try tmp.dir.symLink(std.testing.io, "directory/../tool", "alias", .{});
+    var exes = try findExecutables(t_alloc, std.testing.io, tmp.dir);
+    defer deinitPathList(t_alloc, &exes);
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("alias", exes.items[0]);
+    const stat = try tmp.dir.statFile(std.testing.io, "payload/tool", .{});
+    try std.testing.expect(@as(u32, @intFromEnum(stat.permissions)) & 0o111 != 0);
+}
+
+test "executable symlink discovery rejects escapes, broken links, cycles, and non-executable targets" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "package/bin");
+    try tmp.dir.createDirPath(std.testing.io, "package/data");
+    try tmp.dir.createDirPath(std.testing.io, "outside");
+    (try tmp.dir.createFile(std.testing.io, "package/bin/tool", .{ .permissions = .executable_file })).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "package/data/libfake.so", .{ .permissions = .executable_file })).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "package/data/._metadata", .{ .permissions = .executable_file })).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "package/data/readme", .{})).close(std.testing.io);
+    var external = try tmp.dir.createFile(std.testing.io, "outside/tool", .{});
+    try external.writeStreamingAll(std.testing.io, "\x7fELFoutside");
+    external.close(std.testing.io);
+    var package = try tmp.dir.openDir(std.testing.io, "package", .{ .iterate = true });
+    defer package.close(std.testing.io);
+    const links = .{
+        .{ "escape", "../../outside/tool" },
+        .{ "external-dir", "../../outside" },
+        .{ "through-dir", "external-dir/tool" },
+        .{ "root", ".." },
+        .{ "escape-after-expansion", "root/../outside/tool" },
+        .{ "broken", "missing" },
+        .{ "self", "self" },
+        .{ "cycle-a", "cycle-b" },
+        .{ "cycle-b", "cycle-a" },
+        .{ "directory", "../data" },
+        .{ "non-executable", "../data/readme" },
+        .{ "library", "../data/libfake.so" },
+        .{ "metadata", "../data/._metadata" },
+        .{ "trailing-slash", "tool/" },
+        .{ "not-a-directory", "tool/../tool" },
+    };
+    inline for (links) |link| {
+        try package.symLink(std.testing.io, link[1], "bin/" ++ link[0], .{});
+    }
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const len = try tmp.dir.realPathFile(std.testing.io, "outside/tool", &buf);
+    try package.symLink(std.testing.io, buf[0..len], "bin/absolute-outside", .{});
+    const inside_len = try package.realPathFile(std.testing.io, "bin/tool", &buf);
+    try package.symLink(std.testing.io, buf[0..inside_len], "bin/absolute-inside", .{});
+
+    var exes = try findExecutables(t_alloc, std.testing.io, package);
+    defer deinitPathList(t_alloc, &exes);
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("bin/tool", exes.items[0]);
+    const stat = try tmp.dir.statFile(std.testing.io, "outside/tool", .{});
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @intFromEnum(stat.permissions)) & 0o111);
+}
+
+test "executable symlink discovery never recursively scans directory links" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "nested/bin");
+    (try tmp.dir.createFile(std.testing.io, "nested/bin/tool", .{ .permissions = .executable_file })).close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "nested/bin", "shortcut", .{});
+    var exes = try findExecutables(t_alloc, std.testing.io, tmp.dir);
+    defer deinitPathList(t_alloc, &exes);
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("nested/bin/tool", exes.items[0]);
+}
+
+test "executable symlink discovery bounds chain length" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    (try tmp.dir.createFile(std.testing.io, "link41", .{ .permissions = .executable_file })).close(std.testing.io);
+    for (0..41) |i| {
+        var name_buf: [32]u8 = undefined;
+        var target_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "link{d}", .{i});
+        const target = try std.fmt.bufPrint(&target_buf, "link{d}", .{i + 1});
+        try tmp.dir.symLink(std.testing.io, target, name, .{});
+    }
+    try std.testing.expect(!try isExecutableCandidate(t_alloc, std.testing.io, tmp.dir, "link0", false));
+    try std.testing.expect(try isExecutableCandidate(t_alloc, std.testing.io, tmp.dir, "link1", false));
+}
+
+test "executable symlink discovery preserves execute-only and unreadable file eligibility" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    (try tmp.dir.createFile(std.testing.io, "tool", .{ .permissions = @enumFromInt(0o111) })).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "unreadable", .{ .permissions = @enumFromInt(0) })).close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "tool", "alias", .{});
+    try tmp.dir.symLink(std.testing.io, "unreadable", "unreadable-alias", .{});
+    var exes = try findExecutables(t_alloc, std.testing.io, tmp.dir);
+    defer deinitPathList(t_alloc, &exes);
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+}
+
+test "executable symlink discovery preserves Windows suffix selection" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    (try tmp.dir.createFile(std.testing.io, "Tool.EXE", .{})).close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "Tool.EXE", "Alias.EXE", .{});
+    try tmp.dir.symLink(std.testing.io, "Tool.EXE", "no-suffix", .{});
+    var exes = try findExecutablesForPlatform(t_alloc, std.testing.io, tmp.dir, true);
+    defer deinitPathList(t_alloc, &exes);
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+    var out = Io.Writer.Allocating.init(t_alloc);
+    defer out.deinit();
+    try filterExecutables(t_alloc, &exes, &.{"alias"}, true, &out.writer);
+    try std.testing.expectEqualStrings("Alias.EXE", exes.items[0]);
+}
+
+test "executable symlink discovery handles app aliases but not symlinked bundle directories" {
+    if (host_is_windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "Good.app/Contents/MacOS");
+    try tmp.dir.createDirPath(std.testing.io, "Bad.app");
+    (try tmp.dir.createFile(std.testing.io, "Good.app/Contents/MacOS/tool", .{ .permissions = .executable_file })).close(std.testing.io);
+    try tmp.dir.symLink(std.testing.io, "tool", "Good.app/Contents/MacOS/alias", .{});
+    try tmp.dir.symLink(std.testing.io, "../Good.app/Contents", "Bad.app/Contents", .{});
+    var exes = try findExecutables(t_alloc, std.testing.io, tmp.dir);
+    defer deinitPathList(t_alloc, &exes);
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+    for (exes.items) |path| try std.testing.expect(std.mem.startsWith(u8, path, "Good.app/Contents/MacOS/"));
 }
 
 test "findExecutables stops at shallowest executable level" {
