@@ -109,6 +109,19 @@ directory level containing any executables. It searches deeper only when no
 shallower candidates exist, so nested-only package layouts still work without
 putting executable-looking firmware or data files on `PATH`.
 
+Relative symlink aliases at that level are exposed under their own command
+names when their chains resolve to executable files inside the extracted
+package. For example, `bin/llvm-readelf -> llvm-readobj` publishes
+`llvm-readelf` as well as `llvm-readobj`, without rewriting or copying the
+package's links. Absolute links, escaping paths, broken links, cycles, and
+chains longer than 40 symlinks are ignored. Symlinked directories are not
+searched recursively.
+
+These archive-provided aliases are ordinary owned commands: `--bin llvm-readelf`
+can select an alias without publishing its target's command, and replacement
+and uninstall manage it normally. They are distinct from the `alias=` query
+option, which explicitly renames a discovered command.
+
 ## Filtering installed binaries
 
 `--bin <name>` is repeatable. When present, only the selected executable
