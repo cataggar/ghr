@@ -3902,6 +3902,9 @@ fn commitUnit(
     };
     install_txn.swapUnit(io, p, .{}) catch |err| {
         try err_w.print("error: failed to publish the unit directory '{s}': {t}\n", .{ p.unit, err });
+        if (host_is_windows and (err == error.AccessDenied or err == error.FileBusy)) {
+            try err_w.print("  check directory permissions and programs holding files open, then retry\n", .{});
+        }
         if (err == error.InstallRollbackFailed) {
             // The previous unit was moved aside and could not be put back. Its
             // only copy is the transaction backup, so the journal and backup

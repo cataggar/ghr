@@ -98,6 +98,12 @@ and publishes its complete command set transactionally, or restores the prior
 unit. `ghr uninstall <id>` removes exactly that ID; ID prefixes are not
 recursive.
 
+On Windows, publishing a staged unit briefly retries directory renames that
+fail with `AccessDenied` or `FileBusy`, as an extracted file may be temporarily
+held open. Persistent failures still stop the install and preserve the previous
+unit; close programs using the tool and check directory permissions or
+file-scanning software before retrying the command.
+
 Legacy owner/repo installs remain readable in place. Reinstalling the same
 derived ID migrates one unambiguous legacy unit only after the replacement is
 durable. Use an ID-capable ghr for later mutations; older releases do not
