@@ -1455,8 +1455,10 @@ fn isOwnedAppBundle(io: Io, apps_dir: Dir, app_name: []const u8, tool_dir_path: 
 
     // Read and compare source path
     var content_buf: [Dir.max_path_bytes]u8 = undefined;
-    const file = apps_dir.openFile(io, marker_path, .{ .follow_symlinks = false }) catch return false;
+    var file = apps_dir.openFile(io, marker_path, .{ .follow_symlinks = false }) catch return false;
     defer file.close(io);
+    // Zig 0.16 opens no-follow Windows handles asynchronously but marks them blocking.
+    if (comptime builtin.os.tag == .windows) file.flags.nonblocking = true;
     const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
     return std.mem.eql(u8, content_buf[0..len], tool_dir_path);
 }
@@ -3902,6 +3904,9 @@ fn commitUnit(
     };
     install_txn.swapUnit(io, p, .{}) catch |err| {
         try err_w.print("error: failed to publish the unit directory '{s}': {t}\n", .{ p.unit, err });
+        if (host_is_windows and (err == error.AccessDenied or err == error.FileBusy)) {
+            try err_w.print("  check directory permissions and programs holding files open, then retry\n", .{});
+        }
         if (err == error.InstallRollbackFailed) {
             // The previous unit was moved aside and could not be put back. Its
             // only copy is the transaction backup, so the journal and backup

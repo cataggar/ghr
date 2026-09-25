@@ -35,6 +35,7 @@
 //! point deterministic and idempotent.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const install_state = @import("install_state.zig");
 const install_request = @import("install_request.zig");
 
@@ -653,6 +654,25 @@ pub const Hooks = struct {
     rename: RenameFn = defaultRename,
 };
 
+fn renameUnit(io: Io, old_path: []const u8, new_path: []const u8, hooks: Hooks) !void {
+    var retries: u8 = 0;
+    while (true) {
+        hooks.rename(io, old_path, new_path) catch |err| {
+            if (builtin.os.tag != .windows or
+                (err != error.AccessDenied and err != error.FileBusy) or
+                retries == 5) return err;
+
+            // Windows can deny a directory rename while another process briefly
+            // opens an extracted file without delete sharing.
+            const delay_ms: i64 = @as(i64, 100) << @intCast(retries);
+            retries += 1;
+            try io.sleep(Io.Duration.fromMilliseconds(delay_ms), .real);
+            continue;
+        };
+        return;
+    }
+}
+
 /// Create a fresh transaction root and empty staging directory. Any leftover
 /// staging content from an earlier attempt on the same ID is removed first.
 pub fn prepareStage(io: Io, p: Paths) !void {
@@ -694,13 +714,13 @@ pub fn swapUnit(io: Io, p: Paths, hooks: Hooks) !void {
 
     if (try directoryExists(io, p.unit)) {
         try deleteTreeAbsolute(io, p.backup);
-        try hooks.rename(io, p.unit, p.backup);
-        hooks.rename(io, p.stage, p.unit) catch |err| {
-            hooks.rename(io, p.backup, p.unit) catch return error.InstallRollbackFailed;
+        try renameUnit(io, p.unit, p.backup, hooks);
+        renameUnit(io, p.stage, p.unit, hooks) catch |err| {
+            renameUnit(io, p.backup, p.unit, hooks) catch return error.InstallRollbackFailed;
             return err;
         };
     } else {
-        try hooks.rename(io, p.stage, p.unit);
+        try renameUnit(io, p.stage, p.unit, hooks);
     }
 }
 
@@ -709,7 +729,7 @@ pub fn swapUnit(io: Io, p: Paths, hooks: Hooks) !void {
 pub fn restoreUnit(io: Io, p: Paths, hooks: Hooks) !void {
     if (!try directoryExists(io, p.backup)) return error.BackupNotFound;
     if (try directoryExists(io, p.unit)) try deleteTreeAbsolute(io, p.unit);
-    try hooks.rename(io, p.backup, p.unit);
+    try renameUnit(io, p.backup, p.unit, hooks);
 }
 
 /// Complete the staged swap when recovery finds the unit missing but the stage
@@ -718,7 +738,7 @@ pub fn finishSwap(io: Io, p: Paths, hooks: Hooks) !void {
     if (try directoryExists(io, p.unit)) return;
     if (!try directoryExists(io, p.stage)) return error.StagingDirectoryNotFound;
     try ensureDirAbsolute(io, p.unit_parent);
-    try hooks.rename(io, p.stage, p.unit);
+    try renameUnit(io, p.stage, p.unit, hooks);
 }
 
 /// Observe the current on-disk state of one transaction.
@@ -1012,6 +1032,78 @@ fn failSecondRename(io: Io, old_path: []const u8, new_path: []const u8) anyerror
     second_rename_calls += 1;
     if (second_rename_calls == 2) return error.InjectedRenameFailure;
     try Dir.renameAbsolute(old_path, new_path, io);
+}
+
+var transient_rename_calls: usize = 0;
+var transient_rename_error: anyerror = error.AccessDenied;
+fn failFirstTwoStageRenames(io: Io, old_path: []const u8, new_path: []const u8) anyerror!void {
+    if (std.mem.eql(u8, std.fs.path.basename(old_path), stage_name)) {
+        transient_rename_calls += 1;
+        if (transient_rename_calls <= 2) return transient_rename_error;
+    }
+    try Dir.renameAbsolute(old_path, new_path, io);
+}
+
+test "swapUnit retries transient Windows rename failures" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const base = try tBase(&tmp, &buf);
+
+    var p = try paths(testing.allocator, base, "owner/repo", .windows);
+    defer p.deinit();
+    try prepareStage(tio, p);
+
+    transient_rename_error = error.AccessDenied;
+    transient_rename_calls = 0;
+    try swapUnit(tio, p, .{ .rename = failFirstTwoStageRenames });
+    try testing.expectEqual(@as(usize, 3), transient_rename_calls);
+    try testing.expect(try directoryExists(tio, p.unit));
+    try testing.expect(!try directoryExists(tio, p.backup));
+    try testing.expect(!try directoryExists(tio, p.stage));
+
+    try prepareStage(tio, p);
+    transient_rename_error = error.FileBusy;
+    transient_rename_calls = 0;
+    try swapUnit(tio, p, .{ .rename = failFirstTwoStageRenames });
+    try testing.expectEqual(@as(usize, 3), transient_rename_calls);
+    try testing.expect(try directoryExists(tio, p.unit));
+    try testing.expect(try directoryExists(tio, p.backup));
+}
+
+var persistent_denial_calls: usize = 0;
+fn alwaysDenyStageRename(io: Io, old_path: []const u8, new_path: []const u8) anyerror!void {
+    if (std.mem.eql(u8, std.fs.path.basename(old_path), stage_name)) {
+        persistent_denial_calls += 1;
+        return error.AccessDenied;
+    }
+    try Dir.renameAbsolute(old_path, new_path, io);
+}
+
+test "swapUnit preserves the old unit after persistent access denial" {
+    const tio = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const base = try tBase(&tmp, &buf);
+
+    var p = try paths(testing.allocator, base, "owner/repo", default_platform);
+    defer p.deinit();
+    try ensureDirAbsolute(tio, p.unit);
+    const marker = try std.fmt.allocPrint(testing.allocator, "{s}{c}old", .{ p.unit, std.fs.path.sep });
+    defer testing.allocator.free(marker);
+    (try Dir.createFileAbsolute(tio, marker, .{})).close(tio);
+    try prepareStage(tio, p);
+
+    persistent_denial_calls = 0;
+    try testing.expectError(error.AccessDenied, swapUnit(tio, p, .{ .rename = alwaysDenyStageRename }));
+    try testing.expectEqual(@as(usize, if (builtin.os.tag == .windows) 6 else 1), persistent_denial_calls);
+    var old_file = try Dir.openFileAbsolute(tio, marker, .{});
+    old_file.close(tio);
+    try testing.expect(try directoryExists(tio, p.stage));
+    try testing.expect(!try directoryExists(tio, p.backup));
 }
 
 test "swapUnit rolls the previous unit back when the commit rename fails" {

@@ -52,7 +52,7 @@ jobs:
         id: setup
         uses: $/actions/setup
         with:
-          ghr-version: v0.8.0-dev.1
+          ghr-version: v0.8.1
           cache: 'false'
 
       - name: Validate setup outputs and executable
@@ -65,9 +65,9 @@ jobs:
         run: |
           set -euo pipefail
           test -f "$GHR_PATH"
-          test "$GHR_VERSION" = v0.8.0-dev.1
+          test "$GHR_VERSION" = v0.8.1
           test "$TARGET" = "$EXPECTED_TARGET"
-          test "$("$GHR_PATH" version)" = 0.8.0-dev.1
+          test "$("$GHR_PATH" version)" = 0.8.1
           ghr version
 
   action-hosted-linux:
@@ -81,31 +81,31 @@ jobs:
         id: download
         uses: $/actions/download
         with:
-          ghr-version: v0.8.0-dev.1
+          ghr-version: v0.8.1
           ghr-cache: 'false'
           cache: 'false'
-          tools: cataggar/ghr/ghr-0.8.0-dev.1-linux-musl-x64.tar.gz@v0.8.0-dev.1
+          tools: cataggar/ghr/ghr-0.8.1-linux-musl-x64.tar.gz@v0.8.1
           minisign: RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 
       - name: Validate downloaded release archive
         env:
           DEST: ${{ steps.download.outputs.dest }}
         run: |
-          test -f "$DEST/ghr-0.8.0-dev.1-linux-musl-x64.tar.gz"
+          test -f "$DEST/ghr-0.8.1-linux-musl-x64.tar.gz"
 
       - name: Install with statically bootstrapped ghr
         uses: $/actions/install
         with:
-          ghr-version: v0.8.0-dev.1
+          ghr-version: v0.8.1
           ghr-cache: 'false'
           cache: 'false'
           tools: >-
-            cataggar/ghr@v0.8.0-dev.1
+            cataggar/ghr@v0.8.1
             RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 
       - name: Validate installed command
         run: |
-          test "$(ghr version)" = 0.8.0-dev.1
+          test "$(ghr version)" = 0.8.1
 
   action-bare-container:
     name: First-party actions in ${{ matrix.image }}
@@ -134,10 +134,10 @@ jobs:
         id: download
         uses: $/actions/download
         with:
-          ghr-version: v0.8.0-dev.1
+          ghr-version: v0.8.1
           ghr-cache: 'false'
           cache: 'false'
-          tools: cataggar/ghr/ghr-0.8.0-dev.1-linux-musl-x64.tar.gz@v0.8.0-dev.1
+          tools: cataggar/ghr/ghr-0.8.1-linux-musl-x64.tar.gz@v0.8.1
           minisign: RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 
       - name: Validate downloaded release archive
@@ -145,22 +145,22 @@ jobs:
         env:
           DEST: ${{ steps.download.outputs.dest }}
         run: |
-          test -f "$DEST/ghr-0.8.0-dev.1-linux-musl-x64.tar.gz"
+          test -f "$DEST/ghr-0.8.1-linux-musl-x64.tar.gz"
 
       - name: Install with statically bootstrapped ghr
         uses: $/actions/install
         with:
-          ghr-version: v0.8.0-dev.1
+          ghr-version: v0.8.1
           ghr-cache: 'false'
           cache: 'false'
           tools: >-
-            cataggar/ghr@v0.8.0-dev.1
+            cataggar/ghr@v0.8.1
             RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 
       - name: Validate installed command
         shell: sh
         run: |
-          test "$(ghr version)" = 0.8.0-dev.1
+          test "$(ghr version)" = 0.8.1
 
   build-and-test:
     name: Build & Test
