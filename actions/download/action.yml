@@ -44,6 +44,7 @@ inputs:
     description: >-
       Optional base64 minisign public key. When set, ghr also requires a
       `.minisig` sidecar to be present for every spec and verifies it.
+      Without a key, published `.minisig` sidecars are noted but not verified.
     required: false
     default: ''
   skip-verify:
@@ -59,9 +60,8 @@ inputs:
     default: 'false'
   skip-minisign:
     description: >-
-      Skip just the minisign verification step. Bypasses the fail-closed
-      behavior that would otherwise reject a published `.minisig` sidecar
-      when no key is configured. Default: false.
+      Skip just the minisign verification step, even when a public key
+      is configured. Default: false.
     required: false
     default: 'false'
   skip-sigstore:

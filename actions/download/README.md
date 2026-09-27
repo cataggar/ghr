@@ -37,10 +37,10 @@ verified content therefore invalidates the cache.
 | `extract`           | `false`                          | Extract archive assets into `dest` after download. |
 | `strip-components`  | _(none)_                         | When `extract: true`, strip N leading path components. |
 | `cache`             | `true`                           | Cache the `dest` directory across runs. |
-| `minisign`          | _(empty)_                        | Base64 minisign public key. When set, every spec is verified against a `.minisig` sidecar (fail-closed). |
+| `minisign`          | _(empty)_                        | Base64 minisign public key. When set, every spec is verified against a `.minisig` sidecar (fail-closed). Without a key, published signatures are noted but not verified. |
 | `skip-verify`       | `false`                          | Umbrella: skip every verification step (checksum, minisign, sigstore, GitHub attestation, authenticode). |
 | `skip-checksum`     | `false`                          | Skip just the checksum-sidecar verification step. |
-| `skip-minisign`     | `false`                          | Skip just the minisign verification step. Bypasses the fail-closed "sidecar published but no key" behavior. |
+| `skip-minisign`     | `false`                          | Skip minisign verification even when a key is configured. |
 | `skip-sigstore`     | `false`                          | Skip just the `.sigstore.json` sidecar published as a release asset. Does not affect GitHub's attestation service. |
 | `skip-attestation`  | `false`                          | Skip just GitHub artifact attestation verification, which is looked up by digest rather than published as a release asset. |
 | `skip-authenticode` | `false`                          | Skip just the Authenticode (Windows PE) verification step. |

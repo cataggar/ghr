@@ -27,7 +27,6 @@ fn isClassifiedVerifyError(err: anyerror) bool {
         error.ChecksumDownloadFailed,
         error.ChecksumEntryMissing,
         error.MinisignSidecarMissing,
-        error.MinisignSidecarPresentButNoKey,
         error.MinisignKeyIdMismatch,
         error.MinisignSignatureMismatch,
         error.MinisignGlobalSigMismatch,
@@ -49,7 +48,6 @@ fn verifyExitCode(err: anyerror) u8 {
         error.ChecksumDownloadFailed,
         error.ChecksumEntryMissing,
         error.MinisignSidecarMissing,
-        error.MinisignSidecarPresentButNoKey,
         error.MinisignKeyIdMismatch,
         error.MinisignSignatureMismatch,
         error.MinisignGlobalSigMismatch,
@@ -90,8 +88,7 @@ pub const Options = struct {
     /// `.sha256` sidecar). Minisign, sigstore, and authenticode continue
     /// to run as usual.
     skip_checksum: bool = false,
-    /// Skip just the minisign-sidecar verification step. Bypasses the
-    /// fail-closed "sidecar present but no key" diagnostic.
+    /// Skip minisign-sidecar verification, including when a key was supplied.
     skip_minisign: bool = false,
     /// Skip just the sigstore-bundle verification step. Applies only to a
     /// `.sigstore.json` sidecar published alongside the release asset.
@@ -354,11 +351,8 @@ fn downloadOne(
         try err_w.flush();
     }
 
-    // 4) Pre-flight verification check: if a `.minisig` sidecar is
-    //    published, refuse to download without explicit user intent
-    //    (inline key, `--minisign <key>`, `--skip-minisign`, or
-    //    `--skip-verify`). Similarly, fail early if a minisign key was
-    //    supplied but no sidecar exists.
+    // 4) If a minisign key was supplied, require a matching sidecar before
+    //    downloading. With no key, a published sidecar is informational.
     if (target.release != null and target.asset_name != null) {
         release_mod.preflightVerification(
             target.release.?.parsed.value.assets,
@@ -367,7 +361,6 @@ fn downloadOne(
             effective_minisign_pubkey,
             err_w,
         ) catch |perr| switch (perr) {
-            error.MinisignSidecarPresentButNoKey,
             error.MinisignSidecarMissing,
             => return step.fail(exit_sha256_mismatch),
             error.MinisignPubKeyParseError,

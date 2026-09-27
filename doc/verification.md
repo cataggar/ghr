@@ -23,16 +23,19 @@ verified GitHub artifact provenance or an explicitly supplied trusted SHA-256,
 then safely extracts and cross-checks the binary's version and target before
 adding it to `PATH`.
 
-`ghr install cataggar/ghr@<tag>` verifies the sigstore bundle
-automatically, prints the leaf certificate's SAN (the release-workflow
+`ghr install cataggar/ghr` (or `ghr install cataggar/ghr@<tag>`)
+verifies the sigstore bundle automatically, prints the leaf certificate's SAN (the release-workflow
 URL) and OIDC issuer
 (`https://token.actions.githubusercontent.com`) for visual review, and
-fails-closed on any verification error. To also require minisign
-verification, pass the public key inline (per-spec) or via
+fails-closed on any verification error. If a minisign signature is
+published but no public key is supplied, ghr notes that minisign was
+not verified; the other enabled verifiers still run. To also require
+minisign verification, pass the public key inline (per-spec) or via
 `--minisign`:
 
 ```sh
-ghr install cataggar/ghr@v0.3.0 \
+ghr install cataggar/ghr
+ghr install cataggar/ghr \
     RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 ```
 
@@ -44,8 +47,8 @@ README and the previous key marked as deprecated alongside the last
 tag it signed.
 
 When you install or download a release asset, ghr automatically verifies
-the downloaded bytes against any verification material the release
-publishes:
+the downloaded bytes against supported verification material the release
+publishes. Minisign verification additionally needs a caller-supplied key:
 
 - **GitHub asset digest** — GitHub computes a SHA-256 for every release
   asset at upload time and exposes it inline in the release JSON as
@@ -172,13 +175,11 @@ publishes:
   If a key is configured but no `<asset>.minisig` is published, ghr
   aborts before downloading — minisign verification is fail-closed when
   opted in.
-  If a `<asset>.minisig` IS published but no key was configured and
-  neither `--skip-minisign` nor `--skip-verify` was passed, ghr also
-  aborts before downloading: ignoring a published signature would
-  silently skip a real verification opportunity, so the caller must
-  opt in (pass a key inline or via `--minisign <pubkey>`) or opt out
-  (`--skip-minisign` to bypass just minisign, or `--skip-verify` to
-  bypass every check).
+  If a `<asset>.minisig` is published but no key is configured, ghr
+  prints a note that minisign was not verified and continues with the
+  other enabled verifiers. It does not claim minisign verification or
+  record a minisign key. Pass a key to require minisign verification,
+  or `--skip-minisign` to bypass it even when a key is configured.
 - **Authenticode (Windows)** — auto-detected from the downloaded bytes.
   When the asset is a PE (DOS `MZ` magic) or a `.zip` containing one or
   more `.exe` / `.dll` / `.sys` entries, ghr verifies each PE's embedded

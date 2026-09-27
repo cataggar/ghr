@@ -31,7 +31,8 @@ inputs:
       requires a `.minisig` sidecar to be present and verifies it. An inline
       key on a `tools:` line (the second whitespace-separated token, e.g.
       `jedisct1/minisign@0.12 RWQf6LR…`) overrides this default for that
-      single request.
+      single request. Without a key, published `.minisig` sidecars are
+      noted but not verified.
     required: false
     default: ''
   skip-verify:
@@ -47,9 +48,8 @@ inputs:
     default: 'false'
   skip-minisign:
     description: >-
-      Skip just the minisign verification step. Bypasses the fail-closed
-      behavior that would otherwise reject a published `.minisig` sidecar
-      when no key is configured. Default: false.
+      Skip just the minisign verification step, even when a public key
+      is configured. Default: false.
     required: false
     default: 'false'
   skip-sigstore:

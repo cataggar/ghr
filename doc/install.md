@@ -45,6 +45,7 @@ first-party setup action supplies this automatically from the maintained Node
 ```sh
 # Install latest release
 ghr install burntsushi/ripgrep
+ghr install cataggar/ghr  # a published minisign signature is noted, not verified without a key
 
 # Install a specific tag
 ghr install burntsushi/ripgrep@15.1.0

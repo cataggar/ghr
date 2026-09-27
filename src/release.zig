@@ -2018,11 +2018,9 @@ fn verifyZipPes(
 ///   - `pubkey_b64 == null` AND no `<asset>.minisig` sidecar is published
 ///     → return `.no_verification` silently.
 ///   - `pubkey_b64 == null` AND a `<asset>.minisig` sidecar IS published
-///     → fail-closed with `error.MinisignSidecarPresentButNoKey`. The
-///     release explicitly published a minisign signature, so consuming
-///     the asset without a trust anchor would silently skip a real
-///     verification opportunity. Caller must pass `--minisign <pubkey>`
-///     or `--skip-verify`.
+///     → print a note that minisign was not verified and return
+///     `.no_verification`. A signature cannot be verified without a
+///     caller-supplied trust anchor.
 ///   - `pubkey_b64 != null` but no `<asset>.minisig` sidecar is published
 ///     → fail-closed with `error.MinisignSidecarMissing`. The user
 ///     explicitly required minisign verification.
@@ -2054,18 +2052,12 @@ pub fn verifyDownloadedAssetMinisign(
     const sidecar_opt = minisign.findMinisigAsset(views, asset_name);
 
     const key_b64 = pubkey_b64 orelse {
-        // Caller didn't opt in.
         if (sidecar_opt) |sidecar| {
-            try err_w.print(
-                "error: '{s}' is published with a minisign signature ('{s}') but --minisign was not provided\n",
-                .{ asset_name, sidecar.name },
+            try w.print(
+                "note: minisign signature '{s}' was not verified (no minisign key supplied)\n",
+                .{sidecar.name},
             );
-            try err_w.print(
-                "  hint: pass --minisign <base64-pubkey> to verify, or --skip-verify to bypass\n",
-                .{},
-            );
-            try err_w.flush();
-            return error.MinisignSidecarPresentButNoKey;
+            try w.flush();
         }
         return .no_verification;
     };
@@ -2257,36 +2249,13 @@ pub fn findAssetByName(
     return .{ .ambiguous = try matches.toOwnedSlice(allocator) };
 }
 
-/// Run SHA256 + minisign + sigstore verification on `download_path` and
-/// return the strongest outcome. Mirrors the existing `cmdInstall` flow:
-///
-///   - `skip_verify=true` → prints a `note:` line and returns `.skipped`
-///     without touching the file.
-///   - Otherwise runs SHA256, then minisign (only when `minisign_pubkey_b64`
-///     is non-null), then sigstore. Each verifier is independent; the
-///     strongest success drives the returned outcome.
-///   - Outcome precedence: `.sigstore_verified` > `.minisign_verified` >
-///     `.sha256_verified` > `.no_verification`.
-///   - If neither material is published, prints a `note:` saying the
-///     download is unverified and returns `.no_verification`.
-///
 /// Lightweight pre-flight that inspects only the release's asset list
 /// (no network, no disk) to decide whether the download is allowed to
 /// proceed:
 ///
-///   - `--skip-verify` always short-circuits to ok.
-///   - If a `<asset_name>.minisig` sidecar is present but the caller did
-///     not pass `--minisign`, fail-closed with a hint pointing to both
-///     `--minisign` and `--skip-verify`. This aborts BEFORE the (often
-///     large) download begins.
-///   - If `--minisign` was supplied but no sidecar is published, fail
-///     immediately for the same reason.
-///   - Otherwise (no sidecar, no key, or sidecar+key both present) the
-///     check passes and the caller proceeds. Full cryptographic
-///     verification happens later in `verifyAssetOnDisk`.
-///
-/// Emits the same error messages as the post-download path so users see
-/// consistent diagnostics regardless of when the check fires.
+/// With no minisign key (or when minisign is skipped), the check passes
+/// regardless of published sidecars. With a key, reject a missing sidecar
+/// before downloading; full cryptographic verification happens on disk.
 pub fn preflightVerification(
     assets: []const Asset,
     asset_name: []const u8,
@@ -2295,6 +2264,7 @@ pub fn preflightVerification(
     err_w: *Writer,
 ) !void {
     if (gates.shouldSkip(.minisign)) return;
+    const key_b64 = minisign_pubkey_b64 orelse return;
 
     var views_buf: [256]minisign.AssetView = undefined;
     if (assets.len > views_buf.len) {
@@ -2310,42 +2280,22 @@ pub fn preflightVerification(
 
     const sidecar_opt = minisign.findMinisigAsset(views, asset_name);
 
-    if (minisign_pubkey_b64) |key_b64| {
-        _ = minisign.parsePublicKey(key_b64) catch |err| {
-            try err_w.print(
-                "error: minisign value is not a valid minisign public key ({s})\n",
-                .{@errorName(err)},
-            );
-            try err_w.flush();
-            return error.MinisignPubKeyParseError;
-        };
-
-        if (sidecar_opt == null) {
-            try err_w.print(
-                "error: a minisign key was supplied but no '{s}.minisig' sidecar is published in this release\n",
-                .{asset_name},
-            );
-            try err_w.flush();
-            return error.MinisignSidecarMissing;
-        }
-        return;
-    }
-
-    if (sidecar_opt) |sidecar| {
+    _ = minisign.parsePublicKey(key_b64) catch |err| {
         try err_w.print(
-            "error: '{s}' is published with a minisign signature ('{s}') but no minisign key was provided\n",
-            .{ asset_name, sidecar.name },
-        );
-        try err_w.print(
-            "  hint: pass a minisign key (positional after the spec, or --minisign <base64-pubkey>),\n",
-            .{},
-        );
-        try err_w.print(
-            "        or --skip-minisign / --skip-verify to bypass\n",
-            .{},
+            "error: minisign value is not a valid minisign public key ({s})\n",
+            .{@errorName(err)},
         );
         try err_w.flush();
-        return error.MinisignSidecarPresentButNoKey;
+        return error.MinisignPubKeyParseError;
+    };
+
+    if (sidecar_opt == null) {
+        try err_w.print(
+            "error: a minisign key was supplied but no '{s}.minisig' sidecar is published in this release\n",
+            .{asset_name},
+        );
+        try err_w.flush();
+        return error.MinisignSidecarMissing;
     }
 }
 
@@ -3518,11 +3468,47 @@ test "isSidecarAsset classifies sidecars and primaries" {
     try std.testing.expect(!isSidecarAsset("tool-linux-amd64.tar.gz"));
 }
 
-test "verifyDownloadedAssetMinisign fails closed when no sidecar is published" {
+test "preflightVerification requires a minisign sidecar only when a key is supplied" {
+    const key = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+    const unsigned = [_]Asset{
+        .{ .name = "tool.tar.xz", .browser_download_url = "https://example.invalid/a" },
+    };
+    const signed = [_]Asset{
+        unsigned[0],
+        .{ .name = "tool.tar.xz.minisig", .browser_download_url = "https://example.invalid/b" },
+    };
+    var err = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer err.deinit();
+
+    try preflightVerification(&unsigned, "tool.tar.xz", .{}, null, &err.writer);
+    try preflightVerification(&signed, "tool.tar.xz", .{}, null, &err.writer);
+    try preflightVerification(&signed, "tool.tar.xz", .{}, key, &err.writer);
+    try std.testing.expectEqualStrings("", err.written());
+
+    try std.testing.expectError(error.MinisignSidecarMissing, preflightVerification(
+        &unsigned, "tool.tar.xz", .{}, key, &err.writer,
+    ));
+    try std.testing.expectError(error.MinisignPubKeyParseError, preflightVerification(
+        &signed, "tool.tar.xz", .{}, "not a key", &err.writer,
+    ));
+    try std.testing.expectError(error.MinisignPubKeyParseError, preflightVerification(
+        &unsigned, "tool.tar.xz", .{}, "not a key", &err.writer,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "no 'tool.tar.xz.minisig' sidecar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.written(), "not a valid minisign public key") != null);
+
+    var skipped_err = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer skipped_err.deinit();
+    try preflightVerification(&unsigned, "tool.tar.xz", .{ .skip_minisign = true }, key, &skipped_err.writer);
+    try preflightVerification(&unsigned, "tool.tar.xz", .{ .skip_verify = true }, key, &skipped_err.writer);
+    try std.testing.expectEqualStrings("", skipped_err.written());
+}
+
+test "verifyDownloadedAssetMinisign requires a sidecar when a key is supplied" {
     const a = std.testing.allocator;
     // No --minisign value AND no sidecar → silent .no_verification.
-    var out_buf: [256]u8 = undefined;
-    var out_writer = std.Io.Writer.Discarding.init(&out_buf);
+    var out_writer = std.Io.Writer.Allocating.init(a);
+    defer out_writer.deinit();
     var err_buf: [256]u8 = undefined;
     var err_writer = std.Io.Writer.Discarding.init(&err_buf);
 
@@ -3545,6 +3531,7 @@ test "verifyDownloadedAssetMinisign fails closed when no sidecar is published" {
         &err_writer.writer,
     );
     try std.testing.expectEqual(VerifyOutcome.no_verification, none_outcome);
+    try std.testing.expectEqualStrings("", out_writer.written());
 
     // --minisign set but no sidecar in the asset list → fail-closed.
     // Use a valid pubkey so we get past parsePublicKey.
@@ -3580,21 +3567,21 @@ test "verifyDownloadedAssetMinisign fails closed when no sidecar is published" {
     ));
 }
 
-test "verifyDownloadedAssetMinisign fails closed when sidecar is present but no key given" {
+test "verifyDownloadedAssetMinisign notes an unverified published sidecar without a key" {
     const a = std.testing.allocator;
-    var out_buf: [256]u8 = undefined;
-    var out_writer = std.Io.Writer.Discarding.init(&out_buf);
-    var err_buf: [256]u8 = undefined;
-    var err_writer = std.Io.Writer.Discarding.init(&err_buf);
+    var out_writer = std.Io.Writer.Allocating.init(a);
+    defer out_writer.deinit();
+    var err_writer = std.Io.Writer.Allocating.init(a);
+    defer err_writer.deinit();
 
     const assets = [_]Asset{
         .{ .name = "tool.tar.xz", .browser_download_url = "https://example.invalid/a" },
         .{ .name = "tool.tar.xz.minisig", .browser_download_url = "https://example.invalid/b" },
     };
 
-    // No --minisign value but sidecar exists → fail-closed without
-    // touching the network or disk.
-    try std.testing.expectError(error.MinisignSidecarPresentButNoKey, verifyDownloadedAssetMinisign(
+    // The invalid URL and nonexistent paths ensure no network or disk
+    // access is needed to report an unverified signature.
+    const outcome = try verifyDownloadedAssetMinisign(
         a,
         std.testing.io,
         "/tmp/should/not/be/used",
@@ -3606,6 +3593,51 @@ test "verifyDownloadedAssetMinisign fails closed when sidecar is present but no 
         null,
         &out_writer.writer,
         &err_writer.writer,
+    );
+    try std.testing.expectEqual(VerifyOutcome.no_verification, outcome);
+    try std.testing.expectEqualStrings(
+        "note: minisign signature 'tool.tar.xz.minisig' was not verified (no minisign key supplied)\n",
+        out_writer.written(),
+    );
+    try std.testing.expectEqualStrings("", err_writer.written());
+}
+
+test "verifyAssetOnDisk keeps other verifiers active without a minisign key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "tool.tar.xz", .data = "abc" });
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPathFile(io, "tool.tar.xz", &path_buf);
+    const path = path_buf[0..path_len];
+    const assets = [_]Asset{
+        .{
+            .name = "tool.tar.xz",
+            .browser_download_url = "https://example.invalid/a",
+            .digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        },
+        .{ .name = "tool.tar.xz.minisig", .browser_download_url = "https://example.invalid/b" },
+    };
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    var err = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer err.deinit();
+
+    const outcome = try verifyAssetOnDisk(
+        std.testing.allocator, io, path, &assets, "tool.tar.xz", path,
+        null, null, .{ .skip_attestation = true, .skip_authenticode = true },
+        null, null, &out.writer, &err.writer,
+    );
+    try std.testing.expectEqual(VerifyOutcome.github_digest_verified, outcome);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "verified github sha256") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "minisign signature 'tool.tar.xz.minisig' was not verified") != null);
+    try std.testing.expectEqualStrings("", err.written());
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "tool.tar.xz", .data = "tampered" });
+    try std.testing.expectError(error.ChecksumMismatch, verifyAssetOnDisk(
+        std.testing.allocator, io, path, &assets, "tool.tar.xz", path,
+        null, null, .{ .skip_attestation = true, .skip_authenticode = true },
+        null, null, &out.writer, &err.writer,
     ));
 }
 
