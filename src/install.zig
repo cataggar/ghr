@@ -1813,10 +1813,11 @@ fn verifyDownloadedAsset(
     // disk, before we extract or move anything. Checksum (Phase 1),
     // minisign (issue #65, requires a key — inline or `--minisign`),
     // sigstore sidecar (Phase 2), and GitHub-native attestation
-    // (issue #165) are independent — all run when material is published,
-    // unless the matching skip flag suppresses one. The recorded label is
-    // the strongest successful outcome, ranked by `release_mod`:
-    // github-attestation > sigstore > minisign > authenticode > checksum.
+    // (issue #165) are independent. Minisign requires a supplied key;
+    // the others run when material is published unless skipped. The
+    // recorded label is the strongest successful outcome, ranked by
+    // `release_mod`: github-attestation > sigstore > minisign >
+    // authenticode > checksum.
     var verified_label: []const u8 = "none";
     // Pubkey the install actually verified against (sticky across the
     // other verifiers' outcomes). Recorded in `ghr.json` and surfaced by

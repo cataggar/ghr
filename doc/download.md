@@ -57,8 +57,9 @@ Downloads are auto-verified against any sigstore bundle or checksum
 sidecar published with the release, and against any GitHub artifact
 attestation covering the downloaded digest; pass `--minisign <pubkey>` to
 also require a minisign signature (or attach an inline key to a
-spec), `--skip-<step>` to bypass one verifier individually, or
-`--skip-verify` to bypass all checks. Exit codes: `0` success, `1`
-argument/IO error, `2` HTTP error after retries, `3` checksum or
-minisign mismatch. Multi-spec invocations exit with the most-severe
-code observed across the batch.
+spec). Without a key, a published `.minisig` is noted but not verified;
+other enabled verifiers still run. Use `--skip-<step>` to bypass one
+verifier individually, or `--skip-verify` to bypass all checks. Exit
+codes: `0` success, `1` argument/IO error, `2` HTTP error after retries,
+`3` checksum or minisign mismatch. Multi-spec invocations exit with
+the most-severe code observed across the batch.
