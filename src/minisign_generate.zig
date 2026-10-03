@@ -241,6 +241,10 @@ fn preflight(allocator: Allocator, io: Io, environ: *const Environ, target: Targ
     for (api_key.value.key_id) |c| if (!std.ascii.isDigit(c))
         return fail(err_w, "Actions secrets API returned an invalid key ID", .{});
     var key: [32]u8 = undefined;
+    const decoded_length = std.base64.standard.Decoder.calcSizeForSlice(api_key.value.key) catch
+        return fail(err_w, "Actions secrets API returned an invalid public key", .{});
+    if (decoded_length != key.len)
+        return fail(err_w, "Actions secrets API returned an invalid public key", .{});
     std.base64.standard.Decoder.decode(&key, api_key.value.key) catch
         return fail(err_w, "Actions secrets API returned an invalid public key", .{});
 
@@ -673,6 +677,7 @@ const MockGh = struct {
     override: ?[]const u8 = null,
     repo: []const u8 = "octocat/releases",
     repo_reply: ?[]const u8 = null,
+    api_reply: []const u8 = "{\"key_id\":\"123\",\"key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}",
     list_reply: []const u8 = "[]",
     permission: []const u8 = "ADMIN",
     auth_exit: u8 = 0,
@@ -739,7 +744,7 @@ const MockGh = struct {
                 const endpoint = try allocator.print("repos/{s}/actions/secrets/public-key", .{self.repo});
                 defer allocator.free(endpoint);
                 try expectArgs(&.{ "gh", "api", "--hostname", "github.com", "--method", "GET", endpoint }, argv);
-                reply = "{\"key_id\":\"123\",\"key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}";
+                reply = self.api_reply;
                 exit_code = self.access_exit;
             },
             3 => {
@@ -843,6 +848,7 @@ test "auth, access, malformed JSON, read errors, and existing secrets fail befor
         .{ .repo_reply = "{}" },
         .{ .repo_reply = "{\"nameWithOwner\":\"../../bad\",\"url\":\"https://github.com/../../bad\",\"viewerPermission\":\"ADMIN\"}" },
         .{ .permission = "READ" },
+        .{ .api_reply = "{\"key_id\":\"123\",\"key\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\"}" },
         .{ .list_reply = "{}" },
         .{ .list_reply = "[{\"name\":\"MINISIGN_PASSWORD\"}]" },
         .{ .list_reply = "[{\"name\":\"MINISIGN_SECRET_KEY\"}]" },
