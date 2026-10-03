@@ -118,6 +118,38 @@ and
 [Caching in GitHub Actions](https://github.com/cataggar/ghr/blob/main/doc/github-actions.md)
 for details.
 
+## Build from source
+
+The current source and `site/` require **official Zig 0.17.0**, not a
+development/nightly compiler. Install the signed compiler bundles with:
+
+```sh
+ghr install cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+zig build -Doptimize=safe
+zig build test
+# Static site: codegen + compilation + prerender into site/dist/
+(cd site && zig build prod)
+```
+
+Site route/cache regression checks: `cd site && zig build test &&
+python3 tools/test-cache-freshness.py`. They use an isolated fixture project
+and keep Zig's cache warm while adding, renaming, and deleting routes,
+directories, and optional layouts.
+
+Zig 0.17 spells optimization modes `debug`, `safe`, `fast`, and `small`.
+For releases built with this compiler, the standard-library OS floors are
+Linux **5.10+**, macOS **15.0+**, and Windows **10+**. The release notes
+label the Apple requirement “Darwin 15.0+”; the installed toolchain's
+`std.Target` defines the versionless `*-macos` release targets' minimum
+as macOS 15.0, not the Darwin kernel version corresponding to OS X 10.11.
+Older OS versions are not supported by these new builds;
+this does not change the requirements of previously published releases.
+See the [official release notes](https://ziglang.org/download/0.17.0/release-notes.html#OS-Version-Requirements).
+
+To rebuild a historical release, use the compiler and optimization spelling
+of the **checked-out tag**, not the current branch's toolchain. See the
+[historical rebuild policy](doc/reproducible-builds.md#compiler-selection).
+
 ## Signing releases
 
 `ghr minisign sign` produces a minisign `.minisig` sidecar without an

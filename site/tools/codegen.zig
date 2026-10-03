@@ -5,11 +5,11 @@ const std = @import("std");
 const runtime = @import("runtime");
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    // Initialize std.Io runtime (Auto-selects Evented on Linux, Threaded elsewhere)
+    // The fork uses Threaded I/O on every platform.
     try runtime.init(alloc);
     defer runtime.deinit();
 
@@ -37,7 +37,6 @@ pub fn main() !void {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(alloc);
-    // 0.16: ArrayList no longer has .writer() — use appendSlice/print directly.
 
     try buf.appendSlice(alloc,
         \\// GENERATED — do not edit by hand.
@@ -92,7 +91,8 @@ pub fn main() !void {
         try buf.appendSlice(alloc, "pub const notFound = app_404.render;\n");
     }
 
-    _ = try std.Io.Dir.cwd().createDirPathOpen(runtime.io, "src/generated", .{});
+    const generated_dir = try std.Io.Dir.cwd().createDirPathOpen(runtime.io, "src/generated", .{});
+    generated_dir.close(runtime.io);
     const out = try std.Io.Dir.cwd().createFile(runtime.io, "src/generated/routes.zig", .{});
     defer out.close(runtime.io);
     try out.writePositionalAll(runtime.io, buf.items, 0);
@@ -196,7 +196,7 @@ fn toUrl(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
             out += 1;
         }
     }
-    result = result[0..out];
+    result = try alloc.realloc(result, out);
 
     // Strip trailing "/index" → parent path.
     const index_suffix = "/index";
@@ -229,4 +229,18 @@ fn hasDynamicSegment(path: []const u8) bool {
         }
     }
     return false;
+}
+
+test "dynamic and nested index routes" {
+    const cases = .{
+        .{ "app/users/[id]/index.zig", "/users/:id" },
+        .{ "app/[slug].zig", "/:slug" },
+        .{ "api/v1/users/[id].zig", "/api/v1/users/:id" },
+        .{ "app/index.zig", "/" },
+    };
+    inline for (cases) |case| {
+        const url = try toUrl(std.testing.allocator, case[0]);
+        defer std.testing.allocator.free(url);
+        try std.testing.expectEqualStrings(case[1], url);
+    }
 }

@@ -26,7 +26,7 @@ triggered manually with `workflow_dispatch` (provide the tag, e.g. `v0.3.0`).
 For every release target it:
 
 1. checks out the source at the tag,
-2. installs the pinned Zig version,
+2. installs the Zig version selected from the checked-out tag's manifest,
 3. rebuilds with the same flags as `release.yml`,
 4. **for non-Windows targets**: repackages with `scripts/pack.py`,
    downloads the published `.tar.gz`, verifies it against GitHub's
@@ -40,6 +40,32 @@ For every release target it:
 
 Releases tagged at or before `v0.2.1` predate deterministic packaging and
 the Authenticode signing pipeline; they will not reproduce.
+
+## Compiler selection
+
+Release and reproducibility jobs read `.minimum_zig_version` from the
+**checked-out source's** `build.zig.zon`, after checkout. For the supported
+release history this also records the exact release compiler:
+
+| Checked-out manifest | Signed compiler release | Optimization flag |
+| --- | --- | --- |
+| `0.16.0` | `cataggar/zig@v0.16.0` | `-Doptimize=ReleaseSafe` |
+| `0.17.0` | `cataggar/zig@v0.17.0` | `-Doptimize=safe` |
+
+Both installations require the existing trusted minisign key. Missing,
+ambiguous, or unknown manifest versions fail explicitly; there is no silent
+fallback to the newest compiler. Selection stays inline in the workflows
+because old tags do not contain newly added helper scripts. Future compiler
+upgrades must extend this allowlist without changing the historical rows.
+
+For a local rebuild, first check out the release tag, install its matching
+official compiler, set `SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct HEAD)`,
+and use that tag's release target, version, strip, and optimization flags.
+Current source builds require official Zig 0.17.0; its optimization enum is
+`debug` / `safe` / `fast` / `small`. Do not pass these new spellings to old
+tags built with Zig 0.16.0, and do not rebuild those tags with Zig 0.17.0.
+The compiler selection does not alter archive metadata, packaging scripts,
+or the Windows stripped-signed comparison.
 
 ## Running the strip locally
 

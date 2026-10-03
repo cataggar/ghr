@@ -94,13 +94,30 @@ jobs:
           # commit works for SOURCE_DATE_EPOCH.
           fetch-depth: 0
 
+      - name: Select checked-out source toolchain
+        id: zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep inline: historical tags do not contain a new helper script.
+          version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*,?([[:space:]]*\/\/.*)?[[:space:]]*$/\1/p' build.zig.zon)"
+          case "$version" in
+            0.16.0) optimize=ReleaseSafe ;;
+            0.17.0) optimize=safe ;;
+            *)
+              echo "::error::Unsupported or missing checked-out Zig version: '$version'" >&2
+              exit 1
+              ;;
+          esac
+          printf 'version=%s\noptimize=%s\n' "$version" "$optimize" >> "$GITHUB_OUTPUT"
+
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@v0.6.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v${{ steps.zig.outputs.version }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Compute SOURCE_DATE_EPOCH
         shell: bash
@@ -110,7 +127,7 @@ jobs:
           echo "Using SOURCE_DATE_EPOCH=$SDE"
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
+        run: zig build -Doptimize=${{ steps.zig.outputs.optimize }} -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
 
       - name: Repackage deterministically
         shell: bash
@@ -265,13 +282,30 @@ jobs:
           ref: refs/tags/${{ needs.resolve-tag.outputs.tag }}
           fetch-depth: 0
 
+      - name: Select checked-out source toolchain
+        id: zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep inline: historical tags do not contain a new helper script.
+          version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*,?([[:space:]]*\/\/.*)?[[:space:]]*$/\1/p' build.zig.zon)"
+          case "$version" in
+            0.16.0) optimize=ReleaseSafe ;;
+            0.17.0) optimize=safe ;;
+            *)
+              echo "::error::Unsupported or missing checked-out Zig version: '$version'" >&2
+              exit 1
+              ;;
+          esac
+          printf 'version=%s\noptimize=%s\n' "$version" "$optimize" >> "$GITHUB_OUTPUT"
+
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@v0.6.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v${{ steps.zig.outputs.version }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Compute SOURCE_DATE_EPOCH
         shell: bash
@@ -288,7 +322,7 @@ jobs:
           # and supplies `validate strip-authenticode` for the strip
           # step below. We don't care that this binary is itself
           # reproducible — only that it executes correctly.
-          zig build -Doptimize=ReleaseSafe -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
+          zig build -Doptimize=${{ steps.zig.outputs.optimize }} -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
           mv zig-out/bin/ghr.exe stripper.exe
           ./stripper.exe version
 
@@ -296,7 +330,7 @@ jobs:
         shell: bash
         run: |
           rm -rf zig-out
-          zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
+          zig build -Doptimize=${{ steps.zig.outputs.optimize }} -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ needs.resolve-tag.outputs.version }}"
           PKGNAME="ghr-${{ needs.resolve-tag.outputs.version }}-${{ matrix.name }}"
           echo "PKGNAME=$PKGNAME" >> "$GITHUB_ENV"
           ls -l zig-out/bin/ghr.exe

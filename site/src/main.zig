@@ -10,11 +10,11 @@ const runtime = @import("runtime");
 const log = std.log.scoped(.main);
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    // Initialize std.Io runtime (Auto-selects Evented on Linux, Threaded elsewhere).
+    // The fork uses Threaded I/O on every platform.
     try runtime.init(alloc);
     defer runtime.deinit();
 

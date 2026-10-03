@@ -52,13 +52,30 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Select checked-out source toolchain
+        id: zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep inline: historical tags do not contain a new helper script.
+          version="$(sed -nE 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*,?([[:space:]]*\/\/.*)?[[:space:]]*$/\1/p' build.zig.zon)"
+          case "$version" in
+            0.16.0) optimize=ReleaseSafe ;;
+            0.17.0) optimize=safe ;;
+            *)
+              echo "::error::Unsupported or missing checked-out Zig version: '$version'" >&2
+              exit 1
+              ;;
+          esac
+          printf 'version=%s\noptimize=%s\n' "$version" "$optimize" >> "$GITHUB_OUTPUT"
+
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@v0.6.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v${{ steps.zig.outputs.version }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Get version
         id: version
@@ -75,7 +92,7 @@ jobs:
           echo "SOURCE_DATE_EPOCH=$SDE" >> "$GITHUB_ENV"
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ steps.version.outputs.version }}"
+        run: zig build -Doptimize=${{ steps.zig.outputs.optimize }} -Dtarget=${{ matrix.target }} -Dstrip=true "-Dversion=${{ steps.version.outputs.version }}"
 
       - name: Azure login (for signing)
         if: endsWith(matrix.target, '-windows')
