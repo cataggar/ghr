@@ -226,8 +226,9 @@ in storage. `MINISIGN_PASSWORD` is optional and is not created or changed by
 default setup. No password-manager integration or separate passphrase-storage
 step is required.
 
-The generated private file has mode `0600` on POSIX. Keep the local private
-key protected with restrictive permissions/ACLs.
+Before writing key material, generation protects the private file with mode
+`0600` on POSIX or a verified, protected owner-only DACL on Windows. Keep the
+local private key protected with restrictive permissions/ACLs.
 Never commit it, include it in a cache, upload it as a release or workflow
 artifact, or print key/password values in logs. Publish `minisign.pub` through
 a trusted channel (for example, the project's README or website) so consumers
@@ -256,7 +257,8 @@ and access to Actions secrets. For overwrite refusals, inspect the existing
 files and secrets rather than deleting them blindly. If an upload fails
 after key creation or after only some secrets were uploaded, retain the key
 pair and fix access. From the directory containing the original
-`minisign.key` and `minisign.pub`, retry against the same repository:
+`minisign.key` (and `minisign.pub` if present), retry against the same
+repository:
 
 ```sh
 ghr minisign generate --repo OWNER/REPO \
@@ -264,7 +266,10 @@ ghr minisign generate --repo OWNER/REPO \
 ```
 
 `--reuse-existing-local-pair` validates that the private and public keys
-match; it never generates a key or rewrites either file.
+match; it never generates a key or rewrites the private file. If
+`minisign.pub` is missing, it reconstructs that public file from the same
+private key. Mismatched keys, unsafe private-file permissions, or incorrect
+encryption options/passwords fail before upload.
 `--replace-existing-secrets` explicitly permits replacing signing secrets,
 including any uploaded before the failure, with values from **the same key
 pair**. Inspect the target and existing secrets first; do not regenerate or
@@ -302,9 +307,11 @@ and their signatures, not the private key.
 
 Supply a strong, nonempty `MINISIGN_PASSWORD` in the local environment, then
 run `ghr minisign generate --encrypt` (with `--repo OWNER/REPO` if needed).
-This mode also uploads `MINISIGN_PASSWORD` for unattended signing. Existing
-password-encrypted minisign keys remain supported. Only encrypted keys need
-both variables in the signing step:
+This mode uploads the key first, then `MINISIGN_PASSWORD` for unattended
+signing. A password-upload failure is incomplete setup, not success; use the
+encrypted retry above without rotating the key. Existing password-encrypted
+minisign keys remain supported. Only encrypted keys need both variables in
+the signing step:
 
 ```yaml
 - run: ghr minisign sign artifact.tar.gz

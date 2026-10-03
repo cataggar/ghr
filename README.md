@@ -187,9 +187,10 @@ key files. Existing signing secrets require explicit
 By default, only `MINISIGN_SECRET_KEY` is configured: an **unencrypted
 minisign-format key inside GitHub's encrypted repository secret**.
 `MINISIGN_PASSWORD` is neither required nor changed, even when replacing
-secrets. On POSIX, the generated private file has mode `0600`. Keep
-`minisign.key` private with restrictive permissions/ACLs; never commit it,
-cache it, or upload it as a release or workflow artifact. Publish only
+secrets. The generated private file has mode `0600` on POSIX and a verified,
+protected owner-only DACL on Windows, applied before key material is written.
+Keep `minisign.key` private with restrictive permissions/ACLs; never commit
+it, cache it, or upload it as a release or workflow artifact. Publish only
 `minisign.pub` through a trusted channel so users can verify releases.
 
 See [repository signing setup and recovery](doc/github-actions.md#signing-releases)
