@@ -394,11 +394,7 @@ fn createPair(allocator: Allocator, io: Io, dir: Dir, password: ?[]const u8) !Pa
     try protectPrivate(io, &private);
     var public = try dir.createFileAtomic(io, public_path, .{});
     defer public.deinit(io);
-    // The pinned library copies its arena before allocating the comment.
-    // A parent arena owns even that allocation until the library fixes this.
-    var library_arena: std.heap.ArenaAllocator = .init(allocator);
-    defer library_arena.deinit();
-    var key = try minizign.SecretKey.generate(library_arena.allocator(), io);
+    var key = try minizign.SecretKey.generate(allocator, io);
     defer key.deinit();
     const pk = key.getPublicKey();
     if (password) |bytes| try key.encrypt(allocator, io, bytes);
@@ -472,14 +468,12 @@ fn reusePair(allocator: Allocator, io: Io, dir: Dir, options: Options, password:
 fn validateSigningPair(allocator: Allocator, io: Io, dir: Dir, key: *const minizign.SecretKey, public: minizign.PublicKey) !void {
     const file = try dir.openFile(io, public_path, .{ .follow_symlinks = false, .allow_directory = false });
     defer file.close(io);
-    var library_arena: std.heap.ArenaAllocator = .init(allocator);
-    defer library_arena.deinit();
-    var signature = key.signFile(library_arena.allocator(), io, file, true, "ghr local key recovery check") catch |err| switch (err) {
+    var signature = key.signFile(allocator, io, file, true, "ghr local key recovery check") catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidLocalSigningKey,
     };
     defer signature.deinit();
-    public.verifyFile(library_arena.allocator(), io, file, signature, true) catch |err| switch (err) {
+    public.verifyFile(allocator, io, file, signature, true) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidLocalSigningKey,
     };
@@ -806,9 +800,7 @@ test "generate uses gh current context and uploads only the in-process unencrypt
     var payload = try fixture.dir.createFile(std.testing.io, "payload", .{ .read = true });
     defer payload.close(std.testing.io);
     try payload.writeStreamingAll(std.testing.io, "generated key signing fixture");
-    var signing_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer signing_arena.deinit();
-    var signature = try key.signFile(signing_arena.allocator(), std.testing.io, payload, true, "generation test");
+    var signature = try key.signFile(std.testing.allocator, std.testing.io, payload, true, "generation test");
     defer signature.deinit();
     try key.getPublicKey().verifyFile(std.testing.allocator, std.testing.io, payload, signature, true);
 }
