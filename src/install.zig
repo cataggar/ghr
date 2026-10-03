@@ -98,17 +98,17 @@ pub fn ensureDirAbsoluteRecursive(io: Io, abs_path: []const u8) Dir.CreateDirErr
 
 /// Build a hidden, deterministic staging path beside an install path.
 fn stagingSiblingPath(allocator: std.mem.Allocator, parent: []const u8, leaf: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}{c}.{s}.staging", .{ parent, std.fs.path.sep, leaf });
+    return allocator.print("{s}{c}.{s}.staging", .{ parent, std.fs.path.sep, leaf });
 }
 
 /// Build the tombstone path used while replacing an install path.
 fn backupSiblingPath(allocator: std.mem.Allocator, parent: []const u8, leaf: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}{c}.{s}.old", .{ parent, std.fs.path.sep, leaf });
+    return allocator.print("{s}{c}.{s}.old", .{ parent, std.fs.path.sep, leaf });
 }
 
 /// Build the visible tombstone path used by ghr 0.6.8 and earlier.
 fn legacyBackupPath(allocator: std.mem.Allocator, final_path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}.old", .{final_path});
+    return allocator.print("{s}.old", .{final_path});
 }
 
 fn directoryExists(io: Io, abs_path: []const u8) !bool {
@@ -482,7 +482,7 @@ fn isExecutableTarget(allocator: std.mem.Allocator, io: Io, root: Dir, relative_
     var remaining: []const u8 = pending;
     var links: usize = 0;
     var components: usize = 0;
-    const separators = if (builtin.os.tag == .windows) "/\\" else "/";
+    const separators = if (builtin.target.os.tag == .windows) "/\\" else "/";
 
     while (remaining.len > 0) {
         components += 1;
@@ -508,11 +508,11 @@ fn isExecutableTarget(allocator: std.mem.Allocator, io: Io, root: Dir, relative_
                 const len = try parent.readLink(io, name, &target_buf);
                 const target = target_buf[0..len];
                 if (target.len == 0 or std.fs.path.isAbsolute(target) or
-                    (builtin.os.tag == .windows and target.len >= 2 and target[1] == ':'))
+                    (builtin.target.os.tag == .windows and target.len >= 2 and target[1] == ':'))
                     return false;
                 if (target.len + remaining.len + 1 > Dir.max_path_bytes) return false;
                 const expanded = if (needs_directory)
-                    try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ target, std.fs.path.sep, remaining })
+                    try allocator.print("{s}{c}{s}", .{ target, std.fs.path.sep, remaining })
                 else
                     try allocator.dupe(u8, target);
                 allocator.free(pending);
@@ -530,7 +530,7 @@ fn isExecutableTarget(allocator: std.mem.Allocator, io: Io, root: Dir, relative_
             .file => {
                 if (needs_directory or isSharedLibrary(name) or isAppleArchiveCruft(name)) return false;
                 if (windows) return true;
-                if (@as(u32, @intFromEnum(stat.permissions)) & 0o111 != 0) return true;
+                if (@as(u32, @backingInt(stat.permissions)) & 0o111 != 0) return true;
                 const file = parent.openFile(io, name, .{ .follow_symlinks = false, .allow_directory = false }) catch |err| switch (err) {
                     error.AccessDenied, error.PermissionDenied => return false,
                     else => return err,
@@ -541,7 +541,7 @@ fn isExecutableTarget(allocator: std.mem.Allocator, io: Io, root: Dir, relative_
                 // ZIP mode recovery acts on the opened, contained target, not
                 // on the alias path, which is kept for command publication.
                 if (comptime File.Permissions.has_executable_bit)
-                    try file.setPermissions(io, @enumFromInt(@as(u32, @intFromEnum(opened_stat.permissions)) | 0o111));
+                    try file.setPermissions(io, @fromBackingInt(@intCast(@as(u32, @backingInt(opened_stat.permissions)) | 0o111)));
                 return true;
             },
             else => return false,
@@ -633,7 +633,7 @@ fn deriveBareBinaryName(
             for (bare_binary_archs) |a| {
                 if (matchLeadingToken(after, a) != null) {
                     if (is_windows) {
-                        return std.fmt.allocPrint(allocator, "{s}.exe", .{stem});
+                        return allocator.print("{s}.exe", .{stem});
                     }
                     return allocator.dupe(u8, stem);
                 }
@@ -653,7 +653,7 @@ fn deriveBareBinaryName(
                 for (bare_binary_archs) |a| {
                     if (matchLeadingToken(rest, a) != null) {
                         if (is_windows) {
-                            return std.fmt.allocPrint(allocator, "{s}.exe", .{stem});
+                            return allocator.print("{s}.exe", .{stem});
                         }
                         return allocator.dupe(u8, stem);
                     }
@@ -662,7 +662,7 @@ fn deriveBareBinaryName(
         }
     }
 
-    if (is_windows) return std.fmt.allocPrint(allocator, "{s}.exe", .{repo});
+    if (is_windows) return allocator.print("{s}.exe", .{repo});
     return allocator.dupe(u8, repo);
 }
 
@@ -701,7 +701,7 @@ fn deinitPathList(
 /// keeps executable-looking firmware and other data in deeper directories off
 /// PATH while preserving nested-only archive layouts.
 fn findExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.ArrayListUnmanaged([]const u8) {
-    return findExecutablesForPlatform(allocator, io, dir, builtin.os.tag == .windows);
+    return findExecutablesForPlatform(allocator, io, dir, builtin.target.os.tag == .windows);
 }
 
 fn findExecutablesForPlatform(
@@ -906,7 +906,7 @@ fn findDebExecutables(allocator: std.mem.Allocator, io: Io, dir: Dir) !std.Array
     var iter = bin_dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file and entry.kind != .sym_link) continue;
-        const rel_name = try std.fmt.allocPrint(allocator, "usr/bin/{s}", .{entry.name});
+        const rel_name = try allocator.print("usr/bin/{s}", .{entry.name});
         try result.append(allocator, rel_name);
     }
 
@@ -943,7 +943,7 @@ fn scanExecutableLevel(
         // carry the exec bit, and linking them clutters the bin dir (#123).
         if (isAppleArchiveCruft(entry.name)) continue;
         const rel_name = if (prefix.len > 0)
-            try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name })
+            try allocator.print("{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name })
         else
             try allocator.dupe(u8, entry.name);
 
@@ -1021,13 +1021,13 @@ fn scanAppBundle(
     };
     defer macos_dir.close(io);
 
-    const prefix = try std.fmt.allocPrint(allocator, "{s}/Contents/MacOS", .{app_prefix});
+    const prefix = try allocator.print("{s}/Contents/MacOS", .{app_prefix});
     defer allocator.free(prefix);
 
     var iter = macos_dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .file and entry.kind != .sym_link) continue;
-        const rel_name = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name });
+        const rel_name = try allocator.print("{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name });
         const is_exe = isExecutableCandidate(allocator, io, root, rel_name, windows) catch |err| {
             allocator.free(rel_name);
             return err;
@@ -1139,7 +1139,7 @@ fn cleanupWasmBinEntry(io: Io, bin_dir: Dir, wasm_rel_path: []const u8, tool_pat
 
     if (!owned) return;
     bin_dir.deleteFile(io, ghr_name) catch {};
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         var exe_name_buf: [Dir.max_path_bytes]u8 = undefined;
         const exe_name = std.fmt.bufPrint(&exe_name_buf, "{s}.exe", .{stem}) catch return;
         bin_dir.deleteFile(io, exe_name) catch {};
@@ -1159,7 +1159,7 @@ fn binGhrPointsToToolDir(io: Io, bin_dir: Dir, ghr_name: []const u8, tool_path: 
         bin_dir,
         ghr_name,
         tool_path,
-        builtin.os.tag == .windows,
+        builtin.target.os.tag == .windows,
     );
 }
 
@@ -1240,24 +1240,36 @@ fn validateGhrManifest(
     ghr_path: []const u8,
     err_w: *Writer,
 ) !void {
-    const raw = Dir.cwd().readFileAlloc(io, ghr_path, allocator, Io.Limit.limited(64 * 1024)) catch {
-        try err_w.print("error: cannot read manifest '{s}'\n", .{ghr_path});
-        try err_w.flush();
-        return error.InstallStepFailed;
+    const raw = Dir.cwd().readFileAlloc(io, ghr_path, allocator, Io.Limit.limited(64 * 1024)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            try err_w.print("error: cannot read manifest '{s}'\n", .{ghr_path});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        },
     };
     defer allocator.free(raw);
 
-    const source = try allocator.dupeZ(u8, raw);
+    const source = try allocator.dupeSentinel(u8, raw, 0);
     defer allocator.free(source);
 
-    const manifest = std.zon.parse.fromSliceAlloc(GhrManifest, allocator, source, null, .{
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const manifest = std.zon.parse.fromSlice(GhrManifest, .{
+        .gpa = allocator,
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &diagnostics,
         .ignore_unknown_fields = true,
-    }) catch {
-        try err_w.print("error: invalid `.ghr` manifest '{s}' (must be ZON with a `.version` field)\n", .{ghr_path});
-        try err_w.flush();
-        return error.InstallStepFailed;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseZon => {
+            try err_w.print("error: invalid `.ghr` manifest '{s}' (must be ZON with a `.version` field)\n", .{ghr_path});
+            try err_w.flush();
+            return error.InstallStepFailed;
+        },
     };
-    defer std.zon.parse.free(allocator, manifest);
 
     if (manifest.version != 1) {
         try err_w.print("error: unsupported `.ghr` version {d} (only version 1 is supported)\n", .{manifest.version});
@@ -1291,7 +1303,7 @@ fn scanForAppBundles(
     while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
         const rel_name = if (prefix.len > 0)
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name })
+            try allocator.print("{s}/{s}", .{ prefix, entry.name })
         else
             try allocator.dupe(u8, entry.name);
 
@@ -1327,7 +1339,7 @@ fn installAppBundles(
     if (app_paths.len == 0) return;
 
     const home = environ.get("HOME") orelse return error.HomeNotFound;
-    const apps_dir_path = try std.fmt.allocPrint(allocator, "{s}/Applications", .{home});
+    const apps_dir_path = try allocator.print("{s}/Applications", .{home});
     defer allocator.free(apps_dir_path);
     Dir.createDirAbsolute(io, apps_dir_path, .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -1339,7 +1351,7 @@ fn installAppBundles(
 
     for (app_paths) |rel_path| {
         const app_name = std.fs.path.basename(rel_path);
-        const app_src = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path });
+        const app_src = try allocator.print("{s}/{s}", .{ tool_dir_path, rel_path });
         defer allocator.free(app_src);
 
         // If an existing app is present, only replace it if we own it (has our marker or is a legacy symlink)
@@ -1370,7 +1382,7 @@ fn installAppBundles(
         }
 
         // Copy to a staging name, then rename for atomicity
-        const staging_name = try std.fmt.allocPrint(allocator, ".ghr-staging-{s}", .{app_name});
+        const staging_name = try allocator.print(".ghr-staging-{s}", .{app_name});
         defer allocator.free(staging_name);
         apps_dir.deleteTree(io, staging_name) catch {};
 
@@ -1417,7 +1429,7 @@ fn uninstallAppBundles(
     if (app_paths.len == 0) return;
 
     const home = environ.get("HOME") orelse return error.HomeNotFound;
-    const apps_dir_path = try std.fmt.allocPrint(allocator, "{s}/Applications", .{home});
+    const apps_dir_path = try allocator.print("{s}/Applications", .{home});
     defer allocator.free(apps_dir_path);
 
     var apps_dir = Dir.openDirAbsolute(io, apps_dir_path, .{}) catch |err| switch (err) {
@@ -1455,10 +1467,8 @@ fn isOwnedAppBundle(io: Io, apps_dir: Dir, app_name: []const u8, tool_dir_path: 
 
     // Read and compare source path
     var content_buf: [Dir.max_path_bytes]u8 = undefined;
-    var file = apps_dir.openFile(io, marker_path, .{ .follow_symlinks = false }) catch return false;
+    const file = apps_dir.openFile(io, marker_path, .{ .follow_symlinks = false }) catch return false;
     defer file.close(io);
-    // Zig 0.16 opens no-follow Windows handles asynchronously but marks them blocking.
-    if (comptime builtin.os.tag == .windows) file.flags.nonblocking = true;
     const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
     return std.mem.eql(u8, content_buf[0..len], tool_dir_path);
 }
@@ -1475,7 +1485,7 @@ fn isLegacyAppSymlink(
     var link_buf: [Dir.max_path_bytes]u8 = undefined;
     const len = apps_dir.readLink(io, app_name, &link_buf) catch return false;
     const link_target = link_buf[0..len];
-    const expected = std.fmt.allocPrint(allocator, "{s}/{s}", .{ tool_dir_path, rel_path }) catch return false;
+    const expected = allocator.print("{s}/{s}", .{ tool_dir_path, rel_path }) catch return false;
     defer allocator.free(expected);
     return std.mem.eql(u8, link_target, expected);
 }
@@ -1626,7 +1636,7 @@ fn cleanupOldInstall(
         const exe_name = std.fs.path.basename(exe_rel);
         if (release_mod.isWasmAssetName(exe_rel)) {
             cleanupWasmBinEntry(io, bin_dir, exe_rel, tool_path);
-        } else if (builtin.os.tag == .windows) {
+        } else if (builtin.target.os.tag == .windows) {
             cleanupWindowsBinEntry(io, bin_dir, exe_name, tool_path);
         } else {
             // Verify the symlink points to our tool dir before removing
@@ -1642,7 +1652,7 @@ fn cleanupOldInstall(
     }
 
     // Remove old app bundle copies (macOS)
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         uninstallAppBundles(allocator, io, environ, meta.parsed.value.apps, tool_path, w) catch {};
     }
 }
@@ -1700,7 +1710,7 @@ fn shimPointsToToolDir(io: Io, bin_dir: Dir, shim_name: []const u8, tool_path: [
     const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
     const content = std.mem.trim(u8, content_buf[0..len], &[_]u8{ ' ', '\t', '\r', '\n' });
     if (content.len < tool_path.len) return false;
-    const prefix_matches = if (builtin.os.tag == .windows)
+    const prefix_matches = if (builtin.target.os.tag == .windows)
         std.ascii.eqlIgnoreCase(content[0..tool_path.len], tool_path)
     else
         std.mem.eql(u8, content[0..tool_path.len], tool_path);
@@ -2010,7 +2020,7 @@ fn verifyDownloadedAsset(
 /// Inventory/plan/write platform for the local store. Named once so the
 /// reader, planner, and writer cannot drift apart.
 const host_platform: install_state.Platform = install_state.default_platform;
-const host_is_windows = builtin.os.tag == .windows;
+const host_is_windows = builtin.target.os.tag == .windows;
 
 /// Command-level options for one `ghr install` invocation.
 pub const InstallOptions = struct {
@@ -2352,9 +2362,9 @@ fn writeInstallCacheMaterial(
     try w.print(
         "{{\"schema\":1,\"form\":\"install-cache-key\",\"target\":{{\"os\":\"{t}\",\"arch\":\"{t}\",\"abi\":\"{t}\"}},\"state_schema\":{d},\"layout_generation\":{d},\"requests\":[",
         .{
-            builtin.os.tag,
-            builtin.cpu.arch,
-            builtin.abi,
+            builtin.target.os.tag,
+            builtin.target.cpu.arch,
+            builtin.target.abi,
             install_state_write.schema_version,
             install_state_write.layout_generation,
         },
@@ -2553,7 +2563,7 @@ fn discardStagedUnit(allocator: std.mem.Allocator, io: Io, unit: *StagedUnit) vo
     if (owned_opt) |*owned| {
         defer owned.deinit();
         if (owned.journal.op == .uninstall or
-            @intFromEnum(owned.journal.phase) >= @intFromEnum(install_txn.Phase.swapping))
+            @backingInt(owned.journal.phase) >= @backingInt(install_txn.Phase.swapping))
             return;
     } else if (install_txn.directoryExists(io, unit.paths.backup) catch return) {
         return;
@@ -2943,7 +2953,7 @@ fn discoverStagedCommands(
     }
     unit.commands = commands;
 
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         var apps = try findAppBundles(allocator, ctx.io, stage_dir);
         defer {
             for (apps.items) |app| allocator.free(app);
@@ -3003,7 +3013,7 @@ fn stageArchiveUnit(
         try w.print("downloading {s} ...\n", .{asset.name});
         try w.flush();
 
-        const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+        const download_path = try allocator.print("{s}{c}{s}", .{
             d.cache, std.fs.path.sep, asset.name,
         });
         defer allocator.free(download_path);
@@ -3097,7 +3107,7 @@ fn stageArchiveUnit(
         .result = try a.dupe(u8, verified_label),
         .minisign = if (recorded_minisign_key) |k| try a.dupe(u8, k) else null,
     };
-    unit.display = try std.fmt.allocPrint(a, "{s}@{s}", .{ unit.id, tag_name });
+    unit.display = try a.print("{s}@{s}", .{ unit.id, tag_name });
 
     try out.append(allocator, unit);
     keep = true;
@@ -3139,7 +3149,7 @@ fn stageWasmUnit(
         try err_w.flush();
         return error.InstallStepFailed;
     }
-    const child_id = try std.fmt.allocPrint(a, "{s}/{s}", .{ request.id, canonical_stem });
+    const child_id = try a.print("{s}/{s}", .{ request.id, canonical_stem });
 
     release_mod.preflightVerification(assets, asset.name, ctx.gates, minisign_pubkey_b64, err_w) catch
         return error.InstallStepFailed;
@@ -3153,7 +3163,7 @@ fn stageWasmUnit(
 
     ensureDirAbsoluteRecursive(io, d.cache) catch {};
 
-    const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+    const download_path = try allocator.print("{s}{c}{s}", .{
         d.cache, std.fs.path.sep, asset.name,
     });
     defer allocator.free(download_path);
@@ -3182,7 +3192,7 @@ fn stageWasmUnit(
         debug_w,
     );
 
-    const ghr_name = try std.fmt.allocPrint(allocator, "{s}.ghr", .{asset.name});
+    const ghr_name = try allocator.print("{s}.ghr", .{asset.name});
     defer allocator.free(ghr_name);
     const ghr_asset = release_mod.findGhrManifestAsset(assets, asset.name) orelse {
         try err_w.print(
@@ -3192,7 +3202,7 @@ fn stageWasmUnit(
         try err_w.flush();
         return error.InstallStepFailed;
     };
-    const ghr_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_name });
+    const ghr_path = try allocator.print("{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_name });
     defer allocator.free(ghr_path);
     defer Dir.deleteFileAbsolute(io, ghr_path) catch {};
     const ghr_dl = release_mod.assetDownload(ghr_asset, ctx.auth_header != null);
@@ -3205,7 +3215,7 @@ fn stageWasmUnit(
         try err_w.flush();
         return error.InstallStepFailed;
     };
-    validateGhrManifest(allocator, io, ghr_path, err_w) catch return error.InstallStepFailed;
+    try validateGhrManifest(allocator, io, ghr_path, err_w);
 
     {
         var stage_dir = Dir.openDirAbsolute(io, unit.paths.stage, .{ .iterate = true }) catch |err| {
@@ -3250,7 +3260,7 @@ fn stageWasmUnit(
         .result = try a.dupe(u8, vr.label),
         .minisign = if (vr.minisign_key) |k| try a.dupe(u8, k) else null,
     };
-    unit.display = try std.fmt.allocPrint(a, "{s}@{s}", .{ unit.id, tag_name });
+    unit.display = try a.print("{s}@{s}", .{ unit.id, tag_name });
 
     try out.append(allocator, unit);
     keep = true;
@@ -3411,9 +3421,9 @@ fn verifyGenericUrlMinisign(
         return error.InstallStepFailed;
     };
 
-    const sidecar_url = try std.fmt.allocPrint(allocator, "{s}.minisig", .{url});
+    const sidecar_url = try allocator.print("{s}.minisig", .{url});
     defer allocator.free(sidecar_url);
-    const sidecar_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}.minisig", .{
+    const sidecar_path = try allocator.print("{s}{c}{s}.minisig", .{
         ctx.dirs.cache, std.fs.path.sep, asset_name,
     });
     defer allocator.free(sidecar_path);
@@ -3538,7 +3548,7 @@ fn stageGenericUrlRequest(
     defer stage_dir.close(io);
 
     ensureDirAbsoluteRecursive(io, d.cache) catch {};
-    const download_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+    const download_path = try allocator.print("{s}{c}{s}", .{
         d.cache, std.fs.path.sep, asset_name,
     });
     defer allocator.free(download_path);
@@ -3565,7 +3575,7 @@ fn stageGenericUrlRequest(
         try err_w.flush();
         return error.InstallStepFailed;
     };
-    const digest_hex = try std.fmt.allocPrint(a, "{x}", .{&digest});
+    const digest_hex = try a.print("{x}", .{&digest});
 
     const format = archive.detectFormat(asset_name);
     switch (format) {
@@ -3666,7 +3676,7 @@ fn planAndCommit(ctx: *const InstallContext, units: []const *StagedUnit) !void {
     };
     defer plan.deinit();
 
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         preflightAppBundles(ctx, units, inventory) catch |err| {
             try err_w.print("error: .app bundle publication is not safe: {t}\n", .{err});
             try err_w.print("  no install state was changed\n", .{});
@@ -3705,7 +3715,7 @@ fn preflightAppBundles(
         for (units) |unit| if (unit.apps.len > 0) return error.HomeNotFound;
         return;
     };
-    const apps_path = try std.fmt.allocPrint(a, "{s}/Applications", .{home});
+    const apps_path = try a.print("{s}/Applications", .{home});
     var apps_dir_opt: ?Dir = Dir.openDirAbsolute(ctx.io, apps_path, .{}) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -3948,7 +3958,7 @@ fn commitUnit(
         return error.InstallStepFailed;
     };
 
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         installAppBundles(allocator, io, ctx.environ, unit.apps, p.unit, previous_path, w) catch |err| {
             try err_w.print("error: failed to install .app bundle for '{s}': {t}\n", .{ unit.id, err });
             try err_w.flush();
@@ -4007,7 +4017,7 @@ fn rollbackCommit(
         }
     } else |_| {}
 
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         try uninstallAppBundles(allocator, io, ctx.environ, unit.apps, p.unit, ctx.w);
     }
 
@@ -4038,14 +4048,14 @@ fn rollbackCommit(
             return;
         };
         republishInBin(ctx, prev, p.unit);
-        if (comptime builtin.os.tag.isDarwin()) {
+        if (comptime builtin.target.os.tag.isDarwin()) {
             installAppBundles(allocator, io, ctx.environ, prev.apps, p.unit, null, ctx.w) catch {};
         }
     } else {
         // A legacy unit was never moved, so its content is still live; only its
         // commands may have been overwritten.
         republishInBin(ctx, prev, previous_path orelse p.unit);
-        if (comptime builtin.os.tag.isDarwin()) {
+        if (comptime builtin.target.os.tag.isDarwin()) {
             installAppBundles(
                 allocator,
                 io,
@@ -4215,7 +4225,7 @@ fn retireLegacyUnit(ctx: *const InstallContext, legacy_path: []const u8, kind: i
                 while (it.next(io) catch null) |entry| {
                     const is_dir = entry.kind == .directory;
                     if (is_dir and !isInstallTransactionDir(entry.name)) {
-                        const child = std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+                        const child = allocator.print("{s}{c}{s}", .{
                             legacy_path, std.fs.path.sep, entry.name,
                         }) catch continue;
                         defer allocator.free(child);
@@ -4397,7 +4407,7 @@ fn republishFromUnit(ctx: *const InstallContext, p: install_txn.Paths, journal: 
     var bin_dir = try Dir.openDirAbsolute(io, ctx.dirs.bin, .{});
     defer bin_dir.close(io);
     republishRecordCommands(ctx, bin_dir, record, p.unit);
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         try installAppBundles(
             allocator,
             io,
@@ -4442,7 +4452,7 @@ fn finishRemoval(ctx: *const InstallContext, p: install_txn.Paths, journal: inst
             }
         }
     } else |_| {}
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         try uninstallAppBundles(
             ctx.allocator,
             io,
@@ -4477,7 +4487,7 @@ fn finishRollback(ctx: *const InstallContext, p: install_txn.Paths, journal: ins
                 bin_dir.deleteFile(io, name) catch {};
         }
     } else |_| {}
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         try uninstallAppBundles(ctx.allocator, io, ctx.environ, journal.apps, p.unit, ctx.w);
     }
 
@@ -4530,7 +4540,7 @@ fn republishLegacyUnit(
     var bin_dir = try Dir.openDirAbsolute(ctx.io, ctx.dirs.bin, .{});
     defer bin_dir.close(ctx.io);
     republishRecordCommands(ctx, bin_dir, record, legacy_path);
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         try installAppBundles(
             ctx.allocator,
             ctx.io,
@@ -4656,7 +4666,7 @@ fn publishNativeCommand(
     src_path: []const u8,
     allow_locked_launcher: bool,
 ) !void {
-    if (builtin.os.tag != .windows) {
+    if (builtin.target.os.tag != .windows) {
         bin_dir.deleteFile(io, final_name) catch {};
         try bin_dir.symLink(io, src_path, final_name, .{});
         return;
@@ -4725,15 +4735,26 @@ fn publishWasmCommand(
     var manifest_name_buf: [Dir.max_path_bytes]u8 = undefined;
     const manifest_name = std.fmt.bufPrint(&manifest_name_buf, "{s}.ghr", .{host_rel}) catch
         return error.PathTooLong;
-    const raw = tool_dir.readFileAlloc(io, manifest_name, allocator, Io.Limit.limited(64 * 1024)) catch
-        return error.CreateFailed;
+    const raw = tool_dir.readFileAlloc(io, manifest_name, allocator, Io.Limit.limited(64 * 1024)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CreateFailed,
+    };
     defer allocator.free(raw);
-    const source = try allocator.dupeZ(u8, raw);
+    const source = try allocator.dupeSentinel(u8, raw, 0);
     defer allocator.free(source);
-    const manifest = std.zon.parse.fromSliceAlloc(GhrManifest, allocator, source, null, .{
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const manifest = std.zon.parse.fromSlice(GhrManifest, .{
+        .gpa = allocator,
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &diagnostics,
         .ignore_unknown_fields = true,
-    }) catch return error.WriteFailed;
-    defer std.zon.parse.free(allocator, manifest);
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseZon => return error.WriteFailed,
+    };
 
     var ghr_name_buf: [Dir.max_path_bytes]u8 = undefined;
     const ghr_name = std.fmt.bufPrint(&ghr_name_buf, "{s}.ghr", .{final_name}) catch
@@ -4767,13 +4788,13 @@ fn publishWasmCommand(
     } else |_| {}
 
     var launcher_name_buf: [Dir.max_path_bytes]u8 = undefined;
-    const launcher_name = if (builtin.os.tag == .windows)
+    const launcher_name = if (builtin.target.os.tag == .windows)
         std.fmt.bufPrint(&launcher_name_buf, "{s}.exe", .{final_name}) catch return error.PathTooLong
     else
         final_name;
 
     bin_dir.deleteFile(io, launcher_name) catch {
-        if (builtin.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             var old_name_buf: [Dir.max_path_bytes]u8 = undefined;
             const old_name = std.fmt.bufPrint(&old_name_buf, "{s}.old", .{launcher_name}) catch
                 return error.PathTooLong;
@@ -4961,7 +4982,7 @@ fn uninstallUnit(ctx: *const InstallContext, spec_str: []const u8) !void {
         }
     } else |_| {}
 
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         try uninstallAppBundles(allocator, io, ctx.environ, record.apps, unit_path, w);
     }
 
@@ -5010,11 +5031,11 @@ const TestStore = struct {
         const base = try t_alloc.dupe(u8, buf[0..len]);
         errdefer t_alloc.free(base);
 
-        const bin = try std.fmt.allocPrint(t_alloc, "{s}{c}bin", .{ base, std.fs.path.sep });
+        const bin = try t_alloc.print("{s}{c}bin", .{ base, std.fs.path.sep });
         errdefer t_alloc.free(bin);
-        const tools = try std.fmt.allocPrint(t_alloc, "{s}{c}tools", .{ base, std.fs.path.sep });
+        const tools = try t_alloc.print("{s}{c}tools", .{ base, std.fs.path.sep });
         errdefer t_alloc.free(tools);
-        const cache = try std.fmt.allocPrint(t_alloc, "{s}{c}cache", .{ base, std.fs.path.sep });
+        const cache = try t_alloc.print("{s}{c}cache", .{ base, std.fs.path.sep });
         errdefer t_alloc.free(cache);
         try ensureDirAbsoluteRecursive(std.testing.io, bin);
         try ensureDirAbsoluteRecursive(std.testing.io, tools);
@@ -5064,7 +5085,7 @@ const TestStore = struct {
     }
 
     fn binPath(self: *TestStore, a: std.mem.Allocator, name: []const u8) ![]u8 {
-        return std.fmt.allocPrint(a, "{s}{c}{s}", .{ self.dirs.bin, std.fs.path.sep, name });
+        return a.print("{s}{c}{s}", .{ self.dirs.bin, std.fs.path.sep, name });
     }
 
     fn toolsPath(self: *TestStore, a: std.mem.Allocator, rel: []const u8) ![]u8 {
@@ -5193,7 +5214,7 @@ test "executable symlink aliases preserve names, metadata, and package links aft
     var installed = try Dir.openDirAbsolute(ctx.io, unit.paths.unit, .{});
     defer installed.close(ctx.io);
     for (record.commands) |cmd| {
-        const expected = try std.fmt.allocPrint(t_alloc, "bin/{s}", .{cmd.name});
+        const expected = try t_alloc.print("bin/{s}", .{cmd.name});
         defer t_alloc.free(expected);
         try std.testing.expectEqualStrings(expected, cmd.relative_target);
         try tExpectCommandOutput(&store, cmd.name);
@@ -5342,15 +5363,15 @@ test "app publication adopts a legacy marker and records the v2 unit" {
     defer p.deinit();
     const legacy = try store.toolsPath(a, "example/tool");
 
-    const source_contents = try std.fmt.allocPrint(a, "{s}/Foo.app/Contents", .{p.unit});
+    const source_contents = try a.print("{s}/Foo.app/Contents", .{p.unit});
     try ensureDirAbsoluteRecursive(ctx.io, source_contents);
-    const source_file = try std.fmt.allocPrint(a, "{s}/payload", .{source_contents});
+    const source_file = try a.print("{s}/payload", .{source_contents});
     var payload = try Dir.createFileAbsolute(ctx.io, source_file, .{});
     payload.close(ctx.io);
 
-    const installed_contents = try std.fmt.allocPrint(a, "{s}/Applications/Foo.app/Contents", .{store.base});
+    const installed_contents = try a.print("{s}/Applications/Foo.app/Contents", .{store.base});
     try ensureDirAbsoluteRecursive(ctx.io, installed_contents);
-    const old_marker = try std.fmt.allocPrint(a, "{s}/.ghr-source", .{installed_contents});
+    const old_marker = try a.print("{s}/.ghr-source", .{installed_contents});
     var marker = try Dir.createFileAbsolute(ctx.io, old_marker, .{});
     try marker.writeStreamingAll(ctx.io, legacy);
     marker.close(ctx.io);
@@ -5904,7 +5925,7 @@ test "corrupt metadata anywhere blocks install and uninstall" {
     const a = arena_inst.allocator();
     const other = try store.toolsPath(a, "_v2/units/u-broken/_unit");
     try ensureDirAbsoluteRecursive(ctx.io, other);
-    const meta = try std.fmt.allocPrint(a, "{s}{c}ghr.json", .{ other, std.fs.path.sep });
+    const meta = try a.print("{s}{c}ghr.json", .{ other, std.fs.path.sep });
     {
         var f = try Dir.createFileAbsolute(ctx.io, meta, .{});
         defer f.close(ctx.io);
@@ -6119,14 +6140,15 @@ fn tStageWasmUnit(ctx: *const InstallContext, id: []const u8, module: []const u8
         try f.writeStreamingAll(ctx.io, "\x00asm");
     }
     {
-        const manifest_name = try std.fmt.allocPrint(a, "{s}.ghr", .{module});
+        const manifest_name = try a.print("{s}.ghr", .{module});
         var f = try stage_dir.createFile(ctx.io, manifest_name, .{});
         defer f.close(ctx.io);
         try f.writeStreamingAll(ctx.io,
             \\.{
             \\    .version = 1,
             \\    .runtime = "wasmtime",
-            \\    .runtimeArgs = .{ "--dir=." },
+            \\    .runtimeArgs = .{ "--dir=.", "--env=QUOTED=\"hello world\"" },
+            \\    .future = .{ .nested = "ignored" },
             \\}
         );
     }
@@ -6170,12 +6192,73 @@ test "a wasm module publishes a launcher plus its runtime manifest" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "targetWasm") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "wasmtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "u-parser") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "--env=QUOTED=\\\"hello world\\\"") != null);
 
     var inv = try tScan(&ctx);
     defer inv.deinit(t_alloc);
     const rec = tFindRecord(inv, "example/tools/parser").?;
     try std.testing.expectEqualStrings("wasm", rec.commands[0].kind.?);
     try std.testing.expectEqualStrings("parser.wasm", rec.commands[0].relative_target);
+}
+
+test "downloaded ghr manifests keep unknown fields and reject malformed or unsupported data" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const path = try t_alloc.print("{s}{c}module.ghr", .{ path_buf[0..path_len], std.fs.path.sep });
+    defer t_alloc.free(path);
+
+    const Case = struct { source: []const u8, diagnostic: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .source = ".{ .version = 1 }" },
+        .{ .source = ".{ .version = 1, .runtime = \"wamr\", .runtimeArgs = .{ \"quoted\\\"argument\" }, .future = .{ .nested = true } }" },
+        .{ .source = ".{ .version =", .diagnostic = "invalid `.ghr` manifest" },
+        .{ .source = ".{ .runtime = \"wasmtime\" }", .diagnostic = "invalid `.ghr` manifest" },
+        .{ .source = ".{ .version = 2 }", .diagnostic = "unsupported `.ghr` version 2" },
+        .{ .source = ".{ .version = 1, .runtime = \"other\" }", .diagnostic = "runtime 'other' is not allowed" },
+    };
+    for (cases) |case| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "module.ghr", .data = case.source });
+        var diagnostics = Writer.Allocating.init(t_alloc);
+        defer diagnostics.deinit();
+        if (case.diagnostic) |expected| {
+            try std.testing.expectError(error.InstallStepFailed, validateGhrManifest(t_alloc, io, path, &diagnostics.writer));
+            try std.testing.expect(std.mem.indexOf(u8, diagnostics.written(), expected) != null);
+        } else {
+            try validateGhrManifest(t_alloc, io, path, &diagnostics.writer);
+            try std.testing.expectEqualStrings("", diagnostics.written());
+        }
+    }
+}
+
+test "downloaded ghr manifest validation propagates allocation failure without leaks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "module.ghr",
+        .data =
+        \\.{
+        \\    .version = 1,
+        \\    .runtimeArgs = .{ "--dir=hello world", "quoted\"argument" },
+        \\    .future = .{ .nested = "ignored" },
+        \\}
+        ,
+    });
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const path = try t_alloc.print("{s}{c}module.ghr", .{ path_buf[0..path_len], std.fs.path.sep });
+    defer t_alloc.free(path);
+    const Check = struct {
+        fn validate(allocator: std.mem.Allocator, manifest_path: []const u8) !void {
+            var diagnostics_buf: [1024]u8 = undefined;
+            var diagnostics = Writer.fixed(&diagnostics_buf);
+            try validateGhrManifest(allocator, std.testing.io, manifest_path, &diagnostics);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(t_alloc, Check.validate, .{path});
 }
 
 test "an archive id and its wasm child ids are independent units" {
@@ -6322,9 +6405,9 @@ test "recovery refuses a journal whose legacy path is not this id's legacy unit"
     var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
     defer arena_inst.deinit();
     const a = arena_inst.allocator();
-    const outsider = try std.fmt.allocPrint(a, "{s}{c}outsider", .{ store.base, std.fs.path.sep });
+    const outsider = try a.print("{s}{c}outsider", .{ store.base, std.fs.path.sep });
     try ensureDirAbsoluteRecursive(ctx.io, outsider);
-    const canary = try std.fmt.allocPrint(a, "{s}{c}keep-me", .{ outsider, std.fs.path.sep });
+    const canary = try a.print("{s}{c}keep-me", .{ outsider, std.fs.path.sep });
     (try Dir.createFileAbsolute(ctx.io, canary, .{})).close(ctx.io);
 
     const p = unit.paths;
@@ -6375,8 +6458,7 @@ test "a failed invocation keeps the transaction that still holds live state" {
     try install_txn.ensureDirAbsolute(ctx.io, p.backup);
     var arena_inst = std.heap.ArenaAllocator.init(t_alloc);
     defer arena_inst.deinit();
-    const backup_marker = try std.fmt.allocPrint(
-        arena_inst.allocator(),
+    const backup_marker = try arena_inst.allocator().print(
         "{s}{c}previous",
         .{ p.backup, std.fs.path.sep },
     );
@@ -7395,7 +7477,7 @@ test "executable symlink discovery resolves parent paths after directory links a
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("alias", exes.items[0]);
     const stat = try tmp.dir.statFile(std.testing.io, "payload/tool", .{});
-    try std.testing.expect(@as(u32, @intFromEnum(stat.permissions)) & 0o111 != 0);
+    try std.testing.expect(@as(u32, @backingInt(stat.permissions)) & 0o111 != 0);
 }
 
 test "executable symlink discovery rejects escapes, broken links, cycles, and non-executable targets" {
@@ -7445,7 +7527,7 @@ test "executable symlink discovery rejects escapes, broken links, cycles, and no
     try std.testing.expectEqual(@as(usize, 1), exes.items.len);
     try std.testing.expectEqualStrings("bin/tool", exes.items[0]);
     const stat = try tmp.dir.statFile(std.testing.io, "outside/tool", .{});
-    try std.testing.expectEqual(@as(u32, 0), @as(u32, @intFromEnum(stat.permissions)) & 0o111);
+    try std.testing.expectEqual(@as(u32, 0), @as(u32, @backingInt(stat.permissions)) & 0o111);
 }
 
 test "executable symlink discovery never recursively scans directory links" {
@@ -7481,8 +7563,8 @@ test "executable symlink discovery preserves execute-only and unreadable file el
     if (host_is_windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    (try tmp.dir.createFile(std.testing.io, "tool", .{ .permissions = @enumFromInt(0o111) })).close(std.testing.io);
-    (try tmp.dir.createFile(std.testing.io, "unreadable", .{ .permissions = @enumFromInt(0) })).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "tool", .{ .permissions = @fromBackingInt(@intCast(0o111)) })).close(std.testing.io);
+    (try tmp.dir.createFile(std.testing.io, "unreadable", .{ .permissions = @fromBackingInt(@intCast(0)) })).close(std.testing.io);
     try tmp.dir.symLink(std.testing.io, "tool", "alias", .{});
     try tmp.dir.symLink(std.testing.io, "unreadable", "unreadable-alias", .{});
     var exes = try findExecutables(t_alloc, std.testing.io, tmp.dir);
@@ -7564,7 +7646,7 @@ test "findExecutables stops at shallowest executable level" {
     const stat = try tmp.dir.statFile(std.testing.io, "qemu-linux-arm64/share/openbios-ppc", .{});
     try std.testing.expectEqual(
         @as(u32, 0),
-        @as(u32, @intFromEnum(stat.permissions)) & 0o111,
+        @as(u32, @backingInt(stat.permissions)) & 0o111,
     );
 }
 
@@ -7804,7 +7886,7 @@ test "findExecutables recovers Mach-O without exec bit (zip extraction)" {
     // The fallback must also have chmod'd the file so `linkToBin` produces a
     // runnable symlink target.
     const stat = try tmp.dir.statFile(std.testing.io, "minisign", .{});
-    try std.testing.expect((@as(u32, @intFromEnum(stat.permissions)) & 0o111) != 0);
+    try std.testing.expect((@as(u32, @backingInt(stat.permissions)) & 0o111) != 0);
 }
 
 test "writeJsonEscaped escapes backslashes and quotes" {
@@ -7973,7 +8055,7 @@ test "shimPointsToToolDir validates path boundaries" {
     // On Windows, the prefix comparison is ASCII case-insensitive so a
     // shim written before lowercase-tool-dir migration is still
     // recognized as owned after the dir was case-renamed.
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         try std.testing.expect(shimPointsToToolDir(
             std.testing.io,
             tmp.dir,
@@ -8237,7 +8319,7 @@ test "ensureDirAbsoluteRecursive preserves permission errors from missing ancest
     };
     TestCreateDir.calls = 0;
 
-    const path = if (builtin.os.tag == .windows)
+    const path = if (builtin.target.os.tag == .windows)
         "C:\\tools\\owner"
     else
         "/tools/owner";
@@ -8325,9 +8407,9 @@ test "replaceStagedDir installs a fresh staging tree" {
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const base_len = try tmp.dir.realPath(tio, &path_buf);
     const base = path_buf[0..base_len];
-    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    const owner_path = try allocator.print("{s}{c}owner", .{ base, std.fs.path.sep });
     defer allocator.free(owner_path);
-    const final_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    const final_path = try allocator.print("{s}{c}repo", .{ owner_path, std.fs.path.sep });
     defer allocator.free(final_path);
     const staging_path = try stagingSiblingPath(allocator, owner_path, "repo");
     defer allocator.free(staging_path);
@@ -8357,9 +8439,9 @@ test "replaceStagedDir removes backup after replacing an existing install" {
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const base_len = try tmp.dir.realPath(tio, &path_buf);
     const base = path_buf[0..base_len];
-    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    const owner_path = try allocator.print("{s}{c}owner", .{ base, std.fs.path.sep });
     defer allocator.free(owner_path);
-    const final_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    const final_path = try allocator.print("{s}{c}repo", .{ owner_path, std.fs.path.sep });
     defer allocator.free(final_path);
     const staging_path = try stagingSiblingPath(allocator, owner_path, "repo");
     defer allocator.free(staging_path);
@@ -8386,9 +8468,9 @@ test "recoverStaleBackup restores a missing live install" {
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const base_len = try tmp.dir.realPath(tio, &path_buf);
     const base = path_buf[0..base_len];
-    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    const owner_path = try allocator.print("{s}{c}owner", .{ base, std.fs.path.sep });
     defer allocator.free(owner_path);
-    const final_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    const final_path = try allocator.print("{s}{c}repo", .{ owner_path, std.fs.path.sep });
     defer allocator.free(final_path);
     const backup_path = try backupSiblingPath(allocator, owner_path, "repo");
     defer allocator.free(backup_path);
@@ -8413,13 +8495,13 @@ test "recoverInstallBackups restores a legacy wasm module tombstone" {
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const base_len = try tmp.dir.realPath(tio, &path_buf);
     const base = path_buf[0..base_len];
-    const repo_path = try std.fmt.allocPrint(allocator, "{s}{c}owner{c}repo", .{
+    const repo_path = try allocator.print("{s}{c}owner{c}repo", .{
         base,
         std.fs.path.sep,
         std.fs.path.sep,
     });
     defer allocator.free(repo_path);
-    const module_path = try std.fmt.allocPrint(allocator, "{s}{c}stem", .{ repo_path, std.fs.path.sep });
+    const module_path = try allocator.print("{s}{c}stem", .{ repo_path, std.fs.path.sep });
     defer allocator.free(module_path);
     const backup_path = try backupSiblingPath(allocator, repo_path, "stem");
     defer allocator.free(backup_path);
@@ -8448,9 +8530,9 @@ test "recoverInstallBackups removes a stale legacy archive tombstone" {
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const base_len = try tmp.dir.realPath(tio, &path_buf);
     const base = path_buf[0..base_len];
-    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    const owner_path = try allocator.print("{s}{c}owner", .{ base, std.fs.path.sep });
     defer allocator.free(owner_path);
-    const tool_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    const tool_path = try allocator.print("{s}{c}repo", .{ owner_path, std.fs.path.sep });
     defer allocator.free(tool_path);
     const backup_path = try backupSiblingPath(allocator, owner_path, "repo");
     defer allocator.free(backup_path);
@@ -8490,9 +8572,9 @@ test "replaceStagedDir restores the live install when committing staging fails" 
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const base_len = try tmp.dir.realPath(tio, &path_buf);
     const base = path_buf[0..base_len];
-    const owner_path = try std.fmt.allocPrint(allocator, "{s}{c}owner", .{ base, std.fs.path.sep });
+    const owner_path = try allocator.print("{s}{c}owner", .{ base, std.fs.path.sep });
     defer allocator.free(owner_path);
-    const final_path = try std.fmt.allocPrint(allocator, "{s}{c}repo", .{ owner_path, std.fs.path.sep });
+    const final_path = try allocator.print("{s}{c}repo", .{ owner_path, std.fs.path.sep });
     defer allocator.free(final_path);
     const staging_path = try stagingSiblingPath(allocator, owner_path, "repo");
     defer allocator.free(staging_path);

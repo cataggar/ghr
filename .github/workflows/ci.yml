@@ -165,6 +165,28 @@ jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-22.04
+    needs: [native-build-and-test, cross-compile, site]
+    if: always()
+    steps:
+      - name: Require successful native, cross-target and site validation
+        env:
+          NATIVE_RESULT: ${{ needs.native-build-and-test.result }}
+          CROSS_RESULT: ${{ needs.cross-compile.result }}
+          SITE_RESULT: ${{ needs.site.result }}
+        run: |
+          set -euo pipefail
+          test "$NATIVE_RESULT" = success
+          test "$CROSS_RESULT" = success
+          test "$SITE_RESULT" = success
+
+  native-build-and-test:
+    name: Native build, unit tests & help (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-latest]
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -175,16 +197,49 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Build (Debug)
+      - name: Build (debug)
         run: zig build
 
       - name: Unit tests
         run: zig build test
 
-      - name: Build (ReleaseSafe)
-        run: zig build -Doptimize=ReleaseSafe
+      - name: Build (safe)
+        run: zig build -Doptimize=safe
+
+      - name: Native help checks
+        shell: bash
+        env:
+          GHR_EXE: ${{ runner.os == 'Windows' && 'ghr.exe' || 'ghr' }}
+        run: |
+          set -euo pipefail
+          "zig-out/bin/$GHR_EXE" --help
+          "zig-out/bin/$GHR_EXE" install --help
+          "zig-out/bin/$GHR_EXE" download --help
+
+  site:
+    name: Site production and configuration cache freshness
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@v0.6.1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Test and build production site
+        working-directory: site
+        run: zig build test prod
+
+      - name: Check configuration cache freshness
+        working-directory: site
+        run: python3 tools/test-cache-freshness.py
 
   cross-compile:
     name: Cross-compile ${{ matrix.target }}
@@ -207,10 +262,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+        run: zig build -Doptimize=safe -Dtarget=${{ matrix.target }}
 
   action-install-smoke:
     # End-to-end smoke for the multi-spec install path on every OS the
@@ -233,11 +288,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Build ghr from source (ReleaseSafe)
+      - name: Build ghr from source (safe)
         shell: bash
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=safe
 
       - name: Put ghr on PATH
         shell: bash
@@ -379,11 +434,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Build ghr from source (ReleaseSafe)
+      - name: Build ghr from source (safe)
         shell: bash
-        run: zig build -Doptimize=ReleaseSafe
+        run: zig build -Doptimize=safe
 
       - name: Put ghr on PATH
         shell: bash

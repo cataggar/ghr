@@ -90,8 +90,8 @@ pub const Phase = enum(u8) {
     }
 
     pub fn fromLabel(s: []const u8) ?Phase {
-        inline for (@typeInfo(Phase).@"enum".fields) |f| {
-            const p: Phase = @enumFromInt(f.value);
+        inline for (@typeInfo(Phase).@"enum".field_values) |value| {
+            const p: Phase = @fromBackingInt(@intCast(value));
             if (std.mem.eql(u8, p.label(), s)) return p;
         }
         return null;
@@ -176,7 +176,7 @@ fn sepFor(platform: Platform) u8 {
 }
 
 fn joinPath(allocator: Allocator, platform: Platform, base: []const u8, leaf: []const u8) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ base, sepFor(platform), leaf });
+    return allocator.print("{s}{c}{s}", .{ base, sepFor(platform), leaf });
 }
 
 /// Compute every path for `id`. `install_state.encodeUnitPath` performs the
@@ -241,7 +241,7 @@ pub fn paths(
 
 /// Absolute path of the reserved transaction namespace under `tools_dir`.
 pub fn txnRoot(allocator: Allocator, tools_dir: []const u8, platform: Platform) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}{c}{s}{c}{s}", .{
+    return allocator.print("{s}{c}{s}{c}{s}", .{
         tools_dir,
         sepFor(platform),
         install_state.v2_namespace,
@@ -658,7 +658,7 @@ fn renameUnit(io: Io, old_path: []const u8, new_path: []const u8, hooks: Hooks) 
     var retries: u8 = 0;
     while (true) {
         hooks.rename(io, old_path, new_path) catch |err| {
-            if (builtin.os.tag != .windows or
+            if (builtin.target.os.tag != .windows or
                 (err != error.AccessDenied and err != error.FileBusy) or
                 retries == 5) return err;
 
@@ -816,10 +816,10 @@ fn walkPending(
         if (entry.kind == .sym_link) continue;
         if (entry.kind != .directory and entry.kind != .unknown) continue;
 
-        const child_path = try std.fmt.allocPrint(a, "{s}{c}{s}", .{ prefix, sepFor(platform), entry.name });
+        const child_path = try a.print("{s}{c}{s}", .{ prefix, sepFor(platform), entry.name });
 
         if (std.mem.eql(u8, entry.name, install_state.unit_marker)) {
-            const journal_path = try std.fmt.allocPrint(a, "{s}{c}{s}", .{ child_path, sepFor(platform), journal_name });
+            const journal_path = try a.print("{s}{c}{s}", .{ child_path, sepFor(platform), journal_name });
             if (!fileExists(io, journal_path)) continue;
             const id = decodeSegments(a, segs.items) catch "";
             try out.append(a, .{ .id = id, .root = child_path });
@@ -925,7 +925,7 @@ test "journal read rejects an unsupported schema" {
     });
     var buf: [Dir.max_path_bytes]u8 = undefined;
     const base = try tBase(&tmp, &buf);
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/j.json", .{base});
+    const path = try testing.allocator.print("{s}/j.json", .{base});
     defer testing.allocator.free(path);
     try testing.expectError(error.JournalUnsupportedSchema, readJournal(testing.allocator, tio, path));
 }
@@ -939,7 +939,7 @@ test "journal read rejects a traversal artifact name" {
     });
     var buf: [Dir.max_path_bytes]u8 = undefined;
     const base = try tBase(&tmp, &buf);
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/j.json", .{base});
+    const path = try testing.allocator.print("{s}/j.json", .{base});
     defer testing.allocator.free(path);
     try testing.expectError(error.JournalInvalidPath, readJournal(testing.allocator, tio, path));
 }
@@ -953,7 +953,7 @@ test "journal read rejects a non-canonical id" {
     });
     var buf: [Dir.max_path_bytes]u8 = undefined;
     const base = try tBase(&tmp, &buf);
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/j.json", .{base});
+    const path = try testing.allocator.print("{s}/j.json", .{base});
     defer testing.allocator.free(path);
     try testing.expectError(error.JournalInvalidId, readJournal(testing.allocator, tio, path));
 }
@@ -1006,7 +1006,7 @@ test "swapUnit installs a fresh unit and replaces an existing one" {
     defer p.deinit();
 
     try prepareStage(tio, p);
-    const stage_marker = try std.fmt.allocPrint(testing.allocator, "{s}/marker", .{p.stage});
+    const stage_marker = try testing.allocator.print("{s}/marker", .{p.stage});
     defer testing.allocator.free(stage_marker);
     (try Dir.createFileAbsolute(tio, stage_marker, .{})).close(tio);
     // Fresh install.
@@ -1045,7 +1045,7 @@ fn failFirstTwoStageRenames(io: Io, old_path: []const u8, new_path: []const u8) 
 }
 
 test "swapUnit retries transient Windows rename failures" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const tio = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1092,14 +1092,14 @@ test "swapUnit preserves the old unit after persistent access denial" {
     var p = try paths(testing.allocator, base, "owner/repo", default_platform);
     defer p.deinit();
     try ensureDirAbsolute(tio, p.unit);
-    const marker = try std.fmt.allocPrint(testing.allocator, "{s}{c}old", .{ p.unit, std.fs.path.sep });
+    const marker = try testing.allocator.print("{s}{c}old", .{ p.unit, std.fs.path.sep });
     defer testing.allocator.free(marker);
     (try Dir.createFileAbsolute(tio, marker, .{})).close(tio);
     try prepareStage(tio, p);
 
     persistent_denial_calls = 0;
     try testing.expectError(error.AccessDenied, swapUnit(tio, p, .{ .rename = alwaysDenyStageRename }));
-    try testing.expectEqual(@as(usize, if (builtin.os.tag == .windows) 6 else 1), persistent_denial_calls);
+    try testing.expectEqual(@as(usize, if (builtin.target.os.tag == .windows) 6 else 1), persistent_denial_calls);
     var old_file = try Dir.openFileAbsolute(tio, marker, .{});
     old_file.close(tio);
     try testing.expect(try directoryExists(tio, p.stage));
@@ -1117,7 +1117,7 @@ test "swapUnit rolls the previous unit back when the commit rename fails" {
     defer p.deinit();
 
     try ensureDirAbsolute(tio, p.unit);
-    const live_marker = try std.fmt.allocPrint(testing.allocator, "{s}/live", .{p.unit});
+    const live_marker = try testing.allocator.print("{s}/live", .{p.unit});
     defer testing.allocator.free(live_marker);
     (try Dir.createFileAbsolute(tio, live_marker, .{})).close(tio);
 
@@ -1157,13 +1157,13 @@ test "restoreUnit puts the previous unit back" {
     var p = try paths(testing.allocator, base, "owner/repo", .posix);
     defer p.deinit();
     try ensureDirAbsolute(tio, p.backup);
-    const marker = try std.fmt.allocPrint(testing.allocator, "{s}/old", .{p.backup});
+    const marker = try testing.allocator.print("{s}/old", .{p.backup});
     defer testing.allocator.free(marker);
     (try Dir.createFileAbsolute(tio, marker, .{})).close(tio);
     try ensureDirAbsolute(tio, p.unit);
 
     try restoreUnit(tio, p, .{});
-    const restored = try std.fmt.allocPrint(testing.allocator, "{s}/old", .{p.unit});
+    const restored = try testing.allocator.print("{s}/old", .{p.unit});
     defer testing.allocator.free(restored);
     var f = try Dir.openFileAbsolute(tio, restored, .{});
     f.close(tio);
@@ -1238,7 +1238,7 @@ test "the transaction namespace is invisible to the inventory reader" {
     var p = try paths(testing.allocator, base, "owner/repo", .posix);
     defer p.deinit();
     try prepareStage(tio, p);
-    const staged_meta = try std.fmt.allocPrint(testing.allocator, "{s}/ghr.json", .{p.stage});
+    const staged_meta = try testing.allocator.print("{s}/ghr.json", .{p.stage});
     defer testing.allocator.free(staged_meta);
     {
         var f = try Dir.createFileAbsolute(tio, staged_meta, .{});

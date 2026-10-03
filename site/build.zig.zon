@@ -2,24 +2,21 @@
     .name = .ghr_site,
     .version = "0.1.0",
     .fingerprint = 0xb3fb5661653208ed,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // Pinned to cataggar/merjs@main, which carries fixes upstream
-        // justrach/merjs lacks as of fe5b35c: (1) native-Windows build
-        // (std.c pthread/clock_gettime shims -> std.Io equivalents), (2)
-        // native-Linux build (runtime.zig no longer uses std.Io.Evented/
-        // io_uring, which has a stdlib bug in Zig 0.16.0), and (3) a default
-        // CSP that allows github.com/githubusercontent.com images. With all
-        // three merged, this site's CI workflow builds on ubuntu again.
+        // Immutable, merged Zig 0.17 compatibility revision from cataggar/merjs#5.
+        // The fork retains portable Windows I/O, Threaded I/O on Linux,
+        // and the github.com/githubusercontent.com image CSP allowances.
         .merjs = .{
-            .url = "git+https://github.com/cataggar/merjs.git#ef8dddbafb0c51f8b65f8f3d2ead37308a9f5438",
-            .hash = "merjs-0.2.5-qL9LkrTFYAD1TRIcAbmkaZrh4_8qYBMJrKyI-n-aGcyL",
+            .url = "git+https://github.com/cataggar/merjs.git#23dcf37a471d83469bd2d705f007aea51ceed953",
+            .hash = "merjs-0.2.5-qL9Lkg3JYABh2AupQ9X64qsQ-bNQLv5SSGnHVtb2j9UR",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "tools",
         "app",
         "public",
     },

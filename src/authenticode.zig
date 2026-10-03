@@ -507,7 +507,7 @@ test "stripAuthenticodeIntoBuffer rejects cert table not at end" {
     std.mem.writeInt(u32, unsigned[0x58 + 108 .. 0x58 + 112][0..4], 16, .little);
 
     const cert_table_offset: u32 = @intCast(unsigned.len);
-    const cert_payload = "x" ** 24;
+    const cert_payload: [24]u8 = @splat('x');
     const cert_entry_len: u32 = 8 + cert_payload.len;
     const cert_table_size: u32 = cert_entry_len; // already 8-aligned
     const trailing: u32 = 16; // extra data past the cert table
@@ -831,7 +831,7 @@ fn parseSignedDataInternal(
 
     // signerInfos SET OF SignerInfo
     const sinfos = try der.parseElement(pkcs7_bytes, ji);
-    if (sinfos.identifier.tag != .sequence_of and sinfos.identifier.tag != .sequence)
+    if (sinfos.identifier.tag != .set and sinfos.identifier.tag != .sequence)
         return error.InvalidSignedData;
 
     const first_signer = try der.parseElement(pkcs7_bytes, sinfos.slice.start);
@@ -1033,7 +1033,7 @@ pub fn findUnsignedAttr(signer: SignerInfo, target_oid: []const u8) Pkcs7Error!?
 // ---------------------------------------------------------------------------
 
 fn isContextSpecificTag(id: der.Identifier, tag_no: u5) bool {
-    return id.class == .context_specific and @intFromEnum(id.tag) == tag_no;
+    return id.class == .context_specific and @backingInt(id.tag) == tag_no;
 }
 
 fn hashAlgFromOid(oid_bytes: []const u8) Pkcs7Error!HashAlgorithm {
@@ -1118,7 +1118,7 @@ const CertificateSetIterator = struct {
             if (elem.identifier.tag == .sequence and elem.identifier.class == .universal) {
                 return self.bytes[start..elem.slice.end];
             }
-            if (elem.identifier.class == .context_specific and @intFromEnum(elem.identifier.tag) <= 3) {
+            if (elem.identifier.class == .context_specific and @backingInt(elem.identifier.tag) <= 3) {
                 // Valid CertificateChoices alternative we don't care about.
                 continue;
             }
@@ -1213,7 +1213,7 @@ fn verifyRsaPkcs1v15(
                 return error.InvalidSignature;
             Certificate.rsa.PKCS1v1_5Signature.verify(
                 modulus_len,
-                signature[0..modulus_len].*,
+                signature[0..modulus_len],
                 msg,
                 pub_key,
                 Hash,
@@ -1639,7 +1639,7 @@ fn findRdnAttribute(name_der: []const u8, target_oid: []const u8) ![]const u8 {
     while (i < end) {
         const rdn = der.parseElement(name_der, i) catch return &.{};
         i = rdn.slice.end;
-        if (@intFromEnum(rdn.identifier.tag) != 17) continue; // SET OF
+        if (@backingInt(rdn.identifier.tag) != 17) continue; // SET OF
         var j: u32 = rdn.slice.start;
         while (j < rdn.slice.end) {
             const attr = try der.parseElement(name_der, j);
@@ -2246,7 +2246,7 @@ test "parsePe + Authenticode digest on a minimal PE32+ fixture" {
 }
 
 test "WinCertIterator handles an empty cert table" {
-    var img = [_]u8{0} ** (0x58 + 240);
+    var img: [0x58 + 240]u8 = @splat(0);
     @memcpy(img[0..2], &dos_signature);
     std.mem.writeInt(u32, img[0x3C..0x40], 0x40, .little);
     @memcpy(img[0x40..0x44], &nt_signature);

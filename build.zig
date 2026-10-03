@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/shim.zig"),
             .target = target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .strip = true,
             // macOS needs libc for `_NSGetExecutablePath`.
             .link_libc = resolved_target.os.tag.isDarwin(),
@@ -56,9 +56,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run ghr");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run tests");
@@ -66,6 +64,16 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    const shim_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shim.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = resolved_target.os.tag.isDarwin(),
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(shim_tests).step);
 
     const help_cases = [_]struct {
         args: []const []const u8,

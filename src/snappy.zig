@@ -137,7 +137,7 @@ test "decompresses literals and all copy tag widths" {
         65,
     );
     defer allocator.free(copy_two);
-    try std.testing.expectEqualSlices(u8, "a" ** 65, copy_two);
+    try std.testing.expectEqualSlices(u8, &@as([65]u8, @splat('a')), copy_two);
 
     const copy_four = try decompressAlloc(
         allocator,
@@ -150,10 +150,11 @@ test "decompresses literals and all copy tag widths" {
 
 test "decompresses long literals" {
     const allocator = std.testing.allocator;
-    const compressed = "\x3d\xf0\x3c" ++ ("x" ** 61);
+    const literal: [61]u8 = @splat('x');
+    const compressed = "\x3d\xf0\x3c" ++ literal;
     const output = try decompressAlloc(allocator, compressed, 61);
     defer allocator.free(output);
-    try std.testing.expectEqualSlices(u8, "x" ** 61, output);
+    try std.testing.expectEqualSlices(u8, &literal, output);
 }
 
 test "rejects malformed and oversized inputs" {

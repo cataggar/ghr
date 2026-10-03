@@ -137,8 +137,8 @@ fn endsWithIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
 
 pub const ExtractError = error{
     UnknownArchiveFormat,
-} || std.mem.Allocator.Error || std.fs.File.OpenError ||
-    std.fs.Dir.OpenError || std.fs.Dir.MakeError;
+} || std.mem.Allocator.Error || File.OpenError ||
+    Dir.OpenError || Dir.CreateDirError;
 
 /// Extract `archive_path` into `dest_dir` based on its filename suffix.
 /// `strip_components` is honoured for tar archives (zip ignores it).
@@ -422,9 +422,7 @@ fn createTestDeb(tmp: *std.testing.TmpDir) !File {
     var argv = std.ArrayListUnmanaged([]const u8).empty;
     defer argv.deinit(std.testing.allocator);
 
-    // Each helper invocation requires `tar`, `zstd`, and `ar`. Skip the
-    // test if any of them are missing or fail; CI environments without
-    // dpkg tooling (e.g. Windows, minimal Linux images) shouldn't fail.
+    // Skip when the optional tar/zstd fixture tools are unavailable.
     try argv.appendSlice(std.testing.allocator, &.{ "tar", "--zstd", "-cf", "control.tar.zst", "control" });
     var child = std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } }) catch return error.SkipZigTest;
     var term = child.wait(tio) catch return error.SkipZigTest;
@@ -438,10 +436,11 @@ fn createTestDeb(tmp: *std.testing.TmpDir) !File {
     if (term != .exited or term.exited != 0) return error.SkipZigTest;
 
     argv.items.len = 0;
-    try argv.appendSlice(std.testing.allocator, &.{ "ar", "rcs", "archive.deb", "debian-binary", "control.tar.zst", "data.tar.zst" });
-    child = std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } }) catch return error.SkipZigTest;
-    term = child.wait(tio) catch return error.SkipZigTest;
-    if (term != .exited or term.exited != 0) return error.SkipZigTest;
+    // Debian uses GNU ar, not the host's library archive format.
+    try argv.appendSlice(std.testing.allocator, &.{ "zig", "ar", "--format=gnu", "rcs", "archive.deb", "debian-binary", "control.tar.zst", "data.tar.zst" });
+    child = try std.process.spawn(tio, .{ .argv = argv.items, .cwd = .{ .dir = tmp.dir } });
+    term = try child.wait(tio);
+    try std.testing.expect(term == .exited and term.exited == 0);
 
     return try tmp.dir.openFile(tio, "archive.deb", .{});
 }

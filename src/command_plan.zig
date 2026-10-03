@@ -985,8 +985,8 @@ fn staleLessThan(_: void, a: StaleCommand, b: StaleCommand) bool {
         .gt => return false,
         .eq => {},
     }
-    if (@intFromEnum(a.kind) != @intFromEnum(b.kind))
-        return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+    if (@backingInt(a.kind) != @backingInt(b.kind))
+        return @backingInt(a.kind) < @backingInt(b.kind);
     return std.mem.order(u8, a.relative_target, b.relative_target) == .lt;
 }
 
@@ -1242,7 +1242,7 @@ test "unsafe alias names are rejected, never sanitized" {
 
 test "over-long names fail typed rather than being truncated" {
     const a = testing.allocator;
-    const long = "a" ** (max_final_name_bytes + 5);
+    const long = &@as([max_final_name_bytes + 5]u8, @splat('a'));
     {
         const target = "bin/" ++ long;
         const units = [_]Unit{.{ .id = "x", .commands = &.{tNative(target)} }};
@@ -1258,7 +1258,7 @@ test "over-long names fail typed rather than being truncated" {
     }
     // The boundary name still plans, and every companion fits the file-name bound.
     {
-        const at_limit = "b" ** max_final_name_bytes;
+        const at_limit = &@as([max_final_name_bytes]u8, @splat('b'));
         const units = [_]Unit{.{
             .id = "x",
             .commands = &.{tNative("bin/zig")},
@@ -1803,7 +1803,7 @@ test "duplicate legacy command paths coalesce ownership and stale artifacts" {
 test "an inventory name too long for its own companions fails typed" {
     const a = testing.allocator;
     const units = [_]Unit{.{ .id = "mine", .commands = &.{tNative("bin/tool")} }};
-    const long = "n" ** (max_artifact_name_bytes - 2);
+    const long = &@as([max_artifact_name_bytes - 2]u8, @splat('n'));
     {
         // POSIX wasm needs `<name>.ghr`, which no longer fits.
         var cmds = [_]install_state.OwnedCommand{tOwned(long, "pkg/mod.wasm", "wasm")};
@@ -1903,7 +1903,7 @@ test "a reused diagnostic is fully reset and never dangles" {
 
 test "diagnostic text is bounded, not unbounded input" {
     const a = testing.allocator;
-    const long_id = "q" ** (max_diagnostic_text_bytes + 40);
+    const long_id = &@as([max_diagnostic_text_bytes + 40]u8, @splat('q'));
     const units = [_]Unit{.{ .id = long_id, .commands = &.{tNative("bin/tool")} }};
     var diag = Diagnostic{};
     try testing.expectError(
@@ -1916,8 +1916,8 @@ test "diagnostic text is bounded, not unbounded input" {
 
 test "the core planner takes no io handle" {
     const info = @typeInfo(@TypeOf(plan)).@"fn";
-    inline for (info.params) |param| {
-        const T = param.type.?;
+    inline for (info.param_types) |param_type| {
+        const T = param_type.?;
         try testing.expect(T != Io);
         try testing.expect(T != Dir);
     }
@@ -1948,7 +1948,7 @@ test "snapshot: a missing bin directory is empty, not an error" {
 }
 
 test "snapshot: direct children are sorted and typed, symlinks not followed" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -1977,7 +1977,7 @@ test "snapshot: direct children are sorted and typed, symlinks not followed" {
 }
 
 test "snapshot: a non-directory bin path fails closed" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -1989,7 +1989,7 @@ test "snapshot: a non-directory bin path fails closed" {
 }
 
 test "snapshot: a symlinked bin root is a trusted anchor" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});

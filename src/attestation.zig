@@ -309,7 +309,7 @@ fn fetchOnce(
         if (request.connection) |connection| connection.closing = true;
         request.deinit();
     }
-    request.accept_encoding[@intFromEnum(std.http.ContentEncoding.zstd)] = true;
+    request.accept_encoding[@backingInt(std.http.ContentEncoding.zstd)] = true;
 
     try request.sendBodiless();
     var response = try request.receiveHead(&.{});
@@ -365,7 +365,7 @@ fn resolveRedirectAlloc(
     var auxiliary: []u8 = &buffer;
     const resolved = base.resolveInPlace(location.len, &auxiliary) catch
         return error.InvalidRedirectUrl;
-    return std.fmt.allocPrint(allocator, "{f}", .{resolved.fmt(.all)});
+    return allocator.print("{f}", .{resolved.fmt(.all)});
 }
 
 fn decompressHttpContentAlloc(
@@ -489,8 +489,7 @@ fn buildApiUrl(
     const repo = try encodePathSegment(allocator, repository.repo);
     defer allocator.free(repo);
 
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}/repos/{s}/{s}/attestations/sha256:{s}" ++
             "?predicate_type=provenance&per_page=100",
         .{ base, owner, repo, sha256_hex },
@@ -532,7 +531,8 @@ fn encodePathSegment(
 
 test "builds the versioned GitHub attestation URL" {
     const allocator = std.testing.allocator;
-    const digest = "0123456789abcdef" ** 4;
+    const digest = "0123456789abcdef" ++ "0123456789abcdef" ++
+        "0123456789abcdef" ++ "0123456789abcdef";
     const url = try buildApiUrl(
         allocator,
         api_base,

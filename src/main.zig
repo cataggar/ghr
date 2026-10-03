@@ -22,8 +22,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     // Resolve host names even where `/etc/resolv.conf` defeats the standard
     // library's parser, such as WSL on a corporate network. See `dns.zig`.
-    // Remove this once ghr builds against a Zig release that fixes
-    // https://codeberg.org/ziglang/zig/issues/35371 (milestone 0.17.0).
+    // Zig 0.17 still rejects lines longer than its 512-byte reader buffer.
     const io = dns.wrap(init.io);
     const environ = init.environ_map;
     http.configureProcessCaBundle(environ);
@@ -79,9 +78,9 @@ pub fn main(init: std.process.Init) !void {
         }
         const builtin = @import("builtin");
         try stdout.interface.print("{t}-{t}-{t}\n", .{
-            builtin.os.tag,
-            builtin.cpu.arch,
-            builtin.abi,
+            builtin.target.os.tag,
+            builtin.target.cpu.arch,
+            builtin.target.abi,
         });
         return;
     }

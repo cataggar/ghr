@@ -57,6 +57,17 @@ const Manifest = struct {
     runtimeArgs: []const []const u8 = &.{},
 };
 
+fn parseManifest(gpa: std.mem.Allocator, arena: std.mem.Allocator, source: [:0]const u8) !Manifest {
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    return std.zon.parse.fromSlice(Manifest, .{
+        .gpa = gpa,
+        .arena = arena,
+        .source = source,
+        .diagnostics = &diagnostics,
+        .ignore_unknown_fields = true,
+    });
+}
+
 fn exitWithError(stderr: *Io.Writer, comptime fmt: []const u8, args: anytype) noreturn {
     stderr.print(fmt, args) catch {};
     stderr.flush() catch {};
@@ -65,7 +76,7 @@ fn exitWithError(stderr: *Io.Writer, comptime fmt: []const u8, args: anytype) no
 
 /// Resolve the absolute path of the running shim executable into `buf`.
 fn selfExePath(io: Io, buf: []u8) ![]const u8 {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows => {
             var wbuf: [Io.Dir.max_path_bytes / 2]u16 = undefined;
             const len = GetModuleFileNameW(null, &wbuf, wbuf.len);
@@ -110,10 +121,10 @@ fn resolveOnPath(
     name: []const u8,
 ) ?[]const u8 {
     const path_val = environ.get("PATH") orelse return null;
-    const list_sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
-    const path_sep: u8 = if (builtin.os.tag == .windows) '\\' else '/';
+    const list_sep: u8 = if (builtin.target.os.tag == .windows) ';' else ':';
+    const path_sep: u8 = if (builtin.target.os.tag == .windows) '\\' else '/';
     // On Windows, an executable may carry one of these extensions.
-    const exts: []const []const u8 = if (builtin.os.tag == .windows)
+    const exts: []const []const u8 = if (builtin.target.os.tag == .windows)
         &.{ ".exe", ".cmd", ".bat", ".com", "" }
     else
         &.{""};
@@ -122,7 +133,7 @@ fn resolveOnPath(
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
         for (exts) |ext| {
-            const cand = std.fmt.allocPrint(allocator, "{s}{c}{s}{s}", .{ dir, path_sep, name, ext }) catch return null;
+            const cand = allocator.print("{s}{c}{s}{s}", .{ dir, path_sep, name, ext }) catch return null;
             if (fileExists(io, cand)) return cand;
             allocator.free(cand);
         }
@@ -246,18 +257,17 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (Io.Dir.cwd().readFileAlloc(io, ghr_path, allocator, Io.Limit.limited(64 * 1024))) |raw| {
+        defer allocator.free(raw);
         // ZON parsing requires a sentinel-terminated source.
-        const source = allocator.dupeZ(u8, raw) catch {
+        const source = allocator.dupeSentinel(u8, raw, 0) catch {
             exitWithError(&stderr.interface, "shim: out of memory\n", .{});
         };
-        const manifest = std.zon.parse.fromSliceAlloc(
-            Manifest,
-            allocator,
-            source,
-            null,
-            .{ .ignore_unknown_fields = true },
-        ) catch {
-            exitWithError(&stderr.interface, "shim: invalid manifest {s}\n", .{ghr_path});
+        defer allocator.free(source);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const manifest = parseManifest(allocator, arena.allocator(), source) catch |err| switch (err) {
+            error.OutOfMemory => exitWithError(&stderr.interface, "shim: out of memory\n", .{}),
+            error.ParseZon => exitWithError(&stderr.interface, "shim: invalid manifest {s}\n", .{ghr_path}),
         };
 
         if (manifest.version != max_manifest_version) {
@@ -298,4 +308,61 @@ pub fn main(init: std.process.Init) !void {
     }
 
     runNative(allocator, io, &stderr.interface, target_path, init);
+}
+
+test "manifest parsing retains escaped targets and runtime args in its arena" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const manifest = blk: {
+        const source = try allocator.dupeSentinel(u8,
+            \\.{
+            \\    .version = 1,
+            \\    .target = "C:\\tools\\native.exe",
+            \\    .targetWasm = "/tools/hello.wasm",
+            \\    .runtime = "wamr",
+            \\    .runtimeArgs = .{ "--dir=hello world", "quoted\"argument" },
+            \\    .future = .{ .nested = "ignored" },
+            \\}
+        , 0);
+        defer allocator.free(source);
+        break :blk try parseManifest(allocator, arena.allocator(), source);
+    };
+
+    try std.testing.expectEqual(@as(u32, 1), manifest.version);
+    try std.testing.expectEqualStrings("C:\\tools\\native.exe", manifest.target);
+    try std.testing.expectEqualStrings("/tools/hello.wasm", manifest.targetWasm);
+    try std.testing.expectEqualStrings("wamr", manifest.runtime);
+    try std.testing.expectEqual(@as(usize, 2), manifest.runtimeArgs.len);
+    try std.testing.expectEqualStrings("--dir=hello world", manifest.runtimeArgs[0]);
+    try std.testing.expectEqualStrings("quoted\"argument", manifest.runtimeArgs[1]);
+}
+
+test "manifest parser preserves defaults and rejects malformed or missing versions" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const manifest = try parseManifest(allocator, arena.allocator(), ".{ .version = 1, .target = \"/tools/native\" }");
+    try std.testing.expectEqualStrings("wasmtime", manifest.runtime);
+    try std.testing.expectEqual(@as(usize, 0), manifest.runtimeArgs.len);
+    try std.testing.expectError(error.ParseZon, parseManifest(allocator, arena.allocator(), ".{ .target = \"native\" }"));
+    try std.testing.expectError(error.ParseZon, parseManifest(allocator, arena.allocator(), ".{ .version = \"1\" }"));
+    try std.testing.expectError(error.ParseZon, parseManifest(allocator, arena.allocator(), ".{ .version ="));
+}
+
+test "manifest parser releases arena allocations when parsing runs out of memory" {
+    const Check = struct {
+        fn parse(allocator: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            _ = try parseManifest(allocator, arena.allocator(),
+                \\.{
+                \\    .version = 1,
+                \\    .targetWasm = "/tools/hello.wasm",
+                \\    .runtimeArgs = .{ "--dir=hello world", "quoted\"argument" },
+                \\}
+            );
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.parse, .{});
 }
