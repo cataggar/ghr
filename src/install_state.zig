@@ -2124,6 +2124,17 @@ fn tScan(allocator: Allocator, io: Io, dir: Dir, platform: Platform) !Inventory 
     return scan(allocator, io, buf[0..len], .{ .platform = platform });
 }
 
+fn tScanDeepV2Chain(allocator: Allocator, io: Io, root: Dir, parent: Dir, segment: []const u8, remaining: usize) !Inventory {
+    if (remaining == 0) return tScan(allocator, io, root, .posix);
+    try parent.createDir(io, segment, .default_dir);
+    // Cleanup must also use relative handles: the full path exceeds macOS PATH_MAX.
+    defer parent.deleteDir(io, segment) catch |err|
+        std.debug.panic("cleaning deep v2 fixture: {s}", .{@errorName(err)});
+    var child = try parent.openDir(io, segment, .{ .follow_symlinks = false });
+    defer child.close(io);
+    return tScanDeepV2Chain(allocator, io, root, child, segment, remaining - 1);
+}
+
 fn tFind(inv: Inventory, path: []const u8) ?*const InventoryRecord {
     for (inv.records) |*r| {
         if (std.mem.eql(u8, r.path, path)) return r;
@@ -2442,15 +2453,16 @@ test "scan: same-id v1/v2 records conflict; mixed-case legacy collapses" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    // v1 owner/repo and v2 owner/repo -> duplicate id.
-    try tWriteUnit(io, tmp.dir, "owner/repo",
+    // Mixed-case legacy and canonical v2 paths coexist even on case-insensitive filesystems.
+    try tWriteUnit(io, tmp.dir, "Owner/Repo",
         \\{"tag":"v1","asset":"a.tgz"}
     );
     try tWriteUnit(io, tmp.dir, "_v2/units/u-owner/u-repo/_unit", t_v2_ownerrepo);
     var inv = try tScan(a, io, tmp.dir, .posix);
     defer inv.deinit(a);
-    try testing.expectEqual(Status.conflict, tFind(inv, "owner/repo").?.status);
-    try testing.expectEqual(RecordReason.duplicate_id, tFind(inv, "owner/repo").?.reason);
+    try testing.expectEqualStrings("owner/repo", tFind(inv, "Owner/Repo").?.id.?);
+    try testing.expectEqual(Status.conflict, tFind(inv, "Owner/Repo").?.status);
+    try testing.expectEqual(RecordReason.duplicate_id, tFind(inv, "Owner/Repo").?.reason);
     try testing.expectEqual(Status.conflict, tFind(inv, "_v2/units/u-owner/u-repo/_unit").?.status);
 }
 
@@ -2460,6 +2472,12 @@ test "scan: mixed-case legacy owners collapse to one id conflict" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.createDir(io, "Foo", .default_dir);
+    // In this fresh directory, only a case-insensitive alias can already exist.
+    tmp.dir.createDir(io, "foo", .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.SkipZigTest,
+        else => return err,
+    };
     try tWriteUnit(io, tmp.dir, "Foo/Bar",
         \\{"tag":"v1","asset":"a.tgz"}
     );
@@ -2468,8 +2486,13 @@ test "scan: mixed-case legacy owners collapse to one id conflict" {
     );
     var inv = try tScan(a, io, tmp.dir, .posix);
     defer inv.deinit(a);
-    try testing.expectEqual(Status.conflict, tFind(inv, "Foo/Bar").?.status);
-    try testing.expectEqual(Status.conflict, tFind(inv, "foo/bar").?.status);
+    try testing.expectEqual(@as(usize, 2), inv.records.len);
+    inline for (.{ "Foo/Bar", "foo/bar" }) |path| {
+        const rec = tFind(inv, path).?;
+        try testing.expectEqualStrings("foo/bar", rec.id.?);
+        try testing.expectEqual(Status.conflict, rec.status);
+        try testing.expectEqual(RecordReason.duplicate_id, rec.reason);
+    }
 }
 
 test "scan: duplicate published command ownership uses case rules only" {
@@ -2760,17 +2783,24 @@ test "scan: deep marker-free v2 chain is bounded with path_too_long" {
     var pb: std.ArrayListUnmanaged(u8) = .empty;
     defer pb.deinit(a);
     try pb.appendSlice(a, "_v2/units");
-    for (0..12) |_| {
+    while (pb.items.len + unit_marker.len + 1 <= max_encoded_relative_bytes) {
         try pb.append(a, '/');
         try pb.appendSlice(a, seg);
     }
-    try tmp.dir.createDirPath(io, pb.items);
+    try tmp.dir.createDirPath(io, "_v2/units");
+    var units = try tmp.dir.openDir(io, "_v2/units", .{ .follow_symlinks = false });
+    defer units.close(io);
 
-    var inv = try tScan(a, io, tmp.dir, .posix);
+    var inv = try tScanDeepV2Chain(a, io, tmp.dir, units, seg, 12);
     defer inv.deinit(a);
     // The branch is cut off with exactly one path_too_long record; the scan
     // completes (no unbounded recursion).
-    try testing.expect(tCountReason(inv, .path_too_long) >= 1);
+    try testing.expectEqual(@as(usize, 1), inv.records.len);
+    const rec = inv.records[0];
+    try testing.expectEqual(Status.corrupt, rec.status);
+    try testing.expectEqual(RecordReason.path_too_long, rec.reason);
+    try testing.expectEqualStrings(pb.items, rec.path);
+    try testing.expect(rec.id == null);
 }
 
 test "scan: v2 command names are validated exactly as persisted" {
