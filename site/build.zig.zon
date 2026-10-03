@@ -4,12 +4,12 @@
     .fingerprint = 0xb3fb5661653208ed,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
-        // Immutable Zig 0.17 compatibility revision from cataggar/merjs#5.
+        // Immutable, merged Zig 0.17 compatibility revision from cataggar/merjs#5.
         // The fork retains portable Windows I/O, Threaded I/O on Linux,
         // and the github.com/githubusercontent.com image CSP allowances.
         .merjs = .{
-            .url = "git+https://github.com/cataggar/merjs.git#728fcbe720abf5e24b938255d58da302b33643b7",
-            .hash = "merjs-0.2.5-qL9LkkHIYAB-XMf51E9A8Tcvi0bG9JOw6G1aXUs3nf0G",
+            .url = "git+https://github.com/cataggar/merjs.git#23dcf37a471d83469bd2d705f007aea51ceed953",
+            .hash = "merjs-0.2.5-qL9Lkg3JYABh2AupQ9X64qsQ-bNQLv5SSGnHVtb2j9UR",
         },
     },
     .paths = .{
