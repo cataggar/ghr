@@ -15,7 +15,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = gpa.allocator();
 
     // The fork uses Threaded I/O on every platform.
-    try runtime.init(alloc);
+    try runtime.init(alloc, init.environ);
     defer runtime.deinit();
 
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
