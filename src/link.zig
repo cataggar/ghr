@@ -189,7 +189,7 @@ pub fn readManifest(
     io: Io,
     abs_path: []const u8,
 ) !?std.json.Parsed(Manifest) {
-    var f = Dir.openFileAbsolute(io, abs_path, .{
+    const f = Dir.openFileAbsolute(io, abs_path, .{
         .follow_symlinks = false,
         .allow_directory = false,
     }) catch |err| switch (err) {
@@ -200,9 +200,6 @@ pub fn readManifest(
     defer f.close(io);
     const stat = try f.stat(io);
     if (stat.kind != .file) return error.InvalidManifest;
-    // Keep the no-follow handle workaround until Windows regressions verify
-    // that the upstream synchronous-open path safely replaces it.
-    if (comptime builtin.target.os.tag == .windows) f.flags.nonblocking = true;
     var read_buf: [4096]u8 = undefined;
     var reader = f.reader(io, &read_buf);
     const body = reader.interface.allocRemaining(allocator, Io.Limit.limited(max_manifest_bytes)) catch |err| switch (err) {

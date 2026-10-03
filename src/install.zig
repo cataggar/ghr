@@ -1467,11 +1467,8 @@ fn isOwnedAppBundle(io: Io, apps_dir: Dir, app_name: []const u8, tool_dir_path: 
 
     // Read and compare source path
     var content_buf: [Dir.max_path_bytes]u8 = undefined;
-    var file = apps_dir.openFile(io, marker_path, .{ .follow_symlinks = false }) catch return false;
+    const file = apps_dir.openFile(io, marker_path, .{ .follow_symlinks = false }) catch return false;
     defer file.close(io);
-    // Keep the no-follow handle workaround until Windows regressions verify
-    // that the upstream synchronous-open path safely replaces it.
-    if (comptime builtin.target.os.tag == .windows) file.flags.nonblocking = true;
     const len = file.readPositionalAll(io, &content_buf, 0) catch return false;
     return std.mem.eql(u8, content_buf[0..len], tool_dir_path);
 }

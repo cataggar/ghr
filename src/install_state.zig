@@ -1021,7 +1021,7 @@ const ReadMeta = union(enum) {
 /// permission/I/O/read errors propagate; OOM propagates (never conflated with
 /// absence).
 fn readMetaNoFollow(allocator: Allocator, io: Io, dir: Dir) !ReadMeta {
-    var file = dir.openFile(io, metadata_file, .{
+    const file = dir.openFile(io, metadata_file, .{
         .follow_symlinks = false,
         .allow_directory = false,
     }) catch |err| switch (err) {
@@ -1035,9 +1035,6 @@ fn readMetaNoFollow(allocator: Allocator, io: Io, dir: Dir) !ReadMeta {
     const st = try file.stat(io);
     if (st.kind != .file) return .{ .corrupt = .symlinked_path };
 
-    // Keep the no-follow handle workaround until Windows regressions verify
-    // that the upstream synchronous-open path safely replaces it.
-    if (comptime builtin.target.os.tag == .windows) file.flags.nonblocking = true;
     var buf: [4096]u8 = undefined;
     var fr = file.reader(io, &buf);
     const body = fr.interface.allocRemaining(allocator, Io.Limit.limited(max_metadata_bytes)) catch |err|

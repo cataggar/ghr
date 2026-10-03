@@ -163,8 +163,26 @@ jobs:
           test "$(ghr version)" = 0.8.1
 
   build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-22.04
+    needs: [native-build-and-test, cross-compile, site]
+    if: always()
+    steps:
+      - name: Require successful native, cross-target and site validation
+        env:
+          NATIVE_RESULT: ${{ needs.native-build-and-test.result }}
+          CROSS_RESULT: ${{ needs.cross-compile.result }}
+          SITE_RESULT: ${{ needs.site.result }}
+        run: |
+          set -euo pipefail
+          test "$NATIVE_RESULT" = success
+          test "$CROSS_RESULT" = success
+          test "$SITE_RESULT" = success
+
+  native-build-and-test:
     name: Native build, unit tests & help (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
