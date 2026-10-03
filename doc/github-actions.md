@@ -191,3 +191,97 @@ GitHub artifact attestation covering the downloaded digest.
 The download action's cache key includes extraction settings, every
 verification skip flag, and the minisign key as hashed material. A cache
 created under one verification policy is therefore never reused under another.
+
+## Signing releases
+
+### Configure repository secrets
+
+Run setup locally with `gh` installed and authenticated as an account allowed
+to manage the target repository's Actions secrets:
+
+```sh
+ghr minisign generate
+# Alternative: override gh's current repository context.
+ghr minisign generate --repo OWNER/REPO
+```
+
+The default repository follows GitHub CLI context; there is no interactive
+repository chooser. If that context cannot be resolved, setup fails before
+creating keys or uploading secrets. The command identifies the target
+repository, creates `minisign.key` and `minisign.pub` in the current directory,
+and refuses to overwrite existing key files or signing secrets.
+
+Generation and signing both use
+[`cataggar/minizign`](https://github.com/cataggar/minizign) as an in-process
+library: neither needs a standalone `minisign` or `minizign` executable.
+Authenticated `gh` is still needed to upload repository secrets.
+
+The default uploads **only `MINISIGN_SECRET_KEY`**. Its value is an
+unencrypted minisign-format private key; GitHub encrypts the repository secret
+in storage. `MINISIGN_PASSWORD` is optional and is not created or changed by
+default setup. No password-manager integration or separate passphrase-storage
+step is required.
+
+Keep the local private key protected with restrictive permissions/ACLs.
+Never commit it, include it in a cache, upload it as a release or workflow
+artifact, or print key/password values in logs. Publish `minisign.pub` through
+a trusted channel (for example, the project's README or website) so consumers
+can pin the public key for verification. The public key and `.minisig`
+signatures can accompany release artifacts; the private key cannot.
+
+For comparison, the rough manual equivalent requires a separate `minisign`
+installation:
+
+```sh
+umask 077
+minisign -G -W -p minisign.pub -s minisign.key  # -W: no password encryption
+gh repo view --json nameWithOwner --jq .nameWithOwner
+gh secret list
+# Verify the target and that MINISIGN_SECRET_KEY does not already exist.
+gh secret set MINISIGN_SECRET_KEY < minisign.key
+```
+
+The `gh` commands use the current repository; add `--repo OWNER/REPO` to each
+to override it. Unlike `ghr minisign generate`, `gh secret set` can replace an
+existing secret, so inspect the target and existing secrets before using the
+manual upload.
+
+If setup fails, check `gh` installation/authentication, repository context,
+and access to Actions secrets. For overwrite refusals, inspect the existing
+files and secrets rather than deleting them blindly. If an upload fails
+after key creation or after only some secrets were uploaded, retain the key
+pair, fix access, and complete provisioning with **the same key pair**.
+Inspect which secrets already exist before retrying; do not regenerate or
+rotate a key just to recover from an upload failure. Consult
+`ghr minisign generate --help` for supported recovery options.
+
+### Sign artifacts
+
+After installing `ghr` with the setup action, sign without a private-key file
+on the runner:
+
+```yaml
+- run: ghr minisign sign artifact.tar.gz
+  env:
+    MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+```
+
+Each positional file produces its own `<file>.minisig`. The existing `-t`
+trusted-comment option remains supported. Signing takes keys and any required
+password from the environment, never a tty or stdin. Upload the artifacts
+and their signatures, not the private key.
+
+### Opt in to password-encrypted keys
+
+Supply a strong, nonempty `MINISIGN_PASSWORD` in the local environment, then
+run `ghr minisign generate --encrypt` (with `--repo OWNER/REPO` if needed).
+This mode also uploads `MINISIGN_PASSWORD` for unattended signing. Existing
+password-encrypted minisign keys remain supported. Only encrypted keys need
+both variables in the signing step:
+
+```yaml
+- run: ghr minisign sign artifact.tar.gz
+  env:
+    MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+    MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+```
