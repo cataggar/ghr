@@ -1,9 +1,9 @@
 //! Host name resolution fallback for machines whose `/etc/resolv.conf` the
 //! Zig standard library refuses to parse.
 //!
-//! Zig 0.16's `std.Io.net.HostName.ResolvConf.init` reads the file through a
-//! 512-byte line buffer and copies the entire `search`/`domain` list into a
-//! 255-byte buffer. WSL regenerates `/etc/resolv.conf` on every boot with a
+//! Zig 0.17's `std.Io.net.HostName.ResolvConf.init` still reads the file through
+//! a 512-byte line buffer and ignores `search`/`domain` lists longer than its
+//! 254-byte buffer. WSL regenerates `/etc/resolv.conf` on every boot with a
 //! `search` line naming every DNS suffix the host network advertises; on a
 //! corporate network that line routinely runs past a kilobyte. The line
 //! exceeds the reader buffer, `ResolvConf.init` fails, and every lookup
@@ -20,11 +20,11 @@
 //! standard library resolves names through `/etc/resolv.conf`; Windows uses
 //! `DnsQueryEx` and the BSDs go through libc.
 //!
-//! This module is a workaround for an upstream bug, tracked as
-//! https://codeberg.org/ziglang/zig/issues/35371 and milestoned for Zig
-//! 0.17.0. Delete it once ghr builds against a Zig release carrying the fix:
-//! drop the `dns.wrap` call in `main.zig` and remove this file, leaving the
-//! standard resolver to read these files on its own.
+//! Retain this fallback until the standard resolver tolerates oversized
+//! search/domain lines. Upstream issue 35371 is closed, but concerns a
+//! dependency-fetch SIGSEGV, not this parser limit. Before retiring `wrap`,
+//! verify `ResolvConf.init` and lookups with oversized WSL-style files in an
+//! isolated mount namespace, including hosts-only results and cancellation.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,7 +35,7 @@ const HostName = net.HostName;
 const IpAddress = net.IpAddress;
 
 /// Whether the standard resolver on this target reads `/etc/resolv.conf`.
-pub const enabled = builtin.os.tag == .linux;
+pub const enabled = builtin.target.os.tag == .linux;
 
 /// resolv.conf(5) caps the nameserver list at three entries.
 const max_nameservers = 3;
@@ -116,24 +116,20 @@ fn netLookup(
     // Registered below the branch above, which leaves the close to the
     // standard resolver.
     defer resolved.close(io);
+    defer future.cancel(io) catch {};
 
     var stash: [stash_len]HostName.LookupResult = undefined;
     var stashed: usize = 0;
-    var drain_failure: ?Io.Cancelable = null;
 
-    // Keep taking results even after a failed hand-off, so the resolver always
-    // reaches its own `close` and `await` below cannot block forever.
-    while (private.getOneUncancelable(io)) |result| {
-        if (drain_failure != null) continue;
+    // Cancellation must interrupt both this drain and the standard resolver,
+    // including when it is waiting on DNS or a full private queue.
+    while (private.getOne(io)) |result| {
         switch (result) {
             .canonical_name => {
                 // A second canonical name proves the resolver is already past
                 // `/etc/resolv.conf`, so the one before it can be released.
                 if (stashed == stash.len) {
-                    put(io, resolved, stash[0]) catch |e| {
-                        drain_failure = e;
-                        continue;
-                    };
+                    try put(io, resolved, stash[0]);
                     std.mem.copyForwards(HostName.LookupResult, stash[0 .. stash.len - 1], stash[1..]);
                     stashed -= 1;
                 }
@@ -142,16 +138,14 @@ fn netLookup(
             },
             // Addresses only reach the queue on paths that go on to succeed,
             // so handing them over right away cannot race the fallback.
-            .address => put(io, resolved, result) catch |e| {
-                drain_failure = e;
-            },
+            .address => try put(io, resolved, result),
         }
     } else |err| switch (err) {
         error.Closed => {},
+        error.Canceled => |e| return e,
     }
 
     const lookup_result = future.await(io);
-    if (drain_failure) |e| return e;
     lookup_result catch |err| switch (err) {
         error.ResolvConfParseFailed => return lookupDns(io, host_name, resolved, options),
         else => |e| return e,
@@ -420,7 +414,10 @@ fn query(
                     outgoing_len += 1;
                 }
             }
-            socket.sendMany(io, outgoing[0..outgoing_len], .{}) catch {};
+            socket.sendMany(io, outgoing[0..outgoing_len], .{}) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => {},
+            };
         }
 
         const attempt_deadline = now.addDuration(attempt_duration);
@@ -478,7 +475,10 @@ fn query(
                             .data_ptr = q.ptr,
                             .data_len = q.len,
                         };
-                        socket.sendMany(io, (&retry)[0..1], .{}) catch {};
+                        socket.sendMany(io, (&retry)[0..1], .{}) catch |err| switch (err) {
+                            error.Canceled => |e| return e,
+                            else => {},
+                        };
                     },
                     // Ignore anything else, such as a refusal.
                     else => continue,
@@ -563,7 +563,7 @@ fn writeQuery(
     }
     buffer[len] = 0; // root label
     len += 1;
-    std.mem.writeInt(u16, buffer[len..][0..2], @intFromEnum(record), .big);
+    std.mem.writeInt(u16, buffer[len..][0..2], @backingInt(record), .big);
     len += 2;
     std.mem.writeInt(u16, buffer[len..][0..2], 1, .big); // class IN
     len += 2;
@@ -573,6 +573,55 @@ fn writeQuery(
 // --- tests ---
 
 const testing = std.testing;
+
+test "wrap: cancellation interrupts the standard resolver and full queues" {
+    if (!enabled) return error.SkipZigTest;
+    const Mock = struct {
+        const Mode = enum { waiting, full_queue };
+        var mode: Mode = .waiting;
+        var entered: Io.Event = .unset;
+
+        fn lookup(
+            _: ?*anyopaque,
+            _: HostName,
+            resolved: *Io.Queue(HostName.LookupResult),
+            _: HostName.LookupOptions,
+        ) HostName.LookupError!void {
+            const io = testing.io;
+            defer resolved.close(io);
+            switch (mode) {
+                .waiting => {
+                    entered.set(io);
+                    try io.sleep(.fromSeconds(5), .awake);
+                },
+                .full_queue => for (0..private_queue_len * 2) |i| {
+                    try put(io, resolved, .{ .address = .{ .ip4 = .loopback(443) } });
+                    if (i == private_queue_len + 1) entered.set(io);
+                },
+            }
+        }
+    };
+    var vtable = testing.io.vtable.*;
+    vtable.netLookup = Mock.lookup;
+    const io = wrap(.{ .userdata = testing.io.userdata, .vtable = &vtable });
+    for ([_]Mock.Mode{ .waiting, .full_queue }) |mode| {
+        Mock.mode = mode;
+        Mock.entered.reset();
+        var storage: [1]HostName.LookupResult = undefined;
+        var queue: Io.Queue(HostName.LookupResult) = .init(&storage);
+        var future = io.concurrent(HostName.lookup, .{
+            try HostName.init("cancel.example"), io, &queue, HostName.LookupOptions{ .port = 443 },
+        }) catch return error.SkipZigTest;
+        defer future.cancel(io) catch {};
+        try Mock.entered.wait(io);
+        const start = Io.Clock.awake.now(io);
+        try testing.expectError(error.Canceled, future.cancel(io));
+        try testing.expect(Io.Clock.awake.now(io).nanoseconds - start.nanoseconds < std.time.ns_per_s);
+        while (queue.getOneUncancelable(io)) |_| {} else |err| switch (err) {
+            error.Closed => {},
+        }
+    }
+}
 
 /// Modelled on the file WSL 2 generates on a machine joined to a corporate
 /// network, with the real suffixes replaced by placeholders of the same shape.
@@ -589,7 +638,7 @@ const wsl_resolv_conf =
 test "parse: WSL search line longer than the standard library's line buffer" {
     // The regression this module exists for: the standard library reads
     // resolv.conf through a 512-byte line buffer and copies the search list
-    // into a 255-byte buffer, so this file fails both limits.
+    // into a 254-byte buffer, so this file fails both limits.
     const search_line = wsl_resolv_conf[std.mem.indexOf(u8, wsl_resolv_conf, "search ").?..];
     try testing.expect(std.mem.indexOfScalar(u8, search_line, '\n').? > 512);
 
@@ -605,6 +654,35 @@ test "parse: WSL search line longer than the standard library's line buffer" {
     var last: []const u8 = "";
     while (suffixes.next()) |suffix| last = suffix;
     try testing.expectEqualStrings("example.org", last);
+}
+
+test "parse: Zig 0.17 still needs the oversized search and domain fallback" {
+    const search_line = wsl_resolv_conf[std.mem.indexOf(u8, wsl_resolv_conf, "search ").?..];
+    for ([_][]const u8{ "search", "domain" }) |directive| {
+        const contents = try testing.allocator.print("nameserver 127.0.0.1\n{s} {s}", .{
+            directive, search_line["search ".len..],
+        });
+        defer testing.allocator.free(contents);
+
+        var standard: HostName.ResolvConf = .{
+            .nameservers_buffer = undefined,
+            .nameservers_len = 0,
+            .search_buffer = undefined,
+            .search_len = 0,
+            .ndots = 1,
+            .timeout_seconds = 5,
+            .attempts = 2,
+        };
+        var source: Io.Reader = .fixed(contents);
+        var line_buffer: [512]u8 = undefined;
+        var reader = source.limited(.unlimited, &line_buffer);
+        try testing.expectError(error.StreamTooLong, standard.parse(testing.io, &reader.interface));
+
+        const fallback = try ResolvConf.parse(testing.io, contents);
+        try testing.expectEqual(@as(usize, 1), fallback.nameservers_len);
+        try testing.expect(fallback.search_len > HostName.max_len);
+        try testing.expect(std.mem.endsWith(u8, fallback.search(), "example.org"));
+    }
 }
 
 test "parse: defaults when the file says nothing" {
@@ -685,7 +763,7 @@ test "parse: keeps a nameserver whose address carries a scope" {
 test "copySearchList: drops the first domain that does not fit whole" {
     var buffer: [max_search]u8 = undefined;
 
-    const domain = "a" ** 63 ++ ".example.com";
+    const domain = @as([63]u8, @splat('a')) ++ ".example.com";
     var list: std.ArrayListUnmanaged(u8) = .empty;
     defer list.deinit(testing.allocator);
     for (0..100) |_| {
@@ -704,7 +782,7 @@ test "copySearchList: drops the first domain that does not fit whole" {
 
 test "copySearchList: skips a domain longer than a host name may be" {
     var buffer: [max_search]u8 = undefined;
-    const len = copySearchList(&buffer, "a" ** (HostName.max_len + 1) ++ " ok.example.com");
+    const len = copySearchList(&buffer, @as([HostName.max_len + 1]u8, @splat('a')) ++ " ok.example.com");
     try testing.expectEqualStrings("ok.example.com", buffer[0..len]);
 }
 
@@ -724,9 +802,9 @@ test "writeQuery: encodes a question the standard library can read back" {
         0x01, 0x00, // recursion desired
         0x00, 0x01, // one question
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // no records
-        3,    'a',  'p',  'i',
-        6,    'g',  'i',  't',  'h',  'u',  'b',
-        3,    'c',  'o',  'm',
+        3,    'a',  'p',  'i',  6,    'g',
+        'i',  't',  'h',  'u',  'b',  3,
+        'c',  'o',  'm',
         0, // root label
         0x00, 0x01, // type A
         0x00, 0x01, // class IN
@@ -745,7 +823,8 @@ test "writeQuery: encodes a question the standard library can read back" {
         0x00, 0x01, // class IN
         0x00, 0x00, 0x00, 0x3c, // ttl
         0x00, 0x04, // four bytes of data
-        140,  82,   112,  4,
+        140,  82,
+        112,  4,
     };
     @memcpy(reply[len..][0..answer.len], &answer);
 
@@ -771,13 +850,16 @@ test "writeQuery: strips a trailing dot and rejects unusable names" {
     try testing.expectEqual(@as(?usize, null), writeQuery(&buffer, "", .A, .{ 0, 0 }));
     try testing.expectEqual(@as(?usize, null), writeQuery(&buffer, ".", .A, .{ 0, 0 }));
     try testing.expectEqual(@as(?usize, null), writeQuery(&buffer, "a..b", .A, .{ 0, 0 }));
-    try testing.expectEqual(@as(?usize, null), writeQuery(&buffer, "a" ** 64 ++ ".com", .A, .{ 0, 0 }));
-    try testing.expectEqual(@as(?usize, null), writeQuery(&buffer, "a." ** 127 ++ "ab", .A, .{ 0, 0 }));
+    try testing.expectEqual(@as(?usize, null), writeQuery(&buffer, @as([64]u8, @splat('a')) ++ ".com", .A, .{ 0, 0 }));
+    const many_labels: [127][2]u8 = @splat(.{ 'a', '.' });
+    const many_labels_bytes: *const [254]u8 = @ptrCast(&many_labels);
+    try testing.expectEqual(@as(?usize, null), writeQuery(&buffer, many_labels_bytes.* ++ "ab", .A, .{ 0, 0 }));
 }
 
 test "writeQuery: fills the buffer exactly at the longest legal name" {
     var buffer: [max_query_len]u8 = undefined;
-    const name = ("a" ** 63 ++ ".") ** 3 ++ "a" ** 61;
+    const label = @as([63]u8, @splat('a')) ++ ".";
+    const name = label ++ label ++ label ++ @as([61]u8, @splat('a'));
     try testing.expectEqual(@as(usize, 253), name.len);
     try testing.expectEqual(@as(?usize, max_query_len), writeQuery(&buffer, name, .A, .{ 0, 0 }));
 }

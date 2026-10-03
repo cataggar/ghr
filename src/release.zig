@@ -491,8 +491,8 @@ pub fn getRelease(
     const url = if (tag) |t| blk: {
         const encoded_tag = try urlEncode(allocator, t);
         defer allocator.free(encoded_tag);
-        break :blk try std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/{s}/releases/tags/{s}", .{ owner, repo, encoded_tag });
-    } else try std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/{s}/releases/latest", .{ owner, repo });
+        break :blk try allocator.print("https://api.github.com/repos/{s}/{s}/releases/tags/{s}", .{ owner, repo, encoded_tag });
+    } else try allocator.print("https://api.github.com/repos/{s}/{s}/releases/latest", .{ owner, repo });
     defer allocator.free(url);
 
     var body_writer = std.Io.Writer.Allocating.init(allocator);
@@ -536,7 +536,7 @@ pub fn getRelease(
                         std.log.err("hint: set GH_TOKEN for higher rate limits (5000/hr vs 60/hr)", .{});
                     }
                 } else {
-                    std.log.err("GitHub API HTTP {d}: {s}", .{ @intFromEnum(result.status), msg });
+                    std.log.err("GitHub API HTTP {d}: {s}", .{ @backingInt(result.status), msg });
                 }
             } else |_| {}
         }
@@ -570,13 +570,13 @@ pub const PlatformKeywords = struct {
 };
 
 pub fn currentPlatformKeywords() PlatformKeywords {
-    const os_keywords: []const []const u8 = switch (builtin.os.tag) {
+    const os_keywords: []const []const u8 = switch (builtin.target.os.tag) {
         .windows => &.{ "windows", "win" },
         .linux => &.{"linux"},
         .macos => &.{ "macos", "darwin", "osx" },
         else => &.{},
     };
-    const arch_keywords: []const []const u8 = switch (builtin.cpu.arch) {
+    const arch_keywords: []const []const u8 = switch (builtin.target.cpu.arch) {
         .x86_64 => &.{ "x86_64", "x64", "amd64" },
         .aarch64 => &.{ "aarch64", "arm64" },
         .x86 => &.{ "x86", "i686", "i386" },
@@ -588,8 +588,8 @@ pub fn currentPlatformKeywords() PlatformKeywords {
     // for musl, and the PyPI wheels carry musllinux/manylinux platform tags that
     // pip resolves per host. So our own compiled ABI is a reliable, zero-I/O
     // proxy for the host's libc.
-    const libc: ?Libc = switch (builtin.os.tag) {
-        .linux => if (std.mem.startsWith(u8, @tagName(builtin.abi), "musl")) .musl else .gnu,
+    const libc: ?Libc = switch (builtin.target.os.tag) {
+        .linux => if (std.mem.startsWith(u8, @tagName(builtin.target.abi), "musl")) .musl else .gnu,
         else => null,
     };
     return .{ .os = os_keywords, .arch = arch_keywords, .libc = libc };
@@ -1355,7 +1355,7 @@ pub fn verifyDownloadedAssetSha256(
 
     debugLog(debug_w, "debug: checksum asset: {s}\n", .{checksum_asset.name});
 
-    const checksum_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+    const checksum_path = try allocator.print("{s}{c}{s}", .{
         cache_dir, std.fs.path.sep, checksum_asset.name,
     });
     defer allocator.free(checksum_path);
@@ -1511,7 +1511,7 @@ pub fn verifyDownloadedAssetSigstore(
 
     debugLog(debug_w, "debug: sigstore bundle asset: {s}\n", .{bundle_asset.name});
 
-    const bundle_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+    const bundle_path = try allocator.print("{s}{c}{s}", .{
         cache_dir, std.fs.path.sep, bundle_asset.name,
     });
     defer allocator.free(bundle_path);
@@ -1689,14 +1689,12 @@ pub fn verifyDownloadedAssetAttestation(
 
     debugLog(debug_w, "debug: attestation: {d} candidate(s)\n", .{bundles.len});
 
-    const repository_uri = try std.fmt.allocPrint(
-        allocator,
+    const repository_uri = try allocator.print(
         "https://github.com/{s}/{s}",
         .{ repo.owner, repo.repo },
     );
     defer allocator.free(repository_uri);
-    const owner_uri = try std.fmt.allocPrint(
-        allocator,
+    const owner_uri = try allocator.print(
         "https://github.com/{s}",
         .{repo.owner},
     );
@@ -2081,7 +2079,7 @@ pub fn verifyDownloadedAssetMinisign(
 
     debugLog(debug_w, "debug: minisign sidecar: {s}\n", .{sidecar.name});
 
-    const sidecar_path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{
+    const sidecar_path = try allocator.print("{s}{c}{s}", .{
         cache_dir, std.fs.path.sep, sidecar.name,
     });
     defer allocator.free(sidecar_path);
@@ -3116,8 +3114,8 @@ test "urlEncode handles special characters" {
 test "isHex64 accepts and rejects" {
     try std.testing.expect(isHex64("0123456789abcdefABCDEF000000000000000000000000000000000000000000"));
     try std.testing.expect(!isHex64("0123"));
-    try std.testing.expect(!isHex64("zzzz" ++ ("0" ** 60)));
-    try std.testing.expect(!isHex64("g" ++ ("0" ** 63)));
+    try std.testing.expect(!isHex64("zzzz" ++ @as([60]u8, @splat('0'))));
+    try std.testing.expect(!isHex64("g" ++ @as([63]u8, @splat('0'))));
 }
 
 test "parseChecksumLine GNU two-space form" {
@@ -3152,18 +3150,22 @@ test "parseChecksumLine BSD form" {
 test "parseChecksumLine GNU sha512 two-space form" {
     // Real width Caddy publishes in `caddy_<ver>_checksums.txt`: 128-hex
     // SHA-512, not SHA-256, despite the generic "checksums.txt" filename.
-    const line = ("ab" ** 64) ++ "  caddy_2.11.4_linux_arm64.tar.gz";
+    const pairs: [64][2]u8 = @splat(.{ 'a', 'b' });
+    const hex: *const [128]u8 = @ptrCast(&pairs);
+    const line = hex.* ++ "  caddy_2.11.4_linux_arm64.tar.gz";
     const e = parseChecksumLine(line) orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("ab" ** 64, e.hex);
+    try std.testing.expectEqualStrings(hex, e.hex);
     try std.testing.expectEqualStrings("caddy_2.11.4_linux_arm64.tar.gz", e.name);
     try std.testing.expectEqual(ChecksumAlgo.sha512, e.algo);
 }
 
 test "parseChecksumLine BSD sha512 form" {
-    const line = "SHA512 (app.tar.gz) = " ++ ("cd" ** 64);
+    const pairs: [64][2]u8 = @splat(.{ 'c', 'd' });
+    const hex: *const [128]u8 = @ptrCast(&pairs);
+    const line = "SHA512 (app.tar.gz) = " ++ hex.*;
     const e = parseChecksumLine(line) orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("app.tar.gz", e.name);
-    try std.testing.expectEqualStrings("cd" ** 64, e.hex);
+    try std.testing.expectEqualStrings(hex, e.hex);
     try std.testing.expectEqual(ChecksumAlgo.sha512, e.algo);
 }
 
@@ -3193,11 +3195,11 @@ test "lookupChecksum resolves sha512 entries in a caddy-shaped checksums.txt" {
     // Trimmed shape of the real caddy_2.11.4_checksums.txt (128-hex SHA-512
     // entries, no algorithm hint in the aggregate filename).
     const body =
-        ("11" ** 64) ++ "  caddy_2.11.4_linux_amd64.tar.gz\n" ++
-        ("22" ** 64) ++ "  caddy_2.11.4_linux_arm64.tar.gz\n" ++
-        ("33" ** 64) ++ "  caddy_2.11.4_windows_amd64.zip\n";
+        @as([128]u8, @splat('1')) ++ "  caddy_2.11.4_linux_amd64.tar.gz\n" ++
+        @as([128]u8, @splat('2')) ++ "  caddy_2.11.4_linux_arm64.tar.gz\n" ++
+        @as([128]u8, @splat('3')) ++ "  caddy_2.11.4_windows_amd64.zip\n";
     const got = lookupChecksum(body, "caddy_2.11.4_linux_arm64.tar.gz") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("22" ** 64, got.hex);
+    try std.testing.expectEqualStrings(&@as([128]u8, @splat('2')), got.hex);
     try std.testing.expectEqual(ChecksumAlgo.sha512, got.algo);
     try std.testing.expect(lookupChecksum(body, "caddy_2.11.4_freebsd_amd64.tar.gz") == null);
 }
@@ -3222,13 +3224,13 @@ test "lookupChecksum parses certutil format (Windows .sha256 sidecars)" {
 test "lookupChecksum mixes certutil and gnu entries in one file" {
     const body =
         "SHA256 hash of asset-a.zip:\r\n" ++
-        ("a" ** 64) ++ "\r\n" ++
+        @as([64]u8, @splat('a')) ++ "\r\n" ++
         "CertUtil: -hashfile command completed successfully.\r\n" ++
-        ("b" ** 64) ++ "  asset-b.zip\n";
+        @as([64]u8, @splat('b')) ++ "  asset-b.zip\n";
     const a = lookupChecksum(body, "asset-a.zip") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("a" ** 64, a.hex);
+    try std.testing.expectEqualStrings(&@as([64]u8, @splat('a')), a.hex);
     const b = lookupChecksum(body, "asset-b.zip") orelse return error.TestUnexpectedNull;
-    try std.testing.expectEqualStrings("b" ** 64, b.hex);
+    try std.testing.expectEqualStrings(&@as([64]u8, @splat('b')), b.hex);
 }
 
 test "checksumNameMatches strips path and ignores case" {
@@ -3293,7 +3295,7 @@ test "findChecksumAsset finds a sha512-only sidecar" {
 test "lookupAssetDigest extracts the GitHub sha256 digest" {
     const hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const assets = [_]Asset{
-        .{ .name = "other.zip", .browser_download_url = "", .digest = "sha256:" ++ ("11" ** 32) },
+        .{ .name = "other.zip", .browser_download_url = "", .digest = "sha256:" ++ @as([64]u8, @splat('1')) },
         .{ .name = "app.tar.gz", .browser_download_url = "", .digest = "sha256:" ++ hex },
     };
     const got = lookupAssetDigest(&assets, "app.tar.gz") orelse return error.TestUnexpectedNull;
@@ -3486,13 +3488,25 @@ test "preflightVerification requires a minisign sidecar only when a key is suppl
     try std.testing.expectEqualStrings("", err.written());
 
     try std.testing.expectError(error.MinisignSidecarMissing, preflightVerification(
-        &unsigned, "tool.tar.xz", .{}, key, &err.writer,
+        &unsigned,
+        "tool.tar.xz",
+        .{},
+        key,
+        &err.writer,
     ));
     try std.testing.expectError(error.MinisignPubKeyParseError, preflightVerification(
-        &signed, "tool.tar.xz", .{}, "not a key", &err.writer,
+        &signed,
+        "tool.tar.xz",
+        .{},
+        "not a key",
+        &err.writer,
     ));
     try std.testing.expectError(error.MinisignPubKeyParseError, preflightVerification(
-        &unsigned, "tool.tar.xz", .{}, "not a key", &err.writer,
+        &unsigned,
+        "tool.tar.xz",
+        .{},
+        "not a key",
+        &err.writer,
     ));
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "no 'tool.tar.xz.minisig' sidecar") != null);
     try std.testing.expect(std.mem.indexOf(u8, err.written(), "not a valid minisign public key") != null);
@@ -3624,9 +3638,19 @@ test "verifyAssetOnDisk keeps other verifiers active without a minisign key" {
     defer err.deinit();
 
     const outcome = try verifyAssetOnDisk(
-        std.testing.allocator, io, path, &assets, "tool.tar.xz", path,
-        null, null, .{ .skip_attestation = true, .skip_authenticode = true },
-        null, null, &out.writer, &err.writer,
+        std.testing.allocator,
+        io,
+        path,
+        &assets,
+        "tool.tar.xz",
+        path,
+        null,
+        null,
+        .{ .skip_attestation = true, .skip_authenticode = true },
+        null,
+        null,
+        &out.writer,
+        &err.writer,
     );
     try std.testing.expectEqual(VerifyOutcome.github_digest_verified, outcome);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "verified github sha256") != null);
@@ -3635,9 +3659,19 @@ test "verifyAssetOnDisk keeps other verifiers active without a minisign key" {
 
     try tmp.dir.writeFile(io, .{ .sub_path = "tool.tar.xz", .data = "tampered" });
     try std.testing.expectError(error.ChecksumMismatch, verifyAssetOnDisk(
-        std.testing.allocator, io, path, &assets, "tool.tar.xz", path,
-        null, null, .{ .skip_attestation = true, .skip_authenticode = true },
-        null, null, &out.writer, &err.writer,
+        std.testing.allocator,
+        io,
+        path,
+        &assets,
+        "tool.tar.xz",
+        path,
+        null,
+        null,
+        .{ .skip_attestation = true, .skip_authenticode = true },
+        null,
+        null,
+        &out.writer,
+        &err.writer,
     ));
 }
 

@@ -10,7 +10,7 @@ const EnvironMap = std.process.Environ.Map;
 var process_ca_bundle_path: ?[]const u8 = null;
 
 /// Capture the conventional OpenSSL CA override once at process startup.
-/// Zig 0.16 only scans fixed system paths, so clients must load this file
+/// Zig 0.17 only scans fixed system paths, so clients must load this file
 /// explicitly for package-less Linux containers.
 pub fn configureProcessCaBundle(environ: *const EnvironMap) void {
     process_ca_bundle_path = environ.get("SSL_CERT_FILE");
@@ -125,7 +125,7 @@ pub fn downloadToFile(
         };
 
         // Use unhandled redirects so we can strip Authorization on
-        // cross-domain redirect (github.com -> CDN). Zig 0.16's
+        // cross-domain redirect (github.com -> CDN). Zig 0.17's
         // privileged_headers field is not written by sendHead.
         var req = client.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
@@ -193,7 +193,7 @@ pub fn downloadToFile(
         };
 
         var cdn_req = cdn_client.request(.GET, cdn_uri, .{
-            .redirect_behavior = @enumFromInt(3),
+            .redirect_behavior = @fromBackingInt(@intCast(3)),
             .headers = .{ .user_agent = .{ .override = default_user_agent } },
         }) catch |err| {
             debugLog(opts.debug_w, "  attempt {d}/{d} CDN request error: {}\n", .{ attempts + 1, max_retries, err });
@@ -256,8 +256,8 @@ fn handleDownloadResponse(
 
         if (isTransientStatus(response.head.status)) {
             debugLog(opts.debug_w, "  attempt {d}/{d} HTTP {d} ({s})\n", .{
-                attempt + 1, max_retries,
-                @intFromEnum(response.head.status), @tagName(response.head.status),
+                attempt + 1,                       max_retries,
+                @backingInt(response.head.status), @tagName(response.head.status),
             });
             if (opts.debug_w) |dw| {
                 if (err_body) |b| {
@@ -269,7 +269,7 @@ fn handleDownloadResponse(
             if (attempt + 1 < max_retries) return false;
         }
         std.log.err("download failed with HTTP {d} ({s})", .{
-            @intFromEnum(response.head.status), @tagName(response.head.status),
+            @backingInt(response.head.status), @tagName(response.head.status),
         });
         return error.DownloadFailed;
     }

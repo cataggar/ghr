@@ -47,7 +47,7 @@ pub fn resolveGithubToken(
 /// Returns null if the resolved token is null. Caller owns the result.
 pub fn bearerHeader(allocator: std.mem.Allocator, resolved: Resolved) !?[]const u8 {
     const token = resolved.token orelse return null;
-    return try std.fmt.allocPrint(allocator, "Bearer {s}", .{token});
+    return try allocator.print("Bearer {s}", .{token});
 }
 
 /// Run `gh auth token` to get a GitHub token from the gh CLI.
@@ -88,6 +88,32 @@ pub fn isGithubHost(host: []const u8) bool {
         std.ascii.eqlIgnoreCase(host, "raw.githubusercontent.com") or
         std.ascii.eqlIgnoreCase(host, "objects.githubusercontent.com") or
         std.ascii.eqlIgnoreCase(host, "release-assets.githubusercontent.com");
+}
+
+/// Decode and validate the URI host before deciding whether auth is safe.
+pub fn isGithubUri(uri: std.Uri) bool {
+    var buffer: [Io.net.HostName.max_len]u8 = undefined;
+    const host = Io.net.HostName.fromUri(uri, &buffer) catch return false;
+    return isGithubHost(host.bytes);
+}
+
+test "isGithubUri validates decoded hosts and fails closed" {
+    const cases = [_]struct { url: []const u8, trusted: bool }{
+        .{ .url = "https://GitHub.com/asset", .trusted = true },
+        .{ .url = "https://api%2egithub.com/asset", .trusted = true },
+        .{ .url = "https://github.com@evil.example/asset", .trusted = false },
+        .{ .url = "https://github.com.evil.example/asset", .trusted = false },
+        .{ .url = "https://github.com%00.evil.example/asset", .trusted = false },
+        .{ .url = "https://github.com%2f.evil.example/asset", .trusted = false },
+        .{ .url = "https://github.com./asset", .trusted = false },
+        .{ .url = "https://[::1]/asset", .trusted = false },
+        .{ .url = "https:///asset", .trusted = false },
+        .{ .url = "https:asset", .trusted = false },
+        .{ .url = "https://" ++ @as([254]u8, @splat('a')) ++ "/asset", .trusted = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.trusted, isGithubUri(try std.Uri.parse(case.url)));
+    }
 }
 
 test "ghAuthToken returns token when gh is available" {

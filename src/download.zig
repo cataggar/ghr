@@ -335,16 +335,15 @@ fn downloadOne(
 
     // 3) Per-spec host check: only attach auth for github-owned hosts.
     const uri = std.Uri.parse(target.download_url) catch unreachable; // already validated
-    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = (uri.getHost(&host_buf) catch null) orelse blk: {
-        break :blk std.Io.net.HostName{ .bytes = "" };
-    };
-    const per_spec_auth_header: ?[]const u8 = if (auth.isGithubHost(host.bytes)) ctx.auth_header else null;
-    const per_spec_auth_source: []const u8 = if (auth.isGithubHost(host.bytes)) ctx.auth_resolved.source else "skipped";
+    const github_host = auth.isGithubUri(uri);
+    const per_spec_auth_header: ?[]const u8 = if (github_host) ctx.auth_header else null;
+    const per_spec_auth_source: []const u8 = if (github_host) ctx.auth_resolved.source else "skipped";
 
     if (opts.debug) {
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = std.Io.net.HostName.fromUri(uri, &host_buf) catch null;
         try err_w.print("debug: url: {s}\n", .{target.download_url});
-        try err_w.print("debug: host: {s}\n", .{host.bytes});
+        try err_w.print("debug: host: {s}\n", .{if (host) |h| h.bytes else ""});
         try err_w.print("debug: auth: {s}\n", .{per_spec_auth_source});
         try err_w.print("debug: archive_path: {s}\n", .{paths.archive_path});
         if (paths.extract_dir) |e| try err_w.print("debug: extract_dir: {s}\n", .{e});
@@ -371,7 +370,7 @@ fn downloadOne(
 
     // 5) Download to a `.part` file beside the destination so a partial file
     //    never appears at the user-visible path.
-    const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{paths.archive_path});
+    const part_path = try allocator.print("{s}.part", .{paths.archive_path});
     defer allocator.free(part_path);
 
     Dir.deleteFileAbsolute(io, part_path) catch {};
