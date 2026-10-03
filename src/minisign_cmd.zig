@@ -240,12 +240,12 @@ pub fn printSignUsage(w: *Writer) !void {
         \\
         \\REQUIRED ENVIRONMENT:
         \\    MINISIGN_SECRET_KEY   secret key contents (the .key file body)
-        \\    MINISIGN_PASSWORD     password for the encrypted key
         \\
-        \\Both the secret key and the password MUST come from the environment
-        \\— there is no key-file flag, and the password is never read from a
-        \\tty or stdin, so no `expect` script is needed. MINISIGN_PASSWORD is
-        \\not required for an unencrypted key.
+        \\OPTIONAL ENVIRONMENT:
+        \\    MINISIGN_PASSWORD     password, only when the key is encrypted
+        \\
+        \\Key contents and an encrypted key's password come from the environment.
+        \\There is no key-file flag or tty/stdin password prompt.
         \\
         \\OPTIONS:
         \\    -t <text>   Trusted comment, signed. Defaults (like minisign) to
@@ -261,7 +261,6 @@ pub fn printSignUsage(w: *Writer) !void {
         \\    - run: ghr minisign sign hello.wasm -t "tag:${{{{ github.ref_name }}}}"
         \\      env:
         \\        MINISIGN_SECRET_KEY: ${{{{ secrets.MINISIGN_SECRET_KEY }}}}
-        \\        MINISIGN_PASSWORD:   ${{{{ secrets.MINISIGN_PASSWORD }}}}
         \\
     , .{});
 }
