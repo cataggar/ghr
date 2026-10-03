@@ -146,6 +146,11 @@ Older OS versions are not supported by these new builds;
 this does not change the requirements of previously published releases.
 See the [official release notes](https://ziglang.org/download/0.17.0/release-notes.html#OS-Version-Requirements).
 
+macOS PyPI wheels built with Zig 0.17 use `macosx_15_0_arm64` and
+`macosx_15_0_x86_64` tags to match the binaries' macOS 15.0 minimum.
+`pip` will not select these wheels on older macOS. The previously advertised
+macOS 11.0 (ARM64) and 10.9 (x86_64) wheel tags no longer apply to new builds.
+
 To rebuild a historical release, use the compiler and optimization spelling
 of the **checked-out tag**, not the current branch's toolchain. See the
 [historical rebuild policy](doc/reproducible-builds.md#compiler-selection).
