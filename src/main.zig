@@ -298,6 +298,7 @@ const HelpTopic = enum {
     validate,
     validate_strip_authenticode,
     minisign,
+    minisign_generate,
     minisign_sign,
     version,
 };
@@ -322,6 +323,7 @@ fn detectHelpTopic(args: []const []const u8) ?HelpTopic {
     }
     if (eql(command, "minisign")) {
         return detectNestedHelpTopic(args[1..], &.{
+            .{ "generate", .minisign_generate },
             .{ "sign", .minisign_sign },
         }, .minisign);
     }
@@ -380,6 +382,7 @@ fn printHelpTopic(topic: HelpTopic, w: *Writer) !void {
         .validate => try validate.printUsage(w),
         .validate_strip_authenticode => try validate.printStripUsage(w),
         .minisign => try minisign_cmd.printUsage(w),
+        .minisign_generate => try minisign_cmd.printGenerateUsage(w),
         .minisign_sign => try minisign_cmd.printSignUsage(w),
         .version => try printVersionUsage(w),
     }
@@ -1275,7 +1278,7 @@ fn printUsage(w: *Writer) !void {
         \\    path add [--dry-run]                 Add ghr's bin dir to your user PATH
         \\    path [bin|tools|cache]               Show ghr directories
         \\    validate <SUBCOMMAND>                Run validations against published artifacts
-        \\    minisign <SUBCOMMAND>                Sign release artifacts with a minisign key
+        \\    minisign <SUBCOMMAND>                Generate signing keys or sign release artifacts
         \\    version                              Print version and exit
         \\
         \\Each <source> is `owner/repo[@tag]` (auto-pick asset),
@@ -1316,6 +1319,7 @@ test {
     _ = @import("validate.zig");
     _ = @import("link.zig");
     _ = @import("minisign_cmd.zig");
+    _ = @import("minisign_generate.zig");
     _ = @import("der.zig");
     _ = @import("rfc3161.zig");
     _ = @import("snappy.zig");

@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const minisign = @import("minisign.zig");
+const generate = @import("minisign_generate.zig");
 
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -36,6 +37,13 @@ pub fn cmdMinisign(
         std.process.exit(1);
     };
 
+    if (std.mem.eql(u8, sub, "generate")) {
+        generate.cmdGenerate(allocator, io, environ, args, w, err_w) catch |err| switch (err) {
+            error.GenerateFailed => std.process.exit(1),
+            else => return err,
+        };
+        return;
+    }
     if (std.mem.eql(u8, sub, "sign")) {
         try cmdSign(allocator, io, environ, args, w, err_w);
         return;
@@ -205,21 +213,27 @@ fn nextValue(args: *std.process.Args.Iterator, err_w: *Writer, flag: []const u8)
 
 pub fn printUsage(w: *Writer) !void {
     try w.print(
-        \\ghr minisign - sign release artifacts with a minisign key
+        \\ghr minisign - generate signing keys or sign release artifacts
         \\
         \\USAGE:
         \\    ghr minisign <SUBCOMMAND> [OPTIONS]
         \\
         \\SUBCOMMANDS:
+        \\    generate Generate a key and provision the repository signing secret
         \\    sign     Sign one or more files, writing <file>.minisig sidecars
         \\
-        \\Run 'ghr minisign sign --help' for signing usage and the required
-        \\MINISIGN_SECRET_KEY / MINISIGN_PASSWORD environment variables.
+        \\Run 'ghr minisign generate --help' or 'ghr minisign sign --help'
+        \\for usage. Signing requires MINISIGN_SECRET_KEY; MINISIGN_PASSWORD
+        \\is needed only for an encrypted key.
         \\
         \\OPTIONS:
         \\    -h, --help  Show this help
         \\
     , .{});
+}
+
+pub fn printGenerateUsage(w: *Writer) !void {
+    try generate.printUsage(w);
 }
 
 pub fn printSignUsage(w: *Writer) !void {
