@@ -209,7 +209,11 @@ The default repository follows GitHub CLI context; there is no interactive
 repository chooser. If that context cannot be resolved, setup fails before
 creating keys or uploading secrets. The command identifies the target
 repository, creates `minisign.key` and `minisign.pub` in the current directory,
-and refuses to overwrite existing key files or signing secrets.
+and refuses to overwrite existing key files. It checks for both
+`MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` before provisioning and refuses
+if either secret already exists, unless you explicitly authorize replacement
+with `--replace-existing-secrets`. Default setup never changes the password
+secret, even with that flag.
 
 Generation and signing both use
 [`cataggar/minizign`](https://github.com/cataggar/minizign) as an in-process
@@ -222,7 +226,8 @@ in storage. `MINISIGN_PASSWORD` is optional and is not created or changed by
 default setup. No password-manager integration or separate passphrase-storage
 step is required.
 
-Keep the local private key protected with restrictive permissions/ACLs.
+The generated private file has mode `0600` on POSIX. Keep the local private
+key protected with restrictive permissions/ACLs.
 Never commit it, include it in a cache, upload it as a release or workflow
 artifact, or print key/password values in logs. Publish `minisign.pub` through
 a trusted channel (for example, the project's README or website) so consumers
@@ -250,10 +255,32 @@ If setup fails, check `gh` installation/authentication, repository context,
 and access to Actions secrets. For overwrite refusals, inspect the existing
 files and secrets rather than deleting them blindly. If an upload fails
 after key creation or after only some secrets were uploaded, retain the key
-pair, fix access, and complete provisioning with **the same key pair**.
-Inspect which secrets already exist before retrying; do not regenerate or
-rotate a key just to recover from an upload failure. Consult
-`ghr minisign generate --help` for supported recovery options.
+pair and fix access. From the directory containing the original
+`minisign.key` and `minisign.pub`, retry against the same repository:
+
+```sh
+ghr minisign generate --repo OWNER/REPO \
+  --reuse-existing-local-pair --replace-existing-secrets
+```
+
+`--reuse-existing-local-pair` validates that the private and public keys
+match; it never generates a key or rewrites either file.
+`--replace-existing-secrets` explicitly permits replacing signing secrets,
+including any uploaded before the failure, with values from **the same key
+pair**. Inspect the target and existing secrets first; do not regenerate or
+rotate a key just to recover from an upload failure.
+
+If the original pair was password-encrypted, set the original
+`MINISIGN_PASSWORD` in the local environment and also pass `--encrypt`:
+
+```sh
+ghr minisign generate --repo OWNER/REPO --encrypt \
+  --reuse-existing-local-pair --replace-existing-secrets
+```
+
+The encrypted retry decrypts and validates the existing pair before upload,
+then configures both secrets. Run `ghr minisign generate --help` for all
+options.
 
 ### Sign artifacts
 

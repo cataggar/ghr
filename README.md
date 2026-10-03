@@ -180,14 +180,17 @@ ghr minisign generate --repo OWNER/REPO
 No interactive repository chooser is required. An unresolved repository
 fails before key creation or secret upload. Generation writes `minisign.key`
 and `minisign.pub` in the current directory and refuses to overwrite existing
-key files or signing secrets.
+key files. Existing signing secrets require explicit
+`--replace-existing-secrets`; upload retries reuse the original pair with
+`--reuse-existing-local-pair` rather than generating a new key.
 
 By default, only `MINISIGN_SECRET_KEY` is configured: an **unencrypted
 minisign-format key inside GitHub's encrypted repository secret**.
-`MINISIGN_PASSWORD` is neither required nor changed. Keep `minisign.key`
-private with restrictive permissions/ACLs; never commit it, cache it, or
-upload it as a release or workflow artifact. Publish only `minisign.pub`
-through a trusted channel so users can verify releases.
+`MINISIGN_PASSWORD` is neither required nor changed, even when replacing
+secrets. On POSIX, the generated private file has mode `0600`. Keep
+`minisign.key` private with restrictive permissions/ACLs; never commit it,
+cache it, or upload it as a release or workflow artifact. Publish only
+`minisign.pub` through a trusted channel so users can verify releases.
 
 See [repository signing setup and recovery](doc/github-actions.md#signing-releases)
 for the manual equivalent and upload-failure handling.
