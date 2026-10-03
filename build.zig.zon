@@ -3,7 +3,12 @@
     .version = "0.7.0",
     .fingerprint = 0xa1f6f50846da9442,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .minizign = .{
+            .url = "https://github.com/cataggar/minizign/archive/c6ac7d62c4b6e9696995533ad00f5c48fc404cfb.tar.gz",
+            .hash = "minizign-0.1.14-gg18cTlHAQDKb-58cwT9joqN3ucSaNspstTM512YUHEx",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
 
     const exe_options = b.addOptions();
     exe_options.addOption([]const u8, "version", version_str);
+    const minizign = b.dependency("minizign", .{
+        .target = target,
+        .optimize = optimize,
+        .@"no-cli" = true,
+    }).module("minizign");
 
     const exe = b.addExecutable(.{
         .name = "ghr",
@@ -18,6 +23,7 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
             .imports = &.{
                 .{ .name = "build_options", .module = exe_options.createModule() },
+                .{ .name = "minizign", .module = minizign },
             },
         }),
     });
@@ -94,6 +100,7 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{"validate"}, .usage = "    ghr validate <SUBCOMMAND> [OPTIONS]" },
         .{ .args = &.{ "validate", "strip-authenticode" }, .usage = "    ghr validate strip-authenticode <input.exe> <output.exe>" },
         .{ .args = &.{"minisign"}, .usage = "    ghr minisign <SUBCOMMAND> [OPTIONS]" },
+        .{ .args = &.{ "minisign", "generate" }, .usage = "    ghr minisign generate" },
         .{ .args = &.{ "minisign", "sign" }, .usage = "    ghr minisign sign <file>" },
         .{ .args = &.{"version"}, .usage = "    ghr version" },
         // Help must win after positional arguments so no command reaches IO.
@@ -103,6 +110,7 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{ "uninstall", "example/tool" }, .usage = "    ghr uninstall <id>" },
         .{ .args = &.{ "validate", "strip-authenticode", "input.exe", "output.exe" }, .usage = "    ghr validate strip-authenticode <input.exe> <output.exe>" },
         .{ .args = &.{ "minisign", "sign", "input" }, .usage = "    ghr minisign sign <file>" },
+        .{ .args = &.{ "minisign", "generate", "--repo", "example/tool" }, .usage = "    ghr minisign generate" },
     };
     for (help_cases) |case| {
         addHelpFlagTests(b, test_step, exe, case.args, case.usage);

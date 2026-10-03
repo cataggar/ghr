@@ -25,6 +25,7 @@ ghr link <id>|[--path] <name>                      Link Windows commands into WS
 ghr unlink <id>|[--path] <name>                    Remove ghr-created WSL links
 ghr path add [--dry-run]                           Add ghr's bin dir to your user PATH
 ghr path [bin|tools|cache]                         Show ghr directories
+ghr minisign generate [--repo OWNER/REPO]         Create a signing key and configure repository secrets
 ghr minisign sign <file> [<file> ...]              Sign release artifacts with a minisign key
 ghr version [--target]                             Print version or build target and exit
 ghr -h | --help                                    Print this help and exit
@@ -161,27 +162,78 @@ of the **checked-out tag**, not the current branch's toolchain. See the
 
 ## Signing releases
 
-`ghr minisign sign` produces a minisign `.minisig` sidecar without an
-external `minisign` binary, a key file on disk, or an `expect` script. The
-secret key and password come from the environment, so a release job is a
-single step:
+`ghr minisign generate` and `ghr minisign sign` use
+[`cataggar/minizign`](https://github.com/cataggar/minizign) as an in-process
+library. Neither requires an external `minisign` or `minizign` binary.
+
+### Set up repository signing
+
+With the GitHub CLI (`gh`) installed and authenticated with permission to
+manage the repository's Actions secrets:
+
+```sh
+ghr minisign generate  # current repository, using gh's repository context
+# Or explicitly choose the repository:
+ghr minisign generate --repo OWNER/REPO
+```
+
+No interactive repository chooser is required. An unresolved repository
+fails before key creation or secret upload. Generation writes `minisign.key`
+and `minisign.pub` in the current directory and refuses to overwrite existing
+key files. Existing signing secrets require explicit
+`--replace-existing-secrets`; upload retries reuse the original pair with
+`--reuse-existing-local-pair` rather than generating a new key.
+
+By default, only `MINISIGN_SECRET_KEY` is configured: an **unencrypted
+minisign-format key inside GitHub's encrypted repository secret**.
+`MINISIGN_PASSWORD` is neither required nor changed, even when replacing
+secrets. The generated private file has mode `0600` on POSIX and a verified,
+protected owner-only DACL on Windows, applied before key material is written.
+Keep `minisign.key` private with restrictive permissions/ACLs; never commit
+it, cache it, or upload it as a release or workflow artifact. Publish only
+`minisign.pub` through a trusted channel so users can verify releases.
+
+See [repository signing setup and recovery](doc/github-actions.md#signing-releases)
+for the manual equivalent and upload-failure handling.
+
+### Sign in GitHub Actions
+
+After installing `ghr`, a release job needs only the secret key in its
+environment, not a private-key file on the runner:
 
 ```yaml
 - run: ghr minisign sign hello.wasm -t "tag:${{ github.ref_name }} commit:${GITHUB_SHA}"
   env:
     MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-    MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
 ```
 
 Input files are bare positional arguments (each `<file>` is signed to
 `<file>.minisig`). A trusted comment may be given with `-t` (applied to
 every input); when omitted it defaults, like minisign, to
 `timestamp:<unix>\tfile:<name>\thashed` per file. The secret key **must**
-come from `MINISIGN_SECRET_KEY` and an encrypted key's password from
-`MINISIGN_PASSWORD` — there is no key-file flag, and the password is never
-read from a tty or stdin. Signatures use the prehashed (`ED`) format and
-are byte-for-byte identical to `minisign -S` output. Run
+come from `MINISIGN_SECRET_KEY`; `MINISIGN_PASSWORD` is needed **only for
+password-encrypted keys**. There is no key-file flag, and signing never reads
+a password from a tty or stdin. Signatures use the prehashed (`ED`) format
+and are byte-for-byte identical to `minisign -S` output. Run
 `ghr minisign sign --help` for all options.
+
+### Optional password encryption
+
+To generate a password-encrypted key, supply a strong, nonempty
+`MINISIGN_PASSWORD` in the local environment and run
+`ghr minisign generate --encrypt` (optionally with `--repo OWNER/REPO`).
+Only this opt-in mode also configures the `MINISIGN_PASSWORD` repository
+secret. No password-manager integration is required.
+
+For encrypted keys, including existing ones, add the password to the signing
+step's environment:
+
+```yaml
+- run: ghr minisign sign hello.wasm -t "tag:${{ github.ref_name }} commit:${GITHUB_SHA}"
+  env:
+    MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+    MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+```
 
 ## License
 

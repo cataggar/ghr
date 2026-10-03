@@ -7,11 +7,12 @@
 //! tty, or stdin. Inputs are bare positional file paths; each `<file>` is
 //! signed to `<file>.minisig`.
 //!
-//! Crypto lives in `minisign.zig`; this module is just argument parsing,
-//! key/password sourcing, and sidecar writing.
+//! `minisign.zig` adapts the in-process minizign library; this module is
+//! just argument parsing, key/password sourcing, and sidecar writing.
 
 const std = @import("std");
 const minisign = @import("minisign.zig");
+const generate = @import("minisign_generate.zig");
 
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -36,6 +37,13 @@ pub fn cmdMinisign(
         std.process.exit(1);
     };
 
+    if (std.mem.eql(u8, sub, "generate")) {
+        generate.cmdGenerate(allocator, io, environ, args, w, err_w) catch |err| switch (err) {
+            error.GenerateFailed => std.process.exit(1),
+            else => return err,
+        };
+        return;
+    }
     if (std.mem.eql(u8, sub, "sign")) {
         try cmdSign(allocator, io, environ, args, w, err_w);
         return;
@@ -148,15 +156,15 @@ fn signOne(
 
     const uc = untrusted_comment orelse default_untrusted_comment;
 
-    const sidecar = sk.signArtifact(allocator, io, file, tc, uc) catch |err| {
+    var signature = sk.signFile(allocator, io, file, tc) catch |err| {
         fail(err_w, "failed to sign '{s}': {s}", .{ input, @errorName(err) });
     };
-    defer allocator.free(sidecar);
+    defer signature.deinit();
 
     const out = try allocator.print("{s}.minisig", .{input});
     defer allocator.free(out);
 
-    writeWholeFile(io, out, sidecar) catch |err| {
+    signature.toFile(io, out, uc) catch |err| {
         fail(err_w, "failed to write '{s}': {s}", .{ out, @errorName(err) });
     };
 
@@ -182,15 +190,6 @@ fn openFile(io: Io, path: []const u8) !File {
     return Dir.cwd().openFile(io, path, .{});
 }
 
-fn writeWholeFile(io: Io, path: []const u8, bytes: []const u8) !void {
-    var file = if (std.fs.path.isAbsolute(path))
-        try Dir.createFileAbsolute(io, path, .{})
-    else
-        try Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, bytes);
-}
-
 // ---------------------------------------------------------------------------
 // Argument helpers.
 // ---------------------------------------------------------------------------
@@ -205,21 +204,27 @@ fn nextValue(args: *std.process.Args.Iterator, err_w: *Writer, flag: []const u8)
 
 pub fn printUsage(w: *Writer) !void {
     try w.print(
-        \\ghr minisign - sign release artifacts with a minisign key
+        \\ghr minisign - generate signing keys or sign release artifacts
         \\
         \\USAGE:
         \\    ghr minisign <SUBCOMMAND> [OPTIONS]
         \\
         \\SUBCOMMANDS:
+        \\    generate Generate a key and provision the repository signing secret
         \\    sign     Sign one or more files, writing <file>.minisig sidecars
         \\
-        \\Run 'ghr minisign sign --help' for signing usage and the required
-        \\MINISIGN_SECRET_KEY / MINISIGN_PASSWORD environment variables.
+        \\Run 'ghr minisign generate --help' or 'ghr minisign sign --help'
+        \\for usage. Signing requires MINISIGN_SECRET_KEY; MINISIGN_PASSWORD
+        \\is needed only for an encrypted key.
         \\
         \\OPTIONS:
         \\    -h, --help  Show this help
         \\
     , .{});
+}
+
+pub fn printGenerateUsage(w: *Writer) !void {
+    try generate.printUsage(w);
 }
 
 pub fn printSignUsage(w: *Writer) !void {
@@ -235,12 +240,12 @@ pub fn printSignUsage(w: *Writer) !void {
         \\
         \\REQUIRED ENVIRONMENT:
         \\    MINISIGN_SECRET_KEY   secret key contents (the .key file body)
-        \\    MINISIGN_PASSWORD     password for the encrypted key
         \\
-        \\Both the secret key and the password MUST come from the environment
-        \\— there is no key-file flag, and the password is never read from a
-        \\tty or stdin, so no `expect` script is needed. MINISIGN_PASSWORD is
-        \\not required for an unencrypted key.
+        \\OPTIONAL ENVIRONMENT:
+        \\    MINISIGN_PASSWORD     password, only when the key is encrypted
+        \\
+        \\Key contents and an encrypted key's password come from the environment.
+        \\There is no key-file flag or tty/stdin password prompt.
         \\
         \\OPTIONS:
         \\    -t <text>   Trusted comment, signed. Defaults (like minisign) to
@@ -256,7 +261,6 @@ pub fn printSignUsage(w: *Writer) !void {
         \\    - run: ghr minisign sign hello.wasm -t "tag:${{{{ github.ref_name }}}}"
         \\      env:
         \\        MINISIGN_SECRET_KEY: ${{{{ secrets.MINISIGN_SECRET_KEY }}}}
-        \\        MINISIGN_PASSWORD:   ${{{{ secrets.MINISIGN_PASSWORD }}}}
         \\
     , .{});
 }
