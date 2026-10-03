@@ -65,6 +65,16 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
 
+    const shim_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shim.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = resolved_target.os.tag.isDarwin(),
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(shim_tests).step);
+
     const help_cases = [_]struct {
         args: []const []const u8,
         usage: []const u8,
