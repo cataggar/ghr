@@ -506,8 +506,7 @@ pub const SecretKey = struct {
         var gsig_b64: [enc.calcSize(global_sig_decoded_len)]u8 = undefined;
         _ = enc.encode(&gsig_b64, &global_sig);
 
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             "{s} {s}\n{s}\n{s} {s}\n{s}\n",
             .{ untrusted_prefix, untrusted_comment, sig_b64, trusted_prefix, trusted_comment, gsig_b64 },
         );

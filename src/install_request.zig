@@ -52,7 +52,7 @@ pub const Error = ParseError || std.mem.Allocator.Error;
 pub const max_diagnostic_field_name_bytes: usize = 32;
 
 pub const BoundedFieldName = struct {
-    bytes: [max_diagnostic_field_name_bytes]u8 = [_]u8{0} ** max_diagnostic_field_name_bytes,
+    bytes: [max_diagnostic_field_name_bytes]u8 = @splat(0),
     len: u8 = 0,
     truncated: bool = false,
 
@@ -883,8 +883,8 @@ test "alias validation rejects malformed and duplicate mappings" {
 }
 
 test "ID validation accepts boundaries and rejects unsafe forms" {
-    const segment = "a" ** max_id_segment_bytes;
-    const second = "b" ** max_id_segment_bytes;
+    const segment: [max_id_segment_bytes]u8 = @splat('a');
+    const second: [max_id_segment_bytes]u8 = @splat('b');
     var valid = try parse(std.testing.allocator, &.{
         "o/r",
         "?id=" ++ segment ++ "/" ++ second,
@@ -894,24 +894,24 @@ test "ID validation accepts boundaries and rejects unsafe forms" {
 
     var max_valid = try parse(std.testing.allocator, &.{
         "o/r",
-        "?id=" ++ ("a" ** 60) ++ "/" ++
-            ("b" ** 60) ++ "/" ++
-            ("c" ** 60) ++ "/" ++
-            ("d" ** 57),
+        "?id=" ++ @as([60]u8, @splat('a')) ++ "/" ++
+            @as([60]u8, @splat('b')) ++ "/" ++
+            @as([60]u8, @splat('c')) ++ "/" ++
+            @as([57]u8, @splat('d')),
     });
     defer max_valid.deinit();
     try std.testing.expectEqual(max_id_bytes, max_valid.items[0].id.len);
 
     try std.testing.expectError(error.InvalidIdSegmentTooLong, parse(std.testing.allocator, &.{
         "o/r",
-        "?id=" ++ ("a" ** (max_id_segment_bytes + 1)),
+        "?id=" ++ @as([max_id_segment_bytes + 1]u8, @splat('a')),
     }));
     try std.testing.expectError(error.InvalidIdTooLong, parse(std.testing.allocator, &.{
         "o/r",
-        "?id=" ++ ("a" ** max_id_segment_bytes) ++ "/" ++
-            ("b" ** max_id_segment_bytes) ++ "/" ++
-            ("c" ** max_id_segment_bytes) ++ "/" ++
-            ("d" ** max_id_segment_bytes),
+        "?id=" ++ @as([max_id_segment_bytes]u8, @splat('a')) ++ "/" ++
+            @as([max_id_segment_bytes]u8, @splat('b')) ++ "/" ++
+            @as([max_id_segment_bytes]u8, @splat('c')) ++ "/" ++
+            @as([max_id_segment_bytes]u8, @splat('d')),
     }));
     try std.testing.expectError(error.InvalidIdEmpty, canonicalizeId(std.testing.allocator, ""));
     try std.testing.expectError(error.InvalidIdEmptySegment, parse(std.testing.allocator, &.{ "o/r", "?id=/a" }));

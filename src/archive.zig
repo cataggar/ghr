@@ -137,8 +137,8 @@ fn endsWithIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
 
 pub const ExtractError = error{
     UnknownArchiveFormat,
-} || std.mem.Allocator.Error || std.fs.File.OpenError ||
-    std.fs.Dir.OpenError || std.fs.Dir.MakeError;
+} || std.mem.Allocator.Error || File.OpenError ||
+    Dir.OpenError || Dir.CreateDirError;
 
 /// Extract `archive_path` into `dest_dir` based on its filename suffix.
 /// `strip_components` is honoured for tar archives (zip ignores it).

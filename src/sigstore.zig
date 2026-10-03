@@ -1620,7 +1620,7 @@ fn fulcioExtensionSuffix(oid_bytes: []const u8) ?u8 {
 
 fn parseDerUtf8String(value_bytes: []const u8) ?[]const u8 {
     const inner = der.parseElement(value_bytes, 0) catch return null;
-    if (@intFromEnum(inner.identifier.tag) != 12) return null;
+    if (@backingInt(inner.identifier.tag) != 12) return null;
     if (inner.slice.end != value_bytes.len) return null;
     return value_bytes[inner.slice.start..inner.slice.end];
 }
@@ -2074,7 +2074,7 @@ test "verifyArtifactSignature streams a signed blob end-to-end" {
 
     // Generate an ephemeral P-256 keypair and sign a payload, then verify
     // through the same streaming code path used in production.
-    const seed = [_]u8{0x42} ** EcdsaP256Sha256.KeyPair.seed_length;
+    const seed: [EcdsaP256Sha256.KeyPair.seed_length]u8 = @splat(0x42);
     const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed);
     const payload = "the quick brown fox jumps over the lazy dog";
     var signer = try kp.signer(null);
@@ -2113,7 +2113,7 @@ test "verifyArtifactSignature streams a signed blob end-to-end" {
 test "verifyArtifactSignature rejects a tampered file" {
     const allocator = std.testing.allocator;
 
-    const seed = [_]u8{0x55} ** EcdsaP256Sha256.KeyPair.seed_length;
+    const seed: [EcdsaP256Sha256.KeyPair.seed_length]u8 = @splat(0x55);
     const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed);
     const payload = "hello sigstore";
     var signer = try kp.signer(null);
@@ -2365,7 +2365,7 @@ test "computeDssePae matches the DSSE v1 spec example shape" {
 
 test "verifyDsseSignature round-trips with an ephemeral keypair" {
     const allocator = std.testing.allocator;
-    const seed = [_]u8{0x77} ** EcdsaP256Sha256.KeyPair.seed_length;
+    const seed: [EcdsaP256Sha256.KeyPair.seed_length]u8 = @splat(0x77);
     const kp = try EcdsaP256Sha256.KeyPair.generateDeterministic(seed);
     const payload_type = "application/vnd.in-toto+json";
     const payload = "{\"_type\":\"https://in-toto.io/Statement/v1\"}";

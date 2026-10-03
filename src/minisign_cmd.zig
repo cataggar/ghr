@@ -153,7 +153,7 @@ fn signOne(
     };
     defer allocator.free(sidecar);
 
-    const out = try std.fmt.allocPrint(allocator, "{s}.minisig", .{input});
+    const out = try allocator.print("{s}.minisig", .{input});
     defer allocator.free(out);
 
     writeWholeFile(io, out, sidecar) catch |err| {
@@ -170,7 +170,7 @@ fn defaultTrustedComment(allocator: std.mem.Allocator, io: Io, input: []const u8
     const now = Io.Clock.now(.real, io);
     const secs: i64 = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
     const base = std.fs.path.basename(input);
-    return std.fmt.allocPrint(allocator, "timestamp:{d}\tfile:{s}\thashed", .{ secs, base });
+    return allocator.print("timestamp:{d}\tfile:{s}\thashed", .{ secs, base });
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +273,7 @@ test "defaultTrustedComment: matches minisign's per-file shape" {
     // timestamp:<digits>\tfile:<basename>\thashed — basename only, tab-separated.
     try std.testing.expect(std.mem.startsWith(u8, tc, "timestamp:"));
     try std.testing.expect(std.mem.endsWith(u8, tc, "\tfile:hello.wasm\thashed"));
-    const ts = tc["timestamp:".len .. std.mem.indexOfScalar(u8, tc, '\t').?];
+    const ts = tc["timestamp:".len..std.mem.indexOfScalar(u8, tc, '\t').?];
     try std.testing.expect(ts.len > 0);
     for (ts) |c| try std.testing.expect(c >= '0' and c <= '9');
 }

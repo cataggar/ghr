@@ -29,7 +29,7 @@ fn getEnv(environ: *const EnvironMap, key: []const u8) ?[]const u8 {
 }
 
 fn homeDir(environ: *const EnvironMap) ![]const u8 {
-    const key = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+    const key = if (builtin.target.os.tag == .windows) "USERPROFILE" else "HOME";
     return getEnv(environ, key) orelse error.HomeNotFound;
 }
 
@@ -41,7 +41,7 @@ fn binDir(allocator: std.mem.Allocator, environ: *const EnvironMap) ![]const u8 
 
 fn toolsDir(allocator: std.mem.Allocator, environ: *const EnvironMap) ![]const u8 {
     if (getEnv(environ, "GHR_TOOL_DIR")) |v| return allocator.dupe(u8, v);
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         const appdata = getEnv(environ, "APPDATA") orelse return error.AppDataNotFound;
         return std.fs.path.join(allocator, &.{ appdata, "ghr", "data", "tools" });
     }
@@ -54,11 +54,11 @@ fn toolsDir(allocator: std.mem.Allocator, environ: *const EnvironMap) ![]const u
 
 fn cacheDir(allocator: std.mem.Allocator, environ: *const EnvironMap) ![]const u8 {
     if (getEnv(environ, "GHR_CACHE_DIR")) |v| return allocator.dupe(u8, v);
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         const localappdata = getEnv(environ, "LOCALAPPDATA") orelse return error.LocalAppDataNotFound;
         return std.fs.path.join(allocator, &.{ localappdata, "ghr", "cache" });
     }
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         const h = try homeDir(environ);
         return std.fs.path.join(allocator, &.{ h, "Library", "Caches", "ghr" });
     }

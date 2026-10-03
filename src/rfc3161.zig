@@ -280,7 +280,7 @@ fn parseTimestampToken(bytes: []const u8) VerifyError!TimestampToken {
     }
 
     const signer_infos = try der.parseElement(bytes, next_index);
-    if (signer_infos.identifier.tag != .sequence_of and
+    if (signer_infos.identifier.tag != .set and
         signer_infos.identifier.tag != .sequence)
         return error.InvalidSignedData;
     const first_signer = try der.parseElement(bytes, signer_infos.slice.start);
@@ -488,7 +488,7 @@ fn verifyRsa(
             ) catch return error.InvalidSignature;
             Certificate.rsa.PKCS1v1_5Signature.verify(
                 modulus_len,
-                signature[0..modulus_len].*,
+                signature[0..modulus_len],
                 message,
                 public_key,
                 Hash,
@@ -661,7 +661,7 @@ const CertificateSetIterator = struct {
                 element.identifier.class == .universal)
                 return self.bytes[start..element.slice.end];
             if (element.identifier.class == .context_specific and
-                @intFromEnum(element.identifier.tag) <= 3)
+                @backingInt(element.identifier.tag) <= 3)
                 continue;
             return error.InvalidCertificateChoice;
         }
@@ -767,7 +767,7 @@ fn signatureAlgorithm(oid_bytes: []const u8) VerifyError!SignatureAlgorithm {
 
 fn isContextSpecificTag(identifier: der.Identifier, tag_number: u5) bool {
     return identifier.class == .context_specific and
-        @intFromEnum(identifier.tag) == tag_number;
+        @backingInt(identifier.tag) == tag_number;
 }
 
 fn selectChainTime(clock: ChainClock, now: i64, gen_time: i64) i64 {

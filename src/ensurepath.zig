@@ -75,8 +75,7 @@ fn nushellEscapeSingleQuoted(allocator: std.mem.Allocator, bin: []const u8) ![]u
 fn buildPosixBlock(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
     const esc = try shellEscapeDoubleQuoted(allocator, bin);
     defer allocator.free(esc);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}\ncase \":$PATH:\" in\n  *\":{s}:\"*) ;;\n  *) export PATH=\"{s}:$PATH\" ;;\nesac\n{s}\n",
         .{ begin_marker, esc, esc, end_marker },
     );
@@ -85,8 +84,7 @@ fn buildPosixBlock(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
 fn buildNushellBlock(allocator: std.mem.Allocator, bin: []const u8) ![]u8 {
     const esc = try nushellEscapeSingleQuoted(allocator, bin);
     defer allocator.free(esc);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}\nif ('{s}' not-in $env.PATH) {{\n    $env.PATH = ($env.PATH | prepend '{s}')\n}}\n{s}\n",
         .{ begin_marker, esc, esc, end_marker },
     );
@@ -515,7 +513,7 @@ fn runUnix(
 
 // --- Windows implementation ---
 
-const windows_impl = if (builtin.os.tag == .windows) struct {
+const windows_impl = if (builtin.target.os.tag == .windows) struct {
     const windows = std.os.windows;
     const HKEY = windows.HKEY;
     const LSTATUS = windows.LSTATUS;
@@ -697,7 +695,7 @@ const windows_impl = if (builtin.os.tag == .windows) struct {
                 }
                 // buf is a WCHAR string, possibly NUL-terminated.
                 const wchar_count = size_inout / 2;
-                const wslice = @as([*]const u16, @alignCast(@ptrCast(buf.ptr)))[0..wchar_count];
+                const wslice = @as([*]const u16, @ptrCast(@alignCast(buf.ptr)))[0..wchar_count];
                 var end: usize = wslice.len;
                 while (end > 0 and wslice[end - 1] == 0) : (end -= 1) {}
                 existing_utf8 = try wideToUtf8(allocator, wslice[0..end]);
@@ -823,7 +821,7 @@ pub fn cmdEnsurePath(
     const dirs = try Dirs.detect(allocator, environ);
     defer dirs.deinit();
 
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         try windows_impl.run(allocator, io, environ, dirs, dry_run, stdout);
     } else {
         try runUnix(allocator, io, environ, dirs, dry_run, stdout);
