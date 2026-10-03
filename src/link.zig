@@ -2689,7 +2689,7 @@ fn initLinkTestEnv(
     try env.put("GHR_WIN_TOOLS_DIR", tools);
     try env.put("GHR_BIN_DIR", bin);
     try env.put("XDG_DATA_HOME", base);
-    try env.put("XDG_CACHE_HOME", base);
+    try env.put("GHR_CACHE_DIR", base);
 }
 
 test "normalizeBinPathInPlace: replaces backslashes" {
