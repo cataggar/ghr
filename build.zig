@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
 
     const exe_options = b.addOptions();
     exe_options.addOption([]const u8, "version", version_str);
+    const minizign = b.dependency("minizign", .{
+        .target = target,
+        .optimize = optimize,
+        .@"no-cli" = true,
+    }).module("minizign");
 
     const exe = b.addExecutable(.{
         .name = "ghr",
@@ -18,6 +23,7 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
             .imports = &.{
                 .{ .name = "build_options", .module = exe_options.createModule() },
+                .{ .name = "minizign", .module = minizign },
             },
         }),
     });
