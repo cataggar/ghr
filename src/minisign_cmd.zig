@@ -7,8 +7,8 @@
 //! tty, or stdin. Inputs are bare positional file paths; each `<file>` is
 //! signed to `<file>.minisig`.
 //!
-//! Crypto lives in `minisign.zig`; this module is just argument parsing,
-//! key/password sourcing, and sidecar writing.
+//! `minisign.zig` adapts the in-process minizign library; this module is
+//! just argument parsing, key/password sourcing, and sidecar writing.
 
 const std = @import("std");
 const minisign = @import("minisign.zig");
@@ -156,15 +156,15 @@ fn signOne(
 
     const uc = untrusted_comment orelse default_untrusted_comment;
 
-    const sidecar = sk.signArtifact(allocator, io, file, tc, uc) catch |err| {
+    var signature = sk.signFile(allocator, io, file, tc) catch |err| {
         fail(err_w, "failed to sign '{s}': {s}", .{ input, @errorName(err) });
     };
-    defer allocator.free(sidecar);
+    defer signature.deinit();
 
     const out = try allocator.print("{s}.minisig", .{input});
     defer allocator.free(out);
 
-    writeWholeFile(io, out, sidecar) catch |err| {
+    signature.toFile(io, out, uc) catch |err| {
         fail(err_w, "failed to write '{s}': {s}", .{ out, @errorName(err) });
     };
 
@@ -188,15 +188,6 @@ fn defaultTrustedComment(allocator: std.mem.Allocator, io: Io, input: []const u8
 fn openFile(io: Io, path: []const u8) !File {
     if (std.fs.path.isAbsolute(path)) return Dir.openFileAbsolute(io, path, .{});
     return Dir.cwd().openFile(io, path, .{});
-}
-
-fn writeWholeFile(io: Io, path: []const u8, bytes: []const u8) !void {
-    var file = if (std.fs.path.isAbsolute(path))
-        try Dir.createFileAbsolute(io, path, .{})
-    else
-        try Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    try file.writeStreamingAll(io, bytes);
 }
 
 // ---------------------------------------------------------------------------
