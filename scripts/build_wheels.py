@@ -39,11 +39,11 @@ PLATFORMS = {
         "exe": "ghr",
     },
     "macos-arm64": {
-        "tag": "macosx_11_0_arm64",
+        "tag": "macosx_15_0_arm64",
         "exe": "ghr",
     },
     "macos-x64": {
-        "tag": "macosx_10_9_x86_64",
+        "tag": "macosx_15_0_x86_64",
         "exe": "ghr",
     },
     "windows-x64": {
