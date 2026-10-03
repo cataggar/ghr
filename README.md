@@ -136,6 +136,10 @@ python3 tools/test-cache-freshness.py`. They use an isolated fixture project
 and keep Zig's cache warm while adding, renaming, and deleting routes,
 directories, and optional layouts.
 
+CI runs native unit/help checks on Linux, macOS, and Windows. The required
+`Build & Test` aggregate succeeds only when those jobs, cross-target builds,
+and production-site/cache-freshness checks all pass.
+
 Zig 0.17 spells optimization modes `debug`, `safe`, `fast`, and `small`.
 For releases built with this compiler, the standard-library OS floors are
 Linux **5.10+**, macOS **15.0+**, and Windows **10+**. The release notes
