@@ -200,7 +200,9 @@ pub fn readManifest(
     defer f.close(io);
     const stat = try f.stat(io);
     if (stat.kind != .file) return error.InvalidManifest;
-    if (comptime builtin.os.tag == .windows) f.flags.nonblocking = true;
+    // Keep the no-follow handle workaround until Windows regressions verify
+    // that the upstream synchronous-open path safely replaces it.
+    if (comptime builtin.target.os.tag == .windows) f.flags.nonblocking = true;
     var read_buf: [4096]u8 = undefined;
     var reader = f.reader(io, &read_buf);
     const body = reader.interface.allocRemaining(allocator, Io.Limit.limited(max_manifest_bytes)) catch |err| switch (err) {
@@ -314,7 +316,7 @@ fn persistIdManifestBody(
 
     const final_path = try idManifestPath(allocator, environ, id);
     defer allocator.free(final_path);
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{final_path});
+    const tmp_path = try allocator.print("{s}.tmp", .{final_path});
     defer allocator.free(tmp_path);
     Dir.deleteFileAbsolute(io, tmp_path) catch {};
 
@@ -393,7 +395,7 @@ pub fn writeManifest(
 
     const final_path = try manifestPath(allocator, environ, owner_lower, repo_lower);
     defer allocator.free(final_path);
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{final_path});
+    const tmp_path = try allocator.print("{s}.tmp", .{final_path});
     defer allocator.free(tmp_path);
 
     // Truncate any leftover tombstone.
@@ -530,7 +532,7 @@ fn discoverWindowsToolsDirFromWsl(
             .{user},
         );
         try err_w.print("         set GHR_WIN_TOOLS_DIR to override\n", .{});
-        return std.fmt.allocPrint(allocator, "/mnt/c/Users/{s}/AppData/Roaming/ghr/data/tools", .{user});
+        return allocator.print("/mnt/c/Users/{s}/AppData/Roaming/ghr/data/tools", .{user});
     };
     defer allocator.free(appdata_unix);
     return std.fs.path.join(allocator, &.{ appdata_unix, "ghr", "data", "tools" });
@@ -686,7 +688,7 @@ pub fn computeDesiredLinks(
                 return DesiredError.DuplicateLinkName;
             }
         }
-        const target = try std.fmt.allocPrint(aa, "{s}/{s}", .{ tool_dir_abs, normalized });
+        const target = try aa.print("{s}/{s}", .{ tool_dir_abs, normalized });
         try all_links.append(aa, .{ .name = name, .target = target });
         try available.append(aa, name);
     }
@@ -769,7 +771,7 @@ pub fn computeDesiredCommandLinks(
             if (std.ascii.eqlIgnoreCase(existing.name, name))
                 return DesiredError.DuplicateLinkName;
         }
-        const target = try std.fmt.allocPrint(aa, "{s}/{s}", .{ tool_dir_abs, normalized_target });
+        const target = try aa.print("{s}/{s}", .{ tool_dir_abs, normalized_target });
         try all_links.append(aa, .{ .name = name, .target = target });
         try available.append(aa, name);
     }
@@ -2011,7 +2013,7 @@ fn writeBareExeManifest(
 
     const final_path = try bareExeManifestPath(allocator, environ, name_lower);
     defer allocator.free(final_path);
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{final_path});
+    const tmp_path = try allocator.print("{s}.tmp", .{final_path});
     defer allocator.free(tmp_path);
 
     Dir.deleteFileAbsolute(io, tmp_path) catch {};
@@ -2873,9 +2875,8 @@ test "ID manifest larger than 64 KiB round-trips within shared bound" {
         allocator.free(links);
     }
     for (links, 0..) |*entry, i| {
-        const name = try std.fmt.allocPrint(allocator, "tool-{d}", .{i});
-        const target = std.fmt.allocPrint(
-            allocator,
+        const name = try allocator.print("tool-{d}", .{i});
+        const target = allocator.print(
             "/mnt/c/ghr/tools/_v2/units/u-tool/_unit/bin/{s}.exe",
             .{name},
         ) catch |err| {
@@ -3061,7 +3062,7 @@ test "computeDesiredCommandLinks refuses raw wasm modules" {
 }
 
 test "ID link manifests separate two releases from one repository" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3120,7 +3121,7 @@ test "ID link manifests separate two releases from one repository" {
 }
 
 test "ID reconciliation refuses a modified owned link" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3161,7 +3162,7 @@ test "ID reconciliation refuses a modified owned link" {
 }
 
 test "link lazily imports an unambiguous legacy manifest" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3210,7 +3211,7 @@ test "link lazily imports an unambiguous legacy manifest" {
 }
 
 test "modified legacy link blocks import without deleting legacy state" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3263,7 +3264,7 @@ test "modified legacy link blocks import without deleting legacy state" {
 }
 
 test "legacy manifest can unlink after Windows install removal" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3309,7 +3310,7 @@ test "legacy manifest can unlink after Windows install removal" {
 }
 
 test "filtered legacy unlink refuses partial manifest import" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3375,7 +3376,7 @@ test "filtered legacy unlink refuses partial manifest import" {
 }
 
 test "manifest write failure rolls back newly-created ID links" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3418,7 +3419,7 @@ test "manifest write failure rolls back newly-created ID links" {
 }
 
 test "filtered ID unlink restores removed links when manifest write fails" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3492,7 +3493,7 @@ test "filtered ID unlink restores removed links when manifest write fails" {
 }
 
 test "full ID unlink restores links when manifest deletion fails" {
-    if (builtin.os.tag == .windows or !File.Permissions.has_executable_bit)
+    if (builtin.target.os.tag == .windows or !File.Permissions.has_executable_bit)
         return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
@@ -3534,8 +3535,8 @@ test "full ID unlink restores links when manifest deletion fails" {
     defer allocator.free(manifest_dir);
     var manifest_dir_handle = try Dir.openDirAbsolute(tio, manifest_dir, .{ .iterate = true });
     defer manifest_dir_handle.close(tio);
-    try manifest_dir_handle.setPermissions(tio, @enumFromInt(0o500));
-    defer manifest_dir_handle.setPermissions(tio, @enumFromInt(0o700)) catch {};
+    try manifest_dir_handle.setPermissions(tio, @fromBackingInt(@intCast(0o500)));
+    defer manifest_dir_handle.setPermissions(tio, @fromBackingInt(@intCast(0o700))) catch {};
 
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
@@ -3556,7 +3557,7 @@ test "full ID unlink restores links when manifest deletion fails" {
 }
 
 test "one-segment discovery failure refuses PATH fallback" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const tio = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3643,8 +3644,8 @@ test "isValidBareExeName: rejects path-y, flag-y, empty, and odd inputs" {
     try std.testing.expect(!isValidBareExeName("a;b"));
     try std.testing.expect(!isValidBareExeName("C:foo"));
     // 65 chars exceeds the cap
-    const long = "a" ** 65;
-    try std.testing.expect(!isValidBareExeName(long));
+    const long: [65]u8 = @splat('a');
+    try std.testing.expect(!isValidBareExeName(&long));
 }
 
 test "parseFirstWherePath: returns the first non-blank line trimmed" {

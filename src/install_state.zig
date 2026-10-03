@@ -92,7 +92,7 @@ pub const max_v2_command_bytes: usize = 240;
 /// Windows store from Linux, where separators and command-name rules differ.
 pub const Platform = enum { posix, windows };
 
-pub const default_platform: Platform = if (builtin.os.tag == .windows) .windows else .posix;
+pub const default_platform: Platform = if (builtin.target.os.tag == .windows) .windows else .posix;
 
 pub const ScanOptions = struct {
     platform: Platform = default_platform,
@@ -1035,10 +1035,9 @@ fn readMetaNoFollow(allocator: Allocator, io: Io, dir: Dir) !ReadMeta {
     const st = try file.stat(io);
     if (st.kind != .file) return .{ .corrupt = .symlinked_path };
 
-    // Zig 0.16 opens no-follow Windows handles asynchronously but currently
-    // reports them as synchronous. Correct the flag so positional reads use
-    // the matching APC completion path.
-    if (comptime builtin.os.tag == .windows) file.flags.nonblocking = true;
+    // Keep the no-follow handle workaround until Windows regressions verify
+    // that the upstream synchronous-open path safely replaces it.
+    if (comptime builtin.target.os.tag == .windows) file.flags.nonblocking = true;
     var buf: [4096]u8 = undefined;
     var fr = file.reader(io, &buf);
     const body = fr.interface.allocRemaining(allocator, Io.Limit.limited(max_metadata_bytes)) catch |err|
@@ -1671,7 +1670,7 @@ fn scanOwner(b: *Builder, io: Io, root: Dir, owner: []const u8) !void {
                 // units and must not be classified; skip them.
                 if (entry.kind == .sym_link) continue;
                 if (entry.kind != .directory and entry.kind != .unknown) continue;
-                const repo_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ owner, name });
+                const repo_path = try alloc.print("{s}/{s}", .{ owner, name });
                 defer alloc.free(repo_path);
                 const repo = try alloc.dupe(u8, name);
                 defer alloc.free(repo);
@@ -1717,7 +1716,7 @@ fn scanRepo(
                 // Symlinked extracted content is never a nested unit; skip it.
                 if (entry.kind == .sym_link) continue;
                 if (entry.kind != .directory and entry.kind != .unknown) continue;
-                const stem_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ repo_path, name });
+                const stem_path = try alloc.print("{s}/{s}", .{ repo_path, name });
                 defer alloc.free(stem_path);
                 switch (try openChildDirNoFollow(io, repo_dir, name)) {
                     .absent => {},
@@ -1793,7 +1792,7 @@ fn scanUnitsNode(
     var it = node.iterate();
     while (try it.next(io)) |entry| {
         const name = entry.name;
-        const child_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, name });
+        const child_path = try alloc.print("{s}/{s}", .{ prefix, name });
         defer alloc.free(child_path);
 
         if (std.mem.eql(u8, name, unit_marker)) {
@@ -1977,9 +1976,9 @@ fn recordLessThan(_: void, a: InventoryRecord, b: InventoryRecord) bool {
         .gt => return false,
         .eq => {},
     }
-    if (@intFromEnum(a.kind) != @intFromEnum(b.kind))
-        return @intFromEnum(a.kind) < @intFromEnum(b.kind);
-    return @intFromEnum(a.status) < @intFromEnum(b.status);
+    if (@backingInt(a.kind) != @backingInt(b.kind))
+        return @backingInt(a.kind) < @backingInt(b.kind);
+    return @backingInt(a.status) < @backingInt(b.status);
 }
 
 fn sortRecords(items: []InventoryRecord) void {
@@ -2258,7 +2257,7 @@ test "schema classification is presence-aware" {
 }
 
 test "scan: missing tools directory yields empty inventory" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     var inv = try scan(a, testing.io, "/nonexistent/ghr/tools/xyz", .{});
     defer inv.deinit(a);
@@ -2266,7 +2265,7 @@ test "scan: missing tools directory yields empty inventory" {
 }
 
 test "scan: healthy v2 unit retains full provenance" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2296,7 +2295,7 @@ test "scan: healthy v2 unit retains full provenance" {
 }
 
 test "scan: v1 archive and nested wasm synthesis" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2325,7 +2324,7 @@ test "scan: v1 archive and nested wasm synthesis" {
 }
 
 test "scan: legacy empty object and unsafe bins are corrupt" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2344,7 +2343,7 @@ test "scan: legacy empty object and unsafe bins are corrupt" {
 }
 
 test "scan: schema variants classified precisely" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2366,7 +2365,7 @@ test "scan: schema variants classified precisely" {
 }
 
 test "scan: v2 layout-generation mismatch is unsupported" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2382,7 +2381,7 @@ test "scan: v2 layout-generation mismatch is unsupported" {
 }
 
 test "scan: v1 manifest in v2 location and id mismatch are corrupt" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2400,7 +2399,7 @@ test "scan: v1 manifest in v2 location and id mismatch are corrupt" {
 }
 
 test "scan: visible .old paths are candidates; hidden transactions are ignored" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2441,7 +2440,7 @@ test "scan: visible .old paths are candidates; hidden transactions are ignored" 
 }
 
 test "scan: same-id v1/v2 records conflict; mixed-case legacy collapses" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2459,7 +2458,7 @@ test "scan: same-id v1/v2 records conflict; mixed-case legacy collapses" {
 }
 
 test "scan: mixed-case legacy owners collapse to one id conflict" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2477,7 +2476,7 @@ test "scan: mixed-case legacy owners collapse to one id conflict" {
 }
 
 test "scan: duplicate published command ownership uses case rules only" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2513,7 +2512,7 @@ test "scan: duplicate published command ownership uses case rules only" {
 }
 
 test "scan: v1 derives a final name once, v2 preserves the persisted one" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2539,7 +2538,7 @@ test "scan: v1 derives a final name once, v2 preserves the persisted one" {
 }
 
 test "scan: v2 final names survive suffixes on both platforms" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2566,7 +2565,7 @@ test "scan: v2 final names survive suffixes on both platforms" {
 }
 
 test "scan: internal duplicate command and credential url are corrupt" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2584,7 +2583,7 @@ test "scan: internal duplicate command and credential url are corrupt" {
 }
 
 test "scan: generic_url source validation" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2602,7 +2601,7 @@ test "scan: generic_url source validation" {
 }
 
 test "scan: oversized metadata is corrupt" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2617,7 +2616,7 @@ test "scan: oversized metadata is corrupt" {
 }
 
 test "scan: symlinked metadata and markers are corrupt, never followed" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2636,7 +2635,7 @@ test "scan: symlinked metadata and markers are corrupt, never followed" {
 }
 
 test "scan: malformed v2 branch names are corrupt records" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2650,7 +2649,7 @@ test "scan: malformed v2 branch names are corrupt records" {
 }
 
 test "scan: deterministic ordering" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2723,7 +2722,7 @@ test "url validation: strict authority regressions" {
 }
 
 test "scan: duplicate id includes unsupported and corrupt participants" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     // OK v1 vs unsupported v2 at the same id.
@@ -2755,12 +2754,12 @@ test "scan: duplicate id includes unsupported and corrupt participants" {
 }
 
 test "scan: deep marker-free v2 chain is bounded with path_too_long" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const seg = "u-" ++ ("a" ** 100);
+    const seg = "u-" ++ @as([100]u8, @splat('a'));
     var pb: std.ArrayListUnmanaged(u8) = .empty;
     defer pb.deinit(a);
     try pb.appendSlice(a, "_v2/units");
@@ -2778,7 +2777,7 @@ test "scan: deep marker-free v2 chain is bounded with path_too_long" {
 }
 
 test "scan: v2 command names are validated exactly as persisted" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2807,7 +2806,7 @@ test "scan: v2 command names are validated exactly as persisted" {
 }
 
 test "scan: v1 windows .exe derivation" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2823,7 +2822,7 @@ test "scan: v1 windows .exe derivation" {
 }
 
 test "scan: legacy archive-content symlink yields no spurious record" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2842,7 +2841,7 @@ test "scan: legacy archive-content symlink yields no spurious record" {
 }
 
 test "scan: v2 config alias/selected duplicates and minisign validation" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2868,7 +2867,7 @@ test "scan: v2 config alias/selected duplicates and minisign validation" {
 }
 
 test "scan: v2 source contradictions, api_asset_id and bounded strings" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2893,7 +2892,7 @@ test "scan: v2 source contradictions, api_asset_id and bounded strings" {
 }
 
 test "scan: symlinked v2 marker keeps id and blocks legacy duplicate" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2917,7 +2916,7 @@ test "scan: symlinked v2 marker keeps id and blocks legacy duplicate" {
 }
 
 test "scan: v2 command names must be ascii and length-bounded" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2929,7 +2928,7 @@ test "scan: v2 command names must be ascii and length-bounded" {
     // An over-length (>240) command name is rejected (companion-suffix headroom).
     var namebuf: [241]u8 = undefined;
     @memset(&namebuf, 'a');
-    const body = try std.fmt.allocPrint(a, "{{\"schema\":2,\"layout_generation\":2,\"id\":\"u/long\",\"source\":{{\"kind\":\"github\",\"owner\":\"u\",\"repo\":\"long\"}},\"config\":{{}},\"resolved\":{{\"tag\":\"v\",\"asset\":\"a.tgz\"}},\"commands\":[{{\"name\":\"{s}\",\"relative_target\":\"bin/x\"}}],\"apps\":[],\"verification\":{{\"result\":\"none\"}}}}", .{namebuf});
+    const body = try a.print("{{\"schema\":2,\"layout_generation\":2,\"id\":\"u/long\",\"source\":{{\"kind\":\"github\",\"owner\":\"u\",\"repo\":\"long\"}},\"config\":{{}},\"resolved\":{{\"tag\":\"v\",\"asset\":\"a.tgz\"}},\"commands\":[{{\"name\":\"{s}\",\"relative_target\":\"bin/x\"}}],\"apps\":[],\"verification\":{{\"result\":\"none\"}}}}", .{namebuf});
     defer a.free(body);
     try tWriteUnit(io, tmp.dir, "_v2/units/u-u/u-long/_unit", body);
 
@@ -2940,7 +2939,7 @@ test "scan: v2 command names must be ascii and length-bounded" {
 }
 
 test "scan: v2 resolved minimum provenance and config correspondence" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -2975,7 +2974,7 @@ test "scan: v2 resolved minimum provenance and config correspondence" {
 }
 
 test "scan: v2 verification requires a non-empty result" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -3006,11 +3005,11 @@ fn tNestedPolicy(a: Allocator, depth: usize) ![]u8 {
 fn tPolicyBody(a: Allocator, id: []const u8, owner: []const u8, repo: []const u8, depth: usize) ![]u8 {
     const policy = try tNestedPolicy(a, depth);
     defer a.free(policy);
-    return std.fmt.allocPrint(a, "{{\"schema\":2,\"layout_generation\":2,\"id\":\"{s}\",\"source\":{{\"kind\":\"github\",\"owner\":\"{s}\",\"repo\":\"{s}\"}},\"config\":{{\"verification_policy\":{s}}},\"resolved\":{{\"tag\":\"v\",\"asset\":\"a.tgz\"}},\"commands\":[],\"apps\":[],\"verification\":{{\"result\":\"none\"}}}}", .{ id, owner, repo, policy });
+    return a.print("{{\"schema\":2,\"layout_generation\":2,\"id\":\"{s}\",\"source\":{{\"kind\":\"github\",\"owner\":\"{s}\",\"repo\":\"{s}\"}},\"config\":{{\"verification_policy\":{s}}},\"resolved\":{{\"tag\":\"v\",\"asset\":\"a.tgz\"}},\"commands\":[],\"apps\":[],\"verification\":{{\"result\":\"none\"}}}}", .{ id, owner, repo, policy });
 }
 
 test "scan: verification policy nesting depth is bounded" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -3031,7 +3030,7 @@ test "scan: verification policy nesting depth is bounded" {
 }
 
 test "scan: future layout with changed field shapes is unsupported" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -3050,7 +3049,7 @@ test "scan: future layout with changed field shapes is unsupported" {
 }
 
 test "scan: non-directory tools root fails closed" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
@@ -3058,13 +3057,13 @@ test "scan: non-directory tools root fails closed" {
     try tmp.dir.writeFile(io, .{ .sub_path = "notadir", .data = "x" });
     var buf: [Dir.max_path_bytes]u8 = undefined;
     const len = try tmp.dir.realPath(io, &buf);
-    const path = try std.fmt.allocPrint(a, "{s}/notadir", .{buf[0..len]});
+    const path = try a.print("{s}/notadir", .{buf[0..len]});
     defer a.free(path);
     try testing.expectError(error.NotDir, scan(a, io, path, .{}));
 }
 
 test "scan: non-directory structural nodes are corrupt" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     // A regular file at _v2.
