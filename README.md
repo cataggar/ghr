@@ -157,6 +157,8 @@ Pages source configuration is a one-time administrator step: in repository
 **/ (root)**. The first workflow run creates the branch if necessary; configure
 Pages and rerun it. `GITHUB_TOKEN` cannot change Pages source settings, so the
 workflow verifies them instead of requesting administrator permissions.
+If the `github-pages` environment restricts deployment branches, allow both
+`main` (the publisher workflow) and `website` (the Pages deployment).
 
 CI runs native unit/help checks on Linux, macOS, and Windows. The required
 `Build & Test` aggregate succeeds only when those jobs, cross-target builds,
