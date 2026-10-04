@@ -56,7 +56,7 @@ fn parseOptions(args: anytype, err_w: *Writer) !Options {
             options.repo = repo;
         } else if (std.mem.eql(u8, arg, "--encrypt")) {
             options.encrypt = true;
-        } else if (std.mem.eql(u8, arg, "--replace-existing-secrets")) {
+        } else if (std.mem.eql(u8, arg, "--force")) {
             options.replace = true;
         } else if (std.mem.eql(u8, arg, "--reuse-existing-local-pair")) {
             options.reuse = true;
@@ -75,12 +75,12 @@ pub fn printUsage(w: *Writer) !void {
         \\
         \\USAGE:
         \\    ghr minisign generate [--repo OWNER/REPO] [--encrypt]
-        \\        [--replace-existing-secrets] [--reuse-existing-local-pair]
+        \\        [--force] [--reuse-existing-local-pair]
         \\
         \\--repo OWNER/REPO          Override gh's current repository context
         \\--encrypt                  Encrypt with nonempty MINISIGN_PASSWORD;
         \\                           also upload that password as an Actions secret
-        \\--replace-existing-secrets  Explicitly allow remote secret replacement
+        \\--force                    Explicitly allow remote secret replacement
         \\--reuse-existing-local-pair Retry with minisign.key and minisign.pub;
         \\                           never generate or replace a private key
         \\-h, --help                  Show this help
@@ -88,14 +88,14 @@ pub fn printUsage(w: *Writer) !void {
         \\Default: unencrypted minisign.pub/minisign.key; only MINISIGN_SECRET_KEY
         \\is uploaded. MINISIGN_PASSWORD is not required, read, or modified.
         \\Existing local files/symlinks and either existing remote secret are
-        \\refused without the corresponding explicit option. --replace-existing-
-        \\secrets does not replace local files or alter a password in default mode.
+        \\refused without the corresponding explicit option. --force does not
+        \\replace local files or alter a password in default mode.
         \\
         \\Private files use owner-only permissions (0600 on POSIX, a protected
         \\owner-only DACL on Windows). Keep minisign.key as a secure recovery
         \\backup; never commit, log, cache, or upload it as a build artifact.
         \\Upload is not a transaction: failures may have changed remote secrets.
-        \\Retry with --reuse-existing-local-pair --replace-existing-secrets and
+        \\Retry with --reuse-existing-local-pair --force and
         \\the original --repo/--encrypt options. Reuse reconstructs minisign.pub
         \\if absent, but refuses a different public key or unsafe private file.
         \\
@@ -263,7 +263,7 @@ fn preflight(allocator: Allocator, io: Io, environ: *const Environ, target: Targ
             std.ascii.eqlIgnoreCase(secret.name, "MINISIGN_PASSWORD");
     }
     if (existing and !options.replace)
-        return fail(err_w, "MINISIGN_SECRET_KEY or MINISIGN_PASSWORD already exists; refusing replacement (only --replace-existing-secrets explicitly permits it)", .{});
+        return fail(err_w, "MINISIGN_SECRET_KEY or MINISIGN_PASSWORD already exists; refusing replacement (only --force explicitly permits it)", .{});
 }
 
 fn generate(allocator: Allocator, io: Io, environ: *const Environ, dir: Dir, options: Options, runner: Runner, w: *Writer, err_w: *Writer) !void {
@@ -328,7 +328,7 @@ fn localFailure(err_w: *Writer, err: anyerror) error{ GenerateFailed, WriteFaile
 }
 
 fn recoveryMessage(err_w: *Writer, options: Options) !void {
-    try err_w.print("Remote update may be partial; this is NOT success. Local recovery keys were retained.\nRetry with --reuse-existing-local-pair --replace-existing-secrets{s} and the same --repo (or gh context); never generate a replacement pair to retry.\n", .{if (options.encrypt) " --encrypt (same MINISIGN_PASSWORD)" else ""});
+    try err_w.print("Remote update may be partial; this is NOT success. Local recovery keys were retained.\nRetry with --reuse-existing-local-pair --force{s} and the same --repo (or gh context); never generate a replacement pair to retry.\n", .{if (options.encrypt) " --encrypt (same MINISIGN_PASSWORD)" else ""});
     try err_w.flush();
 }
 
@@ -1028,6 +1028,7 @@ test "generate parser rejects malformed overrides, missing values, duplicate rep
         &.{ "--repo", "../repo" },
         &.{ "--repo", "owner/repo;bad" },
         &.{ "--repo", "owner/repo", "--repo", "owner/other" },
+        &.{"--replace-existing-secrets"},
         &.{"--unknown"},
     };
     var err: Writer.Allocating = .init(std.testing.allocator);
@@ -1036,7 +1037,7 @@ test "generate parser rejects malformed overrides, missing values, duplicate rep
         var args: ListArgs = .{ .values = values };
         try std.testing.expectError(error.GenerateFailed, parseOptions(&args, &err.writer));
     }
-    var args: ListArgs = .{ .values = &.{ "--repo", "owner/valid.repo", "--encrypt", "--replace-existing-secrets", "--reuse-existing-local-pair" } };
+    var args: ListArgs = .{ .values = &.{ "--repo", "owner/valid.repo", "--encrypt", "--force", "--reuse-existing-local-pair" } };
     const options = try parseOptions(&args, &err.writer);
     try std.testing.expectEqualStrings("owner/valid.repo", options.repo.?);
     try std.testing.expect(options.encrypt and options.replace and options.reuse);

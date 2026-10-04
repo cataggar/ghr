@@ -181,7 +181,7 @@ No interactive repository chooser is required. An unresolved repository
 fails before key creation or secret upload. Generation writes `minisign.key`
 and `minisign.pub` in the current directory and refuses to overwrite existing
 key files. Existing signing secrets require explicit
-`--replace-existing-secrets`; upload retries reuse the original pair with
+`--force`; upload retries reuse the original pair with
 `--reuse-existing-local-pair` rather than generating a new key.
 
 By default, only `MINISIGN_SECRET_KEY` is configured: an **unencrypted
