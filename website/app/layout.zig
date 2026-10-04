@@ -18,9 +18,9 @@ pub const logo_url = "https://github.com/cataggar/ghr/releases/download/v0.6.2/g
 /// (a subpath), not the domain root — an absolute link like href="/blog"
 /// would resolve to https://cataggar.github.io/blog (wrong host path, 404).
 /// Every internal link/asset path in the site is prefixed with this so it
-/// resolves under the actual deployed subpath. Update this (and nothing
-/// else) if the site ever moves to a custom domain served from "/".
-pub const base_path = "/ghr";
+/// resolves under the actual deployed subpath. Update src/config.zig if
+/// the site ever moves to a custom domain served from "/".
+pub const base_path = @import("config").base_path;
 
 /// Small rounded pill, e.g. the "MIT licensed" / version badges.
 pub const Badge = mercss.Component(.{
@@ -118,6 +118,17 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\    .prose ul, .prose ol { margin:0 0 16px 24px; }
         \\    .prose li { margin-bottom:6px; }
         \\    .prose blockquote { border-left:3px solid var(--red); padding-left:16px; color:var(--muted); margin:0 0 16px; }
+        \\    .prose h1 { font-size:36px; line-height:1.2; margin:24px 0; }
+        \\    .prose h4, .prose h5, .prose h6 { margin:20px 0 10px; }
+        \\    .prose a { color:var(--red-dark); text-decoration:underline; text-underline-offset:3px; }
+        \\    .prose pre { margin:16px 0; }
+        \\    .prose table { display:block; overflow-x:auto; border-collapse:collapse; margin:20px 0; }
+        \\    .prose th, .prose td { border:1px solid var(--border); padding:8px 12px; text-align:left; }
+        \\    .prose th { background:var(--bg2); }
+        \\    .prose img { max-width:100%; }
+        \\    .prose hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
+        \\    .docs-nav { display:flex; flex-wrap:wrap; gap:8px 16px; padding-bottom:20px; border-bottom:1px solid var(--border); font-size:13px; }
+        \\    .doc-source { margin-top:32px; font-size:13px; color:var(--muted); }
         \\    .back-link { display:inline-block; margin-bottom:24px; font-size:13px; color:var(--muted); }
         \\    .back-link:hover { color:var(--text); }
         \\    .attribution { margin-top:12px; font-size:12px; color:var(--muted); }
@@ -146,12 +157,13 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
     w.print(
         \\    <nav class="nav">
         \\      <a href="{s}/blog">Blog</a>
+        \\      <a href="{s}/docs.html">Documentation</a>
         \\      <a href="https://github.com/cataggar/ghr">GitHub</a>
-        \\      <a href="https://github.com/cataggar/ghr#install">Install</a>
+        \\      <a href="{s}/docs/install.html">Install</a>
         \\    </nav>
         \\    <a href="{s}/" class="site-logo-link"><img src="{s}" alt="ghr logo" class="site-logo"></a>
         \\
-    , .{ base_path, base_path, logo_url }) catch return body;
+    , .{ base_path, base_path, base_path, base_path, logo_url }) catch return body;
     w.writeAll("  </header>\n") catch return body;
 
     _ = path;

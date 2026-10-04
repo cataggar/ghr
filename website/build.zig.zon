@@ -8,8 +8,12 @@
         // The fork retains portable Windows I/O, Threaded I/O on Linux,
         // and the github.com/githubusercontent.com image CSP allowances.
         .merjs = .{
-            .url = "git+https://github.com/cataggar/merjs.git#61366559c176d97392a3599b7db52749652cee19",
-            .hash = "merjs-0.2.54-qL9LkkHWYgDucdbsizHpPejtaLN4fvvahudfa0zcDfdp",
+            .url = "git+https://github.com/cataggar/merjs.git#545eaa7fce35b994b7116ca95a523314ffe2e3c7",
+            .hash = "merjs-0.2.54-qL9Lkv_YYgDgs3s3tmPQr1Rlq92OVlLXlP3brccJ-oEb",
+        },
+        .koino = .{
+            .url = "git+https://github.com/cataggar/koino#181a77a44ed6d0b85dc1dc72c3d9703e7774c946",
+            .hash = "koino-0.1.0-S9LuWtcZBgD-tBiVLXlLm0NhadEZ3LSFxd1CkGLhsfP4",
         },
     },
     .paths = .{
