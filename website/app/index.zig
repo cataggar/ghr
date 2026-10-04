@@ -18,14 +18,14 @@ pub fn render(req: mer.Request) mer.Response {
 fn page() h.Node {
     return h.div(.{}, .{
         h.section(.{ .class = "hero" }, .{
+            h.img(.{ .src = layout.logo_url, .alt = "ghr logo", .class = "hero-art" }),
             h.span(.{ .class = layout.Badge.classes ++ " badge-outline", .style = "background:rgba(255,255,255,0.14);color:#ffe5e4;border-color:rgba(255,255,255,0.2);margin-bottom:14px;" }, "TOOLKIT FOR GITHUB RELEASES"),
             h.h1(.{}, "Install tools from GitHub releases with one command."),
             h.p(.{}, "ghr is a single static binary that picks the right release asset for your OS and architecture, then verifies it with minisign, sigstore, or a plain checksum — on Mac, Linux, and Windows, and in GitHub Actions."),
             h.div(.{ .class = "hero-actions" }, .{
-                h.a(.{ .href = "https://github.com/cataggar/ghr", .class = "btn btn-primary" }, "View on GitHub"),
-                h.a(.{ .href = layout.base_path ++ "/docs/install.html", .class = "btn btn-secondary" }, "Install ghr"),
-                h.a(.{ .href = layout.base_path ++ "/docs.html", .class = "btn btn-secondary" }, "Documentation"),
-                h.a(.{ .href = layout.base_path ++ "/blog", .class = "btn btn-secondary" }, "Read the blog"),
+                h.a(.{ .href = layout.docs_url, .class = "btn btn-primary" }, "Get started"),
+                h.a(.{ .href = layout.docs_url, .class = "btn btn-secondary" }, "Docs"),
+                h.a(.{ .href = "https://github.com/cataggar/ghr", .class = "btn btn-secondary" }, "View on GitHub"),
             }),
         }),
 
