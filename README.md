@@ -152,6 +152,12 @@ branch root at <https://cataggar.github.io/ghr/>. Publication is restricted to
 `main`, and explicitly requests a Pages build because `GITHUB_TOKEN` pushes
 do not automatically trigger branch-based Pages builds.
 
+Pages source configuration is a one-time administrator step: in repository
+**Settings > Pages**, choose **Deploy from a branch**, `website`, and
+**/ (root)**. The first workflow run creates the branch if necessary; configure
+Pages and rerun it. `GITHUB_TOKEN` cannot change Pages source settings, so the
+workflow verifies them instead of requesting administrator permissions.
+
 CI runs native unit/help checks on Linux, macOS, and Windows. The required
 `Build & Test` aggregate succeeds only when those jobs, cross-target builds,
 and production-site/cache-freshness checks all pass.

@@ -72,10 +72,13 @@ jobs:
             git -C "$PUBLISH_DIR" push origin HEAD:refs/heads/website
           fi
 
-      - name: Serve the website branch and request a Pages build
+      - name: Check the Pages source and request a build
         run: |
           set -euo pipefail
-          gh api --method PUT "repos/$GITHUB_REPOSITORY/pages" --input - <<'JSON'
-          {"build_type":"legacy","source":{"branch":"website","path":"/"}}
-          JSON
+          configured=$(gh api "repos/$GITHUB_REPOSITORY/pages" \
+            --jq '.build_type == "legacy" and .source.branch == "website" and .source.path == "/"')
+          if [ "$configured" != true ]; then
+            echo '::error::An administrator must configure GitHub Pages to deploy from website / (root). See README.md.'
+            exit 1
+          fi
           gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"
