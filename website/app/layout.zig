@@ -1,12 +1,4 @@
-// app/layout.zig — shared page chrome for the ghr site.
-//
-// Palette and typography mirror merlionjs.com (https://merlionjs.com/), the
-// framework's own site, which this project is built with. Layout mirrors
-// its warm paper background + brand red accent + DM Serif Display/DM Sans
-// pairing. Structural spacing (`FeatureGrid`) and the small version pill
-// (`Badge`) are generated with `mer.mercss` — merjs's built-in, Tailwind v4
-// inspired, comptime utility CSS engine — the same CSS system that powers
-// the mercss features on merlionjs.com.
+// Shared header, marketing layout, and responsive documentation chrome.
 
 const std = @import("std");
 const mer = @import("mer");
@@ -21,6 +13,7 @@ pub const logo_url = "https://github.com/cataggar/ghr/releases/download/v0.6.2/g
 /// resolves under the actual deployed subpath. Update src/config.zig if
 /// the site ever moves to a custom domain served from "/".
 pub const base_path = @import("config").base_path;
+pub const docs_url = @import("config").docs_url;
 
 /// Small rounded pill, e.g. the "MIT licensed" / version badges.
 pub const Badge = mercss.Component(.{
@@ -43,6 +36,8 @@ pub const FeatureGrid = mercss.ResponsiveComponent(.{
 pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, meta: mer.Meta) []const u8 {
     const title = if (meta.title.len > 0) meta.title else "ghr";
     const desc = if (meta.description.len > 0) meta.description else "A toolkit for GitHub releases.";
+    const is_docs = std.mem.eql(u8, path, "/docs") or std.mem.startsWith(u8, path, "/docs/");
+    const is_blog = std.mem.eql(u8, path, "/blog") or std.mem.startsWith(u8, path, "/blog/");
 
     var buf: std.Io.Writer.Allocating = .init(allocator);
     const w = &buf.writer;
@@ -73,24 +68,30 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         \\    :root {
         \\      --bg:#f0ebe3; --bg2:#e8e2d9; --bg3:#ddd5cc;
-        \\      --text:#252530; --muted:#8a7f78; --border:#d5cdc4;
+        \\      --text:#252530; --muted:#6e625b; --border:#d5cdc4;
         \\      --red:#e8251f; --red-dark:#aa1915; --paper:#fffdfa;
+        \\      --header-height:76px;
         \\    }
         \\    body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,-apple-system,sans-serif; min-height:100vh; line-height:1.65; }
         \\    a { color:inherit; text-decoration:none; }
+        \\    :focus-visible { outline:3px solid var(--red-dark); outline-offset:4px; }
+        \\    [id] { scroll-margin-top:calc(var(--header-height) + 24px); }
+        \\    .skip-link { position:fixed; top:8px; left:16px; z-index:30; transform:translateY(-160%); padding:8px 16px; background:var(--paper); border:1px solid var(--border); border-radius:6px; }
+        \\    .skip-link:focus { transform:none; }
         \\    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
         \\    code { font-size:0.9em; background:var(--bg2); border-radius:4px; padding:2px 6px; }
         \\    pre { background:#201014; color:#ffe8e7; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
         \\    pre code { background:none; padding:0; color:inherit; }
         \\    h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
         \\    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
-        \\    .layout-wide { max-width:1080px; }
-        \\    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
-        \\    .site-logo-link { display:block; width:100%; }
-        \\    .site-logo { display:block; width:100%; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
-        \\    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
-        \\    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
-        \\    .nav a:hover { color:var(--text); }
+        \\    .site-header { position:sticky; top:0; z-index:20; background:var(--paper); border-bottom:1px solid var(--border); }
+        \\    .header-inner { display:flex; align-items:center; gap:32px; min-height:var(--header-height); max-width:1320px; margin:auto; padding:12px 32px; }
+        \\    .site-brand { font-size:28px; font-weight:700; letter-spacing:-0.06em; color:var(--red-dark); }
+        \\    .site-nav { display:flex; align-items:center; gap:24px; margin-left:auto; }
+        \\    .site-nav a { font-size:14px; font-weight:600; color:var(--muted); }
+        \\    .site-nav a:hover, .site-nav a[aria-current] { color:var(--red-dark); }
+        \\    .header-cta { background:var(--red-dark); color:white; white-space:nowrap; }
+        \\    .hero-art { display:block; width:100%; height:auto; border-radius:10px; margin:0 0 28px; }
         \\    .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
         \\    .hero h1 { font-size:clamp(32px,5vw,48px); line-height:1.05; margin-bottom:14px; }
         \\    .hero p { max-width:60ch; color:#ffe8e7; font-size:17px; margin-bottom:22px; }
@@ -127,13 +128,53 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\    .prose th { background:var(--bg2); }
         \\    .prose img { max-width:100%; }
         \\    .prose hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
-        \\    .docs-nav { display:flex; flex-wrap:wrap; gap:8px 16px; padding-bottom:20px; border-bottom:1px solid var(--border); font-size:13px; }
+        \\    .docs-layout { max-width:1320px; padding-top:32px; }
+        \\    .docs-shell { display:grid; grid-template-columns:260px minmax(0,1fr); gap:56px; align-items:start; }
+        \\    .docs-sidebar { position:sticky; top:calc(var(--header-height) + 24px); max-height:calc(100dvh - var(--header-height) - 48px); overflow-y:auto; padding:4px 12px 12px 0; }
+        \\    .docs-menu > summary { display:none; }
+        \\    .docs-index { font-size:14px; }
+        \\    .docs-index-title { color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; margin:0 0 16px 12px; }
+        \\    .docs-index ul { list-style:none; }
+        \\    .docs-group { margin-bottom:12px; }
+        \\    .docs-group > summary { cursor:pointer; font-weight:700; padding:8px 12px; border-radius:6px; }
+        \\    .docs-group > summary:hover { background:var(--bg2); }
+        \\    .docs-group ul { margin:4px 0 0 20px; padding-left:8px; border-left:1px solid var(--border); }
+        \\    .docs-index a { display:block; border-radius:6px; padding:7px 12px; margin:2px 0; color:var(--muted); overflow-wrap:anywhere; }
+        \\    .docs-index a:hover { color:var(--text); background:var(--bg2); }
+        \\    .docs-index a[aria-current="page"] { color:var(--red-dark); background:#fbe3df; font-weight:700; }
+        \\    .docs { min-width:0; max-width:80ch; overflow-wrap:anywhere; }
+        \\    .docs h1, .docs h2, .docs h3, .docs h4, .docs h5, .docs h6 { font-family:'DM Sans',system-ui,sans-serif; font-weight:700; }
+        \\    .docs h1 { font-size:clamp(28px,4vw,38px); margin-top:0; }
+        \\    .docs h2 { border-top:1px solid var(--border); padding-top:24px; }
+        \\    .docs pre, .docs table { max-width:100%; overflow-wrap:normal; }
         \\    .doc-source { margin-top:32px; font-size:13px; color:var(--muted); }
         \\    .back-link { display:inline-block; margin-bottom:24px; font-size:13px; color:var(--muted); }
         \\    .back-link:hover { color:var(--text); }
         \\    .attribution { margin-top:12px; font-size:12px; color:var(--muted); }
         \\    .layout-footer { margin-top:64px; padding-top:24px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); text-align:center; }
         \\    .layout-footer a { text-decoration:underline; text-underline-offset:2px; }
+        \\    @media (max-width:959px) {
+        \\      .docs-shell { display:block; }
+        \\      .docs-sidebar { position:static; max-height:none; padding:0; margin-bottom:28px; }
+        \\      .docs-menu { border:1px solid var(--border); border-radius:8px; background:var(--paper); }
+        \\      .docs-menu > summary { display:list-item; cursor:pointer; font-weight:700; padding:12px 16px; }
+        \\      .docs-index { padding:12px 16px; border-top:1px solid var(--border); }
+        \\      .docs-index-title { display:none; }
+        \\      .docs { max-width:none; }
+        \\    }
+        \\    @media (max-width:600px) {
+        \\      :root { --header-height:112px; }
+        \\      .header-inner { flex-wrap:wrap; gap:8px 16px; padding:12px 20px; }
+        \\      .site-nav { order:3; width:100%; margin:0; justify-content:center; }
+        \\      .header-cta { margin-left:auto; padding:8px 14px; }
+        \\      .layout { padding:28px 20px 56px; }
+        \\      .hero { padding:24px; }
+        \\      .layout-footer { margin-top:40px; }
+        \\    }
+        \\    @media (prefers-reduced-motion:reduce) {
+        \\      .btn { transition:none; }
+        \\      .btn:hover { transform:none; }
+        \\    }
         \\
     ) catch return body;
 
@@ -153,21 +194,22 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         w.writeAll("\n") catch {};
     }
 
-    w.writeAll("</head>\n<body>\n<div class=\"layout\">\n  <header class=\"layout-header\">\n") catch return body;
+    w.writeAll("</head>\n<body>\n<a class=\"skip-link\" href=\"#main-content\">Skip to content</a>\n<header class=\"site-header\"><div class=\"header-inner\">\n") catch return body;
     w.print(
-        \\    <nav class="nav">
-        \\      <a href="{s}/blog">Blog</a>
-        \\      <a href="{s}/docs.html">Documentation</a>
-        \\      <a href="https://github.com/cataggar/ghr">GitHub</a>
-        \\      <a href="{s}/docs/install.html">Install</a>
-        \\    </nav>
-        \\    <a href="{s}/" class="site-logo-link"><img src="{s}" alt="ghr logo" class="site-logo"></a>
+        \\  <a href="{s}/" class="site-brand" aria-label="ghr home">ghr</a>
+        \\  <nav class="site-nav" aria-label="Main navigation">
+        \\    <a href="{s}"{s}>Docs</a>
+        \\    <a href="{s}/blog"{s}>Blog</a>
+        \\    <a href="https://github.com/cataggar/ghr">GitHub</a>
+        \\  </nav>
+        \\  <a href="{s}" class="btn header-cta">Get started</a>
         \\
-    , .{ base_path, base_path, base_path, base_path, logo_url }) catch return body;
-    w.writeAll("  </header>\n") catch return body;
+    , .{ base_path, docs_url, if (is_docs) " aria-current=\"location\"" else "", base_path, if (is_blog) " aria-current=\"location\"" else "", docs_url }) catch return body;
+    w.print("</div></header>\n<div class=\"layout{s}\">\n", .{if (is_docs) " docs-layout" else ""}) catch return body;
 
-    _ = path;
+    if (!is_docs) w.writeAll("<main id=\"main-content\" tabindex=\"-1\">\n") catch return body;
     w.writeAll(body) catch return body;
+    if (!is_docs) w.writeAll("</main>\n") catch return body;
 
     w.writeAll(
         \\
@@ -180,9 +222,22 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\    </span>
         \\  </footer>
         \\</div>
-        \\</body>
-        \\</html>
     ) catch return body;
 
+    if (is_docs) {
+        w.writeAll(
+            \\<script>
+            \\  const menu = document.querySelector('.docs-menu');
+            \\  if (menu) {
+            \\    const desktop = window.matchMedia('(min-width: 960px)');
+            \\    const updateMenu = () => { menu.open = desktop.matches; };
+            \\    desktop.addEventListener('change', updateMenu);
+            \\    updateMenu();
+            \\  }
+            \\</script>
+            \\
+        ) catch return body;
+    }
+    w.writeAll("</body>\n</html>\n") catch return body;
     return buf.written();
 }

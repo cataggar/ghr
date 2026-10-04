@@ -141,6 +141,13 @@ Relative Markdown links and heading fragments are checked and rewritten;
 links outside `doc/` point to GitHub source files. Raw HTML is omitted by
 Koino's safe default. Edit Markdown in `doc/`, not generated route modules.
 
+The shared top menu and homepage **Get started** links open
+`doc/getting-started.md`. Documentation pages have a grouped sidebar with the
+current page highlighted; on smaller screens it becomes a **Documentation
+menu** disclosure. Group order and short labels live in
+`website/tools/docs.zig`. New Markdown pages appear automatically under
+**More documentation** until assigned to a group; missing pages are omitted.
+
 The cache checks use an isolated fixture and keep Zig's cache warm while
 editing, adding, renaming, and deleting Markdown, routes, directories, and
 optional layouts. Production builds remove stale generated pages.

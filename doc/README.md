@@ -3,6 +3,9 @@
 Detailed documentation for ghr. For a quick overview and usage, see the
 [top-level README](../README.md).
 
+New to ghr? Follow [Getting started](getting-started.md) to install ghr and
+your first tool.
+
 ## Topics
 
 - [Install](install.md) — install ghr, see CLI examples, and uninstall it.

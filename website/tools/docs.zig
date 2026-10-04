@@ -13,6 +13,29 @@ const Document = struct {
     ast: *koino.nodes.AstNode,
     anchors: std.StringHashMap(void),
 };
+const NavigationPage = struct { source: []const u8, label: []const u8 };
+const NavigationGroup = struct { label: []const u8, pages: []const NavigationPage };
+const navigation = [_]NavigationGroup{
+    .{ .label = "Getting started", .pages = &.{
+        .{ .source = "getting-started.md", .label = "Quick start" },
+        .{ .source = "README.md", .label = "Overview" },
+        .{ .source = "install.md", .label = "Installation" },
+    } },
+    .{ .label = "Guides", .pages = &.{
+        .{ .source = "download.md", .label = "Download assets" },
+        .{ .source = "github-actions.md", .label = "GitHub Actions" },
+        .{ .source = "wsl-linking.md", .label = "WSL linking" },
+        .{ .source = "troubleshooting.md", .label = "Troubleshooting" },
+    } },
+    .{ .label = "Reference", .pages = &.{
+        .{ .source = "directories.md", .label = "Directories" },
+        .{ .source = "verification.md", .label = "Verification" },
+    } },
+    .{ .label = "Development", .pages = &.{
+        .{ .source = "install-identifiers.md", .label = "Install identifiers" },
+        .{ .source = "reproducible-builds.md", .label = "Reproducible builds" },
+    } },
+};
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
@@ -55,14 +78,11 @@ pub fn main(init: std.process.Init) !void {
     for (documents.items, 0..) |*document, index| {
         try rewriteLinks(allocator, document, documents.items);
         var html: std.Io.Writer.Allocating = .init(allocator);
-        try html.writer.writeAll("<article class=\"prose docs\"><nav class=\"docs-nav\" aria-label=\"Documentation\">");
-        for (documents.items) |item| {
-            const href = try publicUrl(allocator, item.route);
-            try html.writer.print("<a href=\"{s}\">{s}</a> ", .{ try escapeHtml(allocator, href), try escapeHtml(allocator, item.title) });
-        }
-        try html.writer.writeAll("</nav>\n");
+        try html.writer.writeAll("<div class=\"docs-shell\">\n");
+        try renderNavigation(allocator, &html.writer, document.source, documents.items);
+        try html.writer.writeAll("<main id=\"main-content\" tabindex=\"-1\" class=\"prose docs\">\n");
         try koino.html.print(&html.writer, allocator, options, document.ast);
-        try html.writer.print("<p class=\"doc-source\"><a href=\"{s}/blob/main/doc/{s}\">View Markdown source</a></p></article>\n", .{ config.repository_url, try encodePath(allocator, document.source) });
+        try html.writer.print("<p class=\"doc-source\"><a href=\"{s}/blob/main/doc/{s}\">View Markdown source</a></p></main>\n</div>\n", .{ config.repository_url, try encodePath(allocator, document.source) });
         try writer.print("fn render_{d}(_: mer.Request) mer.Response {{ return mer.html(\"{f}\"); }}\n", .{ index, std.zig.fmtString(html.written()) });
     }
     try writer.writeAll("\npub const routes = [_]mer.Route{\n");
@@ -73,6 +93,66 @@ pub fn main(init: std.process.Init) !void {
     const file = try std.Io.Dir.cwd().createFile(init.io, args[2], .{});
     defer file.close(init.io);
     try file.writePositionalAll(init.io, output.written(), 0);
+}
+
+fn renderNavigation(allocator: std.mem.Allocator, writer: *std.Io.Writer, current: []const u8, documents: []const Document) !void {
+    try writer.writeAll("<aside class=\"docs-sidebar\"><details class=\"docs-menu\" open><summary>Documentation menu</summary>\n<nav class=\"docs-index\" aria-label=\"Documentation\"><p class=\"docs-index-title\">Documentation</p><ul>\n");
+    for (navigation) |group| {
+        var present = false;
+        var active = false;
+        for (group.pages) |page| {
+            if (findDocument(documents, page.source) == null) continue;
+            present = true;
+            active = active or std.mem.eql(u8, current, page.source);
+        }
+        if (!present) continue;
+        try writer.print("<li><details class=\"docs-group\"{s}><summary>{s}</summary><ul>\n", .{ if (active) " open" else "", try escapeHtml(allocator, group.label) });
+        for (group.pages) |page| {
+            const document = findDocument(documents, page.source) orelse continue;
+            try renderNavigationLink(allocator, writer, current, document, page.label);
+        }
+        try writer.writeAll("</ul></details></li>\n");
+    }
+    var additional = false;
+    var active = false;
+    for (documents) |document| {
+        if (isClassified(document.source)) continue;
+        additional = true;
+        active = active or std.mem.eql(u8, current, document.source);
+    }
+    if (additional) {
+        try writer.print("<li><details class=\"docs-group\"{s}><summary>More documentation</summary><ul>\n", .{if (active) " open" else ""});
+        for (documents) |document| {
+            if (isClassified(document.source)) continue;
+            try renderNavigationLink(allocator, writer, current, document, document.title);
+        }
+        try writer.writeAll("</ul></details></li>\n");
+    }
+    try writer.writeAll("</ul></nav></details></aside>\n");
+}
+
+fn findDocument(documents: []const Document, source: []const u8) ?Document {
+    for (documents) |document| {
+        if (std.mem.eql(u8, document.source, source)) return document;
+    }
+    return null;
+}
+
+fn isClassified(source: []const u8) bool {
+    for (navigation) |group| {
+        for (group.pages) |page| {
+            if (std.mem.eql(u8, source, page.source)) return true;
+        }
+    }
+    return false;
+}
+
+fn renderNavigationLink(allocator: std.mem.Allocator, writer: *std.Io.Writer, current: []const u8, document: Document, label: []const u8) !void {
+    try writer.print("<li><a href=\"{s}\"{s}>{s}</a></li>\n", .{
+        try escapeHtml(allocator, try publicUrl(allocator, document.route)),
+        if (std.mem.eql(u8, current, document.source)) " aria-current=\"page\"" else "",
+        try escapeHtml(allocator, label),
+    });
 }
 
 fn parseDocument(allocator: std.mem.Allocator, source: []const u8, markdown: []const u8) !Document {
@@ -252,4 +332,41 @@ test "AST link rewriting resolves pages, fragments, queries and repository files
     try std.testing.expectEqualStrings("https://example.test/file.md#x", try rewriteUrl(allocator, &guide, &documents, "https://example.test/file.md#x", false));
     try std.testing.expectError(error.UnknownHeadingFragment, rewriteUrl(allocator, &index, &documents, "nested/guide.md#missing", false));
     try std.testing.expectError(error.MissingMarkdownTarget, rewriteUrl(allocator, &index, &documents, "missing.md", false));
+}
+
+test "documentation navigation groups existing pages in reading order and opens the current group" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const index = try parseDocument(allocator, "README.md", "# Documentation\n");
+    defer index.ast.deinit();
+    const install = try parseDocument(allocator, "install.md", "# Install\n");
+    defer install.ast.deinit();
+    const start = try parseDocument(allocator, "getting-started.md", "# Getting started\n");
+    defer start.ast.deinit();
+    const verify = try parseDocument(allocator, "verification.md", "# Verification\n");
+    defer verify.ast.deinit();
+    var html: std.Io.Writer.Allocating = .init(allocator);
+    try renderNavigation(allocator, &html.writer, verify.source, &.{ index, install, start, verify });
+    const output = html.written();
+    try std.testing.expect(std.mem.find(u8, output, "class=\"docs-group\"><summary>Getting started") != null);
+    try std.testing.expect(std.mem.find(u8, output, "class=\"docs-group\" open><summary>Reference") != null);
+    try std.testing.expect(std.mem.find(u8, output, "/ghr/docs/verification.html\" aria-current=\"page\"") != null);
+    try std.testing.expect(std.mem.find(u8, output, ">Quick start<").? < std.mem.find(u8, output, ">Overview<").?);
+    try std.testing.expect(std.mem.find(u8, output, ">Overview<").? < std.mem.find(u8, output, ">Installation<").?);
+    try std.testing.expect(std.mem.find(u8, output, "<summary>Guides") == null);
+    try std.testing.expect(std.mem.find(u8, output, "/ghr/docs/directories.html") == null);
+}
+
+test "unclassified nested documents remain navigable with escaped titles and encoded URLs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const page = try parseDocument(allocator, "nested/new guide.md", "# Tips & \\<tools\\>\n");
+    defer page.ast.deinit();
+    var html: std.Io.Writer.Allocating = .init(allocator);
+    try renderNavigation(allocator, &html.writer, page.source, &.{page});
+    try std.testing.expect(std.mem.find(u8, html.written(), "class=\"docs-group\" open><summary>More documentation") != null);
+    try std.testing.expect(std.mem.find(u8, html.written(), "href=\"/ghr/docs/nested/new%20guide.html\" aria-current=\"page\"") != null);
+    try std.testing.expect(std.mem.find(u8, html.written(), ">Tips &amp; &lt;tools&gt;</a>") != null);
 }

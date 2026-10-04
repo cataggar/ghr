@@ -67,6 +67,8 @@ fn exercise(allocator: std.mem.Allocator, io: std.Io, source: std.Io.Dir, zig: [
     try fixture.contains("dist/docs/guide.html", "id=\"yés-1\"");
     try fixture.contains("dist/docs/guide.html", "<table>");
     try fixture.contains("dist/docs/guide.html", "class=\"language-zig\"");
+    try fixture.contains("dist/docs.html", "<summary>More documentation</summary>");
+    try fixture.contains("dist/docs/guide.html", "href=\"/ghr/docs/guide.html\" aria-current=\"page\"");
 
     try fixture.write("app/nested/deep/page.zig", page);
     try require(try fixture.build(), "@import(\"app/nested/deep/page\")", true);
@@ -115,6 +117,7 @@ fn exercise(allocator: std.mem.Allocator, io: std.Io, source: std.Io.Dir, zig: [
     _ = try fixture.build();
     try fixture.contains("dist/docs/nested/new.html", "/ghr/docs/guide.html#y%C3%A9s");
     try fixture.contains("dist/docs.html", "/ghr/docs/nested/new.html");
+    try fixture.contains("dist/docs/nested/new.html", "href=\"/ghr/docs/nested/new.html\" aria-current=\"page\"");
     try project.rename("../doc/nested/new.md", project, "../doc/nested/renamed.md", io);
     _ = try fixture.build();
     try fixture.contains("dist/docs/nested/renamed.html", "New document");
