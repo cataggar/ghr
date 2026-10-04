@@ -51,6 +51,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // SSG mode: pre-render pages to dist/ and exit.
     if (do_prerender) {
+        try std.Io.Dir.cwd().deleteTree(runtime.io, "dist");
         try mer.runPrerender(alloc, &router);
         return;
     }

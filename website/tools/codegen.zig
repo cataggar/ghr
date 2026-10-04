@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try buf.print(alloc, "const {s} = @import(\"{s}\");\n", .{ ident, import_name });
     }
 
-    try buf.appendSlice(alloc, "\npub const routes: []const Route = &.{\n");
+    try buf.appendSlice(alloc, "\nconst page_routes = [_]Route{\n");
     for (entries.items) |path| {
         const ident = try toIdent(alloc, path);
         defer alloc.free(ident);
@@ -64,6 +64,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try buf.print(alloc, "    .{{ .path = \"{s}\", .render = {s}.render, .render_stream = if (@hasDecl({s}, \"renderStream\")) {s}.renderStream else null, .meta = if (@hasDecl({s}, \"meta\")) {s}.meta else .{{}}, .prerender = if (@hasDecl({s}, \"prerender\")) {s}.prerender else false }},\n", .{ url, ident, ident, ident, ident, ident, ident, ident });
     }
     try buf.appendSlice(alloc, "};\n\n");
+    try buf.appendSlice(alloc, "pub const routes: []const Route = &(page_routes ++ @import(\"docs\").routes);\n\n");
 
     // Enforce: every app/ page must export `pub const meta: mer.Meta`.
     try buf.appendSlice(alloc, "comptime {\n");

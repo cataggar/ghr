@@ -14,11 +14,11 @@ Detailed documentation for ghr. For a quick overview and usage, see the
 - [Verification](verification.md) — verifier behavior, trust roots, skip flags, and recorded results.
 - [Reproducible builds](reproducible-builds.md) — release archive reproducibility and Authenticode stripping.
 
-## Design and implementation plans
+## Design and implementation
 
-- [Install identifiers](install-identifiers.md) — planned stable install IDs,
-  explicit command aliases, versioned state, and lazy migration. This design is
-  not implemented in the current release.
+- [Install identifiers](install-identifiers.md) — stable install IDs,
+  explicit command aliases, versioned state, and lazy migration, implemented
+  since v0.8.0.
 
 ## Install
 
@@ -55,7 +55,7 @@ files; see [Name resolution on Linux](troubleshooting.md).
 ## Uninstall
 
 Uninstall ghr from the package manager that installed it; see
-[Uninstall](install.md#uninstall).
+[Uninstall](install.md#uninstall-ghr-itself).
 
 ## Verification
 

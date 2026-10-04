@@ -87,10 +87,11 @@ ghr install cataggar/ghr RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC
 ```
 
 See the
-[documentation](https://github.com/cataggar/ghr/blob/main/doc/README.md)
+[documentation](https://cataggar.github.io/ghr/docs.html)
 for download, install, directories, uninstall, and verification details
 (including
-[verifying ghr's own releases](https://github.com/cataggar/ghr/blob/main/doc/verification.md)).
+[verifying ghr's own releases](https://cataggar.github.io/ghr/docs/verification.html)).
+The [Markdown sources](doc/README.md) remain in this repository.
 
 ## GitHub Actions
 
@@ -121,21 +122,35 @@ for details.
 
 ## Build from source
 
-The current source and `site/` require **official Zig 0.17.0**, not a
+The current source and `website/` require **official Zig 0.17.0**, not a
 development/nightly compiler. Install the signed compiler bundles with:
 
 ```sh
 ghr install cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 zig build -Doptimize=safe
 zig build test
-# Static site: codegen + compilation + prerender into site/dist/
-(cd site && zig build prod)
+# Static website: Markdown + routes + compilation + prerender into website/dist/
+(cd website && zig build prod)
 ```
 
-Site route/cache regression checks: `cd site && zig build test &&
-python3 tools/test-cache-freshness.py`. They use an isolated fixture project
-and keep Zig's cache warm while adding, renaming, and deleting routes,
-directories, and optional layouts.
+Website regression checks: `cd website && zig build test prod check`.
+All generation and checks use Zig; Koino converts `doc/**/*.md` mechanically,
+and merjs applies the shared layout and prerenders the result. `doc/README.md`
+becomes `/ghr/docs.html`; other documents become `/ghr/docs/<name>.html`.
+Relative Markdown links and heading fragments are checked and rewritten;
+links outside `doc/` point to GitHub source files. Raw HTML is omitted by
+Koino's safe default. Edit Markdown in `doc/`, not generated route modules.
+
+The cache checks use an isolated fixture and keep Zig's cache warm while
+editing, adding, renaming, and deleting Markdown, routes, directories, and
+optional layouts. Production builds remove stale generated pages.
+
+The Pages workflow publishes only `website/dist/` and `.nojekyll` to the
+independent `website` branch. Its first commit has no parent; later publishes
+preserve that branch's history without force pushes. GitHub Pages serves the
+branch root at <https://cataggar.github.io/ghr/>. Publication is restricted to
+`main`, and explicitly requests a Pages build because `GITHUB_TOKEN` pushes
+do not automatically trigger branch-based Pages builds.
 
 CI runs native unit/help checks on Linux, macOS, and Windows. The required
 `Build & Test` aggregate succeeds only when those jobs, cross-target builds,

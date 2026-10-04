@@ -23,7 +23,8 @@ fn page() h.Node {
             h.p(.{}, "ghr is a single static binary that picks the right release asset for your OS and architecture, then verifies it with minisign, sigstore, or a plain checksum — on Mac, Linux, and Windows, and in GitHub Actions."),
             h.div(.{ .class = "hero-actions" }, .{
                 h.a(.{ .href = "https://github.com/cataggar/ghr", .class = "btn btn-primary" }, "View on GitHub"),
-                h.a(.{ .href = "https://github.com/cataggar/ghr#install", .class = "btn btn-secondary" }, "Install ghr"),
+                h.a(.{ .href = layout.base_path ++ "/docs/install.html", .class = "btn btn-secondary" }, "Install ghr"),
+                h.a(.{ .href = layout.base_path ++ "/docs.html", .class = "btn btn-secondary" }, "Documentation"),
                 h.a(.{ .href = layout.base_path ++ "/blog", .class = "btn btn-secondary" }, "Read the blog"),
             }),
         }),

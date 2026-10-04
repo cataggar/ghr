@@ -9,6 +9,25 @@ pub fn build(b: *std.Build) void {
     const merjs_dep = b.dependency("merjs", .{});
     const mer_mod = merjs_dep.module("mer");
     const runtime_mod = merjs_dep.module("runtime");
+    const config_mod = b.createModule(.{ .root_source_file = b.path("src/config.zig") });
+    const koino_dep = b.dependency("koino", .{ .target = b.graph.host, .optimize = .safe, .@"no-cli" = true });
+    const docs_mod = b.createModule(.{
+        .root_source_file = b.path("tools/docs.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+    });
+    docs_mod.addImport("koino", koino_dep.module("koino"));
+    docs_mod.addImport("config", config_mod);
+    const docs_exe = b.addExecutable(.{ .name = "docs", .root_module = docs_mod, .use_llvm = true });
+    const run_docs = b.addRunArtifact(docs_exe);
+    run_docs.addDirectoryArg(b.path("../doc"));
+    const generated_docs = run_docs.addOutputFileArg("docs.zig");
+    trackDocuments(b, run_docs);
+    const generated_docs_mod = b.createModule(.{ .root_source_file = generated_docs });
+    generated_docs_mod.addImport("mer", mer_mod);
+    const docs_tests = b.addTest(.{ .root_module = docs_mod, .use_llvm = true });
+    const test_step = b.step("test", "Test route and Markdown generation");
+    test_step.dependOn(&b.addRunArtifact(docs_tests).step);
 
     const main_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -21,7 +40,7 @@ pub fn build(b: *std.Build) void {
     main_mod.addImport("runtime", runtime_mod);
     addDirModules(b, main_mod, mer_mod, "app");
     addDirModules(b, main_mod, mer_mod, "api");
-    addRoutesModule(b, main_mod, mer_mod);
+    addRoutesModule(b, main_mod, mer_mod, generated_docs_mod);
 
     const exe = b.addExecutable(.{ .name = "site", .root_module = main_mod });
     b.installArtifact(exe);
@@ -35,7 +54,7 @@ pub fn build(b: *std.Build) void {
     codegen_mod.addImport("runtime", runtime_mod);
     const codegen_exe = b.addExecutable(.{ .name = "codegen", .root_module = codegen_mod });
     const codegen_tests = b.addTest(.{ .root_module = codegen_mod });
-    b.step("test", "Test route code generation").dependOn(&b.addRunArtifact(codegen_tests).step);
+    test_step.dependOn(&b.addRunArtifact(codegen_tests).step);
     const run_codegen = b.addRunArtifact(codegen_exe);
     run_codegen.setCwd(b.path("."));
     b.step("codegen", "Regenerate src/generated/routes.zig").dependOn(&run_codegen.step);
@@ -51,6 +70,7 @@ pub fn build(b: *std.Build) void {
 
     // zig build prerender — SSG: write dist/ for pages with `pub const prerender = true`.
     const run_prerender = b.addRunArtifact(exe);
+    run_prerender.setCwd(b.path("."));
     run_prerender.addArg("--prerender");
     run_prerender.step.dependOn(b.getInstallStep());
     b.step("prerender", "Pre-render pages to dist/").dependOn(&run_prerender.step);
@@ -60,13 +80,25 @@ pub fn build(b: *std.Build) void {
     prod_step.dependOn(&run_codegen.step);
     prod_step.dependOn(b.getInstallStep());
     prod_step.dependOn(&run_prerender.step);
+
+    const check_mod = b.createModule(.{
+        .root_source_file = b.path("tools/test-cache-freshness.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    });
+    const run_check = b.addRunArtifact(b.addExecutable(.{ .name = "check-cache", .root_module = check_mod }));
+    run_check.addDirectoryArg(b.path("."));
+    run_check.addArg(b.graph.zig_exe);
+    run_check.has_side_effects = true;
+    b.step("check", "Check warm-cache routes, Markdown and static output").dependOn(&run_check.step);
 }
 
-fn addRoutesModule(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Module) void {
+fn addRoutesModule(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Module, docs_mod: *std.Build.Module) void {
     const routes_mod = b.createModule(.{
         .root_source_file = b.path("src/generated/routes.zig"),
     });
     routes_mod.addImport("mer", mer_mod);
+    routes_mod.addImport("docs", docs_mod);
     addDirModules(b, routes_mod, mer_mod, "app");
     addDirModules(b, routes_mod, mer_mod, "api");
     mod.addImport("routes", routes_mod);
@@ -80,6 +112,7 @@ fn addDirModules(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Modu
         b.root.access(b.graph.io, layout_path, .{}) catch break :blk null;
         const m = b.createModule(.{ .root_source_file = b.path(layout_path) });
         m.addImport("mer", mer_mod);
+        m.addImport("config", b.createModule(.{ .root_source_file = b.path("src/config.zig") }));
         mod.addImport(b.fmt("{s}/layout", .{dir}), m);
         break :blk m;
     };
@@ -93,6 +126,7 @@ fn addDirModules(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Modu
             b.dependOnDirectoryContents(b.path(b.fmt("{s}/{s}", .{ dir, entry.path })));
             continue;
         }
+
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
         if (std.mem.eql(u8, entry.path, "layout.zig")) continue;
@@ -112,5 +146,21 @@ fn addDirModules(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Modu
         route_mod.addImport("mer", mer_mod);
         if (layout_mod) |lm| route_mod.addImport(b.fmt("{s}/layout", .{dir}), lm);
         mod.addImport(import_name, route_mod);
+    }
+}
+
+fn trackDocuments(b: *std.Build, run: *std.Build.Step.Run) void {
+    b.dependOnDirectoryContents(b.path("../doc"));
+    const dir = b.root.openDir(b.graph.io, "../doc", .{ .iterate = true }) catch |err| {
+        std.log.err("cannot open doc/: {s}", .{@errorName(err)});
+        @panic("documentation inputs are unavailable");
+    };
+    defer dir.close(b.graph.io);
+    var walker = dir.walk(b.allocator) catch @panic("cannot walk doc/");
+    defer walker.deinit();
+    while (walker.next(b.graph.io) catch @panic("cannot read doc/")) |entry| {
+        const path = b.path(b.fmt("../doc/{s}", .{entry.path}));
+        if (entry.kind == .directory) b.dependOnDirectoryContents(path);
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.path, ".md")) run.addFileInput(path);
     }
 }

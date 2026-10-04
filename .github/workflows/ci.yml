@@ -219,7 +219,7 @@ jobs:
           "zig-out/bin/$GHR_EXE" download --help
 
   site:
-    name: Site production and configuration cache freshness
+    name: Website production and configuration cache freshness
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
@@ -234,12 +234,12 @@ jobs:
             cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Test and build production site
-        working-directory: site
+        working-directory: website
         run: zig build test prod
 
       - name: Check configuration cache freshness
-        working-directory: site
-        run: python3 tools/test-cache-freshness.py
+        working-directory: website
+        run: zig build check
 
   cross-compile:
     name: Cross-compile ${{ matrix.target }}
