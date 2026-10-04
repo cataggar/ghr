@@ -17,24 +17,30 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       --bg:#f0ebe3; --bg2:#e8e2d9; --bg3:#ddd5cc;
-      --text:#252530; --muted:#8a7f78; --border:#d5cdc4;
+      --text:#252530; --muted:#6e625b; --border:#d5cdc4;
       --red:#e8251f; --red-dark:#aa1915; --paper:#fffdfa;
+      --header-height:76px;
     }
     body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,-apple-system,sans-serif; min-height:100vh; line-height:1.65; }
     a { color:inherit; text-decoration:none; }
+    :focus-visible { outline:3px solid var(--red-dark); outline-offset:4px; }
+    [id] { scroll-margin-top:calc(var(--header-height) + 24px); }
+    .skip-link { position:fixed; top:8px; left:16px; z-index:30; transform:translateY(-160%); padding:8px 16px; background:var(--paper); border:1px solid var(--border); border-radius:6px; }
+    .skip-link:focus { transform:none; }
     code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
     code { font-size:0.9em; background:var(--bg2); border-radius:4px; padding:2px 6px; }
     pre { background:#201014; color:#ffe8e7; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
     pre code { background:none; padding:0; color:inherit; }
     h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
     .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
-    .layout-wide { max-width:1080px; }
-    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
-    .site-logo-link { display:block; width:100%; }
-    .site-logo { display:block; width:100%; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
-    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
-    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
-    .nav a:hover { color:var(--text); }
+    .site-header { position:sticky; top:0; z-index:20; background:var(--paper); border-bottom:1px solid var(--border); }
+    .header-inner { display:flex; align-items:center; gap:32px; min-height:var(--header-height); max-width:1320px; margin:auto; padding:12px 32px; }
+    .site-brand { font-size:28px; font-weight:700; letter-spacing:-0.06em; color:var(--red-dark); }
+    .site-nav { display:flex; align-items:center; gap:24px; margin-left:auto; }
+    .site-nav a { font-size:14px; font-weight:600; color:var(--muted); }
+    .site-nav a:hover, .site-nav a[aria-current] { color:var(--red-dark); }
+    .header-cta { background:var(--red-dark); color:white; white-space:nowrap; }
+    .hero-art { display:block; width:100%; height:auto; border-radius:10px; margin:0 0 28px; }
     .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
     .hero h1 { font-size:clamp(32px,5vw,48px); line-height:1.05; margin-bottom:14px; }
     .hero p { max-width:60ch; color:#ffe8e7; font-size:17px; margin-bottom:22px; }
@@ -71,32 +77,98 @@
     .prose th { background:var(--bg2); }
     .prose img { max-width:100%; }
     .prose hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
-    .docs-nav { display:flex; flex-wrap:wrap; gap:8px 16px; padding-bottom:20px; border-bottom:1px solid var(--border); font-size:13px; }
+    .docs-layout { max-width:1320px; padding-top:32px; }
+    .docs-shell { display:grid; grid-template-columns:260px minmax(0,1fr); gap:56px; align-items:start; }
+    .docs-sidebar { position:sticky; top:calc(var(--header-height) + 24px); max-height:calc(100dvh - var(--header-height) - 48px); overflow-y:auto; padding:4px 12px 12px 0; }
+    .docs-menu > summary { display:none; }
+    .docs-index { font-size:14px; }
+    .docs-index-title { color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; margin:0 0 16px 12px; }
+    .docs-index ul { list-style:none; }
+    .docs-group { margin-bottom:12px; }
+    .docs-group > summary { cursor:pointer; font-weight:700; padding:8px 12px; border-radius:6px; }
+    .docs-group > summary:hover { background:var(--bg2); }
+    .docs-group ul { margin:4px 0 0 20px; padding-left:8px; border-left:1px solid var(--border); }
+    .docs-index a { display:block; border-radius:6px; padding:7px 12px; margin:2px 0; color:var(--muted); overflow-wrap:anywhere; }
+    .docs-index a:hover { color:var(--text); background:var(--bg2); }
+    .docs-index a[aria-current="page"] { color:var(--red-dark); background:#fbe3df; font-weight:700; }
+    .docs { min-width:0; max-width:80ch; overflow-wrap:anywhere; }
+    .docs h1, .docs h2, .docs h3, .docs h4, .docs h5, .docs h6 { font-family:'DM Sans',system-ui,sans-serif; font-weight:700; }
+    .docs h1 { font-size:clamp(28px,4vw,38px); margin-top:0; }
+    .docs h2 { border-top:1px solid var(--border); padding-top:24px; }
+    .docs pre, .docs table { max-width:100%; overflow-wrap:normal; }
     .doc-source { margin-top:32px; font-size:13px; color:var(--muted); }
     .back-link { display:inline-block; margin-bottom:24px; font-size:13px; color:var(--muted); }
     .back-link:hover { color:var(--text); }
     .attribution { margin-top:12px; font-size:12px; color:var(--muted); }
     .layout-footer { margin-top:64px; padding-top:24px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); text-align:center; }
     .layout-footer a { text-decoration:underline; text-underline-offset:2px; }
+    @media (max-width:959px) {
+      .docs-shell { display:block; }
+      .docs-sidebar { position:static; max-height:none; padding:0; margin-bottom:28px; }
+      .docs-menu { border:1px solid var(--border); border-radius:8px; background:var(--paper); }
+      .docs-menu > summary { display:list-item; cursor:pointer; font-weight:700; padding:12px 16px; }
+      .docs-index { padding:12px 16px; border-top:1px solid var(--border); }
+      .docs-index-title { display:none; }
+      .docs { max-width:none; }
+    }
+    @media (max-width:600px) {
+      :root { --header-height:112px; }
+      .header-inner { flex-wrap:wrap; gap:8px 16px; padding:12px 20px; }
+      .site-nav { order:3; width:100%; margin:0; justify-content:center; }
+      .header-cta { margin-left:auto; padding:8px 14px; }
+      .layout { padding:28px 20px 56px; }
+      .hero { padding:24px; }
+      .layout-footer { margin-top:40px; }
+    }
+    @media (prefers-reduced-motion:reduce) {
+      .btn { transition:none; }
+      .btn:hover { transform:none; }
+    }
 .mcss-display{display:inline-flex;}.mcss-align_items{align-items:center;}.mcss-padding{padding:4px 10px;}.mcss-border_radius{border-radius:999px;}.mcss-font_size{font-size:12px;}.mcss-font_weight{font-weight:700;}.mcss-letter_spacing{letter-spacing:0.04em;}.mcss-gap{gap:16px;}@media (min-width: 768px){.mcss-md-gap{gap:24px;}}    .badge-red { background:var(--red); color:#fff; }
     .badge-outline { border:1px solid var(--border); color:var(--muted); }
   </style>
 </head>
 <body>
-<div class="layout">
-  <header class="layout-header">
-    <nav class="nav">
-      <a href="/ghr/blog">Blog</a>
-      <a href="/ghr/docs.html">Documentation</a>
-      <a href="https://github.com/cataggar/ghr">GitHub</a>
-      <a href="/ghr/docs/install.html">Install</a>
-    </nav>
-    <a href="/ghr/" class="site-logo-link"><img src="https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg" alt="ghr logo" class="site-logo"></a>
-  </header>
-<article class="prose docs"><nav class="docs-nav" aria-label="Documentation"><a href="/ghr/docs.html">ghr documentation</a> <a href="/ghr/docs/directories.html">Directories</a> <a href="/ghr/docs/download.html">Download</a> <a href="/ghr/docs/github-actions.html">Caching in GitHub Actions</a> <a href="/ghr/docs/install-identifiers.html">Install identifiers: design and migration</a> <a href="/ghr/docs/install.html">Install</a> <a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a> <a href="/ghr/docs/troubleshooting.html">Name resolution on Linux</a> <a href="/ghr/docs/verification.html">Verification</a> <a href="/ghr/docs/wsl-linking.html">WSL: linking Windows-side bins (ghr link / ghr unlink)</a> </nav>
+<a class="skip-link" href="#main-content">Skip to content</a>
+<header class="site-header"><div class="header-inner">
+  <a href="/ghr/" class="site-brand" aria-label="ghr home">ghr</a>
+  <nav class="site-nav" aria-label="Main navigation">
+    <a href="/ghr/docs/getting-started.html" aria-current="location">Docs</a>
+    <a href="/ghr/blog">Blog</a>
+    <a href="https://github.com/cataggar/ghr">GitHub</a>
+  </nav>
+  <a href="/ghr/docs/getting-started.html" class="btn header-cta">Get started</a>
+</div></header>
+<div class="layout docs-layout">
+<div class="docs-shell">
+<aside class="docs-sidebar"><details class="docs-menu" open><summary>Documentation menu</summary>
+<nav class="docs-index" aria-label="Documentation"><p class="docs-index-title">Documentation</p><ul>
+<li><details class="docs-group" open><summary>Getting started</summary><ul>
+<li><a href="/ghr/docs/getting-started.html">Quick start</a></li>
+<li><a href="/ghr/docs.html" aria-current="page">Overview</a></li>
+<li><a href="/ghr/docs/install.html">Installation</a></li>
+</ul></details></li>
+<li><details class="docs-group"><summary>Guides</summary><ul>
+<li><a href="/ghr/docs/download.html">Download assets</a></li>
+<li><a href="/ghr/docs/github-actions.html">GitHub Actions</a></li>
+<li><a href="/ghr/docs/wsl-linking.html">WSL linking</a></li>
+<li><a href="/ghr/docs/troubleshooting.html">Troubleshooting</a></li>
+</ul></details></li>
+<li><details class="docs-group"><summary>Reference</summary><ul>
+<li><a href="/ghr/docs/directories.html">Directories</a></li>
+<li><a href="/ghr/docs/verification.html">Verification</a></li>
+</ul></details></li>
+<li><details class="docs-group"><summary>Development</summary><ul>
+<li><a href="/ghr/docs/install-identifiers.html">Install identifiers</a></li>
+<li><a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a></li>
+</ul></details></li>
+</ul></nav></details></aside>
+<main id="main-content" tabindex="-1" class="prose docs">
 <h1><a href="#ghr-documentation" id="ghr-documentation"></a>ghr documentation</h1>
 <p>Detailed documentation for ghr. For a quick overview and usage, see the
 <a href="https://github.com/cataggar/ghr/blob/main/README.md">top-level README</a>.</p>
+<p>New to ghr? Follow <a href="/ghr/docs/getting-started.html">Getting started</a> to install ghr and
+your first tool.</p>
 <h2><a href="#topics" id="topics"></a>Topics</h2>
 <ul>
 <li><a href="/ghr/docs/install.html">Install</a> — install ghr, see CLI examples, and uninstall it.</li>
@@ -144,7 +216,8 @@ install results in <a href="/ghr/docs/verification.html">Verification</a>.</p>
 <p>Linux and macOS release archives are byte-reproducible, and Windows builds are
 checked after stripping Authenticode signatures; see
 <a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a>.</p>
-<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/README.md">View Markdown source</a></p></article>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/README.md">View Markdown source</a></p></main>
+</div>
 
   <footer class="layout-footer">
     Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.17.0 &middot;
@@ -154,6 +227,14 @@ checked after stripping Authenticode signatures; see
       licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
     </span>
   </footer>
-</div>
+</div><script>
+  const menu = document.querySelector('.docs-menu');
+  if (menu) {
+    const desktop = window.matchMedia('(min-width: 960px)');
+    const updateMenu = () => { menu.open = desktop.matches; };
+    desktop.addEventListener('change', updateMenu);
+    updateMenu();
+  }
+</script>
 </body>
 </html>

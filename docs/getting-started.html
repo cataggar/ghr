@@ -8,10 +8,10 @@
   <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="icon" href="/ghr/favicon.ico" sizes="any">
   <link rel="icon" href="/ghr/favicon-32x32.png" type="image/png" sizes="32x32">
-  <title>ghr — a toolkit for GitHub releases — ghr</title>
-  <meta name="description" content="Install tools from GitHub releases with one cross-platform command. A single static binary that picks the right asset for your OS and architecture, and verifies it with minisign, sigstore, or checksums.">
-  <meta property="og:title" content="ghr — a toolkit for GitHub releases">
-  <meta property="og:description" content="Install tools from GitHub releases with one cross-platform command. A single static binary that picks the right asset for your OS and architecture, and verifies it with minisign, sigstore, or checksums.">
+  <title>Getting started — ghr</title>
+  <meta name="description" content="A toolkit for GitHub releases.">
+  <meta property="og:title" content="Getting started">
+  <meta property="og:description" content="A toolkit for GitHub releases.">
   <meta property="og:type" content="website">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -133,15 +133,93 @@
 <header class="site-header"><div class="header-inner">
   <a href="/ghr/" class="site-brand" aria-label="ghr home">ghr</a>
   <nav class="site-nav" aria-label="Main navigation">
-    <a href="/ghr/docs/getting-started.html">Docs</a>
+    <a href="/ghr/docs/getting-started.html" aria-current="location">Docs</a>
     <a href="/ghr/blog">Blog</a>
     <a href="https://github.com/cataggar/ghr">GitHub</a>
   </nav>
   <a href="/ghr/docs/getting-started.html" class="btn header-cta">Get started</a>
 </div></header>
-<div class="layout">
-<main id="main-content" tabindex="-1">
-<div><section class="hero"><img class="hero-art" src="https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg" alt="ghr logo"><span class="mcss-display mcss-align_items mcss-padding mcss-border_radius mcss-font_size mcss-font_weight mcss-letter_spacing badge-outline" style="background:rgba(255,255,255,0.14);color:#ffe5e4;border-color:rgba(255,255,255,0.2);margin-bottom:14px;">TOOLKIT FOR GITHUB RELEASES</span><h1>Install tools from GitHub releases with one command.</h1><p>ghr is a single static binary that picks the right release asset for your OS and architecture, then verifies it with minisign, sigstore, or a plain checksum — on Mac, Linux, and Windows, and in GitHub Actions.</p><div class="hero-actions"><a class="btn btn-primary" href="/ghr/docs/getting-started.html">Get started</a><a class="btn btn-secondary" href="/ghr/docs/getting-started.html">Docs</a><a class="btn btn-secondary" href="https://github.com/cataggar/ghr">View on GitHub</a></div></section><section><div class="section-title">Quick install</div><pre><code>curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | sh</code></pre><pre><code>iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex</code></pre><pre><code>brew install cataggar/ghr/ghr   # or: winget install ghr</code></pre><pre><code>pipx install ghr-bin             # or: uv tool install ghr-bin</code></pre></section><section><div class="section-title">What it does</div><div class="grid mcss-gap mcss-md-gap"><div class="card"><h3>Cross-platform installs</h3><p>ghr picks the right archive for your OS and CPU architecture automatically — one command works on macOS, Linux, and Windows.</p></div><div class="card"><h3>Verified, not just downloaded</h3><p>Every install can check GitHub's own SHA-256, a minisign signature, and a sigstore bundle before anything is extracted.</p></div><div class="card"><h3>Built for GitHub Actions</h3><p>actions/install and actions/download install several tools in one cached step, sharing an HTTP client and auth token.</p></div><div class="card"><h3>Install ghr with ghr</h3><p>ghr can install itself from its own releases — the same verification path every other tool gets.</p></div><div class="card"><h3>No key files on disk</h3><p>ghr minisign sign reads its secret key and password from the environment, so a release job is a single step.</p></div><div class="card"><h3>Fork and self-host</h3><p>Mirroring or re-publishing a project's releases is a normal GitHub fork — no separate registry to run.</p></div></div></section><section><div class="section-title">From the blog</div><div class="post-list"><article class="post-card"><h3>ghr: a toolkit for GitHub releases</h3><p>Why ghr exists, how installs are verified with GitHub's checksum, minisign, and sigstore, and what it looks like to install ghr with ghr itself.</p><a class="read-more" href="https://cataggar.medium.com/ghr-a-toolkit-for-github-releases-60bc489cf3aa" rel="noopener" target="_blank">Read more →</a></article><article class="post-card"><h3>Installable WebAssembly apps</h3><p>Teaching ghr to install WASI 0.3 WebAssembly components straight from a GitHub release — a 3 KB app that runs unmodified on Windows, Linux, and macOS.</p><a class="read-more" href="https://cataggar.medium.com/installable-webassembly-apps-a9c44038a7d9" rel="noopener" target="_blank">Read more →</a></article><article class="post-card"><h3>Installable WASI 0.3 Pet Store example</h3><p>A two-component WebAssembly example — a web component and a storage component talking over a component-model interface — installed with a single ghr command.</p><a class="read-more" href="https://cataggar.medium.com/installable-wasi-0-3-pet-store-example-beb0e04101a6" rel="noopener" target="_blank">Read more →</a></article></div></section></div></main>
+<div class="layout docs-layout">
+<div class="docs-shell">
+<aside class="docs-sidebar"><details class="docs-menu" open><summary>Documentation menu</summary>
+<nav class="docs-index" aria-label="Documentation"><p class="docs-index-title">Documentation</p><ul>
+<li><details class="docs-group" open><summary>Getting started</summary><ul>
+<li><a href="/ghr/docs/getting-started.html" aria-current="page">Quick start</a></li>
+<li><a href="/ghr/docs.html">Overview</a></li>
+<li><a href="/ghr/docs/install.html">Installation</a></li>
+</ul></details></li>
+<li><details class="docs-group"><summary>Guides</summary><ul>
+<li><a href="/ghr/docs/download.html">Download assets</a></li>
+<li><a href="/ghr/docs/github-actions.html">GitHub Actions</a></li>
+<li><a href="/ghr/docs/wsl-linking.html">WSL linking</a></li>
+<li><a href="/ghr/docs/troubleshooting.html">Troubleshooting</a></li>
+</ul></details></li>
+<li><details class="docs-group"><summary>Reference</summary><ul>
+<li><a href="/ghr/docs/directories.html">Directories</a></li>
+<li><a href="/ghr/docs/verification.html">Verification</a></li>
+</ul></details></li>
+<li><details class="docs-group"><summary>Development</summary><ul>
+<li><a href="/ghr/docs/install-identifiers.html">Install identifiers</a></li>
+<li><a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a></li>
+</ul></details></li>
+</ul></nav></details></aside>
+<main id="main-content" tabindex="-1" class="prose docs">
+<h1><a href="#getting-started" id="getting-started"></a>Getting started</h1>
+<p>ghr installs tools from GitHub releases. It selects the asset for your operating
+system and architecture, verifies the download, and exposes the installed
+commands from one shared bin directory.</p>
+<h2><a href="#install-ghr" id="install-ghr"></a>Install ghr</h2>
+<p>Choose the command for your environment:</p>
+<pre><code class="language-sh"># macOS with Homebrew
+brew install cataggar/ghr/ghr
+
+# Windows with winget
+winget install ghr
+
+# Linux, macOS, or Windows with uv
+uv tool install ghr-bin
+</code></pre>
+<p>Check that ghr is available:</p>
+<pre><code class="language-sh">ghr --version
+</code></pre>
+<p>See <a href="/ghr/docs/install.html">Installation</a> for other package managers, direct release
+downloads, and uninstall instructions. In CI, use the first-party
+<a href="/ghr/docs/github-actions.html">GitHub Actions</a> instead of installing a package manager.</p>
+<h2><a href="#install-your-first-tool" id="install-your-first-tool"></a>Install your first tool</h2>
+<p>Install ripgrep from its latest GitHub release:</p>
+<pre><code class="language-sh">ghr install BurntSushi/ripgrep
+</code></pre>
+<p>Add ghr's bin directory to your user <code>PATH</code>, then open a new terminal:</p>
+<pre><code class="language-sh">ghr path add
+</code></pre>
+<p>Run the tool and inspect your installed tools:</p>
+<pre><code class="language-sh">rg --version
+ghr list
+</code></pre>
+<p>To choose a release, append its tag to the repository:</p>
+<pre><code class="language-sh">ghr install BurntSushi/ripgrep@15.1.0
+</code></pre>
+<p>Reinstalling the same repository upgrades that installation. See
+<a href="/ghr/docs/install.html#stable-ids-and-replacement">Installation</a> for independent install
+IDs and command aliases, and <a href="/ghr/docs/directories.html">Directories</a> for storage and
+<code>PATH</code> details.</p>
+<h2><a href="#understand-verification" id="understand-verification"></a>Understand verification</h2>
+<p>ghr checks the GitHub asset digest and supported verification material published
+with a release, including checksum files, Sigstore bundles, and GitHub artifact
+attestations. Minisign verification additionally requires a trusted public key.
+Verification failures stop the operation; an unavailable signature is not a
+claim that an asset has been independently authenticated.</p>
+<p>See <a href="/ghr/docs/verification.html">Verification</a> for trust roots, recorded results, and how
+to require Minisign verification. Keep verification enabled for normal installs.</p>
+<h2><a href="#next-steps" id="next-steps"></a>Next steps</h2>
+<ul>
+<li><a href="/ghr/docs/download.html">Download assets</a> without installing them.</li>
+<li><a href="/ghr/docs/github-actions.html">Use ghr in GitHub Actions</a> with caching.</li>
+<li><a href="/ghr/docs/wsl-linking.html">Link Windows tools into WSL</a>.</li>
+<li>Browse the <a href="/ghr/docs.html">documentation overview</a> for all topics.</li>
+</ul>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/getting-started.md">View Markdown source</a></p></main>
+</div>
 
   <footer class="layout-footer">
     Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.17.0 &middot;
@@ -151,5 +229,14 @@
       licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
     </span>
   </footer>
-</div></body>
+</div><script>
+  const menu = document.querySelector('.docs-menu');
+  if (menu) {
+    const desktop = window.matchMedia('(min-width: 960px)');
+    const updateMenu = () => { menu.open = desktop.matches; };
+    desktop.addEventListener('change', updateMenu);
+    updateMenu();
+  }
+</script>
+</body>
 </html>
