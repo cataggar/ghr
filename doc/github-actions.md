@@ -212,8 +212,8 @@ repository, creates `minisign.key` and `minisign.pub` in the current directory,
 and refuses to overwrite existing key files. It checks for both
 `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` before provisioning and refuses
 if either secret already exists, unless you explicitly authorize replacement
-with `--replace-existing-secrets`. Default setup never changes the password
-secret, even with that flag.
+with `--force`. This flag does not overwrite local key files. Default setup
+never changes the password secret, even with that flag.
 
 Generation and signing both use
 [`cataggar/minizign`](https://github.com/cataggar/minizign) as an in-process
@@ -262,7 +262,7 @@ repository:
 
 ```sh
 ghr minisign generate --repo OWNER/REPO \
-  --reuse-existing-local-pair --replace-existing-secrets
+  --reuse-existing-local-pair --force
 ```
 
 `--reuse-existing-local-pair` validates that the private and public keys
@@ -270,7 +270,7 @@ match; it never generates a key or rewrites the private file. If
 `minisign.pub` is missing, it reconstructs that public file from the same
 private key. Mismatched keys, unsafe private-file permissions, or incorrect
 encryption options/passwords fail before upload.
-`--replace-existing-secrets` explicitly permits replacing signing secrets,
+`--force` explicitly permits replacing signing secrets,
 including any uploaded before the failure, with values from **the same key
 pair**. Inspect the target and existing secrets first; do not regenerate or
 rotate a key just to recover from an upload failure.
@@ -280,7 +280,7 @@ If the original pair was password-encrypted, set the original
 
 ```sh
 ghr minisign generate --repo OWNER/REPO --encrypt \
-  --reuse-existing-local-pair --replace-existing-secrets
+  --reuse-existing-local-pair --force
 ```
 
 The encrypted retry decrypts and validates the existing pair before upload,
