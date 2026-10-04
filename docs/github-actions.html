@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="/ghr/favicon.ico" sizes="any">
+  <link rel="icon" href="/ghr/favicon-32x32.png" type="image/png" sizes="32x32">
+  <title>Caching in GitHub Actions — ghr</title>
+  <meta name="description" content="A toolkit for GitHub releases.">
+  <meta property="og:title" content="Caching in GitHub Actions">
+  <meta property="og:description" content="A toolkit for GitHub releases.">
+  <meta property="og:type" content="website">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#f0ebe3; --bg2:#e8e2d9; --bg3:#ddd5cc;
+      --text:#252530; --muted:#8a7f78; --border:#d5cdc4;
+      --red:#e8251f; --red-dark:#aa1915; --paper:#fffdfa;
+    }
+    body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,-apple-system,sans-serif; min-height:100vh; line-height:1.65; }
+    a { color:inherit; text-decoration:none; }
+    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    code { font-size:0.9em; background:var(--bg2); border-radius:4px; padding:2px 6px; }
+    pre { background:#201014; color:#ffe8e7; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
+    pre code { background:none; padding:0; color:inherit; }
+    h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
+    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
+    .layout-wide { max-width:1080px; }
+    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
+    .site-logo-link { display:block; width:100%; }
+    .site-logo { display:block; width:100%; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
+    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
+    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
+    .nav a:hover { color:var(--text); }
+    .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
+    .hero h1 { font-size:clamp(32px,5vw,48px); line-height:1.05; margin-bottom:14px; }
+    .hero p { max-width:60ch; color:#ffe8e7; font-size:17px; margin-bottom:22px; }
+    .hero-actions { display:flex; gap:12px; flex-wrap:wrap; }
+    .btn { display:inline-flex; align-items:center; font-size:14px; font-weight:700; padding:11px 20px; border-radius:8px; transition:transform 0.15s ease, opacity 0.15s ease; }
+    .btn:hover { transform:translateY(-1px); }
+    .btn-primary { background:#fff; color:var(--red-dark); }
+    .btn-secondary { background:rgba(255,255,255,0.14); color:#fff; border:1px solid rgba(255,255,255,0.2); }
+    .btn-ghost { background:transparent; color:var(--text); border:1px solid var(--border); }
+    .btn-ghost:hover { border-color:var(--text); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+    .card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px; }
+    .card h3 { font-size:16px; margin-bottom:8px; }
+    .card p { font-size:14px; color:var(--muted); }
+    .section-title { font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:16px; }
+    section + section { margin-top:48px; }
+    .post-list { display:flex; flex-direction:column; gap:16px; }
+    .post-card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px 24px; }
+    .post-card h3 { font-size:18px; margin-bottom:6px; }
+    .post-card p { color:var(--muted); font-size:14px; }
+    .post-card .read-more { display:inline-block; margin-top:10px; font-size:13px; font-weight:700; color:var(--red); }
+    .prose h2 { font-size:24px; margin:32px 0 14px; }
+    .prose h3 { font-size:19px; margin:24px 0 10px; }
+    .prose p { margin-bottom:16px; }
+    .prose ul, .prose ol { margin:0 0 16px 24px; }
+    .prose li { margin-bottom:6px; }
+    .prose blockquote { border-left:3px solid var(--red); padding-left:16px; color:var(--muted); margin:0 0 16px; }
+    .prose h1 { font-size:36px; line-height:1.2; margin:24px 0; }
+    .prose h4, .prose h5, .prose h6 { margin:20px 0 10px; }
+    .prose a { color:var(--red-dark); text-decoration:underline; text-underline-offset:3px; }
+    .prose pre { margin:16px 0; }
+    .prose table { display:block; overflow-x:auto; border-collapse:collapse; margin:20px 0; }
+    .prose th, .prose td { border:1px solid var(--border); padding:8px 12px; text-align:left; }
+    .prose th { background:var(--bg2); }
+    .prose img { max-width:100%; }
+    .prose hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
+    .docs-nav { display:flex; flex-wrap:wrap; gap:8px 16px; padding-bottom:20px; border-bottom:1px solid var(--border); font-size:13px; }
+    .doc-source { margin-top:32px; font-size:13px; color:var(--muted); }
+    .back-link { display:inline-block; margin-bottom:24px; font-size:13px; color:var(--muted); }
+    .back-link:hover { color:var(--text); }
+    .attribution { margin-top:12px; font-size:12px; color:var(--muted); }
+    .layout-footer { margin-top:64px; padding-top:24px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); text-align:center; }
+    .layout-footer a { text-decoration:underline; text-underline-offset:2px; }
+.mcss-display{display:inline-flex;}.mcss-align_items{align-items:center;}.mcss-padding{padding:4px 10px;}.mcss-border_radius{border-radius:999px;}.mcss-font_size{font-size:12px;}.mcss-font_weight{font-weight:700;}.mcss-letter_spacing{letter-spacing:0.04em;}.mcss-gap{gap:16px;}@media (min-width: 768px){.mcss-md-gap{gap:24px;}}    .badge-red { background:var(--red); color:#fff; }
+    .badge-outline { border:1px solid var(--border); color:var(--muted); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <header class="layout-header">
+    <nav class="nav">
+      <a href="/ghr/blog">Blog</a>
+      <a href="/ghr/docs.html">Documentation</a>
+      <a href="https://github.com/cataggar/ghr">GitHub</a>
+      <a href="/ghr/docs/install.html">Install</a>
+    </nav>
+    <a href="/ghr/" class="site-logo-link"><img src="https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg" alt="ghr logo" class="site-logo"></a>
+  </header>
+<article class="prose docs"><nav class="docs-nav" aria-label="Documentation"><a href="/ghr/docs.html">ghr documentation</a> <a href="/ghr/docs/directories.html">Directories</a> <a href="/ghr/docs/download.html">Download</a> <a href="/ghr/docs/github-actions.html">Caching in GitHub Actions</a> <a href="/ghr/docs/install-identifiers.html">Install identifiers: design and migration</a> <a href="/ghr/docs/install.html">Install</a> <a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a> <a href="/ghr/docs/troubleshooting.html">Name resolution on Linux</a> <a href="/ghr/docs/verification.html">Verification</a> <a href="/ghr/docs/wsl-linking.html">WSL: linking Windows-side bins (ghr link / ghr unlink)</a> </nav>
+<h1><a href="#caching-in-github-actions" id="caching-in-github-actions"></a>Caching in GitHub Actions</h1>
+<p>The first-party actions bootstrap an exact static <code>ghr</code> release with the
+runner-provided Node action runtime, then cache downloaded or installed tools
+under user-writable <code>$RUNNER_TEMP</code> paths. They do not require Python, <code>pipx</code>,
+<code>curl</code>, <code>gh</code>, or package-manager setup.</p>
+<p>Official minimal Linux images can also omit <code>ca-certificates</code>. If no standard
+Linux CA bundle exists, <code>actions/setup</code> materializes the runner's maintained
+Node 24 TLS roots under <code>$RUNNER_TEMP</code> and exports <code>SSL_CERT_FILE</code> for <code>ghr</code>.
+Existing system trust is left untouched. Releases before <code>v0.8.0</code> also need a
+compatibility link at Zig's standard CA location, so bootstrapping those older
+versions in a bare non-root container requires a preinstalled CA bundle.</p>
+<p>GitHub-hosted runner images include many convenience tools, including <code>pipx</code>.
+A job-level <code>container:</code> supplies a different user space and does not inherit
+those hosted-image packages. Do not assume a tool listed on the hosted runner
+image is available in an arbitrary Ubuntu or Debian container.</p>
+<h2><a href="#recommended-composite-actions" id="recommended-composite-actions"></a>Recommended: composite actions</h2>
+<p>This repository ships two composite actions that wrap the dance below
+end-to-end:</p>
+<ul>
+<li><a href="https://github.com/cataggar/ghr/blob/main/actions/setup/README.md"><code>cataggar/ghr/actions/setup</code></a> —
+install one exact, independently verified static CLI release.</li>
+<li><a href="https://github.com/cataggar/ghr/blob/main/actions/install/README.md"><code>cataggar/ghr/actions/install</code></a> —
+install one or more tools with cross-run caching.</li>
+<li><a href="https://github.com/cataggar/ghr/blob/main/actions/download/README.md"><code>cataggar/ghr/actions/download</code></a> —
+download (and optionally extract) one or more release assets with
+cross-run caching.</li>
+</ul>
+<pre><code class="language-yaml">- uses: cataggar/ghr/actions/install@v0.8.0  # pin to the matching ghr release
+  with:
+    tools: |
+      BurntSushi/ripgrep@14.1.0 ?id=rg-14-1-0&amp;alias=rg:rg-14-1-0
+      BurntSushi/ripgrep@14.1.1 ?id=rg-14-1-1&amp;alias=rg:rg-14-1-1
+      sharkdp/fd@v10.2.0
+</code></pre>
+<p>Each line is one complete install request: a source, optional query token, and
+optional bare minisign key. Query tokens do not need shell quotes inside the
+YAML block, though matching quotes are accepted. To verify some tools with
+minisign, attach the public key after that request. Inline keys override the
+action-level <code>minisign:</code> default:</p>
+<pre><code class="language-yaml">- uses: cataggar/ghr/actions/install@v0.8.0
+  with:
+    tools: |
+      jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+      BurntSushi/ripgrep@14.1.1
+      sharkdp/fd@v10.2.0
+</code></pre>
+<p>The actions ship in this same repository, so their git tags are the
+same as <code>ghr</code>'s — pinning <code>@v0.8.0</code> pins both the action body and the
+static binary the action verifies. Pick the latest tag from
+<a href="https://github.com/cataggar/ghr/releases">the releases page</a>.</p>
+<p>For a reviewed commit pin, select the CLI release separately:</p>
+<pre><code class="language-yaml">- uses: cataggar/ghr/actions/install@&lt;reviewed-commit-sha&gt;
+  with:
+    ghr-version: v0.8.0
+    tools: sharkdp/fd@v10.2.0
+</code></pre>
+<p>An explicit exact version always wins. Commit, branch, floating-tag, range, and
+<code>latest</code> action refs cannot imply a CLI version and fail if <code>ghr-version</code> is
+omitted. The composite actions use GitHub's exact-commit <code>$/actions/setup</code>
+self-reference and require Actions runner 2.336.0 or newer.</p>
+<h2><a href="#manual-development-recipe-ghr-install" id="manual-development-recipe-ghr-install"></a>Manual development recipe (<code>ghr install</code>)</h2>
+<p>If Python and <code>pipx</code> are already available in a development environment, a
+manual recipe remains possible:</p>
+<pre><code class="language-yaml">- run: pipx install ghr-bin
+  shell: bash
+
+- name: Point ghr at a cacheable directory
+  shell: bash
+  run: |
+    echo &quot;GHR_TOOL_DIR=$RUNNER_TEMP/ghr-tools&quot;  &gt;&gt; &quot;$GITHUB_ENV&quot;
+    echo &quot;GHR_BIN_DIR=$RUNNER_TEMP/ghr-bin&quot;     &gt;&gt; &quot;$GITHUB_ENV&quot;
+    echo &quot;GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache&quot; &gt;&gt; &quot;$GITHUB_ENV&quot;
+    echo &quot;$RUNNER_TEMP/ghr-bin&quot; &gt;&gt; &quot;$GITHUB_PATH&quot;
+
+- uses: actions/cache@v4
+  id: ghr-cache
+  with:
+    path: |
+      ${{ runner.temp }}/ghr-tools
+      ${{ runner.temp }}/ghr-bin
+      ${{ runner.temp }}/ghr-cache
+    key: ghr-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0
+
+- if: steps.ghr-cache.outputs.cache-hit != 'true'
+  run: |
+    ghr install \
+      BurntSushi/ripgrep@14.1.1 \
+      sharkdp/fd@v10.2.0
+
+- run: ghr list  # sanity check after a cache restore
+</code></pre>
+<p><code>ghr install</code> is multi-spec: pass every tool as a positional argument
+in a single invocation so they share one HTTP client + auth context,
+and the cache step pairs naturally with one install step. Use
+<code>--keep-going</code> to attempt every spec even if one fails.</p>
+<h2><a href="#cache-key-shape" id="cache-key-shape"></a>Cache key shape</h2>
+<p>The install action asks the ID-capable CLI to hash normalized complete
+definitions. Its key invalidates cleanly when:</p>
+<ul>
+<li>the runner OS or architecture changes,</li>
+<li>the target ABI changes (for example, glibc versus musl),</li>
+<li>a source, pinned tag, stable ID, alias, or selected command changes,</li>
+<li>a verification skip policy or minisign key changes,</li>
+<li>the install-state schema/layout generation changes,</li>
+<li><code>ghr</code> itself is upgraded (the install layout could shift between
+versions).</li>
+</ul>
+<p>Request order does not affect the key, but query tokens and keys are never
+sorted away from their source. The action refuses to run with an older CLI
+that cannot produce this fingerprint.</p>
+<h2><a href="#caveats" id="caveats"></a>Caveats</h2>
+<ul>
+<li>Verification metadata (<code>ghr.json</code>, sigstore bundles, checksum sidecars)
+is stored under <code>GHR_TOOL_DIR</code> as regular files and survives a cache
+round-trip — verification happens at install time, not on restore.</li>
+<li>Windows shims are regular files (the runtime resolves them through
+PATH) and survive the cache round-trip cleanly.</li>
+<li>The setup cache is independent from the installed-tool cache. Its exact key
+includes the setup-cache schema, normalized target, release tag, and archive
+digest. Every restore is rehashed, safely re-extracted, compared with the
+authenticated archive, and version/target checked before execution.</li>
+<li>The default bootstrap requires GitHub release provenance. Grant
+<code>contents: read</code> and <code>attestations: read</code>, or supply an independently trusted
+<code>ghr-sha256</code> that also matches GitHub's asset digest.</li>
+</ul>
+<h2><a href="#caching-ghr-download" id="caching-ghr-download"></a>Caching <code>ghr download</code></h2>
+<p><code>ghr download</code> lands files in the user-chosen directory rather than a
+managed cache, so the pattern is slightly simpler — cache the
+destination directory and the extracted contents (if <code>--extract</code> is
+used):</p>
+<pre><code class="language-yaml">- uses: cataggar/ghr/actions/download@v0.8.0  # pin to the matching ghr release
+  with:
+    tools: |
+      BurntSushi/ripgrep@14.1.1
+      sharkdp/fd@v10.2.0
+    extract: 'true'
+    strip-components: '1'
+    dest: ./bin
+</code></pre>
+<p>Hand-rolled equivalent:</p>
+<pre><code class="language-yaml">- uses: actions/cache@v4
+  id: ghr-dl-cache
+  with:
+    path: ./bin
+    key: ghr-dl-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0
+
+- if: steps.ghr-dl-cache.outputs.cache-hit != 'true'
+  run: |
+    pipx install ghr-bin
+    mkdir -p ./bin
+    ghr download \
+      BurntSushi/ripgrep@14.1.1 \
+      sharkdp/fd@v10.2.0 \
+      --extract ./bin --strip-components 1
+</code></pre>
+<p>The same multi-spec rules apply: <code>-o</code> and <code>--sha256</code> are rejected when
+more than one spec is supplied — <code>--extract &lt;dir&gt;</code> is the multi-spec
+equivalent of <code>-o</code>, and verification falls back to whatever GitHub asset
+digest, sigstore, or sha256 sidecars the release publishes, plus any
+GitHub artifact attestation covering the downloaded digest.</p>
+<p>The download action's cache key includes extraction settings, every
+verification skip flag, and the minisign key as hashed material. A cache
+created under one verification policy is therefore never reused under another.</p>
+<h2><a href="#signing-releases" id="signing-releases"></a>Signing releases</h2>
+<h3><a href="#configure-repository-secrets" id="configure-repository-secrets"></a>Configure repository secrets</h3>
+<p>Run setup locally with <code>gh</code> installed and authenticated as an account allowed
+to manage the target repository's Actions secrets:</p>
+<pre><code class="language-sh">ghr minisign generate
+# Alternative: override gh's current repository context.
+ghr minisign generate --repo OWNER/REPO
+</code></pre>
+<p>The default repository follows GitHub CLI context; there is no interactive
+repository chooser. If that context cannot be resolved, setup fails before
+creating keys or uploading secrets. The command identifies the target
+repository, creates <code>minisign.key</code> and <code>minisign.pub</code> in the current directory,
+and refuses to overwrite existing key files. It checks for both
+<code>MINISIGN_SECRET_KEY</code> and <code>MINISIGN_PASSWORD</code> before provisioning and refuses
+if either secret already exists, unless you explicitly authorize replacement
+with <code>--force</code>. This flag does not overwrite local key files. Default setup
+never changes the password secret, even with that flag.</p>
+<p>Generation and signing both use
+<a href="https://github.com/cataggar/minizign"><code>cataggar/minizign</code></a> as an in-process
+library: neither needs a standalone <code>minisign</code> or <code>minizign</code> executable.
+Authenticated <code>gh</code> is still needed to upload repository secrets.</p>
+<p>The default uploads <strong>only <code>MINISIGN_SECRET_KEY</code></strong>. Its value is an
+unencrypted minisign-format private key; GitHub encrypts the repository secret
+in storage. <code>MINISIGN_PASSWORD</code> is optional and is not created or changed by
+default setup. No password-manager integration or separate passphrase-storage
+step is required.</p>
+<p>Before writing key material, generation protects the private file with mode
+<code>0600</code> on POSIX or a verified, protected owner-only DACL on Windows. Keep the
+local private key protected with restrictive permissions/ACLs.
+Never commit it, include it in a cache, upload it as a release or workflow
+artifact, or print key/password values in logs. Publish <code>minisign.pub</code> through
+a trusted channel (for example, the project's README or website) so consumers
+can pin the public key for verification. The public key and <code>.minisig</code>
+signatures can accompany release artifacts; the private key cannot.</p>
+<p>For comparison, the rough manual equivalent requires a separate <code>minisign</code>
+installation:</p>
+<pre><code class="language-sh">umask 077
+minisign -G -W -p minisign.pub -s minisign.key  # -W: no password encryption
+gh repo view --json nameWithOwner --jq .nameWithOwner
+gh secret list
+# Verify the target and that MINISIGN_SECRET_KEY does not already exist.
+gh secret set MINISIGN_SECRET_KEY &lt; minisign.key
+</code></pre>
+<p>The <code>gh</code> commands use the current repository; add <code>--repo OWNER/REPO</code> to each
+to override it. Unlike <code>ghr minisign generate</code>, <code>gh secret set</code> can replace an
+existing secret, so inspect the target and existing secrets before using the
+manual upload.</p>
+<p>If setup fails, check <code>gh</code> installation/authentication, repository context,
+and access to Actions secrets. For overwrite refusals, inspect the existing
+files and secrets rather than deleting them blindly. If an upload fails
+after key creation or after only some secrets were uploaded, retain the key
+pair and fix access. From the directory containing the original
+<code>minisign.key</code> (and <code>minisign.pub</code> if present), retry against the same
+repository:</p>
+<pre><code class="language-sh">ghr minisign generate --repo OWNER/REPO \
+  --reuse-existing-local-pair --force
+</code></pre>
+<p><code>--reuse-existing-local-pair</code> validates that the private and public keys
+match; it never generates a key or rewrites the private file. If
+<code>minisign.pub</code> is missing, it reconstructs that public file from the same
+private key. Mismatched keys, unsafe private-file permissions, or incorrect
+encryption options/passwords fail before upload.
+<code>--force</code> explicitly permits replacing signing secrets,
+including any uploaded before the failure, with values from <strong>the same key
+pair</strong>. Inspect the target and existing secrets first; do not regenerate or
+rotate a key just to recover from an upload failure.</p>
+<p>If the original pair was password-encrypted, set the original
+<code>MINISIGN_PASSWORD</code> in the local environment and also pass <code>--encrypt</code>:</p>
+<pre><code class="language-sh">ghr minisign generate --repo OWNER/REPO --encrypt \
+  --reuse-existing-local-pair --force
+</code></pre>
+<p>The encrypted retry decrypts and validates the existing pair before upload,
+then configures both secrets. Run <code>ghr minisign generate --help</code> for all
+options.</p>
+<h3><a href="#sign-artifacts" id="sign-artifacts"></a>Sign artifacts</h3>
+<p>After installing <code>ghr</code> with the setup action, sign without a private-key file
+on the runner:</p>
+<pre><code class="language-yaml">- run: ghr minisign sign artifact.tar.gz
+  env:
+    MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+</code></pre>
+<p>Each positional file produces its own <code>&lt;file&gt;.minisig</code>. The existing <code>-t</code>
+trusted-comment option remains supported. Signing takes keys and any required
+password from the environment, never a tty or stdin. Upload the artifacts
+and their signatures, not the private key.</p>
+<h3><a href="#opt-in-to-password-encrypted-keys" id="opt-in-to-password-encrypted-keys"></a>Opt in to password-encrypted keys</h3>
+<p>Supply a strong, nonempty <code>MINISIGN_PASSWORD</code> in the local environment, then
+run <code>ghr minisign generate --encrypt</code> (with <code>--repo OWNER/REPO</code> if needed).
+This mode uploads the key first, then <code>MINISIGN_PASSWORD</code> for unattended
+signing. A password-upload failure is incomplete setup, not success; use the
+encrypted retry above without rotating the key. Existing password-encrypted
+minisign keys remain supported. Only encrypted keys need both variables in
+the signing step:</p>
+<pre><code class="language-yaml">- run: ghr minisign sign artifact.tar.gz
+  env:
+    MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+    MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+</code></pre>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/github-actions.md">View Markdown source</a></p></article>
+
+  <footer class="layout-footer">
+    Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.17.0 &middot;
+    <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
+    <span class="attribution">Logo by
+      <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
+      licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+    </span>
+  </footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,829 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="/ghr/favicon.ico" sizes="any">
+  <link rel="icon" href="/ghr/favicon-32x32.png" type="image/png" sizes="32x32">
+  <title>Install identifiers: design and migration — ghr</title>
+  <meta name="description" content="A toolkit for GitHub releases.">
+  <meta property="og:title" content="Install identifiers: design and migration">
+  <meta property="og:description" content="A toolkit for GitHub releases.">
+  <meta property="og:type" content="website">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#f0ebe3; --bg2:#e8e2d9; --bg3:#ddd5cc;
+      --text:#252530; --muted:#8a7f78; --border:#d5cdc4;
+      --red:#e8251f; --red-dark:#aa1915; --paper:#fffdfa;
+    }
+    body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,-apple-system,sans-serif; min-height:100vh; line-height:1.65; }
+    a { color:inherit; text-decoration:none; }
+    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    code { font-size:0.9em; background:var(--bg2); border-radius:4px; padding:2px 6px; }
+    pre { background:#201014; color:#ffe8e7; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
+    pre code { background:none; padding:0; color:inherit; }
+    h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
+    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
+    .layout-wide { max-width:1080px; }
+    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
+    .site-logo-link { display:block; width:100%; }
+    .site-logo { display:block; width:100%; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
+    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
+    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
+    .nav a:hover { color:var(--text); }
+    .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
+    .hero h1 { font-size:clamp(32px,5vw,48px); line-height:1.05; margin-bottom:14px; }
+    .hero p { max-width:60ch; color:#ffe8e7; font-size:17px; margin-bottom:22px; }
+    .hero-actions { display:flex; gap:12px; flex-wrap:wrap; }
+    .btn { display:inline-flex; align-items:center; font-size:14px; font-weight:700; padding:11px 20px; border-radius:8px; transition:transform 0.15s ease, opacity 0.15s ease; }
+    .btn:hover { transform:translateY(-1px); }
+    .btn-primary { background:#fff; color:var(--red-dark); }
+    .btn-secondary { background:rgba(255,255,255,0.14); color:#fff; border:1px solid rgba(255,255,255,0.2); }
+    .btn-ghost { background:transparent; color:var(--text); border:1px solid var(--border); }
+    .btn-ghost:hover { border-color:var(--text); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+    .card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px; }
+    .card h3 { font-size:16px; margin-bottom:8px; }
+    .card p { font-size:14px; color:var(--muted); }
+    .section-title { font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:16px; }
+    section + section { margin-top:48px; }
+    .post-list { display:flex; flex-direction:column; gap:16px; }
+    .post-card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px 24px; }
+    .post-card h3 { font-size:18px; margin-bottom:6px; }
+    .post-card p { color:var(--muted); font-size:14px; }
+    .post-card .read-more { display:inline-block; margin-top:10px; font-size:13px; font-weight:700; color:var(--red); }
+    .prose h2 { font-size:24px; margin:32px 0 14px; }
+    .prose h3 { font-size:19px; margin:24px 0 10px; }
+    .prose p { margin-bottom:16px; }
+    .prose ul, .prose ol { margin:0 0 16px 24px; }
+    .prose li { margin-bottom:6px; }
+    .prose blockquote { border-left:3px solid var(--red); padding-left:16px; color:var(--muted); margin:0 0 16px; }
+    .prose h1 { font-size:36px; line-height:1.2; margin:24px 0; }
+    .prose h4, .prose h5, .prose h6 { margin:20px 0 10px; }
+    .prose a { color:var(--red-dark); text-decoration:underline; text-underline-offset:3px; }
+    .prose pre { margin:16px 0; }
+    .prose table { display:block; overflow-x:auto; border-collapse:collapse; margin:20px 0; }
+    .prose th, .prose td { border:1px solid var(--border); padding:8px 12px; text-align:left; }
+    .prose th { background:var(--bg2); }
+    .prose img { max-width:100%; }
+    .prose hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
+    .docs-nav { display:flex; flex-wrap:wrap; gap:8px 16px; padding-bottom:20px; border-bottom:1px solid var(--border); font-size:13px; }
+    .doc-source { margin-top:32px; font-size:13px; color:var(--muted); }
+    .back-link { display:inline-block; margin-bottom:24px; font-size:13px; color:var(--muted); }
+    .back-link:hover { color:var(--text); }
+    .attribution { margin-top:12px; font-size:12px; color:var(--muted); }
+    .layout-footer { margin-top:64px; padding-top:24px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); text-align:center; }
+    .layout-footer a { text-decoration:underline; text-underline-offset:2px; }
+.mcss-display{display:inline-flex;}.mcss-align_items{align-items:center;}.mcss-padding{padding:4px 10px;}.mcss-border_radius{border-radius:999px;}.mcss-font_size{font-size:12px;}.mcss-font_weight{font-weight:700;}.mcss-letter_spacing{letter-spacing:0.04em;}.mcss-gap{gap:16px;}@media (min-width: 768px){.mcss-md-gap{gap:24px;}}    .badge-red { background:var(--red); color:#fff; }
+    .badge-outline { border:1px solid var(--border); color:var(--muted); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <header class="layout-header">
+    <nav class="nav">
+      <a href="/ghr/blog">Blog</a>
+      <a href="/ghr/docs.html">Documentation</a>
+      <a href="https://github.com/cataggar/ghr">GitHub</a>
+      <a href="/ghr/docs/install.html">Install</a>
+    </nav>
+    <a href="/ghr/" class="site-logo-link"><img src="https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg" alt="ghr logo" class="site-logo"></a>
+  </header>
+<article class="prose docs"><nav class="docs-nav" aria-label="Documentation"><a href="/ghr/docs.html">ghr documentation</a> <a href="/ghr/docs/directories.html">Directories</a> <a href="/ghr/docs/download.html">Download</a> <a href="/ghr/docs/github-actions.html">Caching in GitHub Actions</a> <a href="/ghr/docs/install-identifiers.html">Install identifiers: design and migration</a> <a href="/ghr/docs/install.html">Install</a> <a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a> <a href="/ghr/docs/troubleshooting.html">Name resolution on Linux</a> <a href="/ghr/docs/verification.html">Verification</a> <a href="/ghr/docs/wsl-linking.html">WSL: linking Windows-side bins (ghr link / ghr unlink)</a> </nav>
+<h1><a href="#install-identifiers-design-and-migration" id="install-identifiers-design-and-migration"></a>Install identifiers: design and migration</h1>
+<h2><a href="#status" id="status"></a>Status</h2>
+<p>This document is the design contract and migration reference for the stable-ID
+syntax and v2 install state introduced in ghr v0.8.0. The ordered rollout is
+complete. Older ghr releases continue to understand untouched legacy installs,
+but they cannot safely mutate v2 state.</p>
+<h2><a href="#goals" id="goals"></a>Goals</h2>
+<p>An install needs a stable name that does not change when its release, selected
+asset, download URL, or executable names change. That stable name is the
+<strong>install ID</strong>.</p>
+<p>The design separates four concepts:</p>
+<ol>
+<li><strong>ID</strong>: stable identity used by install, list, and uninstall.</li>
+<li><strong>Source intent</strong>: durable user input, such as a GitHub repository and
+optional tag or asset selector.</li>
+<li><strong>Resolved provenance</strong>: the release, asset, URL, and digest selected for one
+completed install.</li>
+<li><strong>Configuration</strong>: durable choices such as aliases and verification
+material.</li>
+</ol>
+<p>This separation permits:</p>
+<ul>
+<li>two installs from the same repository under different IDs;</li>
+<li>replacing one ID without disturbing another;</li>
+<li>explicit executable renaming;</li>
+<li>safe ownership and collision checks before publication; and</li>
+<li>durable source intent that a future upgrade command can resolve again.</li>
+</ul>
+<h2><a href="#non-goals-for-this-release" id="non-goals-for-this-release"></a>Non-goals for this release</h2>
+<ul>
+<li>There is no <code>ghr upgrade</code> command in this release. Installing an existing ID
+replaces it transactionally.</li>
+<li>An ID does not implicitly rename an executable.</li>
+<li>This design does not make arbitrary install IDs into literal filesystem
+paths.</li>
+<li>Legacy installs are not eagerly rewritten.</li>
+<li>Downgrading to an old ghr after v2 state has been written is unsupported.</li>
+</ul>
+<h2><a href="#motivating-examples" id="motivating-examples"></a>Motivating examples</h2>
+<p>Install a repository release with a stable custom ID and rename its <code>zig</code>
+command to <code>zigb</code>:</p>
+<pre><code class="language-sh">ghr install cataggar/zig@zigb-0.16.1 &quot;?id=zigb&amp;alias=zig:zigb&quot;
+</code></pre>
+<p>Install another release from the same repository alongside it:</p>
+<pre><code class="language-sh">ghr install cataggar/zig@ziga-0.15.2 &quot;?id=ziga&amp;alias=zig:ziga&quot;
+</code></pre>
+<p>The IDs <code>zigb</code> and <code>ziga</code> coexist because identity is no longer derived solely
+from the repository. Neither ID implies an alias: the <code>alias</code> mapping is what
+changes the published command name.</p>
+<p>Existing inline minisign syntax remains valid:</p>
+<pre><code class="language-sh">ghr install jedisct1/minisign@0.12 \
+  RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+</code></pre>
+<p>A bare key is shorthand for minisign configuration attached to the preceding
+source. It is not a second install request.</p>
+<h2><a href="#terminology" id="terminology"></a>Terminology</h2>
+<ul>
+<li><strong>Source token</strong>: the positional token that says where to resolve an
+artifact.</li>
+<li><strong>Query token</strong>: a quoted positional token beginning with <code>?</code>, attached to
+the immediately preceding source token.</li>
+<li><strong>Request</strong>: one source token plus its query token and/or bare minisign key.</li>
+<li><strong>Canonical ID</strong>: the normalized ID used for comparisons and persisted
+ownership.</li>
+<li><strong>Unit</strong>: one independently replaceable installed directory and its owned
+commands. An archive or bare executable is normally one unit; each wasm
+module is a separate unit.</li>
+<li><strong>Command</strong>: a name published into ghr's bin directory.</li>
+<li><strong>Alias</strong>: an explicit mapping from a discovered command name to its
+published command name.</li>
+<li><strong>Legacy state</strong> or <strong>v1</strong>: the pre-v2 unversioned <code>ghr.json</code> layout under
+<code>&lt;tools&gt;/&lt;owner&gt;/&lt;repo&gt;/</code>, including nested wasm units.</li>
+<li><strong>v2 state</strong>: the versioned, ID-keyed state used by ID-capable ghr releases.</li>
+</ul>
+<h2><a href="#command-grammar" id="command-grammar"></a>Command grammar</h2>
+<p>The positional grammar is:</p>
+<pre><code class="language-text">install       = &quot;ghr install&quot; request *(request) [options]
+request       = source [query-token] [bare-minisign-key]
+source        = github-spec / github-release-url / generic-url
+query-token   = &quot;?&quot; query-pair *(&quot;&amp;&quot; query-pair)
+query-pair    = query-name &quot;=&quot; query-value
+</code></pre>
+<p>Each <code>&amp;</code>-delimited pair is split at its <strong>first</strong> <code>=</code>. Everything before that
+<code>=</code> is the name; everything after it, including any further <code>=</code>, is the value.
+Splitting at the first <code>=</code> keeps base64 values intact, because minisign keys
+and other base64 material carry trailing <code>=</code> padding that must survive
+verbatim. A pair with no <code>=</code>, or with an empty name, is an error.</p>
+<p>The grammar recognizes these query names:</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Repeats?</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td>singleton</td>
+<td>Explicit stable install ID.</td>
+</tr>
+<tr>
+<td><code>alias</code></td>
+<td>repeatable</td>
+<td>One explicit command mapping, <code>source-name:published-name</code>. Repeat <code>alias=</code> to map several commands.</td>
+</tr>
+<tr>
+<td><code>minisign</code></td>
+<td>singleton</td>
+<td>Minisign public key required for this request.</td>
+</tr>
+</tbody>
+</table>
+<p>Aliases are expressed as one mapping per <code>alias=from:to</code> pair, repeated as
+needed (for example <code>?id=x&amp;alias=a:aa&amp;alias=b:bb</code>). Comma-packed values are not
+used: repeated pairs keep each mapping independently reportable in diagnostics,
+avoid a second in-value delimiter that could collide with future command-name
+rules, and read the same as every other pair. <code>id</code> and <code>minisign</code> remain
+singletons.</p>
+<p>For example, these are two requests in one invocation:</p>
+<pre><code class="language-sh">ghr install \
+  cataggar/zig@zigb-0.16.1 &quot;?id=zigb&amp;alias=zig:zigb&quot; \
+  cataggar/zig@ziga-0.15.2 &quot;?id=ziga&amp;alias=zig:ziga&quot;
+</code></pre>
+<p>The query token is a separate positional token rather than a suffix on the
+source. This keeps source parsing independent and preserves multi-install
+boundaries. It should be quoted because <code>?</code> and <code>&amp;</code> have shell meanings.</p>
+<h3><a href="#query-token-rules" id="query-token-rules"></a>Query token rules</h3>
+<ul>
+<li>A query token attaches only to the immediately preceding source.</li>
+<li>A query token with no preceding source is a <strong>lone query token</strong> and is an
+error.</li>
+<li>A second query token for the same source is a duplicate and is an error.</li>
+<li>Unknown query names are errors. Configuration is a closed set for each CLI
+version so typos do not silently change install policy.</li>
+<li>Every pair splits at its first <code>=</code> and must have a non-empty name and a
+value. Empty segments, such as <code>?id=x&amp;&amp;alias=a:b</code>, and pairs with no <code>=</code> are
+errors.</li>
+<li><code>id</code> and <code>minisign</code> are singletons and may appear at most once. <code>alias</code> is
+repeatable; each <code>alias=from:to</code> pair contributes one mapping.</li>
+<li>A bare minisign key and <code>minisign=</code> on the same request are duplicate
+configuration and are rejected, even if their values match.</li>
+<li>A bare minisign key without a preceding source remains an error. A second
+bare key for one request remains an error.</li>
+<li>A source begins the next request. Configuration never floats forward or
+backward across source tokens.</li>
+</ul>
+<p>Query names and values use RFC 3986 percent-decoding, applied to each half
+after the first-<code>=</code> split. A <code>%</code> must be followed by exactly two hexadecimal
+digits. Invalid escapes and decoded values that are invalid for their field are
+errors. This is URI query decoding, not HTML form decoding: <code>+</code> remains a
+literal plus and is never turned into a space. Preserving <code>+</code> is required for
+minisign keys, which commonly contain <code>+</code>.</p>
+<p>The parser retains enough source spans to report which token and which query
+name failed, identifying the field by name and position only. It does not
+echo whole query tokens or raw values in diagnostics or logs, because a value
+may be a minisign key or other credential-like material. Report the offending
+field by name (for example, &quot;invalid value for <code>id</code>&quot;), not by dumping the
+token.</p>
+<h3><a href="#compatibility-with-current-arguments" id="compatibility-with-current-arguments"></a>Compatibility with current arguments</h3>
+<p><code>owner/repo[@tag] [bare-minisign-key]</code> remains valid. The bare key is normalized
+as though minisign configuration had been supplied for that request.</p>
+<p>Existing command-level options are applied to each affected request during
+normalization. Options whose current behavior requires exactly one source,
+such as <code>--bin</code>, keep that restriction until a later design explicitly gives
+them per-request query forms.</p>
+<h2><a href="#normalized-request-model" id="normalized-request-model"></a>Normalized request model</h2>
+<p>Parsing produces a model independent of download resolution:</p>
+<pre><code class="language-text">InstallRequest
+  id: canonical ID
+  id_origin: explicit | derived
+  source:
+    kind: github | generic_url
+    durable source intent
+  config:
+    aliases: ordered source -&gt; published mappings
+    selected commands, if configured by existing CLI options
+    minisign key, if configured
+    effective verification policy
+  original tokens: diagnostic-only source locations
+</code></pre>
+<p>Download resolution later adds a separate result:</p>
+<pre><code class="language-text">ResolvedInstall
+  request: InstallRequest
+  resolved release/tag
+  selected asset(s)
+  requested and final download URL(s)
+  content digest(s), when available
+  discovered commands and app bundles
+  verification outcomes and evidence references
+</code></pre>
+<p>Resolved URLs are provenance, not the durable source definition. A future
+upgrade-by-ID operation can resolve the stored source intent again rather than
+treating an expiring redirect or API asset URL as the source.</p>
+<p>Resolved provenance must never persist secrets. Auth headers, bearer or
+installation tokens, API credentials, and sensitive or expiring signed query
+parameters (for example, a pre-signed object-store redirect carrying
+<code>X-Amz-Signature</code>, <code>X-Amz-Credential</code>, or an expiry) must not be written to
+disk. A resolved download URL is persisted only when it is stable and free of
+such material -- for example, a canonical release-asset URL. When the effective
+download URL is a signed or credential-bearing redirect, ghr stores
+non-sensitive provenance instead -- repository, tag, asset name, and the API
+asset identity sufficient to resolve the artifact again -- and omits the signed
+URL. Digests remain safe to persist and are preferred for provenance.</p>
+<h2><a href="#id-rules" id="id-rules"></a>ID rules</h2>
+<p>The ID is the only identity accepted by install-state operations:</p>
+<ul>
+<li><code>ghr install</code> creates or replaces IDs.</li>
+<li><code>ghr list</code> reports IDs and their definitions.</li>
+<li><code>ghr uninstall &lt;id&gt;</code> removes exactly that ID.</li>
+</ul>
+<p>Canonical IDs follow deliberately portable rules:</p>
+<ul>
+<li>IDs are non-empty ASCII and are canonicalized to lowercase.</li>
+<li>IDs consist of slash-separated segments.</li>
+<li>Each segment starts and ends with an ASCII letter or digit and may contain
+ASCII letters, digits, <code>.</code>, <code>_</code>, and <code>-</code> internally.</li>
+<li>Empty segments, <code>.</code> and <code>..</code> segments, leading or trailing <code>/</code>, control
+characters, backslashes, and percent escapes remaining after query decoding
+are rejected.</li>
+<li>Canonical comparison is byte-for-byte after lowercasing. Thus <code>ZigB</code> and
+<code>zigb</code> are one ID, including on case-sensitive filesystems.</li>
+<li>IDs are limited to 240 bytes total and 100 bytes per segment. These limits
+are enforced before any filesystem work.</li>
+</ul>
+<p>GitHub source specs may derive an ID as
+<code>lowercase(owner)/lowercase(repo)</code>. An explicit <code>id=</code> overrides that
+derivation. Generic URLs have no reliable repository identity and therefore
+require an explicit <code>id=</code>.</p>
+<p>The source does not own the ID namespace. Two IDs may refer to the same
+repository, tag, asset, or URL. Conversely, one ID may have only one live
+definition.</p>
+<h2><a href="#id-path-encoding" id="id-path-encoding"></a>ID path encoding</h2>
+<p>v2 units live in a dedicated, versioned namespace under the tool store:</p>
+<pre><code class="language-text">&lt;tools&gt;/_v2/units/u-&lt;segment&gt;/.../_unit/
+</code></pre>
+<p>Each canonical ID segment is stored in its own <code>u-</code>-prefixed directory. The
+terminal <code>_unit</code> marker allows prefix-related IDs such as <code>a</code> and <code>a/b</code> to
+coexist. The encoding:</p>
+<ul>
+<li>be reversible and injective for every accepted canonical ID;</li>
+<li>never interpret an arbitrary ID directly as an absolute or relative path;</li>
+<li>prevent traversal, separator injection, reserved device names, trailing-dot
+and trailing-space hazards, and case-folding collisions;</li>
+<li>behave consistently across Windows, macOS, and Linux;</li>
+<li>permit inventory code to verify that the encoded path matches the ID stored
+in metadata; and</li>
+<li>provide a defined failure for IDs that cannot fit platform path limits.</li>
+</ul>
+<p>A readable encoding is desirable, but correctness is more important. A hash
+alone is insufficient unless metadata provides a checked, unambiguous reverse
+mapping.</p>
+<h2><a href="#aliases-command-ownership-and-collisions" id="aliases-command-ownership-and-collisions"></a>Aliases, command ownership, and collisions</h2>
+<p>IDs and command names are separate namespaces.</p>
+<pre><code class="language-text">?id=zigb
+</code></pre>
+<p>does not rename <code>zig</code> to <code>zigb</code>. Renaming is explicit:</p>
+<pre><code class="language-text">?id=zigb&amp;alias=zig:zigb
+</code></pre>
+<p>Alias requirements:</p>
+<ul>
+<li>The left side names one discovered command selected for the unit.</li>
+<li>The right side is the exact published command name.</li>
+<li>An alias whose source command is absent is an error.</li>
+<li>Duplicate source mappings or duplicate published names in one request are
+errors.</li>
+<li>Platform command equivalence is used for collision checks. In particular,
+Windows command names compare case-insensitively and account for the shim
+files used to publish one command.</li>
+<li>Unaliased selected commands retain their discovered names.</li>
+<li>Aliases do not change the install ID or the stored relative executable path.</li>
+</ul>
+<p>Before any live directory or command change, ghr must:</p>
+<ol>
+<li>resolve every effective ID in the invocation, including wasm expansion;</li>
+<li>reject duplicate IDs;</li>
+<li>resolve aliases and the final command set;</li>
+<li>reject duplicate final commands within the invocation;</li>
+<li>build an ownership inventory from valid v1 and v2 state; and</li>
+<li>reject commands owned by another ID or unmanaged entries in the bin
+directory.</li>
+</ol>
+<p>Replacing the same ID may replace that ID's existing commands. It may not take
+commands owned by another ID. Cross-ID and unmanaged collisions must be
+reported before live state changes, not as warnings after a directory has
+already been replaced.</p>
+<h2><a href="#persisted-v2-state" id="persisted-v2-state"></a>Persisted v2 state</h2>
+<p>Today, archive and bare-binary installs live at
+<code>&lt;tools&gt;/&lt;owner&gt;/&lt;repo&gt;/</code>; wasm units live at
+<code>&lt;tools&gt;/&lt;owner&gt;/&lt;repo&gt;/&lt;stem&gt;/</code>. Their unversioned <code>ghr.json</code> records <code>tag</code>,
+<code>asset</code>, <code>verified</code>, optional <code>minisign</code>, and <code>bins</code>/<code>apps</code>.</p>
+<p>v2 metadata is schema-versioned and sufficient to reconstruct ownership and a
+future upgrade request. The following illustrates its wire shape:</p>
+<pre><code class="language-json">{
+  &quot;schema&quot;: 2,
+  &quot;layout_generation&quot;: 2,
+  &quot;id&quot;: &quot;zigb&quot;,
+  &quot;source&quot;: {
+    &quot;kind&quot;: &quot;github&quot;,
+    &quot;owner&quot;: &quot;cataggar&quot;,
+    &quot;repo&quot;: &quot;zig&quot;,
+    &quot;tag&quot;: &quot;zigb-0.16.1&quot;,
+    &quot;asset_selector&quot;: null
+  },
+  &quot;config&quot;: {
+    &quot;aliases&quot;: [
+      { &quot;from&quot;: &quot;zig&quot;, &quot;to&quot;: &quot;zigb&quot; }
+    ],
+    &quot;selected_commands&quot;: null,
+    &quot;minisign&quot;: null,
+    &quot;verification_policy&quot;: {}
+  },
+  &quot;resolved&quot;: {
+    &quot;tag&quot;: &quot;zigb-0.16.1&quot;,
+    &quot;asset&quot;: &quot;example.tar.xz&quot;,
+    &quot;api_asset_id&quot;: 123456789,
+    &quot;download_url&quot;: &quot;https://github.com/cataggar/zig/releases/download/zigb-0.16.1/example.tar.xz&quot;,
+    &quot;digest&quot;: { &quot;algorithm&quot;: &quot;sha256&quot;, &quot;value&quot;: &quot;...&quot; }
+  },
+  &quot;commands&quot;: [
+    {
+      &quot;name&quot;: &quot;zigb&quot;,
+      &quot;source_name&quot;: &quot;zig&quot;,
+      &quot;relative_target&quot;: &quot;zig&quot;
+    }
+  ],
+  &quot;apps&quot;: [],
+  &quot;verification&quot;: {
+    &quot;result&quot;: &quot;checksum&quot;,
+    &quot;minisign&quot;: null
+  },
+  &quot;tag&quot;: &quot;zigb-0.16.1&quot;,
+  &quot;asset&quot;: &quot;example.tar.xz&quot;,
+  &quot;verified&quot;: &quot;checksum&quot;,
+  &quot;bins&quot;: [&quot;zig&quot;]
+}
+</code></pre>
+<p>Schema requirements:</p>
+<ul>
+<li><code>id</code>, durable <code>source</code>, normalized <code>config</code>, resolved provenance, explicit
+commands and ownership, and existing verification data are required
+concepts.</li>
+<li>Source intent and resolved provenance must not be conflated.</li>
+<li>Resolved provenance must be non-sensitive. <code>download_url</code> is persisted only
+when it is a stable, credential-free URL; when resolution used a signed or
+token-bearing redirect, <code>download_url</code> is omitted and the artifact is instead
+identified by repository, tag, asset name, and <code>api_asset_id</code>. Auth headers,
+tokens, credentials, and expiring signed query parameters are never written.</li>
+<li>Relative paths from metadata must be validated before use.</li>
+<li>Writers may retain legacy-compatible top-level fields (<code>tag</code>, <code>asset</code>,
+<code>verified</code>, <code>bins</code>) only as read-only hints for current tooling and
+diagnostics. Their presence does not make the record writable by old ghr and
+must not be read as license for downgrade mutation.</li>
+<li>Missing <code>schema</code> means v1. An unknown future schema is unsupported, not v1.</li>
+<li>Readers must distinguish missing, malformed, conflicting, corrupt, and
+unsupported state rather than silently treating all of them as absent.</li>
+</ul>
+<p>Old ghr versions cannot understand custom IDs or the dedicated v2 namespace.
+Once v2 state is written, downgrade mutation (install, uninstall, link, unlink
+with an older ghr) is unsupported. Legacy-compatible top-level fields exist for
+read-only compatibility only and never make old-ghr mutation of a v2 record
+safe.</p>
+<h2><a href="#transaction-and-recovery-invariants" id="transaction-and-recovery-invariants"></a>Transaction and recovery invariants</h2>
+<p>Installing an existing ID is replacement, not a separate upgrade operation.
+Replacement must be transactional across both the unit directory and command
+publication.</p>
+<p>The v2 installer stages the unit and complete command plan before publication.
+A per-ID transaction journal coordinates the staged, backup, live, and command
+states so publication failure restores the previous definition instead of
+leaving a partially replaced ID.</p>
+<p>The v2 implementation must satisfy these invariants:</p>
+<ul>
+<li>Downloads, extraction, metadata construction, ID expansion, alias
+resolution, ownership inventory, and collision checks complete before live
+mutation.</li>
+<li>A per-ID commit either exposes the new directory and complete command set,
+or restores the previous directory and command set.</li>
+<li>Metadata describing ownership is committed consistently with the live
+commands.</li>
+<li>Stale commands from the same ID are removed only as part of the successful
+replacement.</li>
+<li>Another ID's commands and unmanaged files are never overwritten or removed.</li>
+<li>Interruption at each commit step has a deterministic recovery path.</li>
+<li>Recovery validates identity and ownership before deleting staging, backup,
+command, or journal artifacts.</li>
+<li>Independently installed wasm siblings survive archive replacement.</li>
+<li>The local install transaction covers only local tool directories, commands,
+apps, and metadata. Cross-OS WSL manifest reconciliation is a separate step
+(see <a href="#wsl-manifests">WSL manifests</a>) and is never part of this atomic
+commit; a WSL failure must not roll back a completed local install.</li>
+<li>Multi-request collision planning covers the complete invocation before its
+first live mutation. Runtime failure policy may still be per request, as
+selected by fail-fast or <code>--keep-going</code>.</li>
+</ul>
+<p>The implementation uses rename-based staging and a per-ID transaction journal,
+with failure-injection tests covering recovery at each publication boundary.</p>
+<h2><a href="#list-and-uninstall-semantics" id="list-and-uninstall-semantics"></a>List and uninstall semantics</h2>
+<p><code>ghr list</code> uses the inventory reader rather than inferring identity only from
+directory depth. It:</p>
+<ul>
+<li>reports the canonical ID for every valid unit;</li>
+<li>distinguishes v1 and v2 entries during migration;</li>
+<li>exposes enough source and configuration to reproduce an install definition
+without substituting resolved URLs for source intent;</li>
+<li>reports conflict, corrupt, and unsupported entries clearly; and</li>
+<li>avoids presenting malformed metadata as an unowned but healthy install.</li>
+</ul>
+<p>The implemented human and machine-readable list formats are deliberately
+unambiguous. A definition and a bare ID are not interchangeable because an ID
+can carry aliases, a selector, and configuration that a plain slug cannot.
+The separate forms are:</p>
+<ul>
+<li>a plain <strong>list of IDs</strong> (one canonical ID per line) for scripting that only
+needs identities; and</li>
+<li>a <strong>reproducible install definition</strong> per ID (source intent plus effective
+configuration) suitable for re-running an install.</li>
+</ul>
+<p>The default output labels itself as a report, <code>--ids</code> emits one healthy ID per
+line, and <code>--json</code> emits deterministic versioned records with a full definition
+for each v2 unit. Legacy definitions are explicitly null because v1 state does
+not retain enough source intent to reproduce them.</p>
+<p><code>ghr uninstall &lt;id&gt;</code> removes exactly the canonical ID and its owned commands,
+apps, metadata, and unit directory. It must inventory and validate ownership
+before mutation. Prefixes are not recursive: uninstalling <code>owner/repo</code> does not
+implicitly remove <code>owner/repo/module</code>.</p>
+<p>If an ID is missing, conflicted, corrupt, or uses an unsupported schema,
+uninstall refuses mutation and reports the state. There is no fallback to
+deleting a path constructed directly from user input.</p>
+<h2><a href="#wasm-units" id="wasm-units"></a>Wasm units</h2>
+<p>Wasm modules remain independent units.</p>
+<p>When one source request with base ID <code>example/tools</code> selects several modules,
+it expands deterministically:</p>
+<pre><code class="language-text">example/tools/parser
+example/tools/formatter
+</code></pre>
+<p>The suffix is the canonical module stem. Expansion happens before duplicate-ID
+and command collision checks. A repeated or unsafe stem is an error.</p>
+<p>An archive installed as <code>example/tools</code> may coexist with those module IDs.
+Replacing the archive preserves sibling wasm IDs. Replacing one wasm ID
+touches neither the archive nor another module. Exact-ID uninstall semantics
+also apply to wasm units.</p>
+<p>For legacy nested wasm units, the synthesized ID is
+<code>lower(owner)/lower(repo)/stem</code>.</p>
+<h2><a href="#wsl-manifests" id="wsl-manifests"></a>WSL manifests</h2>
+<p>Legacy WSL manifests are keyed by owner/repo and persist command targets as
+paths. v2 linking uses versioned, ID-keyed manifests derived from the same
+install inventory used by install, list, and uninstall.</p>
+<p>Requirements:</p>
+<ul>
+<li>WSL manifest reconciliation is a separate step from the local install
+transaction. <code>ghr link</code>/<code>ghr unlink</code>, run under WSL interop, reconcile
+manifests from the shared install inventory; the local install/uninstall
+transaction neither waits on nor rolls back for WSL, and never invokes
+cross-OS operations inside its atomic commit.</li>
+<li><code>ghr link</code> and <code>ghr unlink</code> reconcile an ID's explicit command ownership.</li>
+<li>Manifests carry a schema version and canonical ID.</li>
+<li>A changed encoded unit path can be reconciled without confusing another ID
+from the same repository.</li>
+<li>Existing owner/repo manifests are not eagerly rewritten.</li>
+<li>A legacy manifest is imported lazily only after its paths and commands have
+been successfully reconciled to one unambiguous install ID.</li>
+<li>A conflict, modified link, malformed manifest, or ambiguous legacy install
+is reported without destructive cleanup.</li>
+</ul>
+<p>Bare Windows-PATH executable manifests remain a separate kind because they are
+not backed by a ghr install ID.</p>
+<p>The implemented ID manifest is stored at:</p>
+<pre><code class="language-text">&lt;links&gt;/by-id/u-&lt;segment&gt;/.../_manifest.json
+</code></pre>
+<p>It uses the same prefixed, slash-segment encoding principle as install state,
+so IDs such as <code>a</code> and <code>a/b</code> can coexist and raw IDs are never interpreted as
+paths. The payload records <code>schema: 2</code>, <code>layout_generation: 2</code>, <code>kind: &quot;wsl-id&quot;</code>, the canonical <code>id</code>, the inventory-relative <code>unit_path</code>, the
+diagnostic absolute <code>source</code>, and each owned link's exact name and target. The
+ID is the ownership key; <code>source</code> is never used to infer identity.</p>
+<p><code>ghr link &lt;id&gt;</code> resolves exact command ownership from a Windows-platform
+inventory, so aliases remain aliases and are not re-derived from executable
+filenames. For the compatibility shorthand <code>ghr link &lt;name&gt;</code>, an existing
+one-segment ID or ID manifest takes precedence; otherwise the name retains its
+historical Windows-PATH meaning. <code>--id</code> and <code>--path</code> force either side of that
+ambiguity. Automatic disambiguation requires canonical Windows tools-directory
+discovery; if that lookup fails, it refuses the operation rather than guessing
+from the WSL username and requires explicit <code>--path</code> or
+<code>GHR_WIN_TOOLS_DIR</code>.</p>
+<p>Before replacing or retiring any link, reconciliation verifies that its live
+target still equals the target in the owning manifest. A changed link or an
+unmanaged entry blocks the operation before mutation. During lazy import, the
+new ID manifest is written only after links are reconciled; failure rolls link
+changes back, and the old owner/repo manifest is deleted only after the new
+manifest is durable. A legacy manifest can still be unlinked safely after its
+Windows install has been removed because its exact source and targets are
+validated directly; partial <code>--bin</code> operations are refused until legacy state
+has been fully reconciled.</p>
+<p>Legacy owner/repo validation preserves the actual casing recorded in the
+manifest while requiring its final two source components to case-fold to the
+canonical ID. This keeps pre-migration mixed-case installs recoverable without
+allowing a legacy manifest to claim targets outside the Windows tools root.</p>
+<p>Native Windows commands link directly to their installed executables. Wasm
+commands are refused rather than linked to raw <code>.wasm</code> bytes, which are not
+directly executable through WSL interop; a future WSL-aware wasm launcher can
+add that support without emitting broken links today.</p>
+<h2><a href="#github-actions-and-caches" id="github-actions-and-caches"></a>GitHub Actions and caches</h2>
+<p>The install composite action accepts one complete
+<code>source [query-token] [minisign-key]</code> request per line. It gates on an
+ID-capable CLI and asks that CLI to produce the cache fingerprint, so shell
+token handling cannot drift from the install parser.</p>
+<p>The implemented action:</p>
+<ul>
+<li>parses complete install definitions without losing quoted query tokens;</li>
+<li>normalizes source plus effective ID and configuration before hashing;</li>
+<li>includes the state layout/schema generation, target OS/architecture/ABI, and
+ghr version in the key;</li>
+<li>rejects duplicate IDs and malformed definitions consistently with the CLI;</li>
+<li>preserves <code>+</code> in minisign material; and</li>
+<li>caches the tool store, command store, and any required transaction/state
+roots as one compatible generation.</li>
+</ul>
+<p>The cache definition must be complete: changing an ID, alias, source selector,
+verification policy, or minisign key must invalidate the cache. Sorting is
+permitted only after requests have been parsed into complete definitions; raw
+token sorting could detach a query token or key from its source.</p>
+<p>Action rollout is gated by checking for the CLI's normalized cache-key mode.
+The action fails clearly rather than emitting new syntax to a <code>ghr-bin</code> version
+that only understands the old positional grammar.</p>
+<h2><a href="#migration-plan" id="migration-plan"></a>Migration plan</h2>
+<h3><a href="#is-there-a-good-migration-plan" id="is-there-a-good-migration-plan"></a>Is there a good migration plan?</h3>
+<p>Yes: keep legacy installs readable indefinitely and migrate each one lazily
+only when its inferred ID is successfully replaced by a v2 install.</p>
+<p>Lazy migration is safest because current metadata does not contain enough
+information to reconstruct all source and configuration intent. Command and
+app ownership is path-based, WSL manifests persist those paths, and nested
+wasm directories are independent units. An eager rewrite would have to invent
+facts or risk moving one unit while leaving commands and WSL links owned by an
+old path.</p>
+<h3><a href="#reading-legacy-state" id="reading-legacy-state"></a>Reading legacy state</h3>
+<p>Missing <code>schema</code> is v1. The inventory reader synthesizes IDs only from facts
+that are reliable:</p>
+<ul>
+<li>repo-level unit: <code>lower(owner)/lower(repo)</code>;</li>
+<li>nested wasm unit: <code>lower(owner)/lower(repo)/stem</code>.</li>
+</ul>
+<p>The reader may preserve known <code>tag</code>, <code>asset</code>, <code>verified</code>, <code>minisign</code>, <code>bins</code>,
+and <code>apps</code> fields. It must not invent a resolved URL, original source token,
+asset-selection intent, alias policy, or verification policy that v1 did not
+record.</p>
+<p>Legacy directories remain in place and usable. Merely listing, linking, or
+starting ghr must not move them.</p>
+<h3><a href="#lazy-replacement" id="lazy-replacement"></a>Lazy replacement</h3>
+<p>When a v2 install successfully replaces an ID currently represented by one
+unambiguous legacy unit:</p>
+<ol>
+<li>stage and validate the complete v2 replacement;</li>
+<li>reconcile old path-based command/app ownership into the v2 command plan;</li>
+<li>commit the v2 unit, its commands, and its metadata transactionally;</li>
+<li>remove the replaced legacy unit only after the new v2 state <strong>and</strong> its
+published commands are durable -- never before both are committed; and</li>
+<li>reconcile WSL manifests as a separate follow-up, outside the local
+transaction. WSL reconciliation is not required for steps 3 and 4 to be
+considered complete, and a WSL failure never resurrects or blocks removal of
+the migrated legacy unit.</li>
+</ol>
+<p>Steps 1-4 are local and atomic; step 5 is cross-OS best-effort. Because legacy
+removal in step 4 depends only on durable local v2 state and command
+publication, an interrupted or unavailable WSL environment can never leave a
+half-deleted legacy install.</p>
+<p>An archive replacement preserves independent nested wasm units. A wasm
+replacement migrates only its exact synthesized child ID.</p>
+<h3><a href="#states-that-refuse-mutation" id="states-that-refuse-mutation"></a>States that refuse mutation</h3>
+<p>The inventory must surface and refuse mutation when:</p>
+<ul>
+<li>a legacy entry and a v2 entry map to the same canonical ID;</li>
+<li>mixed-case legacy paths collapse to one canonical ID;</li>
+<li>two metadata records claim the same command;</li>
+<li>metadata is malformed or contains unsafe paths;</li>
+<li>an encoded v2 path does not match its metadata ID;</li>
+<li>a WSL manifest cannot be reconciled unambiguously; or</li>
+<li>metadata uses an unknown future schema.</li>
+</ul>
+<p>These are conflict, corrupt, or unsupported states, not opportunities to pick
+one entry arbitrarily.</p>
+<h3><a href="#downgrade" id="downgrade"></a>Downgrade</h3>
+<p>Old ghr may continue to read untouched legacy installs, but it cannot
+understand custom IDs, v2 ownership, or v2 WSL manifests. Once any v2 writer
+has mutated the store, using an older ghr to install, uninstall, link, or
+unlink is unsupported. Recovery should use an ID-capable ghr, not manual
+movement into owner/repo paths.</p>
+<h2><a href="#rollout-sequence" id="rollout-sequence"></a>Rollout sequence</h2>
+<p>The implementation was split and merged in this strict order:</p>
+<ol>
+<li><strong>Design contract only</strong>: add <code>doc/install-identifiers.md</code> and index it from
+<code>doc/README.md</code>.</li>
+<li><strong>Pure install-request parser</strong>: add <code>src/install_request.zig</code> without
+changing download parsing.</li>
+<li><strong>Versioned install state/inventory reader</strong>: add
+<code>src/install_state.zig</code>, legacy-compatible, with writers still unused.</li>
+<li><strong>Collision-safe command publication planner</strong>: add
+<code>src/command_plan.zig</code> plus narrow install helpers, still not activated.</li>
+<li><strong>Activate ID install/list/uninstall</strong>: first persisted-state change and
+lazy legacy migration.</li>
+<li><strong>Convert WSL link/unlink</strong>: use ID inventory and versioned manifests.</li>
+<li><strong>Update action and public surfaces</strong>: composite action, help, CI smoke
+tests, and user documentation; gate action rollout on an ID-capable CLI.</li>
+</ol>
+<p>Each stage was enabled for auto-merge only after its predecessor merged and
+post-merge <code>main</code> CI passed.</p>
+<h2><a href="#validation-matrix" id="validation-matrix"></a>Validation matrix</h2>
+<p>The rollout added focused tests across this matrix, with lifecycle smoke
+coverage on every supported runner platform.</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Required cases</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request boundaries</td>
+<td>One request; multiple requests; query attaches to preceding source; source after configured request starts a new request.</td>
+</tr>
+<tr>
+<td>Query errors</td>
+<td>Lone query; duplicate query token; unknown name; repeated singleton (<code>id</code>/<code>minisign</code>); empty name/value; pair with no <code>=</code>; empty segment; malformed <code>%</code> escape.</td>
+</tr>
+<tr>
+<td>Pair splitting</td>
+<td>Split at first <code>=</code>; value containing further <code>=</code>; base64 <code>=</code> padding in a <code>minisign=</code> value preserved.</td>
+</tr>
+<tr>
+<td>Percent decoding</td>
+<td><code>%2F</code>, <code>%3A</code>, <code>%25</code>, lowercase hex, invalid hex, and literal <code>+</code> (never a space) in a minisign key.</td>
+</tr>
+<tr>
+<td>Diagnostics safety</td>
+<td>Failing field named without echoing the whole token or a key-bearing value.</td>
+</tr>
+<tr>
+<td>Minisign compatibility</td>
+<td>Existing bare key; lone key; double key; bare key plus <code>minisign=</code> duplicate; per-request key overriding a command-level default where allowed.</td>
+</tr>
+<tr>
+<td>IDs</td>
+<td>Derived lowercase GitHub ID; required explicit generic-URL ID; case collapse; unsafe segments; length limits; two IDs for one repository.</td>
+</tr>
+<tr>
+<td>Aliases</td>
+<td>No inference from ID; valid rename; multiple repeated <code>alias=</code> pairs; missing source command; duplicate source mapping; duplicate published name; platform case collision.</td>
+</tr>
+<tr>
+<td>Invocation planning</td>
+<td>Duplicate IDs; duplicate commands; cross-ID owned collision; unmanaged collision; same-ID replacement allowed; no live mutation on rejection.</td>
+</tr>
+<tr>
+<td>v1 inventory</td>
+<td>Repo unit; nested wasm unit; missing schema; mixed-case path; absent optional fields; reliable facts only.</td>
+</tr>
+<tr>
+<td>v2 inventory</td>
+<td>Valid schema; reversible path check; malformed metadata; unsafe relative target; unknown future schema.</td>
+</tr>
+<tr>
+<td>Provenance safety</td>
+<td>Stable <code>download_url</code> persisted; signed/credential redirect not persisted (falls back to asset identity); no auth headers/tokens written.</td>
+</tr>
+<tr>
+<td>Migration ordering</td>
+<td>Legacy unit removed only after v2 state and commands are durable; WSL unavailable does not block or half-delete legacy; interrupted removal recovers.</td>
+</tr>
+<tr>
+<td>Mixed inventory</td>
+<td>v1/v2 same-ID conflict; mixed-case legacy collapse; duplicate command ownership; deterministic diagnostics.</td>
+</tr>
+<tr>
+<td>Replacement</td>
+<td>Fresh install; same-ID replacement; failure before commit; failure during directory publication; failure during command publication; recovery after interruption.</td>
+</tr>
+<tr>
+<td>Commands/apps</td>
+<td>New commands published; stale same-ID commands removed; other-ID and unmanaged entries untouched; app ownership rollback where supported.</td>
+</tr>
+<tr>
+<td>Wasm</td>
+<td>One module; deterministic multi-module expansion; duplicate stem; exact child replacement/uninstall; archive preserves siblings.</td>
+</tr>
+<tr>
+<td>List/uninstall</td>
+<td>List-of-IDs form and reproducible-definition form each labeled and unambiguous; IDs reported from inventory; exact-ID uninstall; prefix is not recursive; corrupt/conflict/unsupported state refuses mutation.</td>
+</tr>
+<tr>
+<td>WSL</td>
+<td>New ID-keyed manifest; same repo with two IDs; lazy legacy import; changed or ambiguous target refuses destructive reconciliation.</td>
+</tr>
+<tr>
+<td>Actions/cache</td>
+<td>Complete normalized definitions; reordered requests; changed ID/alias/policy/key invalidates; layout generation invalidates; old CLI gate.</td>
+</tr>
+<tr>
+<td>Platforms</td>
+<td>Linux symlinks, Windows shims and case rules, macOS app bundles, path limits, reserved names, and recovery on each filesystem model.</td>
+</tr>
+</tbody>
+</table>
+<p>The repository test suite runs with:</p>
+<pre><code class="language-sh">zig build test
+</code></pre>
+<p>It covers install, replacement, list, uninstall, multi-ID coexistence,
+collision refusal, wasm independence, and cache restoration. Platform CI
+smoke jobs additionally exercise the full native install lifecycle.</p>
+<h2><a href="#implemented-storage-choices" id="implemented-storage-choices"></a>Implemented storage choices</h2>
+<p>The rollout settled the previously open implementation choices as follows:</p>
+<ul>
+<li>v2 units use <code>_v2/units/u-&lt;segment&gt;/.../_unit</code>;</li>
+<li>canonical IDs are limited to 240 bytes with 100-byte segments;</li>
+<li>per-ID journals coordinate staged, backup, live, and command-publication
+recovery; and</li>
+<li><code>ghr list</code>, <code>ghr list --ids</code>, and <code>ghr list --json</code> provide separate human,
+identity-only, and machine-readable forms.</li>
+</ul>
+<p>These choices preserve the ID safety, ownership, schema-versioning, and
+rollback requirements above.</p>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/install-identifiers.md">View Markdown source</a></p></article>
+
+  <footer class="layout-footer">
+    Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.17.0 &middot;
+    <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
+    <span class="attribution">Logo by
+      <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
+      licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+    </span>
+  </footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="/ghr/favicon.ico" sizes="any">
+  <link rel="icon" href="/ghr/favicon-32x32.png" type="image/png" sizes="32x32">
+  <title>ghr documentation — ghr</title>
+  <meta name="description" content="A toolkit for GitHub releases.">
+  <meta property="og:title" content="ghr documentation">
+  <meta property="og:description" content="A toolkit for GitHub releases.">
+  <meta property="og:type" content="website">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#f0ebe3; --bg2:#e8e2d9; --bg3:#ddd5cc;
+      --text:#252530; --muted:#8a7f78; --border:#d5cdc4;
+      --red:#e8251f; --red-dark:#aa1915; --paper:#fffdfa;
+    }
+    body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,-apple-system,sans-serif; min-height:100vh; line-height:1.65; }
+    a { color:inherit; text-decoration:none; }
+    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    code { font-size:0.9em; background:var(--bg2); border-radius:4px; padding:2px 6px; }
+    pre { background:#201014; color:#ffe8e7; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
+    pre code { background:none; padding:0; color:inherit; }
+    h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
+    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
+    .layout-wide { max-width:1080px; }
+    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
+    .site-logo-link { display:block; width:100%; }
+    .site-logo { display:block; width:100%; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
+    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
+    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
+    .nav a:hover { color:var(--text); }
+    .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
+    .hero h1 { font-size:clamp(32px,5vw,48px); line-height:1.05; margin-bottom:14px; }
+    .hero p { max-width:60ch; color:#ffe8e7; font-size:17px; margin-bottom:22px; }
+    .hero-actions { display:flex; gap:12px; flex-wrap:wrap; }
+    .btn { display:inline-flex; align-items:center; font-size:14px; font-weight:700; padding:11px 20px; border-radius:8px; transition:transform 0.15s ease, opacity 0.15s ease; }
+    .btn:hover { transform:translateY(-1px); }
+    .btn-primary { background:#fff; color:var(--red-dark); }
+    .btn-secondary { background:rgba(255,255,255,0.14); color:#fff; border:1px solid rgba(255,255,255,0.2); }
+    .btn-ghost { background:transparent; color:var(--text); border:1px solid var(--border); }
+    .btn-ghost:hover { border-color:var(--text); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+    .card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px; }
+    .card h3 { font-size:16px; margin-bottom:8px; }
+    .card p { font-size:14px; color:var(--muted); }
+    .section-title { font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:16px; }
+    section + section { margin-top:48px; }
+    .post-list { display:flex; flex-direction:column; gap:16px; }
+    .post-card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px 24px; }
+    .post-card h3 { font-size:18px; margin-bottom:6px; }
+    .post-card p { color:var(--muted); font-size:14px; }
+    .post-card .read-more { display:inline-block; margin-top:10px; font-size:13px; font-weight:700; color:var(--red); }
+    .prose h2 { font-size:24px; margin:32px 0 14px; }
+    .prose h3 { font-size:19px; margin:24px 0 10px; }
+    .prose p { margin-bottom:16px; }
+    .prose ul, .prose ol { margin:0 0 16px 24px; }
+    .prose li { margin-bottom:6px; }
+    .prose blockquote { border-left:3px solid var(--red); padding-left:16px; color:var(--muted); margin:0 0 16px; }
+    .prose h1 { font-size:36px; line-height:1.2; margin:24px 0; }
+    .prose h4, .prose h5, .prose h6 { margin:20px 0 10px; }
+    .prose a { color:var(--red-dark); text-decoration:underline; text-underline-offset:3px; }
+    .prose pre { margin:16px 0; }
+    .prose table { display:block; overflow-x:auto; border-collapse:collapse; margin:20px 0; }
+    .prose th, .prose td { border:1px solid var(--border); padding:8px 12px; text-align:left; }
+    .prose th { background:var(--bg2); }
+    .prose img { max-width:100%; }
+    .prose hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
+    .docs-nav { display:flex; flex-wrap:wrap; gap:8px 16px; padding-bottom:20px; border-bottom:1px solid var(--border); font-size:13px; }
+    .doc-source { margin-top:32px; font-size:13px; color:var(--muted); }
+    .back-link { display:inline-block; margin-bottom:24px; font-size:13px; color:var(--muted); }
+    .back-link:hover { color:var(--text); }
+    .attribution { margin-top:12px; font-size:12px; color:var(--muted); }
+    .layout-footer { margin-top:64px; padding-top:24px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); text-align:center; }
+    .layout-footer a { text-decoration:underline; text-underline-offset:2px; }
+.mcss-display{display:inline-flex;}.mcss-align_items{align-items:center;}.mcss-padding{padding:4px 10px;}.mcss-border_radius{border-radius:999px;}.mcss-font_size{font-size:12px;}.mcss-font_weight{font-weight:700;}.mcss-letter_spacing{letter-spacing:0.04em;}.mcss-gap{gap:16px;}@media (min-width: 768px){.mcss-md-gap{gap:24px;}}    .badge-red { background:var(--red); color:#fff; }
+    .badge-outline { border:1px solid var(--border); color:var(--muted); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <header class="layout-header">
+    <nav class="nav">
+      <a href="/ghr/blog">Blog</a>
+      <a href="/ghr/docs.html">Documentation</a>
+      <a href="https://github.com/cataggar/ghr">GitHub</a>
+      <a href="/ghr/docs/install.html">Install</a>
+    </nav>
+    <a href="/ghr/" class="site-logo-link"><img src="https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg" alt="ghr logo" class="site-logo"></a>
+  </header>
+<article class="prose docs"><nav class="docs-nav" aria-label="Documentation"><a href="/ghr/docs.html">ghr documentation</a> <a href="/ghr/docs/directories.html">Directories</a> <a href="/ghr/docs/download.html">Download</a> <a href="/ghr/docs/github-actions.html">Caching in GitHub Actions</a> <a href="/ghr/docs/install-identifiers.html">Install identifiers: design and migration</a> <a href="/ghr/docs/install.html">Install</a> <a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a> <a href="/ghr/docs/troubleshooting.html">Name resolution on Linux</a> <a href="/ghr/docs/verification.html">Verification</a> <a href="/ghr/docs/wsl-linking.html">WSL: linking Windows-side bins (ghr link / ghr unlink)</a> </nav>
+<h1><a href="#ghr-documentation" id="ghr-documentation"></a>ghr documentation</h1>
+<p>Detailed documentation for ghr. For a quick overview and usage, see the
+<a href="https://github.com/cataggar/ghr/blob/main/README.md">top-level README</a>.</p>
+<h2><a href="#topics" id="topics"></a>Topics</h2>
+<ul>
+<li><a href="/ghr/docs/install.html">Install</a> — install ghr, see CLI examples, and uninstall it.</li>
+<li><a href="/ghr/docs/download.html">Download</a> — fetch, extract, authenticate, and verify release assets.</li>
+<li><a href="/ghr/docs/github-actions.html">Caching in GitHub Actions</a> — cache ghr installs and downloads in workflows.</li>
+<li><a href="/ghr/docs/directories.html">Directories</a> — default directories and <code>ghr path add</code> behavior.</li>
+<li><a href="/ghr/docs/wsl-linking.html">WSL linking</a> — expose Windows-side tools inside WSL.</li>
+<li><a href="/ghr/docs/troubleshooting.html">Troubleshooting</a> — Linux name-resolution fallback for long <code>resolv.conf</code> files.</li>
+<li><a href="/ghr/docs/verification.html">Verification</a> — verifier behavior, trust roots, skip flags, and recorded results.</li>
+<li><a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a> — release archive reproducibility and Authenticode stripping.</li>
+</ul>
+<h2><a href="#design-and-implementation" id="design-and-implementation"></a>Design and implementation</h2>
+<ul>
+<li><a href="/ghr/docs/install-identifiers.html">Install identifiers</a> — stable install IDs,
+explicit command aliases, versioned state, and lazy migration, implemented
+since v0.8.0.</li>
+</ul>
+<h2><a href="#install" id="install"></a>Install</h2>
+<p>Install ghr with pipx, uv, pip, winget, or Homebrew; see <a href="/ghr/docs/install.html">Install</a>.</p>
+<h2><a href="#download" id="download"></a>Download</h2>
+<p>Download one or more GitHub release assets, optionally extracting archives; see
+<a href="/ghr/docs/download.html">Download</a>.</p>
+<h2><a href="#caching-in-github-actions" id="caching-in-github-actions"></a>Caching in GitHub Actions</h2>
+<p>Cache installed tools or downloaded assets in workflows; see
+<a href="/ghr/docs/github-actions.html">Caching in GitHub Actions</a>,
+<a href="https://github.com/cataggar/ghr/blob/main/actions/setup/README.md"><code>actions/setup</code></a>,
+<a href="https://github.com/cataggar/ghr/blob/main/actions/install/README.md"><code>actions/install</code></a>, and
+<a href="https://github.com/cataggar/ghr/blob/main/actions/download/README.md"><code>actions/download</code></a>.</p>
+<h2><a href="#directories" id="directories"></a>Directories</h2>
+<p>ghr follows uv-style directory conventions and supports environment overrides;
+see <a href="/ghr/docs/directories.html">Directories</a>.</p>
+<h2><a href="#wsl-linking-windows-side-bins-ghr-link--ghr-unlink" id="wsl-linking-windows-side-bins-ghr-link--ghr-unlink"></a>WSL: linking Windows-side bins (<code>ghr link</code> / <code>ghr unlink</code>)</h2>
+<p>Expose Windows-side installs and selected Windows <code>PATH</code> executables inside WSL;
+see <a href="/ghr/docs/wsl-linking.html">WSL linking</a>.</p>
+<h2><a href="#name-resolution-on-linux" id="name-resolution-on-linux"></a>Name resolution on Linux</h2>
+<p>ghr includes a fallback DNS path for oversized WSL-generated <code>resolv.conf</code>
+files; see <a href="/ghr/docs/troubleshooting.html">Name resolution on Linux</a>.</p>
+<h2><a href="#uninstall" id="uninstall"></a>Uninstall</h2>
+<p>Uninstall ghr from the package manager that installed it; see
+<a href="/ghr/docs/install.html#uninstall-ghr-itself">Uninstall</a>.</p>
+<h2><a href="#verification" id="verification"></a>Verification</h2>
+<p>Review automatic verification, skip/failure behavior, trust roots, and recorded
+install results in <a href="/ghr/docs/verification.html">Verification</a>.</p>
+<h2><a href="#reproducible-builds" id="reproducible-builds"></a>Reproducible builds</h2>
+<p>Linux and macOS release archives are byte-reproducible, and Windows builds are
+checked after stripping Authenticode signatures; see
+<a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a>.</p>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/README.md">View Markdown source</a></p></article>
+
+  <footer class="layout-footer">
+    Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.17.0 &middot;
+    <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
+    <span class="attribution">Logo by
+      <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
+      licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+    </span>
+  </footer>
+</div>
+</body>
+</html>

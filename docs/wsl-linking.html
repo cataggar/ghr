@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="/ghr/favicon.ico" sizes="any">
+  <link rel="icon" href="/ghr/favicon-32x32.png" type="image/png" sizes="32x32">
+  <title>WSL: linking Windows-side bins (ghr link / ghr unlink) — ghr</title>
+  <meta name="description" content="A toolkit for GitHub releases.">
+  <meta property="og:title" content="WSL: linking Windows-side bins (ghr link / ghr unlink)">
+  <meta property="og:description" content="A toolkit for GitHub releases.">
+  <meta property="og:type" content="website">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#f0ebe3; --bg2:#e8e2d9; --bg3:#ddd5cc;
+      --text:#252530; --muted:#8a7f78; --border:#d5cdc4;
+      --red:#e8251f; --red-dark:#aa1915; --paper:#fffdfa;
+    }
+    body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,-apple-system,sans-serif; min-height:100vh; line-height:1.65; }
+    a { color:inherit; text-decoration:none; }
+    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    code { font-size:0.9em; background:var(--bg2); border-radius:4px; padding:2px 6px; }
+    pre { background:#201014; color:#ffe8e7; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
+    pre code { background:none; padding:0; color:inherit; }
+    h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
+    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
+    .layout-wide { max-width:1080px; }
+    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
+    .site-logo-link { display:block; width:100%; }
+    .site-logo { display:block; width:100%; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
+    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
+    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
+    .nav a:hover { color:var(--text); }
+    .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
+    .hero h1 { font-size:clamp(32px,5vw,48px); line-height:1.05; margin-bottom:14px; }
+    .hero p { max-width:60ch; color:#ffe8e7; font-size:17px; margin-bottom:22px; }
+    .hero-actions { display:flex; gap:12px; flex-wrap:wrap; }
+    .btn { display:inline-flex; align-items:center; font-size:14px; font-weight:700; padding:11px 20px; border-radius:8px; transition:transform 0.15s ease, opacity 0.15s ease; }
+    .btn:hover { transform:translateY(-1px); }
+    .btn-primary { background:#fff; color:var(--red-dark); }
+    .btn-secondary { background:rgba(255,255,255,0.14); color:#fff; border:1px solid rgba(255,255,255,0.2); }
+    .btn-ghost { background:transparent; color:var(--text); border:1px solid var(--border); }
+    .btn-ghost:hover { border-color:var(--text); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+    .card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px; }
+    .card h3 { font-size:16px; margin-bottom:8px; }
+    .card p { font-size:14px; color:var(--muted); }
+    .section-title { font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:16px; }
+    section + section { margin-top:48px; }
+    .post-list { display:flex; flex-direction:column; gap:16px; }
+    .post-card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px 24px; }
+    .post-card h3 { font-size:18px; margin-bottom:6px; }
+    .post-card p { color:var(--muted); font-size:14px; }
+    .post-card .read-more { display:inline-block; margin-top:10px; font-size:13px; font-weight:700; color:var(--red); }
+    .prose h2 { font-size:24px; margin:32px 0 14px; }
+    .prose h3 { font-size:19px; margin:24px 0 10px; }
+    .prose p { margin-bottom:16px; }
+    .prose ul, .prose ol { margin:0 0 16px 24px; }
+    .prose li { margin-bottom:6px; }
+    .prose blockquote { border-left:3px solid var(--red); padding-left:16px; color:var(--muted); margin:0 0 16px; }
+    .prose h1 { font-size:36px; line-height:1.2; margin:24px 0; }
+    .prose h4, .prose h5, .prose h6 { margin:20px 0 10px; }
+    .prose a { color:var(--red-dark); text-decoration:underline; text-underline-offset:3px; }
+    .prose pre { margin:16px 0; }
+    .prose table { display:block; overflow-x:auto; border-collapse:collapse; margin:20px 0; }
+    .prose th, .prose td { border:1px solid var(--border); padding:8px 12px; text-align:left; }
+    .prose th { background:var(--bg2); }
+    .prose img { max-width:100%; }
+    .prose hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
+    .docs-nav { display:flex; flex-wrap:wrap; gap:8px 16px; padding-bottom:20px; border-bottom:1px solid var(--border); font-size:13px; }
+    .doc-source { margin-top:32px; font-size:13px; color:var(--muted); }
+    .back-link { display:inline-block; margin-bottom:24px; font-size:13px; color:var(--muted); }
+    .back-link:hover { color:var(--text); }
+    .attribution { margin-top:12px; font-size:12px; color:var(--muted); }
+    .layout-footer { margin-top:64px; padding-top:24px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); text-align:center; }
+    .layout-footer a { text-decoration:underline; text-underline-offset:2px; }
+.mcss-display{display:inline-flex;}.mcss-align_items{align-items:center;}.mcss-padding{padding:4px 10px;}.mcss-border_radius{border-radius:999px;}.mcss-font_size{font-size:12px;}.mcss-font_weight{font-weight:700;}.mcss-letter_spacing{letter-spacing:0.04em;}.mcss-gap{gap:16px;}@media (min-width: 768px){.mcss-md-gap{gap:24px;}}    .badge-red { background:var(--red); color:#fff; }
+    .badge-outline { border:1px solid var(--border); color:var(--muted); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <header class="layout-header">
+    <nav class="nav">
+      <a href="/ghr/blog">Blog</a>
+      <a href="/ghr/docs.html">Documentation</a>
+      <a href="https://github.com/cataggar/ghr">GitHub</a>
+      <a href="/ghr/docs/install.html">Install</a>
+    </nav>
+    <a href="/ghr/" class="site-logo-link"><img src="https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg" alt="ghr logo" class="site-logo"></a>
+  </header>
+<article class="prose docs"><nav class="docs-nav" aria-label="Documentation"><a href="/ghr/docs.html">ghr documentation</a> <a href="/ghr/docs/directories.html">Directories</a> <a href="/ghr/docs/download.html">Download</a> <a href="/ghr/docs/github-actions.html">Caching in GitHub Actions</a> <a href="/ghr/docs/install-identifiers.html">Install identifiers: design and migration</a> <a href="/ghr/docs/install.html">Install</a> <a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a> <a href="/ghr/docs/troubleshooting.html">Name resolution on Linux</a> <a href="/ghr/docs/verification.html">Verification</a> <a href="/ghr/docs/wsl-linking.html">WSL: linking Windows-side bins (ghr link / ghr unlink)</a> </nav>
+<h1><a href="#wsl-linking-windows-side-bins-ghr-link--ghr-unlink" id="wsl-linking-windows-side-bins-ghr-link--ghr-unlink"></a>WSL: linking Windows-side bins (<code>ghr link</code> / <code>ghr unlink</code>)</h1>
+<p>When ghr is installed on Windows, a parallel WSL distribution can expose the
+same tools without re-downloading them. <code>ghr link &lt;id&gt;</code> resolves the exact
+Windows install from ghr's inventory and creates Linux symlinks in
+<code>~/.local/bin</code> for that ID's persisted command names. The links point directly
+at the Windows-side <code>.exe</code> (via <code>/mnt/c/...</code>); WSL interop runs the binary
+transparently.</p>
+<pre><code class="language-sh"># Link an executable already on the Windows %PATH% (no install needed).
+ghr link --path az           # → bash wrapper that runs az.cmd via cmd.exe
+ghr unlink --path az
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li><code>ghr link</code> is a <strong>reconciler</strong>. Without <code>--bin</code>, it makes the WSL link set match the current Windows install — adding new bins, updating moved ones, and removing entries that disappeared from <code>ghr.json</code>. With <code>--bin &lt;name&gt;</code> filters, only the named entries are touched.</li>
+<li>The symlink target is the real <code>.exe</code> under the inventory-selected unit, not the Windows shim. A <code>C:\…</code> target would not trigger interop; the WSL path is required.</li>
+<li>Both commands require <code>WSL_INTEROP</code> to be set. They refuse to run outside WSL so you don't accidentally create dangling links on bare Linux or macOS.</li>
+<li>IDs are canonicalized to lowercase. Multiple IDs sourced from the same repository remain independent.</li>
+<li>Raw wasm modules are refused because direct symlinks to <code>.wasm</code> bytes are not executable through WSL interop.</li>
+</ul>
+<h2><a href="#bare-executable-form" id="bare-executable-form"></a>Bare executable form</h2>
+<p>A one-segment argument is ambiguous: an existing install ID or ID manifest
+wins; otherwise ghr retains the historical Windows-PATH behavior. Use <code>--id</code>
+or <code>--path</code> to select explicitly. PATH mode resolves the name via <code>where.exe</code>
+(honouring <code>PATHEXT</code>), converts the result with <code>wslpath -u</code>, and writes an
+entry in ghr's bin directory based on the resolved file's extension:</p>
+<ul>
+<li><code>.exe</code> / <code>.com</code> → symlink. WSL interop direct-executes the PE image, no extra process hop.</li>
+<li><code>.cmd</code> / <code>.bat</code> -&gt; small bash wrapper that runs <code>cmd.exe /c '&lt;windows-path&gt;' &quot;$@&quot;</code> via WSL interop. This is how <code>ghr link --path az</code> exposes Azure CLI's <code>az.cmd</code>, for example.</li>
+<li><code>.ps1</code> (and anything else) → rejected. Running PowerShell scripts safely needs a different launcher and arg-quoting model; install <code>pwsh</code> separately if you want it.</li>
+</ul>
+<p>Other guardrails:</p>
+<ul>
+<li>The resolved path must live under <code>/mnt/&lt;letter&gt;/</code> (drvfs); UNC and <code>/mnt/wsl/</code> paths are rejected.</li>
+<li><code>--bin</code> is not supported with the bare form (there is exactly one bin to link).</li>
+<li><code>ghr unlink --path &lt;name&gt;</code> removes the symlink or wrapper created by PATH
+mode. Wrappers are only deleted when their magic comment and embedded Windows
+target match what the manifest recorded, so a user-edited wrapper is left
+alone.</li>
+<li>Automatic one-segment disambiguation requires canonical <code>%APPDATA%</code>
+discovery. If discovery fails, ghr requires <code>--path</code> or
+<code>GHR_WIN_TOOLS_DIR</code> instead of guessing and possibly selecting the wrong
+ownership mode.</li>
+</ul>
+<h2><a href="#recipe-git-credential-manager-from-wsl" id="recipe-git-credential-manager-from-wsl"></a>Recipe: Git Credential Manager from WSL</h2>
+<p>Use this when Git runs natively in WSL but credentials should be prompted for
+and stored by Windows Git Credential Manager.</p>
+<p>In Windows PowerShell:</p>
+<pre><code class="language-powershell">ghr install git-ecosystem/git-credential-manager
+</code></pre>
+<p>Inside WSL:</p>
+<pre><code class="language-sh">ghr link git-ecosystem/git-credential-manager
+git config --global credential.helper manager
+</code></pre>
+<p><code>ghr link</code> exposes the Windows <code>git-credential-manager.exe</code> as
+<code>git-credential-manager</code> on the WSL <code>PATH</code>. Native WSL Git remains in use; when
+Git needs credentials, it runs the linked Windows helper through WSL interop, so
+the sign-in flow and credential storage happen on Windows.</p>
+<p>Do not link the bare Windows Git executable for this setup: that would expose
+Windows Git itself, not just the credential helper. Git authentication through
+GCM does not require a separate <code>keyring</code> install.</p>
+<p>For Azure Repos, also configure WSL Git to pass the organization path:</p>
+<pre><code class="language-sh">git config --global credential.https://dev.azure.com.useHttpPath true
+</code></pre>
+<p>To prefer Microsoft Entra OAuth tokens for Azure Repos, configure the Windows
+Git/GCM settings from Windows PowerShell:</p>
+<pre><code class="language-powershell">git config --global credential.azreposCredentialType oauth
+</code></pre>
+<p>If <code>ghr link</code> cannot find the Windows install, see
+<a href="#locating-the-windows-tools-dir">Locating the Windows tools dir</a>.</p>
+<h2><a href="#recipe-uv-with-azure-devops-feeds-from-wsl" id="recipe-uv-with-azure-devops-feeds-from-wsl"></a>Recipe: uv with Azure DevOps feeds from WSL</h2>
+<p>Use this when <code>uv</code> runs in WSL but Azure DevOps authentication should reuse the
+Windows Microsoft identity cache.</p>
+<p>In Windows PowerShell:</p>
+<pre><code class="language-powershell">ghr install cataggar/keyring
+</code></pre>
+<p>Inside WSL:</p>
+<pre><code class="language-sh">ghr link cataggar/keyring
+ghr install astral-sh/uv
+keyring -b ado diagnose
+export UV_KEYRING_PROVIDER=subprocess
+</code></pre>
+<p>Use an Azure Artifacts index URL that includes the conventional
+<code>VssSessionToken</code> username:</p>
+<pre><code class="language-sh">uv pip install \
+  --index-url &quot;https://VssSessionToken@pkgs.dev.azure.com/&lt;organization&gt;/&lt;project&gt;/_packaging/&lt;feed&gt;/pypi/simple/&quot; \
+  &lt;package&gt;
+</code></pre>
+<p><code>UV_KEYRING_PROVIDER=subprocess</code> tells <code>uv</code> to invoke the <code>keyring</code> command.
+Because <code>ghr link cataggar/keyring</code> points to the Windows <code>keyring.exe</code>, the <code>ado</code>
+backend can reuse the Windows Microsoft identity cache and return the session
+token to <code>uv</code>; the token is not written into the URL or config. This path does
+not require Python <code>artifacts-keyring</code> or a .NET runtime inside WSL.</p>
+<p>For troubleshooting, run <code>keyring -b ado diagnose</code>, then see
+<a href="https://github.com/cataggar/keyring/blob/main/doc/azure-devops.md">cataggar/keyring Azure DevOps</a>
+and <a href="https://docs.astral.sh/uv/concepts/authentication/http/#keyring-providers">uv keyring providers</a>.</p>
+<h2><a href="#locating-the-windows-tools-dir" id="locating-the-windows-tools-dir"></a>Locating the Windows tools dir</h2>
+<p><code>ghr link</code> resolves the Windows-side tools dir in this order:</p>
+<ol>
+<li><code>GHR_WIN_TOOLS_DIR</code> — explicit override. Accepts either a WSL path (<code>/mnt/c/Users/x/AppData/Roaming/ghr/data/tools</code>) or a Windows path (<code>C:\Users\x\AppData\Roaming\ghr\data\tools</code>).</li>
+<li><code>cmd.exe /c echo %APPDATA%</code>, run through <code>wslpath -u</code>. This is the canonical lookup and handles non-default Windows usernames and redirected APPDATA.</li>
+<li>For explicit ID operations, fallback to
+<code>/mnt/c/Users/$USER/AppData/Roaming/ghr/data/tools</code> with a warning, assuming
+the WSL username matches the Windows one. Automatic one-segment
+disambiguation does not use this heuristic.</li>
+</ol>
+<h2><a href="#per-link-manifest" id="per-link-manifest"></a>Per-link manifest</h2>
+<p>For each linked ID, ghr records what it created at
+<code>$XDG_DATA_HOME/ghr/links/by-id/u-&lt;segment&gt;/.../_manifest.json</code> (or under
+<code>~/.local/share</code>). The prefixed segment encoding keeps IDs such as <code>a</code> and
+<code>a/b</code> independent. Bare-executable links live in the sibling
+<code>by-path/&lt;name&gt;.json</code> tree.</p>
+<p>The manifest records the canonical ID and exact published command names.
+<code>ghr unlink</code> verifies each live symlink still points where the manifest
+recorded before deleting, so a user-rewritten symlink is never clobbered.
+Validated legacy owner/repo manifests migrate lazily during a full
+reconciliation and can still be unlinked after the Windows install disappears.</p>
+<h2><a href="#recipe-microsoft-authentication-cli-from-wsl" id="recipe-microsoft-authentication-cli-from-wsl"></a>Recipe: Microsoft Authentication CLI from WSL</h2>
+<p>Use this when Microsoft Authentication CLI is installed on Windows and only the
+<code>azureauth</code> binary should be exposed inside WSL.</p>
+<p>In Windows PowerShell:</p>
+<pre><code class="language-powershell">ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
+</code></pre>
+<p>Inside WSL:</p>
+<pre><code class="language-sh">ghr link azuread/microsoft-authentication-cli --bin azureauth
+</code></pre>
+<p>The release archive also contains <code>createdump.exe</code>. Install-time <code>--bin</code>
+selection keeps that command out of the Windows publication set, while
+link-time <code>--bin</code> limits which already-owned Windows commands are exposed in
+WSL.</p>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/wsl-linking.md">View Markdown source</a></p></article>
+
+  <footer class="layout-footer">
+    Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.17.0 &middot;
+    <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
+    <span class="attribution">Logo by
+      <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
+      licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+    </span>
+  </footer>
+</div>
+</body>
+</html>

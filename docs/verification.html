@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="icon" href="/ghr/favicon.ico" sizes="any">
+  <link rel="icon" href="/ghr/favicon-32x32.png" type="image/png" sizes="32x32">
+  <title>Verification — ghr</title>
+  <meta name="description" content="A toolkit for GitHub releases.">
+  <meta property="og:title" content="Verification">
+  <meta property="og:description" content="A toolkit for GitHub releases.">
+  <meta property="og:type" content="website">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#f0ebe3; --bg2:#e8e2d9; --bg3:#ddd5cc;
+      --text:#252530; --muted:#8a7f78; --border:#d5cdc4;
+      --red:#e8251f; --red-dark:#aa1915; --paper:#fffdfa;
+    }
+    body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,-apple-system,sans-serif; min-height:100vh; line-height:1.65; }
+    a { color:inherit; text-decoration:none; }
+    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    code { font-size:0.9em; background:var(--bg2); border-radius:4px; padding:2px 6px; }
+    pre { background:#201014; color:#ffe8e7; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
+    pre code { background:none; padding:0; color:inherit; }
+    h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
+    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
+    .layout-wide { max-width:1080px; }
+    .layout-header { display:flex; flex-direction:column; align-items:center; text-align:center; margin-bottom:48px; gap:18px; }
+    .site-logo-link { display:block; width:100%; }
+    .site-logo { display:block; width:100%; height:auto; border-radius:16px; box-shadow:0 16px 40px rgba(37,37,48,0.18); }
+    .nav { display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
+    .nav a { font-size:13px; color:var(--muted); transition:color 0.15s; }
+    .nav a:hover { color:var(--text); }
+    .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
+    .hero h1 { font-size:clamp(32px,5vw,48px); line-height:1.05; margin-bottom:14px; }
+    .hero p { max-width:60ch; color:#ffe8e7; font-size:17px; margin-bottom:22px; }
+    .hero-actions { display:flex; gap:12px; flex-wrap:wrap; }
+    .btn { display:inline-flex; align-items:center; font-size:14px; font-weight:700; padding:11px 20px; border-radius:8px; transition:transform 0.15s ease, opacity 0.15s ease; }
+    .btn:hover { transform:translateY(-1px); }
+    .btn-primary { background:#fff; color:var(--red-dark); }
+    .btn-secondary { background:rgba(255,255,255,0.14); color:#fff; border:1px solid rgba(255,255,255,0.2); }
+    .btn-ghost { background:transparent; color:var(--text); border:1px solid var(--border); }
+    .btn-ghost:hover { border-color:var(--text); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
+    .card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px; }
+    .card h3 { font-size:16px; margin-bottom:8px; }
+    .card p { font-size:14px; color:var(--muted); }
+    .section-title { font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:16px; }
+    section + section { margin-top:48px; }
+    .post-list { display:flex; flex-direction:column; gap:16px; }
+    .post-card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px 24px; }
+    .post-card h3 { font-size:18px; margin-bottom:6px; }
+    .post-card p { color:var(--muted); font-size:14px; }
+    .post-card .read-more { display:inline-block; margin-top:10px; font-size:13px; font-weight:700; color:var(--red); }
+    .prose h2 { font-size:24px; margin:32px 0 14px; }
+    .prose h3 { font-size:19px; margin:24px 0 10px; }
+    .prose p { margin-bottom:16px; }
+    .prose ul, .prose ol { margin:0 0 16px 24px; }
+    .prose li { margin-bottom:6px; }
+    .prose blockquote { border-left:3px solid var(--red); padding-left:16px; color:var(--muted); margin:0 0 16px; }
+    .prose h1 { font-size:36px; line-height:1.2; margin:24px 0; }
+    .prose h4, .prose h5, .prose h6 { margin:20px 0 10px; }
+    .prose a { color:var(--red-dark); text-decoration:underline; text-underline-offset:3px; }
+    .prose pre { margin:16px 0; }
+    .prose table { display:block; overflow-x:auto; border-collapse:collapse; margin:20px 0; }
+    .prose th, .prose td { border:1px solid var(--border); padding:8px 12px; text-align:left; }
+    .prose th { background:var(--bg2); }
+    .prose img { max-width:100%; }
+    .prose hr { border:0; border-top:1px solid var(--border); margin:24px 0; }
+    .docs-nav { display:flex; flex-wrap:wrap; gap:8px 16px; padding-bottom:20px; border-bottom:1px solid var(--border); font-size:13px; }
+    .doc-source { margin-top:32px; font-size:13px; color:var(--muted); }
+    .back-link { display:inline-block; margin-bottom:24px; font-size:13px; color:var(--muted); }
+    .back-link:hover { color:var(--text); }
+    .attribution { margin-top:12px; font-size:12px; color:var(--muted); }
+    .layout-footer { margin-top:64px; padding-top:24px; border-top:1px solid var(--border); font-size:12px; color:var(--muted); text-align:center; }
+    .layout-footer a { text-decoration:underline; text-underline-offset:2px; }
+.mcss-display{display:inline-flex;}.mcss-align_items{align-items:center;}.mcss-padding{padding:4px 10px;}.mcss-border_radius{border-radius:999px;}.mcss-font_size{font-size:12px;}.mcss-font_weight{font-weight:700;}.mcss-letter_spacing{letter-spacing:0.04em;}.mcss-gap{gap:16px;}@media (min-width: 768px){.mcss-md-gap{gap:24px;}}    .badge-red { background:var(--red); color:#fff; }
+    .badge-outline { border:1px solid var(--border); color:var(--muted); }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <header class="layout-header">
+    <nav class="nav">
+      <a href="/ghr/blog">Blog</a>
+      <a href="/ghr/docs.html">Documentation</a>
+      <a href="https://github.com/cataggar/ghr">GitHub</a>
+      <a href="/ghr/docs/install.html">Install</a>
+    </nav>
+    <a href="/ghr/" class="site-logo-link"><img src="https://github.com/cataggar/ghr/releases/download/v0.6.2/ghr-logo.jpg" alt="ghr logo" class="site-logo"></a>
+  </header>
+<article class="prose docs"><nav class="docs-nav" aria-label="Documentation"><a href="/ghr/docs.html">ghr documentation</a> <a href="/ghr/docs/directories.html">Directories</a> <a href="/ghr/docs/download.html">Download</a> <a href="/ghr/docs/github-actions.html">Caching in GitHub Actions</a> <a href="/ghr/docs/install-identifiers.html">Install identifiers: design and migration</a> <a href="/ghr/docs/install.html">Install</a> <a href="/ghr/docs/reproducible-builds.html">Reproducible builds</a> <a href="/ghr/docs/troubleshooting.html">Name resolution on Linux</a> <a href="/ghr/docs/verification.html">Verification</a> <a href="/ghr/docs/wsl-linking.html">WSL: linking Windows-side bins (ghr link / ghr unlink)</a> </nav>
+<h1><a href="#verification" id="verification"></a>Verification</h1>
+<p>ghr's own releases ship per-asset <code>*.sigstore.json</code> sidecars (cosign
+v0.3 bundles) and <code>*.minisig</code> sidecars (minisign v2) for every
+published <code>.tar.gz</code> and <code>.zip</code>. The sigstore bundle is signed by the
+release workflow's GitHub Actions OIDC identity; the minisign sidecar
+is signed by a long-lived project key whose public token is:</p>
+<pre><code>RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+</code></pre>
+<p>ghr no longer publishes <code>.sha256</code> sidecars: because releases are built on
+GitHub Actions, a CI-generated checksum shares GitHub's trust root and adds
+nothing over GitHub's built-in asset digest (added 2025-06-03), which ghr
+verifies for free. Independent provenance is covered by the sigstore and
+minisign signatures above.</p>
+<p>The first-party <a href="https://github.com/cataggar/ghr/blob/main/actions/setup/README.md"><code>actions/setup</code></a> bootstrap does
+not ask an unverified <code>ghr</code> binary to verify itself. Its bundled Node
+implementation requires the GitHub asset digest plus either cryptographically
+verified GitHub artifact provenance or an explicitly supplied trusted SHA-256,
+then safely extracts and cross-checks the binary's version and target before
+adding it to <code>PATH</code>.</p>
+<p><code>ghr install cataggar/ghr</code> (or <code>ghr install cataggar/ghr@&lt;tag&gt;</code>)
+verifies the sigstore bundle automatically, prints the leaf certificate's SAN (the release-workflow
+URL) and OIDC issuer
+(<code>https://token.actions.githubusercontent.com</code>) for visual review, and
+fails-closed on any verification error. If a minisign signature is
+published but no public key is supplied, ghr notes that minisign was
+not verified; the other enabled verifiers still run. To also require
+minisign verification, pass the public key inline (per-spec) or via
+<code>--minisign</code>:</p>
+<pre><code class="language-sh">ghr install cataggar/ghr
+ghr install cataggar/ghr \
+    RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
+</code></pre>
+<p>Minisign sidecars start appearing with the release that introduced
+<code>.github/workflows/release.yml</code>'s signing step; pre-existing tags
+have no <code>.minisig</code> and fail closed if a key is supplied. Key
+rotation, if needed, will land as a new pubkey published in this
+README and the previous key marked as deprecated alongside the last
+tag it signed.</p>
+<p>When you install or download a release asset, ghr automatically verifies
+the downloaded bytes against supported verification material the release
+publishes. Minisign verification additionally needs a caller-supplied key:</p>
+<ul>
+<li>
+<p><strong>GitHub asset digest</strong> — GitHub computes a SHA-256 for every release
+asset at upload time and exposes it inline in the release JSON as
+<code>&quot;digest&quot;: &quot;sha256:&lt;hex&gt;&quot;</code> (added 2025-06-03). ghr verifies the download
+against it with <strong>no extra network request</strong> — the digest already
+arrived with the release metadata. Its trust root is GitHub itself (the
+same as a CI-generated sidecar): it attests integrity, not independent
+provenance. Assets uploaded before the rollout carry no digest.</p>
+</li>
+<li>
+<p><strong>Checksum files</strong> — sidecar <code>&lt;asset&gt;.sha256</code> / <code>&lt;asset&gt;.sha512</code> files
+and aggregate <code>*checksums*</code> / <code>SHA256SUMS</code> / <code>SHA512SUMS</code> files are all
+supported, in GNU and BSD formats, and may use SHA-256 (64-hex) or
+SHA-512 (128-hex) digests — the entry's hex width picks the algorithm
+per asset, so a single aggregate file can even mix both (e.g. some
+projects publish 128-hex SHA-512 in a file simply named
+<code>checksums.txt</code>). When a release publishes one it is <strong>always
+validated</strong> (in addition to the GitHub digest, never as a silent
+substitute); both must match. The sidecar download is the only case
+that costs an extra request, so releases that rely solely on the
+built-in digest verify for free.</p>
+</li>
+<li>
+<p><strong>Sigstore bundles</strong> — <code>&lt;asset&gt;.sigstore.json</code> (cosign bundle v0.3),
+published as a release asset, is verified entirely natively in Zig.
+This is a separate mechanism from GitHub artifact attestations below;
+a release may publish either, both, or neither, and each is verified
+independently of the other. The X.509 chain is walked from the
+bundle's leaf cert to embedded production Fulcio roots, the artifact's
+ECDSA-P256/SHA-256 signature is checked against the leaf, and Rekor's
+signed entry timestamp is verified against the embedded Rekor public
+key. The Rekor <code>integratedTime</code> is used as the verification clock since
+cosign leaf certs only live for ~10 minutes. When the bundle carries
+an inclusion proof, the Merkle audit path is replayed (RFC 6962) to
+recompute the log root, and the signed checkpoint envelope is verified
+against the embedded Rekor key — anchoring the entry to a publicly
+observable log root. The signer's SAN (URI/email) and OIDC issuer are
+extracted from the leaf cert and printed to stdout for visual review;
+ghr does not yet enforce a specific identity.</p>
+<p>Two artifact-binding shapes are supported, matching the two Rekor entry
+kinds we see in the wild:</p>
+<ul>
+<li><code>hashedrekord</code> — cosign's classic blob-signing form. The bundle's
+<code>messageSignature</code> covers a single artifact whose sha256 is the
+<code>messageDigest</code>. ghr requires a sibling <code>&lt;asset&gt;.sigstore.json</code>.</li>
+<li><code>dsse</code> — a DSSE envelope wrapping an
+<a href="https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md">in-toto v1 Statement</a>,
+typically a <a href="https://slsa.dev/provenance/v1">SLSA Provenance v1</a>
+attestation produced by <code>slsa-github-generator</code> or
+<code>cosign attest</code>. The Statement's <code>subject</code> list binds one or more
+artifacts by <code>name</code> + <code>sha256</code>. ghr falls back to any bare
+<code>*.sigstore.json</code> asset (e.g. <code>wash.sigstore.json</code> covering all
+<code>wash-&lt;platform&gt;</code> binaries) when no per-asset sidecar is published,
+and requires the downloaded asset's name + sha256 to appear as one
+of the Statement's subjects.</li>
+</ul>
+<p>DSSE signatures are verified against the
+<a href="https://github.com/secure-systems-lab/dsse/blob/master/protocol.md">DSSE v1 pre-authenticated encoding</a>
+of the payload; the Rekor <code>dsse / 0.0.1</code> body is checked to bind back
+to the bundle's envelope (<code>payloadHash</code> equals sha256 of the payload;
+signature + verifier cert equal the bundle's).</p>
+</li>
+<li>
+<p><strong>GitHub artifact attestations</strong> — unlike every other method here,
+these are **not published as release assets**, so there is nothing to
+spot in a release's file list. After downloading, ghr asks GitHub's
+<a href="https://docs.github.com/en/rest/repos/attestations">attestation API</a>
+for any attestation matching the file's SHA-256, and verifies it with
+the same native Zig Sigstore stack described above. This is what
+<code>gh attestation verify</code> checks, and it covers the many releases built
+by <a href="https://github.com/actions/attest-build-provenance"><code>actions/attest-build-provenance</code></a>
+that publish no sidecar at all.</p>
+<p>Two trust models are handled, and the bundle itself selects which:</p>
+<ul>
+<li><strong>Public repositories</strong> are signed by the public Sigstore instance
+(<code>O=sigstore.dev, CN=sigstore-intermediate</code>) and logged in Rekor. A
+verified Rekor signed entry timestamp is <strong>required</strong>, and its
+<code>integratedTime</code> is the certificate-validity clock. An inclusion
+proof, when present, is replayed against the signed checkpoint.</li>
+<li><strong>Private repositories</strong> are signed by GitHub's own Fulcio
+(<code>O=GitHub, Inc., CN=Fulcio Intermediate l2</code>) and are not in a public
+log. In place of Rekor the bundle carries a full RFC 3161
+<code>TimeStampResp</code> from GitHub's TSA, whose <code>genTime</code> becomes the clock.
+The TSA chain is pinned to GitHub's embedded trust root, so a
+timestamp token cannot carry its own signer.</li>
+</ul>
+<p>The attestation must be a <a href="https://slsa.dev/provenance/v1">SLSA Provenance v1</a>
+statement whose subject digest matches the download, and whose signing
+certificate names the repository the asset came from. The predicate type
+is checked against the <em>signed</em> statement rather than trusting the API's
+<code>predicate_type</code> filter, which is an unsigned request parameter that also
+admits older provenance versions. This is the same predicate
+<code>gh attestation verify</code> enforces by default, so an attestation ghr accepts
+here is one <code>gh</code> accepts too. Subject <em>names</em>
+are deliberately not matched — the local filename is chosen by the
+downloader, so it carries no meaning here. Repository identity is bound
+by the certificate's rename-stable numeric repository id as well as its
+URI, so a repository that was renamed or transferred after signing still
+verifies rather than failing as an impostor.</p>
+<p>Lookups are <strong>fail-closed</strong>: only two responses count as &quot;no attestation
+exists&quot; — a <code>404</code> (the repository has never produced one) and a success
+carrying an empty list (it uses attestations, but not for this digest).
+Both fall back to the other verifiers. Anything else — a rate limit, an
+expired token, a network error, a <code>500</code> — aborts the operation, so a
+transport failure can never be silently reported as an unattested
+artifact.</p>
+<p>Because each lookup is a GitHub API call, <strong>unauthenticated use can hit
+API rate limits</strong>. Set <code>GH_TOKEN</code> or <code>GITHUB_TOKEN</code> (private
+repositories additionally need the <code>attestations:read</code> permission), or
+opt out explicitly with <code>--skip-attestation</code>.</p>
+<p>A missing attestation is not a policy failure. ghr reports what a
+release actually published; it does not require provenance to exist. If
+you need &quot;this artifact MUST be attested&quot;, enforce that separately.</p>
+</li>
+<li>
+<p>**Minisign signatures** — <code>&lt;asset&gt;.minisig</code> sidecars
+(<a href="https://jedisct1.github.io/minisign/">minisign v2</a>) are verified when
+the caller supplies a public key — either via <code>--minisign &lt;base64-pubkey&gt;</code>
+(applied to every spec as a default) or as an inline positional
+immediately after a spec (per-spec override). The key value is the
+single-line base64 token from a minisign <code>.pub</code> file (algorithm <code>Ed</code>
+or <code>ED</code>, 8-byte key id, 32-byte Ed25519 public key). Both the artifact
+signature (<code>Ed</code> = pure Ed25519 over the file, <code>ED</code> = Ed25519 over the
+Blake2b-512 digest, streamed from disk) and the trailing trusted-comment
+global signature are verified against the same key. The trusted comment
+(often a <code>timestamp:... file:... hashed</code> blob) is printed on success.
+If a key is configured but no <code>&lt;asset&gt;.minisig</code> is published, ghr
+aborts before downloading — minisign verification is fail-closed when
+opted in.
+If a <code>&lt;asset&gt;.minisig</code> is published but no key is configured, ghr
+prints a note that minisign was not verified and continues with the
+other enabled verifiers. It does not claim minisign verification or
+record a minisign key. Pass a key to require minisign verification,
+or <code>--skip-minisign</code> to bypass it even when a key is configured.</p>
+</li>
+<li>
+<p><strong>Authenticode (Windows)</strong> — auto-detected from the downloaded bytes.
+When the asset is a PE (DOS <code>MZ</code> magic) or a <code>.zip</code> containing one or
+more <code>.exe</code> / <code>.dll</code> / <code>.sys</code> entries, ghr verifies each PE's embedded
+PKCS#7 SignedData natively in Zig:</p>
+<ol>
+<li>Recompute the SHA-256 Authenticode digest (CheckSum, Security
+data-directory entry, and certificate table excluded — per the
+Authenticode whitepaper / <code>signify</code>).</li>
+<li>Parse the embedded <code>SpcIndirectDataContent</code> and bind its declared
+digest to the recomputed one.</li>
+<li>Verify the SignerInfo signature over <code>signedAttrs</code> (replacing the
+IMPLICIT <code>[0]</code> tag with the SET-OF tag for the CMS-canonical input)
+against the signer cert's public key. RSA-PKCS#1 v1.5 with SHA-256
+/ SHA-384 / SHA-512 and ECDSA-P256 / -P384 are all accepted.</li>
+<li>Locate the RFC 3161 timestamp counter-signature (either
+<code>id-aa-signatureTimeStampToken</code> or Microsoft's
+<code>szOID_RFC3161_counterSign</code>), verify the TimeStampToken's own
+SignerInfo signature, walk the TSA cert chain to a trusted TSA
+root, and bind <code>TSTInfo.messageImprint</code> to <code>sha256(signer signature)</code>. The TSA chain is validated at the token's own
+<code>genTime</code>, the same clock used for the signer chain — timestamp
+authorities rotate their certificates too, and an archived
+signature does not stop being correctly timestamped when the TSA's
+cert expires.</li>
+<li>Walk the X.509 chain from the signer cert through the
+intermediates carried in the SignedData's <code>certificates</code> SET to
+one of the 15 embedded trust roots (Microsoft Identity
+Verification Root 2020, Microsoft Root CA 2011, Microsoft Root
+CA 2010, DigiCert Trusted Root G4 / Global G3 / Global / High
+Assurance EV / Assured ID G3, GlobalSign Root CA R3 / R6 / Code
+Signing R45, USERTrust RSA / ECC, Entrust Root G2 / EC1). The
+TSA's <code>genTime</code> is used as the validity clock so signatures
+remain trustworthy past the signer cert's <code>notAfter</code>. The wall
+clock plays no part in certificate validity anywhere in this
+path, including the construction of the trust root set itself.</li>
+</ol>
+<p>Authenticode is fail-closed when a PE inside the asset carries a
+signature that doesn't verify, and fail-open when no PE carries any
+signature (consistent with the other verifiers). Untimestamped
+signatures are rejected since the cert-validity clock can't be
+derived without a TSA witness.</p>
+</li>
+</ul>
+<p>On any verification failure the operation is aborted and the cached
+download is deleted. Malformed input counts as a verification failure:
+every DER structure <code>ghr</code> parses — X.509 certificates, PKCS#7
+SignedData, RFC 3161 tokens — goes through a bounds-checked parser, so
+a truncated or hostile encoding is reported as an ordinary failure
+rather than crashing the process. If no checksum, minisign sidecar,
+sigstore bundle, GitHub attestation, or Authenticode signature is
+published the download proceeds with a <code>note:</code> line so you know it was
+unverified.</p>
+<p>Pass <code>--skip-verify</code> to bypass every check at once. To bypass only one
+step (e.g. when its sidecar is broken in a particular release while the
+others still apply), use the narrower flags: <code>--skip-checksum</code>,
+<code>--skip-minisign</code>, <code>--skip-sigstore</code>, <code>--skip-attestation</code>,
+<code>--skip-authenticode</code>.</p>
+<p>Note that <code>--skip-sigstore</code> and <code>--skip-attestation</code> are <strong>not</strong>
+interchangeable even though both verify Sigstore material:
+<code>--skip-sigstore</code> covers only a <code>.sigstore.json</code> sidecar published as a
+release asset, while <code>--skip-attestation</code> covers only GitHub's
+attestation service. Skipping one leaves the other active. For
+<code>install</code>, the strongest result is recorded in each tool's <code>ghr.json</code>
+metadata as <code>&quot;verified&quot;</code>:</p>
+<ul>
+<li><code>&quot;github-attestation&quot;</code> — a GitHub artifact attestation for the file's
+digest verified under the SLSA v1 + repository-identity policy.</li>
+<li><code>&quot;sigstore&quot;</code> — sigstore bundle verified (also implies the bundle's
+declared SHA256 matches the file).</li>
+<li><code>&quot;minisign&quot;</code> — minisign sidecar verified by the caller-supplied
+minisign key (artifact + trusted-comment signatures).</li>
+<li><code>&quot;authenticode&quot;</code> — Authenticode signature on the downloaded PE (or on
+a PE inside the downloaded <code>.zip</code>) verified against an embedded MS /
+commercial CA trust root, with a valid RFC 3161 timestamp.</li>
+<li><code>&quot;checksum&quot;</code> — checksum sidecar verified.</li>
+<li><code>&quot;github-digest&quot;</code> — the asset's GitHub-published SHA-256 <code>digest</code> field
+matched the download (no extra request; integrity, not provenance).</li>
+<li><code>&quot;none&quot;</code> — no verification material was published.</li>
+<li><code>&quot;skipped&quot;</code> — <code>--skip-verify</code> was passed.</li>
+</ul>
+<p>When more than one verifier succeeds (e.g. checksum <em>and</em> sigstore, or
+checksum <em>and</em> Authenticode) the strongest one is recorded — precedence
+is github-attestation &gt; sigstore &gt; minisign &gt; authenticode &gt; checksum.
+All successful verifiers still print their own diagnostic line, so the
+full set is visible at install time.</p>
+<p>When the install actually verifies the asset with a minisign key
+(inline per-spec or <code>--minisign</code>), the key itself is also recorded in
+<code>ghr.json</code> as <code>&quot;minisign&quot;</code> and <code>ghr list</code> appends it to the matching
+line so the full output is directly pasteable as <code>ghr install &lt;line&gt;</code>
+on the next upgrade.</p>
+<p>The trust roots embedded in ghr come from three sources:
+<a href="https://github.com/sigstore/root-signing"><code>sigstore/root-signing</code></a>
+for the sigstore + Rekor anchor, GitHub's own TUF trust root for the
+GitHub Fulcio and TSA anchors used by artifact attestations, and a
+Mozilla CCADB snapshot plus direct issuing-CA fetches for the
+Authenticode + RFC 3161 roots (documented per-root in
+<a href="https://github.com/cataggar/ghr/blob/main/src/authenticode/trust/README.md"><code>src/authenticode/trust/README.md</code></a>).</p>
+<p>Because these are embedded rather than fetched, GitHub rotating its
+attestation signing material requires a new ghr release. In restricted
+networks, attestation verification needs <code>api.github.com</code> and the
+GitHub-hosted bundle URLs to be reachable, or <code>--skip-attestation</code>.</p>
+<p>GitHub artifact attestation support is tracked in
+<a href="https://github.com/cataggar/ghr/issues/165">#165</a>.
+Rotating them requires a new ghr release.</p>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/verification.md">View Markdown source</a></p></article>
+
+  <footer class="layout-footer">
+    Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.17.0 &middot;
+    <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
+    <span class="attribution">Logo by
+      <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
+      licensed <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>.
+    </span>
+  </footer>
+</div>
+</body>
+</html>
