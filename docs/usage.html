@@ -9,9 +9,9 @@
   <link rel="icon" href="/ghr/favicon.ico" sizes="any">
   <link rel="icon" href="/ghr/favicon-32x32.png" type="image/png" sizes="32x32">
   <script src="/ghr/site.js" defer></script>
-  <title>WSL: linking Windows-side bins (ghr link / ghr unlink) — ghr</title>
+  <title>Usage — ghr</title>
   <meta name="description" content="A toolkit for GitHub releases.">
-  <meta property="og:title" content="WSL: linking Windows-side bins (ghr link / ghr unlink)">
+  <meta property="og:title" content="Usage">
   <meta property="og:description" content="A toolkit for GitHub releases.">
   <meta property="og:type" content="website">
   <style>
@@ -148,11 +148,11 @@
 <li><details class="docs-group" open><summary>Guides</summary><ul>
 <li><a href="/ghr/docs/download.html">Download assets</a></li>
 <li><a href="/ghr/docs/github-actions.html">GitHub Actions</a></li>
-<li><a href="/ghr/docs/wsl-linking.html" aria-current="page">WSL linking</a></li>
+<li><a href="/ghr/docs/wsl-linking.html">WSL linking</a></li>
 <li><a href="/ghr/docs/troubleshooting.html">Troubleshooting</a></li>
 </ul></details></li>
 <li><details class="docs-group" open><summary>Reference</summary><ul>
-<li><a href="/ghr/docs/usage.html">Usage</a></li>
+<li><a href="/ghr/docs/usage.html" aria-current="page">Usage</a></li>
 <li><a href="/ghr/docs/directories.html">Directories</a></li>
 <li><a href="/ghr/docs/verification.html">Verification</a></li>
 </ul></details></li>
@@ -162,136 +162,62 @@
 </ul></details></li>
 </ul></nav></details></aside>
 <main id="main-content" tabindex="-1" class="prose docs">
-<h1><a href="#wsl-linking-windows-side-bins-ghr-link--ghr-unlink" id="wsl-linking-windows-side-bins-ghr-link--ghr-unlink"></a>WSL: linking Windows-side bins (<code>ghr link</code> / <code>ghr unlink</code>)</h1>
-<p>When ghr is installed on Windows, a parallel WSL distribution can expose the
-same tools without re-downloading them. <code>ghr link &lt;id&gt;</code> resolves the exact
-Windows install from ghr's inventory and creates Linux symlinks in
-<code>~/.local/bin</code> for that ID's persisted command names. The links point directly
-at the Windows-side <code>.exe</code> (via <code>/mnt/c/...</code>); WSL interop runs the binary
-transparently.</p>
-<pre><code class="language-sh"># Link an executable already on the Windows %PATH% (no install needed).
-ghr link --path az           # → bash wrapper that runs az.cmd via cmd.exe
-ghr unlink --path az
+<h1><a href="#usage" id="usage"></a>Usage</h1>
+<pre><code class="language-text">ghr list [--ids|--json]                           Report installed units
+ghr install &lt;source&gt; [&quot;?&lt;query&gt;&quot;] [&lt;pubkey&gt;] ...  Install or replace tools by stable ID
+ghr uninstall &lt;id&gt;                              Remove exactly one installed ID
+ghr download &lt;spec&gt; [&lt;pubkey&gt;] [&lt;spec&gt; ...]       Download one or more release assets
+ghr link &lt;id&gt;|[--path] &lt;name&gt;                     Link Windows commands into WSL
+ghr unlink &lt;id&gt;|[--path] &lt;name&gt;                   Remove ghr-created WSL links
+ghr path add [--dry-run]                         Add ghr's bin dir to your user PATH
+ghr path [bin|tools|cache]                       Show ghr directories
+ghr minisign generate [--repo owner/repo]        Create a signing key and configure repository secrets
+ghr minisign sign &lt;file&gt; [&lt;file&gt; ...]             Sign release artifacts with a minisign key
+ghr version [--target]                          Print version or build target and exit
+ghr -h | --help                                 Print this help and exit
 </code></pre>
-<p>Notes:</p>
-<ul>
-<li><code>ghr link</code> is a <strong>reconciler</strong>. Without <code>--bin</code>, it makes the WSL link set match the current Windows install — adding new bins, updating moved ones, and removing entries that disappeared from <code>ghr.json</code>. With <code>--bin &lt;name&gt;</code> filters, only the named entries are touched.</li>
-<li>The symlink target is the real <code>.exe</code> under the inventory-selected unit, not the Windows shim. A <code>C:\…</code> target would not trigger interop; the WSL path is required.</li>
-<li>Both commands require <code>WSL_INTEROP</code> to be set. They refuse to run outside WSL so you don't accidentally create dangling links on bare Linux or macOS.</li>
-<li>IDs are canonicalized to lowercase. Multiple IDs sourced from the same repository remain independent.</li>
-<li>Raw wasm modules are refused because direct symlinks to <code>.wasm</code> bytes are not executable through WSL interop.</li>
-</ul>
-<h2><a href="#bare-executable-form" id="bare-executable-form"></a>Bare executable form</h2>
-<p>A one-segment argument is ambiguous: an existing install ID or ID manifest
-wins; otherwise ghr retains the historical Windows-PATH behavior. Use <code>--id</code>
-or <code>--path</code> to select explicitly. PATH mode resolves the name via <code>where.exe</code>
-(honouring <code>PATHEXT</code>), converts the result with <code>wslpath -u</code>, and writes an
-entry in ghr's bin directory based on the resolved file's extension:</p>
-<ul>
-<li><code>.exe</code> / <code>.com</code> → symlink. WSL interop direct-executes the PE image, no extra process hop.</li>
-<li><code>.cmd</code> / <code>.bat</code> -&gt; small bash wrapper that runs <code>cmd.exe /c '&lt;windows-path&gt;' &quot;$@&quot;</code> via WSL interop. This is how <code>ghr link --path az</code> exposes Azure CLI's <code>az.cmd</code>, for example.</li>
-<li><code>.ps1</code> (and anything else) → rejected. Running PowerShell scripts safely needs a different launcher and arg-quoting model; install <code>pwsh</code> separately if you want it.</li>
-</ul>
-<p>Other guardrails:</p>
-<ul>
-<li>The resolved path must live under <code>/mnt/&lt;letter&gt;/</code> (drvfs); UNC and <code>/mnt/wsl/</code> paths are rejected.</li>
-<li><code>--bin</code> is not supported with the bare form (there is exactly one bin to link).</li>
-<li><code>ghr unlink --path &lt;name&gt;</code> removes the symlink or wrapper created by PATH
-mode. Wrappers are only deleted when their magic comment and embedded Windows
-target match what the manifest recorded, so a user-edited wrapper is left
-alone.</li>
-<li>Automatic one-segment disambiguation requires canonical <code>%APPDATA%</code>
-discovery. If discovery fails, ghr requires <code>--path</code> or
-<code>GHR_WIN_TOOLS_DIR</code> instead of guessing and possibly selecting the wrong
-ownership mode.</li>
-</ul>
-<h2><a href="#recipe-git-credential-manager-from-wsl" id="recipe-git-credential-manager-from-wsl"></a>Recipe: Git Credential Manager from WSL</h2>
-<p>Use this when Git runs natively in WSL but credentials should be prompted for
-and stored by Windows Git Credential Manager.</p>
-<p>In Windows PowerShell:</p>
-<pre><code class="language-powershell">ghr install git-ecosystem/git-credential-manager
+<p>Each install <code>&lt;source&gt;</code> is <code>owner/repo[@tag]</code>,
+<code>owner/repo/file[@tag]</code>, a GitHub release-download URL, or a direct URL. GitHub
+sources derive the stable lowercase ID <code>owner/repo</code>; direct URLs require
+<code>?id=&lt;id&gt;</code>. A quoted query token can set <code>id</code>, repeat
+<code>alias=&lt;source&gt;:&lt;published&gt;</code>, and set <code>minisign</code>. A 56-character
+<code>RW</code>/<code>RU</code>-prefixed key immediately after a source remains supported.
+Reinstalling an existing ID replaces it transactionally.</p>
+<p>Run <code>ghr &lt;command&gt; --help</code> for complete syntax and examples.</p>
+<blockquote>
+<p>[!IMPORTANT]
+<strong>Breaking change in v0.8.0:</strong> the <code>help</code> command and positional help
+aliases were removed. Replace <code>ghr help</code> with <code>ghr --help</code>, and replace
+<code>ghr &lt;command&gt; help</code> with <code>ghr &lt;command&gt; --help</code> or <code>ghr &lt;command&gt; -h</code>.</p>
+</blockquote>
+<h2><a href="#examples" id="examples"></a>Examples</h2>
+<p>Install the latest release of a tool:</p>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep
 </code></pre>
-<p>Inside WSL:</p>
-<pre><code class="language-sh">ghr link git-ecosystem/git-credential-manager
-git config --global credential.helper manager
+<p>Install a specific version:</p>
+<pre><code class="language-sh">ghr install bytecodealliance/wasmtime@v44.0.1
 </code></pre>
-<p><code>ghr link</code> exposes the Windows <code>git-credential-manager.exe</code> as
-<code>git-credential-manager</code> on the WSL <code>PATH</code>. Native WSL Git remains in use; when
-Git needs credentials, it runs the linked Windows helper through WSL interop, so
-the sign-in flow and credential storage happen on Windows.</p>
-<p>Do not link the bare Windows Git executable for this setup: that would expose
-Windows Git itself, not just the credential helper. Git authentication through
-GCM does not require a separate <code>keyring</code> install.</p>
-<p>For Azure Repos, also configure WSL Git to pass the organization path:</p>
-<pre><code class="language-sh">git config --global credential.https://dev.azure.com.useHttpPath true
+<p>Install several tools in one invocation (shared HTTP client and authentication):</p>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
 </code></pre>
-<p>To prefer Microsoft Entra OAuth tokens for Azure Repos, configure the Windows
-Git/GCM settings from Windows PowerShell:</p>
-<pre><code class="language-powershell">git config --global credential.azreposCredentialType oauth
+<p>Keep two releases from one repository under independent IDs and commands:</p>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep@14.1.0 &quot;?id=rg-14-1-0&amp;alias=rg:rg-14-1-0&quot;
 </code></pre>
-<p>If <code>ghr link</code> cannot find the Windows install, see
-<a href="#locating-the-windows-tools-dir">Locating the Windows tools dir</a>.</p>
-<h2><a href="#recipe-uv-with-azure-devops-feeds-from-wsl" id="recipe-uv-with-azure-devops-feeds-from-wsl"></a>Recipe: uv with Azure DevOps feeds from WSL</h2>
-<p>Use this when <code>uv</code> runs in WSL but Azure DevOps authentication should reuse the
-Windows Microsoft identity cache.</p>
-<p>In Windows PowerShell:</p>
-<pre><code class="language-powershell">ghr install cataggar/keyring
+<pre><code class="language-sh">ghr install burntsushi/ripgrep@14.1.1 &quot;?id=rg-14-1-1&amp;alias=rg:rg-14-1-1&quot;
 </code></pre>
-<p>Inside WSL:</p>
-<pre><code class="language-sh">ghr link cataggar/keyring
-ghr install astral-sh/uv
-keyring -b ado diagnose
-export UV_KEYRING_PROVIDER=subprocess
+<p>Replace one ID:</p>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep@14.1.1 &quot;?id=rg-14-1-0&amp;alias=rg:rg-14-1-0&quot;
 </code></pre>
-<p>Use an Azure Artifacts index URL that includes the conventional
-<code>VssSessionToken</code> username:</p>
-<pre><code class="language-sh">uv pip install \
-  --index-url &quot;https://VssSessionToken@pkgs.dev.azure.com/&lt;organization&gt;/&lt;project&gt;/_packaging/&lt;feed&gt;/pypi/simple/&quot; \
-  &lt;package&gt;
+<p>List exact identities:</p>
+<pre><code class="language-sh">ghr list --ids
 </code></pre>
-<p><code>UV_KEYRING_PROVIDER=subprocess</code> tells <code>uv</code> to invoke the <code>keyring</code> command.
-Because <code>ghr link cataggar/keyring</code> points to the Windows <code>keyring.exe</code>, the <code>ado</code>
-backend can reuse the Windows Microsoft identity cache and return the session
-token to <code>uv</code>; the token is not written into the URL or config. This path does
-not require Python <code>artifacts-keyring</code> or a .NET runtime inside WSL.</p>
-<p>For troubleshooting, run <code>keyring -b ado diagnose</code>, then see
-<a href="https://github.com/cataggar/keyring/blob/main/doc/azure-devops.md">cataggar/keyring Azure DevOps</a>
-and <a href="https://docs.astral.sh/uv/concepts/authentication/http/#keyring-providers">uv keyring providers</a>.</p>
-<h2><a href="#locating-the-windows-tools-dir" id="locating-the-windows-tools-dir"></a>Locating the Windows tools dir</h2>
-<p><code>ghr link</code> resolves the Windows-side tools dir in this order:</p>
-<ol>
-<li><code>GHR_WIN_TOOLS_DIR</code> — explicit override. Accepts either a WSL path (<code>/mnt/c/Users/x/AppData/Roaming/ghr/data/tools</code>) or a Windows path (<code>C:\Users\x\AppData\Roaming\ghr\data\tools</code>).</li>
-<li><code>cmd.exe /c echo %APPDATA%</code>, run through <code>wslpath -u</code>. This is the canonical lookup and handles non-default Windows usernames and redirected APPDATA.</li>
-<li>For explicit ID operations, fallback to
-<code>/mnt/c/Users/$USER/AppData/Roaming/ghr/data/tools</code> with a warning, assuming
-the WSL username matches the Windows one. Automatic one-segment
-disambiguation does not use this heuristic.</li>
-</ol>
-<h2><a href="#per-link-manifest" id="per-link-manifest"></a>Per-link manifest</h2>
-<p>For each linked ID, ghr records what it created at
-<code>$XDG_DATA_HOME/ghr/links/by-id/u-&lt;segment&gt;/.../_manifest.json</code> (or under
-<code>~/.local/share</code>). The prefixed segment encoding keeps IDs such as <code>a</code> and
-<code>a/b</code> independent. Bare-executable links live in the sibling
-<code>by-path/&lt;name&gt;.json</code> tree.</p>
-<p>The manifest records the canonical ID and exact published command names.
-<code>ghr unlink</code> verifies each live symlink still points where the manifest
-recorded before deleting, so a user-rewritten symlink is never clobbered.
-Validated legacy owner/repo manifests migrate lazily during a full
-reconciliation and can still be unlinked after the Windows install disappears.</p>
-<h2><a href="#recipe-microsoft-authentication-cli-from-wsl" id="recipe-microsoft-authentication-cli-from-wsl"></a>Recipe: Microsoft Authentication CLI from WSL</h2>
-<p>Use this when Microsoft Authentication CLI is installed on Windows and only the
-<code>azureauth</code> binary should be exposed inside WSL.</p>
-<p>In Windows PowerShell:</p>
-<pre><code class="language-powershell">ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
+<p>Remove only that ID:</p>
+<pre><code class="language-sh">ghr uninstall rg-14-1-0
 </code></pre>
-<p>Inside WSL:</p>
-<pre><code class="language-sh">ghr link azuread/microsoft-authentication-cli --bin azureauth
+<p>Install Minisign itself, verifying with its Minisign public key:</p>
+<pre><code class="language-sh">ghr install jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
 </code></pre>
-<p>The release archive also contains <code>createdump.exe</code>. Install-time <code>--bin</code>
-selection keeps that command out of the Windows publication set, while
-link-time <code>--bin</code> limits which already-owned Windows commands are exposed in
-WSL.</p>
-<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/wsl-linking.md">View Markdown source</a></p></main>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/usage.md">View Markdown source</a></p></main>
 </div>
 
   <footer class="layout-footer">

@@ -152,6 +152,7 @@
 <li><a href="/ghr/docs/troubleshooting.html">Troubleshooting</a></li>
 </ul></details></li>
 <li><details class="docs-group" open><summary>Reference</summary><ul>
+<li><a href="/ghr/docs/usage.html">Usage</a></li>
 <li><a href="/ghr/docs/directories.html">Directories</a></li>
 <li><a href="/ghr/docs/verification.html">Verification</a></li>
 </ul></details></li>
@@ -191,8 +192,8 @@ cross-run caching.</li>
 <pre><code class="language-yaml">- uses: cataggar/ghr/actions/install@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.0 ?id=rg-14-1-0&amp;alias=rg:rg-14-1-0
-      BurntSushi/ripgrep@14.1.1 ?id=rg-14-1-1&amp;alias=rg:rg-14-1-1
+      burntsushi/ripgrep@14.1.0 ?id=rg-14-1-0&amp;alias=rg:rg-14-1-0
+      burntsushi/ripgrep@14.1.1 ?id=rg-14-1-1&amp;alias=rg:rg-14-1-1
       sharkdp/fd@v10.2.0
 </code></pre>
 <p>Each line is one complete install request: a source, optional query token, and
@@ -204,7 +205,7 @@ action-level <code>minisign:</code> default:</p>
   with:
     tools: |
       jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
 </code></pre>
 <p>The actions ship in this same repository, so their git tags are the
@@ -247,7 +248,7 @@ manual recipe remains possible:</p>
 - if: steps.ghr-cache.outputs.cache-hit != 'true'
   run: |
     ghr install \
-      BurntSushi/ripgrep@14.1.1 \
+      burntsushi/ripgrep@14.1.1 \
       sharkdp/fd@v10.2.0
 
 - run: ghr list  # sanity check after a cache restore
@@ -294,7 +295,7 @@ used):</p>
 <pre><code class="language-yaml">- uses: cataggar/ghr/actions/download@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
     extract: 'true'
     strip-components: '1'
@@ -312,7 +313,7 @@ used):</p>
     pipx install ghr-bin
     mkdir -p ./bin
     ghr download \
-      BurntSushi/ripgrep@14.1.1 \
+      burntsushi/ripgrep@14.1.1 \
       sharkdp/fd@v10.2.0 \
       --extract ./bin --strip-components 1
 </code></pre>

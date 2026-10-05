@@ -152,6 +152,7 @@
 <li><a href="/ghr/docs/troubleshooting.html">Troubleshooting</a></li>
 </ul></details></li>
 <li><details class="docs-group" open><summary>Reference</summary><ul>
+<li><a href="/ghr/docs/usage.html">Usage</a></li>
 <li><a href="/ghr/docs/directories.html">Directories</a></li>
 <li><a href="/ghr/docs/verification.html">Verification</a></li>
 </ul></details></li>
@@ -167,56 +168,24 @@ system and architecture, verifies the download, and exposes the installed
 commands from one shared bin directory.</p>
 <h2><a href="#install-ghr" id="install-ghr"></a>Install ghr</h2>
 <p>Choose the command for your environment:</p>
-<p>macOS with Homebrew:</p>
-<pre><code class="language-sh">brew install cataggar/ghr/ghr
+<p>Linux and macOS:</p>
+<pre><code class="language-sh">curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | sh
 </code></pre>
-<p>Windows with winget:</p>
-<pre><code class="language-sh">winget install ghr
+<p>Windows (PowerShell):</p>
+<pre><code class="language-powershell">iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
 </code></pre>
-<p>Linux, macOS, or Windows with uv:</p>
-<pre><code class="language-sh">uv tool install ghr-bin
-</code></pre>
-<p>Check that ghr is available:</p>
+<p>Open a new terminal after installation, then check that ghr is available:</p>
 <pre><code class="language-sh">ghr --version
 </code></pre>
-<p>See <a href="/ghr/docs/install.html">Installation</a> for other package managers, direct release
-downloads, and uninstall instructions. In CI, use the first-party
-<a href="/ghr/docs/github-actions.html">GitHub Actions</a> instead of installing a package manager.</p>
+<p>See <a href="/ghr/docs/install.html">Installation</a> for package managers, direct release downloads,
+and uninstall instructions.</p>
 <h2><a href="#install-your-first-tool" id="install-your-first-tool"></a>Install your first tool</h2>
 <p>Install ripgrep from its latest GitHub release:</p>
-<pre><code class="language-sh">ghr install BurntSushi/ripgrep
-</code></pre>
-<p>Add ghr's bin directory to your user <code>PATH</code>, then open a new terminal:</p>
-<pre><code class="language-sh">ghr path add
+<pre><code class="language-sh">ghr install burntsushi/ripgrep
 </code></pre>
 <p>Run the tool:</p>
 <pre><code class="language-sh">rg --version
 </code></pre>
-<p>Inspect your installed tools:</p>
-<pre><code class="language-sh">ghr list
-</code></pre>
-<p>To choose a release, append its tag to the repository:</p>
-<pre><code class="language-sh">ghr install BurntSushi/ripgrep@15.1.0
-</code></pre>
-<p>Reinstalling the same repository upgrades that installation. See
-<a href="/ghr/docs/install.html#stable-ids-and-replacement">Installation</a> for independent install
-IDs and command aliases, and <a href="/ghr/docs/directories.html">Directories</a> for storage and
-<code>PATH</code> details.</p>
-<h2><a href="#understand-verification" id="understand-verification"></a>Understand verification</h2>
-<p>ghr checks the GitHub asset digest and supported verification material published
-with a release, including checksum files, Sigstore bundles, and GitHub artifact
-attestations. Minisign verification additionally requires a trusted public key.
-Verification failures stop the operation; an unavailable signature is not a
-claim that an asset has been independently authenticated.</p>
-<p>See <a href="/ghr/docs/verification.html">Verification</a> for trust roots, recorded results, and how
-to require Minisign verification. Keep verification enabled for normal installs.</p>
-<h2><a href="#next-steps" id="next-steps"></a>Next steps</h2>
-<ul>
-<li><a href="/ghr/docs/download.html">Download assets</a> without installing them.</li>
-<li><a href="/ghr/docs/github-actions.html">Use ghr in GitHub Actions</a> with caching.</li>
-<li><a href="/ghr/docs/wsl-linking.html">Link Windows tools into WSL</a>.</li>
-<li>Browse the <a href="/ghr/docs.html">documentation overview</a> for all topics.</li>
-</ul>
 <p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/getting-started.md">View Markdown source</a></p></main>
 </div>
 
