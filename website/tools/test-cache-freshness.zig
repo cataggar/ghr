@@ -58,12 +58,17 @@ fn exercise(allocator: std.mem.Allocator, io: std.Io, source: std.Io.Dir, zig: [
     for ([_][]const u8{ "src", "tools", "public" }) |path| try copyDirectory(allocator, io, source, project, path);
     const fixture: Fixture = .{ .allocator = allocator, .io = io, .project = project, .zig = zig };
     try fixture.write("app/index.zig", page);
-    try fixture.write("../doc/README.md", "# Documentation\n[Guide](guide.md#yés)\n");
+    try fixture.write("../doc/README.md", "# Documentation\n[Guide](guide.md#yés)\n[Build](build-from-source.md#compiler-selection)\n");
     try fixture.write("../doc/guide.md", guide);
+    try fixture.write("../doc/build-from-source.md", "# Build from source\n## Compiler selection\nrepository-only-content-marker\n");
+    try fixture.write("dist/docs/build-from-source.html", "stale-repository-only-page\n");
     _ = try fixture.build();
     _ = try fixture.build();
     try fixture.contains("dist/index.html", "cache-route-marker");
     try fixture.contains("dist/docs.html", "/ghr/docs/guide.html#y%C3%A9s");
+    try fixture.contains("dist/docs.html", "https://github.com/cataggar/ghr/blob/main/doc/build-from-source.md#compiler-selection");
+    try fixture.absent("dist/docs/build-from-source.html");
+    try require(try fixture.read("dist/docs.html"), "/ghr/docs/build-from-source.html", false);
     try fixture.contains("dist/docs/guide.html", "id=\"yés-1\"");
     try fixture.contains("dist/docs/guide.html", "<table>");
     try fixture.contains("dist/docs/guide.html", "class=\"language-zig\"");
@@ -142,12 +147,21 @@ fn exercise(allocator: std.mem.Allocator, io: std.Io, source: std.Io.Dir, zig: [
     _ = try fixture.build();
     try fixture.contains("dist/index.html", "class=\"docs-shell\"");
     try fixture.contains("dist/index.html", "/ghr/docs/guide.html");
+    try require(try fixture.read("dist/index.html"), "build-from-source", false);
     try fixture.write("../doc/home-guide.md", "# Homepage navigation guide\n");
     _ = try fixture.build();
     try fixture.contains("dist/index.html", "/ghr/docs/home-guide.html");
     try project.deleteFile(io, "../doc/home-guide.md");
     _ = try fixture.build();
     try require(try fixture.read("dist/index.html"), "/ghr/docs/home-guide.html", false);
+    try fixture.write("../doc/build-from-source.md", "# Build from source\n## Compiler selection\nedited-repository-only-content-marker\n");
+    _ = try fixture.build();
+    try fixture.absent("dist/docs/build-from-source.html");
+    try require(try fixture.read("dist/index.html"), "edited-repository-only-content-marker", false);
+    try fixture.write("../doc/usage.md", "# Usage\n");
+    _ = try fixture.build();
+    try fixture.contains("dist/docs/usage.html", "href=\"/ghr/docs/usage.html\" aria-current=\"page\"");
+    try fixture.contains("dist/index.html", "<summary>Reference</summary><ul>\n<li><a href=\"/ghr/docs/usage.html\">Usage</a>");
 }
 
 const Fixture = struct {

@@ -12,6 +12,7 @@ const Document = struct {
     title: []const u8,
     ast: *koino.nodes.AstNode,
     anchors: std.StringHashMap(void),
+    published: bool,
 };
 const NavigationPage = struct { source: []const u8, label: []const u8 };
 const NavigationGroup = struct { label: []const u8, pages: []const NavigationPage };
@@ -28,6 +29,7 @@ const navigation = [_]NavigationGroup{
         .{ .source = "troubleshooting.md", .label = "Troubleshooting" },
     } },
     .{ .label = "Reference", .pages = &.{
+        .{ .source = "usage.md", .label = "Usage" },
         .{ .source = "directories.md", .label = "Directories" },
         .{ .source = "verification.md", .label = "Verification" },
     } },
@@ -64,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
     }.less);
     var documents: std.ArrayList(Document) = .empty;
     defer for (documents.items) |document| document.ast.deinit();
+    var published_count: usize = 0;
     for (paths.items) |path| {
         const markdown = try dir.readFileAlloc(init.io, path, allocator, .limited(4 * 1024 * 1024));
         const document = parseDocument(allocator, path, markdown) catch |err| {
@@ -71,7 +74,9 @@ pub fn main(init: std.process.Init) !void {
             return err;
         };
         try documents.append(allocator, document);
+        if (document.published) published_count += 1;
     }
+    if (published_count == 0) return error.NoPublishedDocuments;
     var output: std.Io.Writer.Allocating = .init(allocator);
     const writer = &output.writer;
     try writer.writeAll("// Generated from doc/; do not edit.\nconst mer = @import(\"mer\");\n\n");
@@ -79,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
     try renderNavigation(allocator, &home_navigation.writer, "", documents.items);
     try writer.print("pub const home_navigation = \"{f}\";\n\n", .{std.zig.fmtString(home_navigation.written())});
     for (documents.items, 0..) |*document, index| {
+        if (!document.published) continue;
         try rewriteLinks(allocator, document, documents.items);
         var html: std.Io.Writer.Allocating = .init(allocator);
         try html.writer.writeAll("<div class=\"docs-shell\">\n");
@@ -90,6 +96,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try writer.writeAll("\npub const routes = [_]mer.Route{\n");
     for (documents.items, 0..) |document, index| {
+        if (!document.published) continue;
         try writer.print("    .{{ .path = \"{f}\", .render = render_{d}, .meta = .{{ .title = \"{f}\" }}, .prerender = true }},\n", .{ std.zig.fmtString(document.route), index, std.zig.fmtString(try escapeHtml(allocator, document.title)) });
     }
     try writer.writeAll("};\n");
@@ -103,26 +110,26 @@ fn renderNavigation(allocator: std.mem.Allocator, writer: *std.Io.Writer, curren
     for (navigation) |group| {
         var present = false;
         for (group.pages) |page| {
-            if (findDocument(documents, page.source) == null) continue;
+            if (findPublishedDocument(documents, page.source) == null) continue;
             present = true;
         }
         if (!present) continue;
         try writer.print("<li><details class=\"docs-group\" open><summary>{s}</summary><ul>\n", .{try escapeHtml(allocator, group.label)});
         for (group.pages) |page| {
-            const document = findDocument(documents, page.source) orelse continue;
+            const document = findPublishedDocument(documents, page.source) orelse continue;
             try renderNavigationLink(allocator, writer, current, document, page.label);
         }
         try writer.writeAll("</ul></details></li>\n");
     }
     var additional = false;
     for (documents) |document| {
-        if (isClassified(document.source)) continue;
+        if (!document.published or isClassified(document.source)) continue;
         additional = true;
     }
     if (additional) {
         try writer.writeAll("<li><details class=\"docs-group\" open><summary>More documentation</summary><ul>\n");
         for (documents) |document| {
-            if (isClassified(document.source)) continue;
+            if (!document.published or isClassified(document.source)) continue;
             try renderNavigationLink(allocator, writer, current, document, document.title);
         }
         try writer.writeAll("</ul></details></li>\n");
@@ -130,9 +137,9 @@ fn renderNavigation(allocator: std.mem.Allocator, writer: *std.Io.Writer, curren
     try writer.writeAll("</ul></nav></details></aside>\n");
 }
 
-fn findDocument(documents: []const Document, source: []const u8) ?Document {
+fn findPublishedDocument(documents: []const Document, source: []const u8) ?Document {
     for (documents) |document| {
-        if (std.mem.eql(u8, document.source, source)) return document;
+        if (document.published and std.mem.eql(u8, document.source, source)) return document;
     }
     return null;
 }
@@ -192,6 +199,7 @@ fn parseDocument(allocator: std.mem.Allocator, source: []const u8, markdown: []c
         .title = title orelse return error.DocumentMissingH1,
         .ast = ast,
         .anchors = anchors,
+        .published = !std.mem.eql(u8, source, "build-from-source.md"),
     };
 }
 
@@ -230,6 +238,9 @@ fn rewriteUrl(allocator: std.mem.Allocator, current: *const Document, documents:
         for (documents) |target| {
             if (!std.mem.eql(u8, target.source, resolved["/doc/".len..])) continue;
             if (fragment.len != 0 and !target.anchors.contains(try decodePath(allocator, fragment))) return error.UnknownHeadingFragment;
+            if (!target.published) {
+                return std.fmt.allocPrint(allocator, "{s}/blob/main{s}{s}", .{ config.repository_url, try encodePath(allocator, resolved), url[path_end..] });
+            }
             const suffix = if (fragment_index) |index| url[index..] else "";
             if (path.len == 0 and query.len == 0) return allocator.dupe(u8, suffix);
             return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ try publicUrl(allocator, target.route), query, suffix });
@@ -375,4 +386,22 @@ test "unclassified nested documents remain navigable with escaped titles and enc
     html.clearRetainingCapacity();
     try renderNavigation(allocator, &html.writer, "", &.{page});
     try std.testing.expect(std.mem.find(u8, html.written(), "class=\"docs-group\" open><summary>More documentation") != null);
+}
+
+test "repository-only build guide stays out of navigation and links resolve to source" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const index = try parseDocument(allocator, "README.md", "# Documentation\n");
+    defer index.ast.deinit();
+    const build = try parseDocument(allocator, "build-from-source.md", "# Build from source\n## Compiler selection\n");
+    defer build.ast.deinit();
+    try std.testing.expect(!build.published);
+    var html: std.Io.Writer.Allocating = .init(allocator);
+    try renderNavigation(allocator, &html.writer, index.source, &.{ index, build });
+    try std.testing.expect(std.mem.find(u8, html.written(), "build-from-source") == null);
+    try std.testing.expect(std.mem.find(u8, html.written(), "More documentation") == null);
+    try std.testing.expectEqualStrings(config.repository_url ++ "/blob/main/doc/build-from-source.md?plain=1#compiler-selection", try rewriteUrl(allocator, &index, &.{ index, build }, "build-from-source.md?plain=1#compiler-selection", false));
+    try std.testing.expectError(error.UnknownHeadingFragment, rewriteUrl(allocator, &index, &.{ index, build }, "build-from-source.md#missing", false));
+    try std.testing.expectError(error.MissingMarkdownTarget, rewriteUrl(allocator, &index, &.{index}, "build-from-source.md", false));
 }

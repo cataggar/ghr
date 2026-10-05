@@ -78,7 +78,7 @@ jobs:
           configured=$(gh api "repos/$GITHUB_REPOSITORY/pages" \
             --jq '.build_type == "legacy" and .source.branch == "website" and .source.path == "/"')
           if [ "$configured" != true ]; then
-            echo '::error::An administrator must configure GitHub Pages to deploy from website / (root). See README.md.'
+            echo '::error::An administrator must configure GitHub Pages to deploy from website / (root). See doc/build-from-source.md.'
             exit 1
           fi
           gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"

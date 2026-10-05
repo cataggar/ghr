@@ -7,7 +7,7 @@ each archive into a destination directory, and cache the result across runs.
 - uses: cataggar/ghr/actions/download@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
     extract: 'true'
 ```
@@ -78,7 +78,7 @@ verified content therefore invalidates the cache.
 - uses: cataggar/ghr/actions/download@v1
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
     dest: ./artifacts
 ```
@@ -89,7 +89,7 @@ verified content therefore invalidates the cache.
 - uses: cataggar/ghr/actions/download@v1
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
     extract: 'true'
     strip-components: '1'
@@ -140,7 +140,7 @@ pin the action to a commit SHA and supply the CLI version independently:
 - uses: cataggar/ghr/actions/download@<sha> # reviewed action commit
   with:
     ghr-version: v0.8.0
-    tools: BurntSushi/ripgrep@14.1.1
+    tools: burntsushi/ripgrep@14.1.1
 ```
 
 Commit, branch, major-tag, range, and `latest` references never silently select

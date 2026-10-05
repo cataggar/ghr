@@ -11,267 +11,39 @@ static binary that picks the right asset for your OS and architecture.
 Supports verifying with [minisign](https://jedisct1.github.io/minisign/),
 [sigstore](https://sigstore.dev/),
 [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/verify-attestations-offline),
-and checksums. Install it locally with `pipx install ghr-bin`, or use the first-party static
-bootstrap in GitHub Actions.
+and checksums. Use it locally or in GitHub Actions.
 
-## Usage
+## Quick start
 
-```
-ghr list [--ids|--json]                            Report installed units
-ghr install <source> ["?<query>"] [<pubkey>] ...   Install or replace tools by stable ID
-ghr uninstall <id>                                 Remove exactly one installed ID
-ghr download <spec> [<pubkey>] [<spec> ...]        Download one or more release assets
-ghr link <id>|[--path] <name>                      Link Windows commands into WSL
-ghr unlink <id>|[--path] <name>                    Remove ghr-created WSL links
-ghr path add [--dry-run]                           Add ghr's bin dir to your user PATH
-ghr path [bin|tools|cache]                         Show ghr directories
-ghr minisign generate [--repo OWNER/REPO]         Create a signing key and configure repository secrets
-ghr minisign sign <file> [<file> ...]              Sign release artifacts with a minisign key
-ghr version [--target]                             Print version or build target and exit
-ghr -h | --help                                    Print this help and exit
-```
-
-Each install `<source>` is `owner/repo[@tag]`,
-`owner/repo/file[@tag]`, a GitHub release-download URL, or a direct URL. GitHub
-sources derive the stable lowercase ID `owner/repo`; direct URLs require
-`?id=<id>`. A quoted query token can set `id`, repeat
-`alias=<source>:<published>`, and set `minisign`. A 56-character
-`RW`/`RU`-prefixed key immediately after a source remains supported.
-Reinstalling an existing ID replaces it transactionally.
-
-Run `ghr <COMMAND> --help` for complete syntax and examples.
-
-> [!IMPORTANT]
-> **Breaking change in v0.8.0:** the `help` command and positional help
-> aliases were removed. Replace `ghr help` with `ghr --help`, and replace
-> `ghr <COMMAND> help` with `ghr <COMMAND> --help` or `ghr <COMMAND> -h`.
-
-### Examples
+Linux and macOS:
 
 ```sh
-# Install the latest release of a tool
-ghr install burntsushi/ripgrep
-
-# Install a specific version
-# https://github.com/bytecodealliance/wasmtime/releases/tag/v44.0.1
-ghr install bytecodealliance/wasmtime@v44.0.1
-
-# Install several tools in one invocation (shared HTTP client + auth)
-ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
-
-# Keep two releases from one repository under independent IDs and commands
-ghr install BurntSushi/ripgrep@14.1.0 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
-ghr install BurntSushi/ripgrep@14.1.1 "?id=rg-14-1-1&alias=rg:rg-14-1-1"
-
-# Replace one ID, list exact identities, then remove only that ID
-ghr install BurntSushi/ripgrep@14.1.1 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
-ghr list --ids
-ghr uninstall rg-14-1-0
-
-# Install minisign itself, verifying with its minisign public key
-ghr install jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
-```
-
-## Install
-
-```sh
-pipx install ghr-bin
-uv tool install ghr-bin
-winget install ghr
-brew install cataggar/ghr/ghr
 curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | sh
-iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
-ghr install cataggar/ghr
-# Require minisign verification with the trusted public key
-ghr install cataggar/ghr RWSbsumpaHb+N3KCEt/EUXQ5y6Kkk8r/zCb5Z4jhEuEX8x2/U5wr5QC0
 ```
 
-See the
+Windows (PowerShell):
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
+```
+
+Open a new terminal after installation.
+
+See [Quick start](https://cataggar.github.io/ghr/docs/getting-started.html)
+to install your first tool, and
+[Installation](https://cataggar.github.io/ghr/docs/install.html)
+for package managers and uninstall instructions.
+
+## Documentation
+
+See [Usage](https://cataggar.github.io/ghr/docs/usage.html) for command syntax
+and examples, or browse the
 [documentation](https://cataggar.github.io/ghr/docs.html)
-for download, install, directories, uninstall, and verification details
-(including
-[verifying ghr's own releases](https://cataggar.github.io/ghr/docs/verification.html)).
+for download, directories, and verification details.
 The [Markdown sources](doc/README.md) remain in this repository.
 
-## GitHub Actions
-
-For workflows, install several tools in one cached step:
-
-```yaml
-- uses: cataggar/ghr/actions/install@v0.8.0  # pin to the matching ghr release
-  with:
-    tools: |
-      burntsushi/ripgrep@14.1.0 ?id=rg-14-1-0&alias=rg:rg-14-1-0
-      burntsushi/ripgrep@14.1.1 ?id=rg-14-1-1&alias=rg:rg-14-1-1
-      sharkdp/fd@v10.2.0
-```
-
-The action shares git tags with the `ghr` CLI — pinning `@v0.8.0` pins
-both the action body and the verified static binary. The bootstrap uses the
-runner's maintained Node action runtime, so it also works inside bare Ubuntu
-and Debian job containers without Python or `pipx`. Pick the latest tag from
-[the releases page](https://github.com/cataggar/ghr/releases).
-
-See
-[`actions/install`](https://github.com/cataggar/ghr/blob/main/actions/install/README.md),
-[`actions/download`](https://github.com/cataggar/ghr/blob/main/actions/download/README.md),
-[`actions/setup`](https://github.com/cataggar/ghr/blob/main/actions/setup/README.md),
-and
-[Caching in GitHub Actions](https://github.com/cataggar/ghr/blob/main/doc/github-actions.md)
-for details.
-
-## Build from source
-
-The current source and `website/` require **official Zig 0.17.0**, not a
-development/nightly compiler. Install the signed compiler bundles with:
-
-```sh
-ghr install cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
-zig build -Doptimize=safe
-zig build test
-# Static website: Markdown + routes + compilation + prerender into website/dist/
-(cd website && zig build prod)
-```
-
-Website regression checks: `cd website && zig build test prod check`.
-All generation and checks use Zig; Koino converts `doc/**/*.md` mechanically,
-and merjs applies the shared layout and prerenders the result. `doc/README.md`
-becomes `/ghr/docs.html`; other documents become `/ghr/docs/<name>.html`.
-Relative Markdown links and heading fragments are checked and rewritten;
-links outside `doc/` point to GitHub source files. Raw HTML is omitted by
-Koino's safe default. Edit Markdown in `doc/`, not generated route modules.
-
-The shared top menu and homepage **Get started** links open
-`doc/getting-started.md`. The homepage and documentation share a grouped sidebar
-with every group expanded by default and the current document highlighted;
-on smaller screens it becomes a **Documentation
-menu** disclosure. Group order and short labels live in
-`website/tools/docs.zig`. New Markdown pages appear automatically under
-**More documentation** until assigned to a group; missing pages are omitted.
-
-The palette uses the logo's black, orange, and muted olive tones, with a darker
-orange for readable text links. Code blocks have keyboard-accessible copy
-buttons with success/failure feedback, using the browser's Clipboard API.
-Without JavaScript, code remains selectable and navigation stays available.
-Keep alternative install commands in separate Markdown fences so each can
-be copied independently.
-
-The cache checks use an isolated fixture and keep Zig's cache warm while
-editing, adding, renaming, and deleting Markdown, routes, directories, and
-optional layouts. Production builds remove stale generated pages.
-
-The Pages workflow publishes only `website/dist/` and `.nojekyll` to the
-independent `website` branch. Its first commit has no parent; later publishes
-preserve that branch's history without force pushes. GitHub Pages serves the
-branch root at <https://cataggar.github.io/ghr/>. Publication is restricted to
-`main`, and explicitly requests a Pages build because `GITHUB_TOKEN` pushes
-do not automatically trigger branch-based Pages builds.
-
-Pages source configuration is a one-time administrator step: in repository
-**Settings > Pages**, choose **Deploy from a branch**, `website`, and
-**/ (root)**. The first workflow run creates the branch if necessary; configure
-Pages and rerun it. `GITHUB_TOKEN` cannot change Pages source settings, so the
-workflow verifies them instead of requesting administrator permissions.
-If the `github-pages` environment restricts deployment branches, allow both
-`main` (the publisher workflow) and `website` (the Pages deployment).
-
-CI runs native unit/help checks on Linux, macOS, and Windows. The required
-`Build & Test` aggregate succeeds only when those jobs, cross-target builds,
-and production-site/cache-freshness checks all pass.
-
-Zig 0.17 spells optimization modes `debug`, `safe`, `fast`, and `small`.
-For releases built with this compiler, the standard-library OS floors are
-Linux **5.10+**, macOS **15.0+**, and Windows **10+**. The release notes
-label the Apple requirement “Darwin 15.0+”; the installed toolchain's
-`std.Target` defines the versionless `*-macos` release targets' minimum
-as macOS 15.0, not the Darwin kernel version corresponding to OS X 10.11.
-Older OS versions are not supported by these new builds;
-this does not change the requirements of previously published releases.
-See the [official release notes](https://ziglang.org/download/0.17.0/release-notes.html#OS-Version-Requirements).
-
-macOS PyPI wheels built with Zig 0.17 use `macosx_15_0_arm64` and
-`macosx_15_0_x86_64` tags to match the binaries' macOS 15.0 minimum.
-`pip` will not select these wheels on older macOS. The previously advertised
-macOS 11.0 (ARM64) and 10.9 (x86_64) wheel tags no longer apply to new builds.
-
-To rebuild a historical release, use the compiler and optimization spelling
-of the **checked-out tag**, not the current branch's toolchain. See the
-[historical rebuild policy](doc/reproducible-builds.md#compiler-selection).
-
-## Signing releases
-
-`ghr minisign generate` and `ghr minisign sign` use
-[`cataggar/minizign`](https://github.com/cataggar/minizign) as an in-process
-library. Neither requires an external `minisign` or `minizign` binary.
-
-### Set up repository signing
-
-With the GitHub CLI (`gh`) installed and authenticated with permission to
-manage the repository's Actions secrets:
-
-```sh
-ghr minisign generate  # current repository, using gh's repository context
-# Or explicitly choose the repository:
-ghr minisign generate --repo OWNER/REPO
-```
-
-No interactive repository chooser is required. An unresolved repository
-fails before key creation or secret upload. Generation writes `minisign.key`
-and `minisign.pub` in the current directory and refuses to overwrite existing
-key files. Existing signing secrets require explicit
-`--force`; upload retries reuse the original pair with
-`--reuse-existing-local-pair` rather than generating a new key.
-
-By default, only `MINISIGN_SECRET_KEY` is configured: an **unencrypted
-minisign-format key inside GitHub's encrypted repository secret**.
-`MINISIGN_PASSWORD` is neither required nor changed, even when replacing
-secrets. The generated private file has mode `0600` on POSIX and a verified,
-protected owner-only DACL on Windows, applied before key material is written.
-Keep `minisign.key` private with restrictive permissions/ACLs; never commit
-it, cache it, or upload it as a release or workflow artifact. Publish only
-`minisign.pub` through a trusted channel so users can verify releases.
-
-See [repository signing setup and recovery](doc/github-actions.md#signing-releases)
-for the manual equivalent and upload-failure handling.
-
-### Sign in GitHub Actions
-
-After installing `ghr`, a release job needs only the secret key in its
-environment, not a private-key file on the runner:
-
-```yaml
-- run: ghr minisign sign hello.wasm -t "tag:${{ github.ref_name }} commit:${GITHUB_SHA}"
-  env:
-    MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-```
-
-Input files are bare positional arguments (each `<file>` is signed to
-`<file>.minisig`). A trusted comment may be given with `-t` (applied to
-every input); when omitted it defaults, like minisign, to
-`timestamp:<unix>\tfile:<name>\thashed` per file. The secret key **must**
-come from `MINISIGN_SECRET_KEY`; `MINISIGN_PASSWORD` is needed **only for
-password-encrypted keys**. There is no key-file flag, and signing never reads
-a password from a tty or stdin. Signatures use the prehashed (`ED`) format
-and are byte-for-byte identical to `minisign -S` output. Run
-`ghr minisign sign --help` for all options.
-
-### Optional password encryption
-
-To generate a password-encrypted key, supply a strong, nonempty
-`MINISIGN_PASSWORD` in the local environment and run
-`ghr minisign generate --encrypt` (optionally with `--repo OWNER/REPO`).
-Only this opt-in mode also configures the `MINISIGN_PASSWORD` repository
-secret. No password-manager integration is required.
-
-For encrypted keys, including existing ones, add the password to the signing
-step's environment:
-
-```yaml
-- run: ghr minisign sign hello.wasm -t "tag:${{ github.ref_name }} commit:${GITHUB_SHA}"
-  env:
-    MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-    MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-```
+Contributor instructions are in [Build from source](doc/build-from-source.md),
+a repository-only guide that is not published on the website.
 
 ## License
 

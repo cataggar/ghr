@@ -7,8 +7,8 @@ the results across runs.
 - uses: cataggar/ghr/actions/install@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.0 ?id=rg-14-1-0&alias=rg:rg-14-1-0
-      BurntSushi/ripgrep@14.1.1 "?id=rg-14-1-1&alias=rg:rg-14-1-1"
+      burntsushi/ripgrep@14.1.0 ?id=rg-14-1-0&alias=rg:rg-14-1-0
+      burntsushi/ripgrep@14.1.1 "?id=rg-14-1-1&alias=rg:rg-14-1-1"
       sharkdp/fd@v10.2.0
 ```
 
@@ -101,7 +101,7 @@ action-level `minisign:` default for that spec.
   with:
     tools: |
       jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
 ```
 
@@ -113,7 +113,7 @@ unavailable in a given release, while keeping the others active.
 ```yaml
 - uses: cataggar/ghr/actions/install@v1
   with:
-    tools: BurntSushi/ripgrep@14.1.1
+    tools: burntsushi/ripgrep@14.1.1
     skip-checksum: 'true'   # checksum-sidecar bypass; minisign + sigstore still apply
 ```
 
@@ -150,7 +150,7 @@ unattested artifact. Set `skip-attestation: 'true'` to opt out deliberately.
 - uses: cataggar/ghr/actions/install@v1
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
       maybe/missing@1.0
     keep-going: 'true'
@@ -166,7 +166,7 @@ pin the action to a commit SHA and supply the CLI version independently:
 - uses: cataggar/ghr/actions/install@<sha> # reviewed action commit
   with:
     ghr-version: v0.8.0
-    tools: BurntSushi/ripgrep@14.1.1
+    tools: burntsushi/ripgrep@14.1.1
 ```
 
 Commit, branch, major-tag, range, and `latest` references never silently select

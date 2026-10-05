@@ -1,6 +1,6 @@
 # ghr documentation
 
-Detailed documentation for ghr. For a quick overview and usage, see the
+Detailed guides and command reference for ghr. For a project overview, see the
 [top-level README](../README.md).
 
 New to ghr? Follow [Getting started](getting-started.md) to install ghr and
@@ -8,6 +8,7 @@ your first tool.
 
 ## Topics
 
+- [Usage](usage.md) — command syntax and examples.
 - [Install](install.md) — install ghr, see CLI examples, and uninstall it.
 - [Download](download.md) — fetch, extract, authenticate, and verify release assets.
 - [Caching in GitHub Actions](github-actions.md) — cache ghr installs and downloads in workflows.
@@ -25,7 +26,13 @@ your first tool.
 
 ## Install
 
-Install ghr with pipx, uv, pip, winget, or Homebrew; see [Install](install.md).
+Install ghr with the shell or PowerShell bootstrap, or a package manager;
+see [Install](install.md).
+
+## Usage
+
+See [Usage](usage.md) for the command overview, install source syntax,
+and examples.
 
 ## Download
 
