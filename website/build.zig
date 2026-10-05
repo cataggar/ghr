@@ -38,8 +38,8 @@ pub fn build(b: *std.Build) void {
     });
     main_mod.addImport("mer", mer_mod);
     main_mod.addImport("runtime", runtime_mod);
-    addDirModules(b, main_mod, mer_mod, "app");
-    addDirModules(b, main_mod, mer_mod, "api");
+    addDirModules(b, main_mod, mer_mod, generated_docs_mod, "app");
+    addDirModules(b, main_mod, mer_mod, generated_docs_mod, "api");
     addRoutesModule(b, main_mod, mer_mod, generated_docs_mod);
 
     const exe = b.addExecutable(.{ .name = "site", .root_module = main_mod });
@@ -99,12 +99,12 @@ fn addRoutesModule(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Mo
     });
     routes_mod.addImport("mer", mer_mod);
     routes_mod.addImport("docs", docs_mod);
-    addDirModules(b, routes_mod, mer_mod, "app");
-    addDirModules(b, routes_mod, mer_mod, "api");
+    addDirModules(b, routes_mod, mer_mod, docs_mod, "app");
+    addDirModules(b, routes_mod, mer_mod, docs_mod, "api");
     mod.addImport("routes", routes_mod);
 }
 
-fn addDirModules(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Module, dir: []const u8) void {
+fn addDirModules(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Module, docs_mod: *std.Build.Module, dir: []const u8) void {
     // Directory inputs track optional layouts and route additions/removals.
     // The dependency is non-recursive, so register every walked directory too.
     const layout_path = b.fmt("{s}/layout.zig", .{dir});
@@ -113,6 +113,7 @@ fn addDirModules(b: *std.Build, mod: *std.Build.Module, mer_mod: *std.Build.Modu
         const m = b.createModule(.{ .root_source_file = b.path(layout_path) });
         m.addImport("mer", mer_mod);
         m.addImport("config", b.createModule(.{ .root_source_file = b.path("src/config.zig") }));
+        m.addImport("docs", docs_mod);
         mod.addImport(b.fmt("{s}/layout", .{dir}), m);
         break :blk m;
     };

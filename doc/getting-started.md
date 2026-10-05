@@ -8,14 +8,21 @@ commands from one shared bin directory.
 
 Choose the command for your environment:
 
+macOS with Homebrew:
+
 ```sh
-# macOS with Homebrew
 brew install cataggar/ghr/ghr
+```
 
-# Windows with winget
+Windows with winget:
+
+```sh
 winget install ghr
+```
 
-# Linux, macOS, or Windows with uv
+Linux, macOS, or Windows with uv:
+
+```sh
 uv tool install ghr-bin
 ```
 
@@ -43,10 +50,15 @@ Add ghr's bin directory to your user `PATH`, then open a new terminal:
 ghr path add
 ```
 
-Run the tool and inspect your installed tools:
+Run the tool:
 
 ```sh
 rg --version
+```
+
+Inspect your installed tools:
+
+```sh
 ghr list
 ```
 

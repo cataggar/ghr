@@ -75,6 +75,9 @@ pub fn main(init: std.process.Init) !void {
     var output: std.Io.Writer.Allocating = .init(allocator);
     const writer = &output.writer;
     try writer.writeAll("// Generated from doc/; do not edit.\nconst mer = @import(\"mer\");\n\n");
+    var home_navigation: std.Io.Writer.Allocating = .init(allocator);
+    try renderNavigation(allocator, &home_navigation.writer, "", documents.items);
+    try writer.print("pub const home_navigation = \"{f}\";\n\n", .{std.zig.fmtString(home_navigation.written())});
     for (documents.items, 0..) |*document, index| {
         try rewriteLinks(allocator, document, documents.items);
         var html: std.Io.Writer.Allocating = .init(allocator);
@@ -99,14 +102,12 @@ fn renderNavigation(allocator: std.mem.Allocator, writer: *std.Io.Writer, curren
     try writer.writeAll("<aside class=\"docs-sidebar\"><details class=\"docs-menu\" open><summary>Documentation menu</summary>\n<nav class=\"docs-index\" aria-label=\"Documentation\"><p class=\"docs-index-title\">Documentation</p><ul>\n");
     for (navigation) |group| {
         var present = false;
-        var active = false;
         for (group.pages) |page| {
             if (findDocument(documents, page.source) == null) continue;
             present = true;
-            active = active or std.mem.eql(u8, current, page.source);
         }
         if (!present) continue;
-        try writer.print("<li><details class=\"docs-group\"{s}><summary>{s}</summary><ul>\n", .{ if (active) " open" else "", try escapeHtml(allocator, group.label) });
+        try writer.print("<li><details class=\"docs-group\" open><summary>{s}</summary><ul>\n", .{try escapeHtml(allocator, group.label)});
         for (group.pages) |page| {
             const document = findDocument(documents, page.source) orelse continue;
             try renderNavigationLink(allocator, writer, current, document, page.label);
@@ -114,14 +115,12 @@ fn renderNavigation(allocator: std.mem.Allocator, writer: *std.Io.Writer, curren
         try writer.writeAll("</ul></details></li>\n");
     }
     var additional = false;
-    var active = false;
     for (documents) |document| {
         if (isClassified(document.source)) continue;
         additional = true;
-        active = active or std.mem.eql(u8, current, document.source);
     }
     if (additional) {
-        try writer.print("<li><details class=\"docs-group\"{s}><summary>More documentation</summary><ul>\n", .{if (active) " open" else ""});
+        try writer.writeAll("<li><details class=\"docs-group\" open><summary>More documentation</summary><ul>\n");
         for (documents) |document| {
             if (isClassified(document.source)) continue;
             try renderNavigationLink(allocator, writer, current, document, document.title);
@@ -334,7 +333,7 @@ test "AST link rewriting resolves pages, fragments, queries and repository files
     try std.testing.expectError(error.MissingMarkdownTarget, rewriteUrl(allocator, &index, &documents, "missing.md", false));
 }
 
-test "documentation navigation groups existing pages in reading order and opens the current group" {
+test "documentation navigation expands all groups and keeps reading order and current page" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -349,13 +348,17 @@ test "documentation navigation groups existing pages in reading order and opens 
     var html: std.Io.Writer.Allocating = .init(allocator);
     try renderNavigation(allocator, &html.writer, verify.source, &.{ index, install, start, verify });
     const output = html.written();
-    try std.testing.expect(std.mem.find(u8, output, "class=\"docs-group\"><summary>Getting started") != null);
+    try std.testing.expect(std.mem.find(u8, output, "class=\"docs-group\" open><summary>Getting started") != null);
     try std.testing.expect(std.mem.find(u8, output, "class=\"docs-group\" open><summary>Reference") != null);
     try std.testing.expect(std.mem.find(u8, output, "/ghr/docs/verification.html\" aria-current=\"page\"") != null);
     try std.testing.expect(std.mem.find(u8, output, ">Quick start<").? < std.mem.find(u8, output, ">Overview<").?);
     try std.testing.expect(std.mem.find(u8, output, ">Overview<").? < std.mem.find(u8, output, ">Installation<").?);
     try std.testing.expect(std.mem.find(u8, output, "<summary>Guides") == null);
     try std.testing.expect(std.mem.find(u8, output, "/ghr/docs/directories.html") == null);
+    html.clearRetainingCapacity();
+    try renderNavigation(allocator, &html.writer, "", &.{ index, install, start, verify });
+    try std.testing.expect(std.mem.find(u8, html.written(), "class=\"docs-group\"><summary>") == null);
+    try std.testing.expect(std.mem.find(u8, html.written(), "aria-current=\"page\"") == null);
 }
 
 test "unclassified nested documents remain navigable with escaped titles and encoded URLs" {
@@ -369,4 +372,7 @@ test "unclassified nested documents remain navigable with escaped titles and enc
     try std.testing.expect(std.mem.find(u8, html.written(), "class=\"docs-group\" open><summary>More documentation") != null);
     try std.testing.expect(std.mem.find(u8, html.written(), "href=\"/ghr/docs/nested/new%20guide.html\" aria-current=\"page\"") != null);
     try std.testing.expect(std.mem.find(u8, html.written(), ">Tips &amp; &lt;tools&gt;</a>") != null);
+    html.clearRetainingCapacity();
+    try renderNavigation(allocator, &html.writer, "", &.{page});
+    try std.testing.expect(std.mem.find(u8, html.written(), "class=\"docs-group\" open><summary>More documentation") != null);
 }

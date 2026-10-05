@@ -1,4 +1,4 @@
-// Shared header, marketing layout, and responsive documentation chrome.
+// Shared header, homepage, and responsive documentation chrome.
 
 const std = @import("std");
 const mer = @import("mer");
@@ -15,17 +15,6 @@ pub const logo_url = "https://github.com/cataggar/ghr/releases/download/v0.6.2/g
 pub const base_path = @import("config").base_path;
 pub const docs_url = @import("config").docs_url;
 
-/// Small rounded pill, e.g. the "MIT licensed" / version badges.
-pub const Badge = mercss.Component(.{
-    .display = "inline-flex",
-    .align_items = "center",
-    .padding = "4px 10px",
-    .border_radius = "999px",
-    .font_size = "12px",
-    .font_weight = "700",
-    .letter_spacing = "0.04em",
-});
-
 /// Mobile-first responsive gap for the feature/blog card grids.
 pub const FeatureGrid = mercss.ResponsiveComponent(.{
     .base = .{ .gap = "16px" },
@@ -37,6 +26,8 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
     const title = if (meta.title.len > 0) meta.title else "ghr";
     const desc = if (meta.description.len > 0) meta.description else "A toolkit for GitHub releases.";
     const is_docs = std.mem.eql(u8, path, "/docs") or std.mem.startsWith(u8, path, "/docs/");
+    const is_home = std.mem.eql(u8, path, "/");
+    const has_sidebar = is_docs or is_home;
     const is_blog = std.mem.eql(u8, path, "/blog") or std.mem.startsWith(u8, path, "/blog/");
 
     var buf: std.Io.Writer.Allocating = .init(allocator);
@@ -56,6 +47,7 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
 
     w.print("  <link rel=\"icon\" href=\"{s}/favicon.ico\" sizes=\"any\">\n", .{base_path}) catch return body;
     w.print("  <link rel=\"icon\" href=\"{s}/favicon-32x32.png\" type=\"image/png\" sizes=\"32x32\">\n", .{base_path}) catch return body;
+    w.print("  <script src=\"{s}/site.js\" defer></script>\n", .{base_path}) catch return body;
 
     w.print("  <title>{s} \u{2014} ghr</title>\n", .{title}) catch return body;
     w.print("  <meta name=\"description\" content=\"{s}\">\n", .{desc}) catch return body;
@@ -67,61 +59,60 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\  <style>
         \\    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         \\    :root {
-        \\      --bg:#f0ebe3; --bg2:#e8e2d9; --bg3:#ddd5cc;
-        \\      --text:#252530; --muted:#6e625b; --border:#d5cdc4;
-        \\      --red:#e8251f; --red-dark:#aa1915; --paper:#fffdfa;
+        \\      --bg:#f7f8f3; --bg2:#edf0e6; --bg3:#dfe4d3;
+        \\      --text:#171a15; --muted:#59624f; --border:#d7decd;
+        \\      --orange:#ee6e41; --link:#b84b25; --accent-bg:#fff0e8; --paper:#fffefb;
         \\      --header-height:76px;
         \\    }
         \\    body { background:var(--bg); color:var(--text); font-family:'DM Sans',system-ui,-apple-system,sans-serif; min-height:100vh; line-height:1.65; }
-        \\    a { color:inherit; text-decoration:none; }
-        \\    :focus-visible { outline:3px solid var(--red-dark); outline-offset:4px; }
+        \\    a { color:var(--link); text-decoration:none; }
+        \\    :focus-visible { outline:3px solid var(--link); outline-offset:4px; }
         \\    [id] { scroll-margin-top:calc(var(--header-height) + 24px); }
         \\    .skip-link { position:fixed; top:8px; left:16px; z-index:30; transform:translateY(-160%); padding:8px 16px; background:var(--paper); border:1px solid var(--border); border-radius:6px; }
         \\    .skip-link:focus { transform:none; }
         \\    code, pre { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
         \\    code { font-size:0.9em; background:var(--bg2); border-radius:4px; padding:2px 6px; }
-        \\    pre { background:#201014; color:#ffe8e7; border-radius:10px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
+        \\    pre { background:var(--bg2); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:18px 20px; overflow-x:auto; font-size:13px; line-height:1.6; }
         \\    pre code { background:none; padding:0; color:inherit; }
+        \\    .code-block { position:relative; margin:16px 0; min-width:0; }
+        \\    .code-block pre { margin:0; padding-right:60px; }
+        \\    .copy-button { position:absolute; top:8px; right:8px; display:flex; align-items:center; justify-content:center; width:32px; height:32px; border:1px solid var(--border); border-radius:6px; background:var(--paper); color:var(--muted); cursor:pointer; }
+        \\    .copy-button:hover, .copy-button.copied { color:var(--link); border-color:var(--link); }
+        \\    .copy-button:disabled { cursor:wait; }
+        \\    .copy-status { display:block; font-size:13px; margin-top:6px; }
+        \\    .copy-status:empty { display:none; }
         \\    h1, h2, h3 { font-family:'DM Serif Display',Georgia,serif; letter-spacing:-0.02em; }
         \\    .layout { max-width:880px; margin:0 auto; padding:48px 32px 96px; }
         \\    .site-header { position:sticky; top:0; z-index:20; background:var(--paper); border-bottom:1px solid var(--border); }
         \\    .header-inner { display:flex; align-items:center; gap:32px; min-height:var(--header-height); max-width:1320px; margin:auto; padding:12px 32px; }
-        \\    .site-brand { font-size:28px; font-weight:700; letter-spacing:-0.06em; color:var(--red-dark); }
+        \\    .site-brand { font-size:28px; font-weight:700; letter-spacing:-0.06em; color:#000; }
         \\    .site-nav { display:flex; align-items:center; gap:24px; margin-left:auto; }
-        \\    .site-nav a { font-size:14px; font-weight:600; color:var(--muted); }
-        \\    .site-nav a:hover, .site-nav a[aria-current] { color:var(--red-dark); }
-        \\    .header-cta { background:var(--red-dark); color:white; white-space:nowrap; }
+        \\    .site-nav a { font-size:14px; font-weight:600; color:var(--link); }
+        \\    .site-nav a:hover, .site-nav a[aria-current] { text-decoration:underline; text-underline-offset:4px; }
+        \\    .header-cta { background:var(--orange); color:var(--text); white-space:nowrap; }
         \\    .hero-art { display:block; width:100%; height:auto; border-radius:10px; margin:0 0 28px; }
-        \\    .hero { background:linear-gradient(145deg,#2f1214 0%,#7a1715 45%,#e8251f 100%); color:#fff8f7; border-radius:14px; padding:40px; margin-bottom:40px; box-shadow:0 20px 50px rgba(111,19,18,0.18); }
-        \\    .hero h1 { font-size:clamp(32px,5vw,48px); line-height:1.05; margin-bottom:14px; }
-        \\    .hero p { max-width:60ch; color:#ffe8e7; font-size:17px; margin-bottom:22px; }
-        \\    .hero-actions { display:flex; gap:12px; flex-wrap:wrap; }
+        \\    .page-actions { display:flex; gap:12px; flex-wrap:wrap; margin:24px 0 32px; }
         \\    .btn { display:inline-flex; align-items:center; font-size:14px; font-weight:700; padding:11px 20px; border-radius:8px; transition:transform 0.15s ease, opacity 0.15s ease; }
         \\    .btn:hover { transform:translateY(-1px); }
-        \\    .btn-primary { background:#fff; color:var(--red-dark); }
-        \\    .btn-secondary { background:rgba(255,255,255,0.14); color:#fff; border:1px solid rgba(255,255,255,0.2); }
-        \\    .btn-ghost { background:transparent; color:var(--text); border:1px solid var(--border); }
-        \\    .btn-ghost:hover { border-color:var(--text); }
-        \\    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }
-        \\    .card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px; }
-        \\    .card h3 { font-size:16px; margin-bottom:8px; }
-        \\    .card p { font-size:14px; color:var(--muted); }
-        \\    .section-title { font-size:14px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); margin-bottom:16px; }
+        \\    .btn-primary { background:var(--orange); color:var(--text); }
+        \\    .btn-secondary { background:var(--paper); color:var(--link); border:1px solid var(--border); }
         \\    section + section { margin-top:48px; }
         \\    .post-list { display:flex; flex-direction:column; gap:16px; }
         \\    .post-card { background:var(--paper); border:1px solid var(--border); border-radius:12px; padding:22px 24px; }
         \\    .post-card h3 { font-size:18px; margin-bottom:6px; }
         \\    .post-card p { color:var(--muted); font-size:14px; }
-        \\    .post-card .read-more { display:inline-block; margin-top:10px; font-size:13px; font-weight:700; color:var(--red); }
+        \\    .post-card .read-more { display:inline-block; margin-top:10px; font-size:13px; font-weight:700; color:var(--link); }
         \\    .prose h2 { font-size:24px; margin:32px 0 14px; }
         \\    .prose h3 { font-size:19px; margin:24px 0 10px; }
         \\    .prose p { margin-bottom:16px; }
         \\    .prose ul, .prose ol { margin:0 0 16px 24px; }
         \\    .prose li { margin-bottom:6px; }
-        \\    .prose blockquote { border-left:3px solid var(--red); padding-left:16px; color:var(--muted); margin:0 0 16px; }
+        \\    .prose blockquote { border-left:3px solid var(--orange); padding-left:16px; color:var(--muted); margin:0 0 16px; }
         \\    .prose h1 { font-size:36px; line-height:1.2; margin:24px 0; }
         \\    .prose h4, .prose h5, .prose h6 { margin:20px 0 10px; }
-        \\    .prose a { color:var(--red-dark); text-decoration:underline; text-underline-offset:3px; }
+        \\    .prose a { color:var(--link); text-decoration:underline; text-underline-offset:3px; }
+        \\    .prose a.btn { text-decoration:none; }
+        \\    .prose a.btn-primary { color:var(--text); }
         \\    .prose pre { margin:16px 0; }
         \\    .prose table { display:block; overflow-x:auto; border-collapse:collapse; margin:20px 0; }
         \\    .prose th, .prose td { border:1px solid var(--border); padding:8px 12px; text-align:left; }
@@ -139,9 +130,9 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\    .docs-group > summary { cursor:pointer; font-weight:700; padding:8px 12px; border-radius:6px; }
         \\    .docs-group > summary:hover { background:var(--bg2); }
         \\    .docs-group ul { margin:4px 0 0 20px; padding-left:8px; border-left:1px solid var(--border); }
-        \\    .docs-index a { display:block; border-radius:6px; padding:7px 12px; margin:2px 0; color:var(--muted); overflow-wrap:anywhere; }
-        \\    .docs-index a:hover { color:var(--text); background:var(--bg2); }
-        \\    .docs-index a[aria-current="page"] { color:var(--red-dark); background:#fbe3df; font-weight:700; }
+        \\    .docs-index a { display:block; border-radius:6px; padding:7px 12px; margin:2px 0; color:var(--link); overflow-wrap:anywhere; }
+        \\    .docs-index a:hover { background:var(--bg2); }
+        \\    .docs-index a[aria-current="page"] { background:var(--accent-bg); font-weight:700; }
         \\    .docs { min-width:0; max-width:80ch; overflow-wrap:anywhere; }
         \\    .docs h1, .docs h2, .docs h3, .docs h4, .docs h5, .docs h6 { font-family:'DM Sans',system-ui,sans-serif; font-weight:700; }
         \\    .docs h1 { font-size:clamp(28px,4vw,38px); margin-top:0; }
@@ -168,7 +159,6 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\      .site-nav { order:3; width:100%; margin:0; justify-content:center; }
         \\      .header-cta { margin-left:auto; padding:8px 14px; }
         \\      .layout { padding:28px 20px 56px; }
-        \\      .hero { padding:24px; }
         \\      .layout-footer { margin-top:40px; }
         \\    }
         \\    @media (prefers-reduced-motion:reduce) {
@@ -179,15 +169,9 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
     ) catch return body;
 
     // mercss-generated utility CSS (comptime, atomic — see mercss.zig).
-    w.writeAll(Badge.css) catch return body;
     w.writeAll(FeatureGrid.css) catch return body;
 
-    w.writeAll(
-        \\    .badge-red { background:var(--red); color:#fff; }
-        \\    .badge-outline { border:1px solid var(--border); color:var(--muted); }
-        \\  </style>
-        \\
-    ) catch return body;
+    w.writeAll("  </style>\n") catch return body;
 
     if (meta.extra_head) |extra| {
         w.writeAll(extra) catch {};
@@ -205,16 +189,23 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\  <a href="{s}" class="btn header-cta">Get started</a>
         \\
     , .{ base_path, docs_url, if (is_docs) " aria-current=\"location\"" else "", base_path, if (is_blog) " aria-current=\"location\"" else "", docs_url }) catch return body;
-    w.print("</div></header>\n<div class=\"layout{s}\">\n", .{if (is_docs) " docs-layout" else ""}) catch return body;
+    w.print("</div></header>\n<div class=\"layout{s}\">\n", .{if (has_sidebar) " docs-layout" else ""}) catch return body;
 
-    if (!is_docs) w.writeAll("<main id=\"main-content\" tabindex=\"-1\">\n") catch return body;
+    if (is_home) {
+        w.writeAll("<div class=\"docs-shell\">\n") catch return body;
+        w.writeAll(@import("docs").home_navigation) catch return body;
+        w.writeAll("<main id=\"main-content\" tabindex=\"-1\" class=\"prose docs\">\n") catch return body;
+    } else if (!is_docs) {
+        w.writeAll("<main id=\"main-content\" tabindex=\"-1\">\n") catch return body;
+    }
     w.writeAll(body) catch return body;
     if (!is_docs) w.writeAll("</main>\n") catch return body;
+    if (is_home) w.writeAll("</div>\n") catch return body;
 
     w.writeAll(
         \\
         \\  <footer class="layout-footer">
-        \\    Built with <a href="https://merlionjs.com/">merjs</a> &middot; Zig 0.17.0 &middot;
+        \\    Built with <a href="https://github.com/cataggar/merjs">merjs</a> &middot; Zig 0.17.0 &middot;
         \\    <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
         \\    <span class="attribution">Logo by
         \\      <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
@@ -224,20 +215,6 @@ pub fn wrap(allocator: std.mem.Allocator, path: []const u8, body: []const u8, me
         \\</div>
     ) catch return body;
 
-    if (is_docs) {
-        w.writeAll(
-            \\<script>
-            \\  const menu = document.querySelector('.docs-menu');
-            \\  if (menu) {
-            \\    const desktop = window.matchMedia('(min-width: 960px)');
-            \\    const updateMenu = () => { menu.open = desktop.matches; };
-            \\    desktop.addEventListener('change', updateMenu);
-            \\    updateMenu();
-            \\  }
-            \\</script>
-            \\
-        ) catch return body;
-    }
     w.writeAll("</body>\n</html>\n") catch return body;
     return buf.written();
 }
