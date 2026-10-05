@@ -68,6 +68,8 @@ fn exercise(allocator: std.mem.Allocator, io: std.Io, source: std.Io.Dir, zig: [
     try fixture.contains("dist/docs/guide.html", "<table>");
     try fixture.contains("dist/docs/guide.html", "class=\"language-zig\"");
     try fixture.contains("dist/docs.html", "<summary>More documentation</summary>");
+    try fixture.contains("dist/docs.html", "class=\"docs-group\" open><summary>More documentation");
+    try fixture.contains("dist/site.js", "Copy code to clipboard");
     try fixture.contains("dist/docs/guide.html", "href=\"/ghr/docs/guide.html\" aria-current=\"page\"");
 
     try fixture.write("app/nested/deep/page.zig", page);
@@ -127,6 +129,25 @@ fn exercise(allocator: std.mem.Allocator, io: std.Io, source: std.Io.Dir, zig: [
     _ = try fixture.build();
     try fixture.absent("dist/docs/nested/renamed.html");
     try require(try fixture.read("dist/docs.html"), "/ghr/docs/nested/renamed.html", false);
+    try fixture.write("public/site.js", "// edited-copy-script-marker\n");
+    _ = try fixture.build();
+    try fixture.contains("dist/site.js", "edited-copy-script-marker");
+    try project.deleteFile(io, "public/site.js");
+    _ = try fixture.build();
+    try fixture.absent("dist/site.js");
+
+    try source.copyFile("public/site.js", project, "public/site.js", io, .{});
+    try source.copyFile("app/index.zig", project, "app/index.zig", io, .{});
+    try source.copyFile("app/layout.zig", project, "app/layout.zig", io, .{});
+    _ = try fixture.build();
+    try fixture.contains("dist/index.html", "class=\"docs-shell\"");
+    try fixture.contains("dist/index.html", "/ghr/docs/guide.html");
+    try fixture.write("../doc/home-guide.md", "# Homepage navigation guide\n");
+    _ = try fixture.build();
+    try fixture.contains("dist/index.html", "/ghr/docs/home-guide.html");
+    try project.deleteFile(io, "../doc/home-guide.md");
+    _ = try fixture.build();
+    try require(try fixture.read("dist/index.html"), "/ghr/docs/home-guide.html", false);
 }
 
 const Fixture = struct {

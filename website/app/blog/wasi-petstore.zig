@@ -32,7 +32,8 @@ fn page() h.Node {
         }),
 
         h.p(.{}, "I published a petstore-serve.wasm and a petstore-test.wasm — WASI 0.3 examples that install with a single ghr command:"),
-        h.pre(.{}, .{h.code(.{}, "ghr install cataggar/wabt/petstore-serve@petstore-0.1.0\nghr install cataggar/wabt/petstore-test@petstore-0.1.0")}),
+        h.pre(.{}, .{h.code(.{}, "ghr install cataggar/wabt/petstore-serve@petstore-0.1.0")}),
+        h.pre(.{}, .{h.code(.{}, "ghr install cataggar/wabt/petstore-test@petstore-0.1.0")}),
 
         h.p(.{}, "petstore-serve starts a web service, and petstore-test makes a series of HTTP calls to exercise its endpoints. Internally, the web service is composed of two WebAssembly components: a web component and a storage component. The storage component implements a store interface that the web component consumes — for this example, an in-memory storage implementation was used."),
 

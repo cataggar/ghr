@@ -3,20 +3,33 @@
 It can be installed with pipx, uv, pip, winget, Homebrew, or
 downloaded straight from a GitHub release.
 
+pipx:
+
 ```sh
-# pipx
 pipx install ghr-bin
+```
 
-# uv
+uv:
+
+```sh
 uv tool install ghr-bin
+```
 
-# pip
+pip:
+
+```sh
 python3 -m pip install ghr-bin
+```
 
-# winget
+winget:
+
+```sh
 winget install ghr
+```
 
-# Homebrew (tap)
+Homebrew (tap):
+
+```sh
 brew install cataggar/ghr/ghr
 ```
 
@@ -42,41 +55,86 @@ first-party setup action supplies this automatically from the maintained Node
 
 ## Examples
 
+Install the latest release:
+
 ```sh
-# Install latest release
 ghr install burntsushi/ripgrep
-ghr install cataggar/ghr  # a published minisign signature is noted, not verified without a key
+```
 
-# Install a specific tag
+Install ghr itself (a published Minisign signature is noted, not verified
+without a key):
+
+```sh
+ghr install cataggar/ghr
+```
+
+Install a specific tag:
+
+```sh
 ghr install burntsushi/ripgrep@15.1.0
+```
 
-# Install several tools in one invocation (shared HTTP client + auth)
+Install several tools in one invocation (shared HTTP client and authentication):
+
+```sh
 ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
+```
 
-# Install a specific asset by name (exact match or unique substring)
+Install a specific asset by name (exact match or unique substring):
+
+```sh
 ghr install WebAssembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
+```
 
-# Keep two releases from the same repository under independent IDs
+Keep two releases from the same repository under independent IDs:
+
+```sh
 ghr install BurntSushi/ripgrep@14.1.0 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
+```
+
+```sh
 ghr install BurntSushi/ripgrep@14.1.1 "?id=rg-14-1-1&alias=rg:rg-14-1-1"
+```
 
-# A direct URL has no repository identity, so its ID is explicit
+A direct URL has no repository identity, so its ID is explicit:
+
+```sh
 ghr install https://example.com/tool.tar.xz "?id=example/tool"
+```
 
-# Install only a selected binary from a release
+Install only a selected binary from a release:
+
+```sh
 ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
+```
 
-# Report stable identities or complete machine-readable definitions
+Report stable identities:
+
+```sh
 ghr list --ids
+```
+
+Report complete machine-readable definitions:
+
+```sh
 ghr list --json
+```
 
-# Remove exactly one ID
+Remove exactly one ID:
+
+```sh
 ghr uninstall rg-14-1-0
+```
 
-# Show where tools are stored
+Show where tools are stored:
+
+```sh
 ghr path tools
+```
 
-# Show where binaries are symlinked
+Show where binaries are symlinked:
+
+```sh
 ghr path bin
 ```
 
@@ -148,19 +206,32 @@ which filters links for a tool already installed on Windows. See
 
 ## Uninstall ghr itself
 
+pipx:
+
 ```sh
-# pipx
 pipx uninstall ghr-bin
+```
 
-# uv
+uv:
+
+```sh
 uv tool uninstall ghr-bin
+```
 
-# pip
+pip:
+
+```sh
 python -m pip uninstall ghr-bin -y
+```
 
-# winget
+winget:
+
+```sh
 winget uninstall ghr
+```
 
-# Homebrew
+Homebrew:
+
+```sh
 brew uninstall ghr
 ```

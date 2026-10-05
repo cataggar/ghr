@@ -36,12 +36,18 @@ fn page() h.Node {
         h.pre(.{}, .{h.code(.{}, "winget install ghr")}),
 
         h.p(.{}, "Every language ecosystem now has a way to install tools. Python tools provide a nice way to install native tools across platforms:"),
-        h.pre(.{}, .{h.code(.{}, "pipx install ghr-bin\nuv tool install ghr-bin")}),
+        h.pre(.{}, .{h.code(.{}, "pipx install ghr-bin")}),
+        h.p(.{}, "Or use uv:"),
+        h.pre(.{}, .{h.code(.{}, "uv tool install ghr-bin")}),
         h.p(.{}, "Both pipx and uv install binaries into ~/.local/bin. ghr does the same, but the binaries come from GitHub Releases."),
 
         h.h2(.{}, "Installing anything from a release"),
         h.p(.{}, "Once ghr is installed, it can install self-contained executables directly from their releases:"),
-        h.pre(.{}, .{h.code(.{}, "ghr install astral-sh/uv\nghr install bytecodealliance/wasmtime\nghr install casey/just\nghr install nushell/nushell\nghr install burntsushi/ripgrep")}),
+        h.pre(.{}, .{h.code(.{}, "ghr install astral-sh/uv")}),
+        h.pre(.{}, .{h.code(.{}, "ghr install bytecodealliance/wasmtime")}),
+        h.pre(.{}, .{h.code(.{}, "ghr install casey/just")}),
+        h.pre(.{}, .{h.code(.{}, "ghr install nushell/nushell")}),
+        h.pre(.{}, .{h.code(.{}, "ghr install burntsushi/ripgrep")}),
 
         h.h2(.{}, "Installing ghr with ghr"),
         h.p(.{}, "It's possible to install ghr with ghr itself — and it's the best example of what verifications are possible:"),
