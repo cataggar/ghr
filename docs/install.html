@@ -172,8 +172,11 @@
 </code></pre>
 <p>Open a new terminal after installation so the updated <code>PATH</code> is available.</p>
 <h2><a href="#package-managers" id="package-managers"></a>Package managers</h2>
-<p>ghr can also be installed with pipx, uv, pip, winget, or Homebrew, or
-downloaded directly from a <a href="https://github.com/cataggar/ghr/releases">GitHub release</a>.</p>
+<p>ghr is also available through winget, pipx, uv, and pip. You can download it
+directly from a <a href="https://github.com/cataggar/ghr/releases">GitHub release</a>.</p>
+<p>winget:</p>
+<pre><code class="language-sh">winget install ghr
+</code></pre>
 <p>pipx:</p>
 <pre><code class="language-sh">pipx install ghr-bin
 </code></pre>
@@ -183,16 +186,6 @@ downloaded directly from a <a href="https://github.com/cataggar/ghr/releases">Gi
 <p>pip:</p>
 <pre><code class="language-sh">python3 -m pip install ghr-bin
 </code></pre>
-<p>winget:</p>
-<pre><code class="language-sh">winget install ghr
-</code></pre>
-<p>Homebrew (tap):</p>
-<pre><code class="language-sh">brew install cataggar/ghr/ghr
-</code></pre>
-<p>The Homebrew formula lives at <a href="https://github.com/cataggar/homebrew-ghr">cataggar/homebrew-ghr</a>.
-It is installed through a custom tap (<code>cataggar/ghr/ghr</code>) because the short
-name <code>ghr</code> collides with another formula in the default Homebrew tap — see
-<a href="https://github.com/cataggar/ghr/issues/46">issue #46</a> for context.</p>
 <p><code>pipx</code> is preinstalled on GitHub-hosted runner images, but a job-level
 <code>container:</code> replaces that user space and does not inherit hosted-image tools.
 Official Ubuntu, Debian slim, and Python containers do not promise <code>pipx</code>.
@@ -312,9 +305,6 @@ which filters links for a tool already installed on Windows. See
 </code></pre>
 <p>winget:</p>
 <pre><code class="language-sh">winget uninstall ghr
-</code></pre>
-<p>Homebrew:</p>
-<pre><code class="language-sh">brew uninstall ghr
 </code></pre>
 <p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/install.md">View Markdown source</a></p></main>
 </div>
