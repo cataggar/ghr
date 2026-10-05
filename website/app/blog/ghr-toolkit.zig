@@ -30,9 +30,7 @@ fn page() h.Node {
         h.p(.{}, "or on Windows:"),
         h.pre(.{}, .{h.code(.{}, "iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex")}),
 
-        h.p(.{}, "I trust package managers more, so if you have Homebrew installed on Mac or Linux:"),
-        h.pre(.{}, .{h.code(.{}, "brew install cataggar/ghr/ghr")}),
-        h.p(.{}, "or using winget on Windows:"),
+        h.p(.{}, "I trust package managers more, so on Windows you can use winget:"),
         h.pre(.{}, .{h.code(.{}, "winget install ghr")}),
 
         h.p(.{}, "Every language ecosystem now has a way to install tools. Python tools provide a nice way to install native tools across platforms:"),

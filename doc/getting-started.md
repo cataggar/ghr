@@ -23,7 +23,7 @@ iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
 Open a new terminal after installation, then check that ghr is available:
 
 ```sh
-ghr --version
+ghr version
 ```
 
 See [Installation](install.md) for package managers, direct release downloads,
