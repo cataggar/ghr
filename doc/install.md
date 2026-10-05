@@ -18,8 +18,14 @@ Open a new terminal after installation so the updated `PATH` is available.
 
 ## Package managers
 
-ghr can also be installed with pipx, uv, pip, winget, or Homebrew, or
-downloaded directly from a [GitHub release](https://github.com/cataggar/ghr/releases).
+ghr is also available through winget, pipx, uv, and pip. You can download it
+directly from a [GitHub release](https://github.com/cataggar/ghr/releases).
+
+winget:
+
+```sh
+winget install ghr
+```
 
 pipx:
 
@@ -38,23 +44,6 @@ pip:
 ```sh
 python3 -m pip install ghr-bin
 ```
-
-winget:
-
-```sh
-winget install ghr
-```
-
-Homebrew (tap):
-
-```sh
-brew install cataggar/ghr/ghr
-```
-
-The Homebrew formula lives at [cataggar/homebrew-ghr](https://github.com/cataggar/homebrew-ghr).
-It is installed through a custom tap (`cataggar/ghr/ghr`) because the short
-name `ghr` collides with another formula in the default Homebrew tap — see
-[issue #46](https://github.com/cataggar/ghr/issues/46) for context.
 
 `pipx` is preinstalled on GitHub-hosted runner images, but a job-level
 `container:` replaces that user space and does not inherit hosted-image tools.
@@ -246,10 +235,4 @@ winget:
 
 ```sh
 winget uninstall ghr
-```
-
-Homebrew:
-
-```sh
-brew uninstall ghr
 ```
