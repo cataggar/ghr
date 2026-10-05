@@ -34,8 +34,8 @@ end-to-end:
 - uses: cataggar/ghr/actions/install@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.0 ?id=rg-14-1-0&alias=rg:rg-14-1-0
-      BurntSushi/ripgrep@14.1.1 ?id=rg-14-1-1&alias=rg:rg-14-1-1
+      burntsushi/ripgrep@14.1.0 ?id=rg-14-1-0&alias=rg:rg-14-1-0
+      burntsushi/ripgrep@14.1.1 ?id=rg-14-1-1&alias=rg:rg-14-1-1
       sharkdp/fd@v10.2.0
 ```
 
@@ -50,7 +50,7 @@ action-level `minisign:` default:
   with:
     tools: |
       jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
 ```
 
@@ -102,7 +102,7 @@ manual recipe remains possible:
 - if: steps.ghr-cache.outputs.cache-hit != 'true'
   run: |
     ghr install \
-      BurntSushi/ripgrep@14.1.1 \
+      burntsushi/ripgrep@14.1.1 \
       sharkdp/fd@v10.2.0
 
 - run: ghr list  # sanity check after a cache restore
@@ -156,7 +156,7 @@ used):
 - uses: cataggar/ghr/actions/download@v0.8.0  # pin to the matching ghr release
   with:
     tools: |
-      BurntSushi/ripgrep@14.1.1
+      burntsushi/ripgrep@14.1.1
       sharkdp/fd@v10.2.0
     extract: 'true'
     strip-components: '1'
@@ -177,7 +177,7 @@ Hand-rolled equivalent:
     pipx install ghr-bin
     mkdir -p ./bin
     ghr download \
-      BurntSushi/ripgrep@14.1.1 \
+      burntsushi/ripgrep@14.1.1 \
       sharkdp/fd@v10.2.0 \
       --extract ./bin --strip-components 1
 ```

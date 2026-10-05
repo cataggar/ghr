@@ -1,7 +1,25 @@
 # Install
 
-It can be installed with pipx, uv, pip, winget, Homebrew, or
-downloaded straight from a GitHub release.
+Install ghr with the bootstrap script for your operating system:
+
+Linux and macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/cataggar/ghr/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
+```
+
+Open a new terminal after installation so the updated `PATH` is available.
+
+## Package managers
+
+ghr can also be installed with pipx, uv, pip, winget, or Homebrew, or
+downloaded directly from a [GitHub release](https://github.com/cataggar/ghr/releases).
 
 pipx:
 
@@ -83,17 +101,17 @@ ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
 Install a specific asset by name (exact match or unique substring):
 
 ```sh
-ghr install WebAssembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
+ghr install webassembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
 ```
 
 Keep two releases from the same repository under independent IDs:
 
 ```sh
-ghr install BurntSushi/ripgrep@14.1.0 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
+ghr install burntsushi/ripgrep@14.1.0 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
 ```
 
 ```sh
-ghr install BurntSushi/ripgrep@14.1.1 "?id=rg-14-1-1&alias=rg:rg-14-1-1"
+ghr install burntsushi/ripgrep@14.1.1 "?id=rg-14-1-1&alias=rg:rg-14-1-1"
 ```
 
 A direct URL has no repository identity, so its ID is explicit:
