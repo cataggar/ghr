@@ -487,6 +487,9 @@ Only policy fields with CLI equivalents are emitted. `--json` emits
 deterministic versioned records with a full definition for each v2 unit. The
 output flags are mutually exclusive. Legacy definitions are explicitly null
 because v1 state does not retain enough source intent to reproduce them.
+All formats are alphabetical, ignoring ASCII case. Default/`--tags` and
+`--install` sort by displayed source before shell quoting, breaking ties by
+canonical install ID. `--ids`, `--full`, and `--json` sort by canonical install ID.
 Damaged units are reported on stderr in the default/`--ids`/`--tags`/`--install`
 output and included in `--full`/`--json` output; all forms exit non-zero when any
 unit is not healthy.

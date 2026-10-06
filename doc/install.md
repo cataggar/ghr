@@ -161,6 +161,10 @@ ghr list --json
 `--tags` explicitly selects the default tagged output. The `--ids`,
 `--tags`, `--install`, `--full`, and `--json` flags are mutually exclusive.
 
+All formats are alphabetical, ignoring ASCII case. Default/`--tags` and
+`--install` sort by displayed source before shell quoting, with install IDs
+breaking ties. `--ids`, `--full`, and `--json` sort by canonical install ID.
+
 Remove exactly one ID:
 
 ```sh

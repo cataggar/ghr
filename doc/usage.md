@@ -78,6 +78,11 @@ canonical IDs, `ghr list --install` for shell-ready install commands,
 `ghr list --full` for the detailed human report, or `ghr list --json` for
 machine-readable definitions. These output flags are mutually exclusive.
 
+All formats are alphabetical, ignoring ASCII case. Default/`--tags` and
+`--install` sort by displayed source, with install IDs breaking ties.
+`--ids`, `--full`, and `--json` sort by canonical install ID. Shell quoting does
+not affect the order.
+
 Default/`--tags` output contains raw, unquoted arguments, without a `ghr install`
 prefix. It includes the installed GitHub tag, stored asset selectors, aliases,
 minisign keys, and

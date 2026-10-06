@@ -678,6 +678,8 @@ fn printListUsage(w: *Writer) !void {
         \\    -h, --help  Show this help
         \\
         \\Raw --tags output is not shell-escaped; use --install for shell commands.
+        \\Lists are alphabetical, ignoring ASCII case: --tags/--install by
+        \\displayed source, and --ids/--full/--json by canonical install id.
         \\Legacy/incomplete definitions use recorded information best-effort,
         \\without warnings. Direct URLs stay unchanged; tags and URLs cannot
         \\guarantee immutable release contents.
@@ -904,13 +906,40 @@ fn printListErrors(inventory: install_state.Inventory, err_w: *Writer) !void {
     }
 }
 
+const ListArgumentLine = struct {
+    id: []const u8, // Borrowed from the inventory.
+    source: []u8,
+    text: []u8,
+
+    fn deinit(self: ListArgumentLine, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.text);
+    }
+};
+
+fn listArgumentLessThan(_: void, a: ListArgumentLine, b: ListArgumentLine) bool {
+    switch (std.ascii.orderIgnoreCase(a.source, b.source)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => {},
+    }
+    switch (std.mem.order(u8, a.id, b.id)) {
+        .lt => return true,
+        .gt => return false,
+        .eq => return std.mem.lessThan(u8, a.text, b.text),
+    }
+}
+
 fn printListArguments(allocator: std.mem.Allocator, inventory: install_state.Inventory, w: *Writer, err_w: *Writer, format: ListFormat) !bool {
+    var lines: std.ArrayListUnmanaged(ListArgumentLine) = .empty;
+    defer {
+        for (lines.items) |line| line.deinit(allocator);
+        lines.deinit(allocator);
+    }
     var failed = false;
     for (inventory.records) |rec| {
         if (rec.status != .ok) continue;
-        var line: Io.Writer.Allocating = .init(allocator);
-        defer line.deinit();
-        writeListArguments(allocator, rec, &line.writer, format) catch |err| switch (err) {
+        const line = renderListArguments(allocator, rec, format) catch |err| switch (err) {
             error.UnrepresentableInstallSource, error.UnrepresentableInstallId, error.UnsupportedVerificationPolicy => {
                 try err_w.print("error: {s}: cannot format install arguments ({t})\n", .{ rec.id orelse "<unknown id>", err });
                 failed = true;
@@ -918,14 +947,18 @@ fn printListArguments(allocator: std.mem.Allocator, inventory: install_state.Inv
             },
             else => return err,
         };
-        try w.writeAll(line.written());
+        errdefer line.deinit(allocator);
+        try lines.append(allocator, line);
     }
+    std.mem.sort(ListArgumentLine, lines.items, {}, listArgumentLessThan);
+    for (lines.items) |line| try w.writeAll(line.text);
     try printListErrors(inventory, err_w);
     return failed;
 }
 
-fn writeListArguments(allocator: std.mem.Allocator, rec: install_state.InventoryRecord, w: *Writer, format: ListFormat) !void {
-    var request_id = rec.id orelse return error.UnrepresentableInstallId;
+fn renderListArguments(allocator: std.mem.Allocator, rec: install_state.InventoryRecord, format: ListFormat) !ListArgumentLine {
+    const id = rec.id orelse return error.UnrepresentableInstallId;
+    var request_id = id;
     var src = rec.source orelse blk: {
         const slash = std.mem.indexOfScalar(u8, request_id, '/') orelse return error.UnrepresentableInstallSource;
         const repo_end = std.mem.indexOfScalarPos(u8, request_id, slash + 1, '/') orelse request_id.len;
@@ -1025,6 +1058,9 @@ fn writeListArguments(allocator: std.mem.Allocator, rec: install_state.Inventory
             try writePercentEncoded(&query.writer, key, "/:+=");
         }
     }
+    var line: Io.Writer.Allocating = .init(allocator);
+    defer line.deinit();
+    const w = &line.writer;
     if (format == .install) try w.writeAll("ghr install ");
     try writeListArgument(w, source.written(), format);
     if (query.written().len > 0) {
@@ -1046,6 +1082,12 @@ fn writeListArguments(allocator: std.mem.Allocator, rec: install_state.Inventory
         }
     }
     try w.writeByte('\n');
+
+    const sort_source = try allocator.dupe(u8, source.written());
+    errdefer allocator.free(sort_source);
+    var text = line.toArrayList();
+    defer text.deinit(allocator);
+    return .{ .id = id, .source = sort_source, .text = try text.toOwnedSlice(allocator) };
 }
 
 fn beginInstallQueryPair(query: *Io.Writer.Allocating, name: []const u8) !void {
@@ -1396,6 +1438,49 @@ fn tParseTaggedRequest(text: []const u8) !install_request.ParsedRequests {
     return install_request.parse(t_list_alloc, &.{source});
 }
 
+test "list argument formats alphabetize displayed sources ignoring case and shell quoting" {
+    var zulu = tV2Record();
+    zulu.id = "a/custom";
+    zulu.source = .{ .kind = .github, .owner = "Zulu", .repo = "tool" };
+    zulu.resolved.?.tag = "v1";
+    var beta = zulu;
+    beta.id = "b/custom";
+    beta.source.?.owner = "Beta";
+    var url = zulu;
+    url.id = "c/url";
+    url.source = .{ .kind = .generic_url, .url = "https://example.com/tool?version=1&variant=a" };
+    var upper = zulu;
+    upper.id = "d/custom";
+    upper.source.?.owner = "Alpha";
+    var lower = zulu;
+    lower.id = "z/custom";
+    lower.source.?.owner = "alpha";
+    var records = [_]install_state.InventoryRecord{ zulu, beta, url, upper, lower };
+    const cases = [_]struct { format: ListFormat, expected: []const u8 }{
+        .{
+            .format = .tags,
+            .expected = "Alpha/tool@v1 ?id=d/custom\n" ++
+                "alpha/tool@v1 ?id=z/custom\n" ++
+                "Beta/tool@v1 ?id=b/custom\n" ++
+                "https://example.com/tool?version=1&variant=a ?id=c/url\n" ++
+                "Zulu/tool@v1 ?id=a/custom\n",
+        },
+        .{
+            .format = .install,
+            .expected = "ghr install Alpha/tool@v1 \"?id=d/custom\"\n" ++
+                "ghr install alpha/tool@v1 \"?id=z/custom\"\n" ++
+                "ghr install Beta/tool@v1 \"?id=b/custom\"\n" ++
+                "ghr install \"https://example.com/tool?version=1&variant=a\" \"?id=c/url\"\n" ++
+                "ghr install Zulu/tool@v1 \"?id=a/custom\"\n",
+        },
+    };
+    for (cases) |case| {
+        const text = try tListRender(&records, case.format);
+        defer t_list_alloc.free(text);
+        try std.testing.expectEqualStrings(case.expected, text);
+    }
+}
+
 test "list --tags pins the resolved tag and omits a redundant id" {
     var rec = tV2Record();
     rec.id = "cataggar/zig";
@@ -1593,8 +1678,8 @@ test "list --tags emits best-effort legacy definitions without warnings" {
     defer t_list_alloc.free(result.out);
     defer t_list_alloc.free(result.err);
     try std.testing.expectEqualStrings(
-        "burntsushi/ripgrep@14.1.0 ?minisign=" ++ key ++ " --skip-verify\n" ++
-            "burntsushi/ripgrep/mod.wasm@14.1.0\n" ++
+        "burntsushi/ripgrep/mod.wasm@14.1.0\n" ++
+            "burntsushi/ripgrep@14.1.0 ?minisign=" ++ key ++ " --skip-verify\n" ++
             "cataggar/zig@zigb-0.16.1 ?id=zigb --skip-checksum\n",
         result.out,
     );
