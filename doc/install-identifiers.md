@@ -230,8 +230,9 @@ URL. Digests remain safe to persist and are preferred for provenance.
 The ID is the only identity accepted by install-state operations:
 
 - `ghr install` creates or replaces IDs.
-- `ghr list` reports IDs; `--tags` adds reinstall arguments, `--full` adds
-  details, and `--json` includes definitions.
+- `ghr list` reports shell-ready install commands; `--tags` reports raw tagged
+  arguments, `--ids` reports IDs, `--full` adds details, and `--json`
+  includes definitions.
 - `ghr uninstall <id>` removes exactly that ID.
 
 Canonical IDs follow deliberately portable rules:
@@ -466,23 +467,32 @@ The separate forms are:
 - a **reproducible install definition** per ID (source intent plus effective
   configuration) suitable for re-running an install.
 
-The default output (also available explicitly with `--ids`) emits one healthy
-ID per line. `--full` labels itself as a human report and shows each unit's
-kind, status, source, tag, and commands. `--tags` emits compact install arguments
-using the resolved GitHub tag, stored asset selector, necessary ID and query
-configuration, binary filters, and non-default verification flags. For wasm
-units, the ID argument names the parent request so reinstalling does not append
-the module stem twice. Each line is for a separate `ghr install` invocation and
-uses POSIX-shell quoting. Direct URLs retain their source intent; tags and URLs
-cannot guarantee immutable content. Legacy or incomplete definitions are
-best-effort without warnings because missing configuration cannot be recovered.
+The default output (also available explicitly with `--install`) emits one
+shell-ready `ghr install` command per unit, with POSIX-shell quoting and stored
+binary filters. `--tags` emits compact raw install arguments, one unit per line,
+without quotes, a command prefix, or binary filters.
+`--ids` emits one healthy canonical ID per line. `--full` labels itself as a
+human report and shows each unit's kind, status, source, tag, and commands.
+The default/`--install` and `--tags` outputs use the resolved GitHub tag, stored
+asset selector, necessary ID and query configuration, and non-default
+verification flags.
+Binary filters (`--bin`) are intentionally omitted from tagged output but
+remain in the `--json` definition. For wasm units, the ID argument names the
+parent request so reinstalling does not append the module stem twice.
+Raw tagged output is not shell-escaped. Direct URLs retain their source intent;
+tags and URLs cannot guarantee immutable content. Legacy or incomplete
+definitions are best-effort without
+warnings because missing configuration cannot be recovered.
 Only policy fields with CLI equivalents are emitted. `--json` emits
 deterministic versioned records with a full definition for each v2 unit. The
 output flags are mutually exclusive. Legacy definitions are explicitly null
 because v1 state does not retain enough source intent to reproduce them.
-Damaged units are reported on stderr in the default/`--ids`/`--tags` output and
-included in `--full`/`--json` output; all forms exit non-zero when any unit is
-not healthy.
+All formats are alphabetical, ignoring ASCII case. Default/`--install` and
+`--tags` sort by displayed source before shell quoting, breaking ties by
+canonical install ID. `--ids`, `--full`, and `--json` sort by canonical install ID.
+Damaged units are reported on stderr in the default/`--ids`/`--tags`/`--install`
+output and included in `--full`/`--json` output; all forms exit non-zero when any
+unit is not healthy.
 
 `ghr uninstall <id>` removes exactly the canonical ID and its owned commands,
 apps, metadata, and unit directory. It must inventory and validate ownership
@@ -756,9 +766,10 @@ The rollout settled the previously open implementation choices as follows:
 - canonical IDs are limited to 240 bytes with 100-byte segments;
 - per-ID journals coordinate staged, backup, live, and command-publication
   recovery; and
-- `ghr list` (also `ghr list --ids`), `ghr list --tags`, `ghr list --full`, and
-  `ghr list --json` provide identity-only, tagged install arguments, detailed
-  human, and machine-readable forms.
+- `ghr list` (also `ghr list --install`), `ghr list --tags`, `ghr list --ids`,
+  `ghr list --full`, and `ghr list --json` provide shell-ready install commands,
+  raw tagged arguments, identity-only, detailed human, and
+  machine-readable forms.
 
 These choices preserve the ID safety, ownership, schema-versioning, and
 rollback requirements above.

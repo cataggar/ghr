@@ -118,7 +118,7 @@ ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
 Report stable identities:
 
 ```sh
-ghr list
+ghr list --ids
 ```
 
 Report installed units with their status, source, tag, and commands:
@@ -127,18 +127,31 @@ Report installed units with their status, source, tag, and commands:
 ghr list --full
 ```
 
-Report compact, tagged arguments to reproduce each install:
+Report compact, tagged install arguments:
 
 ```sh
 ghr list --tags
 ```
 
-Each line can follow `ghr install` in a separate invocation. GitHub sources
-use the installed tag, together with any stored selector, custom ID, aliases,
-minisign key, binary filters, and non-default verification options. IDs implied
-by the source and default options are omitted. Legacy or incomplete definitions
-are best-effort without warnings; direct URLs remain unchanged. Arguments are
-quoted for POSIX shells, and tags/URLs do not guarantee immutable content.
+Each line contains raw arguments only, without quotes or a `ghr install` prefix.
+GitHub sources use the installed tag, together with any stored selector, custom
+ID, aliases, minisign key, and non-default verification options. IDs implied by
+the source, default options, and binary
+filters (`--bin`) are omitted. `--json` retains the stored binary selection.
+Legacy or incomplete definitions are best-effort without warnings; direct URLs
+remain unchanged. Raw tagged output is not shell-escaped, and tags/URLs do not
+guarantee immutable content.
+
+Report shell-ready install commands:
+
+```sh
+ghr list --install
+```
+
+This is also the default `ghr list` output. Each line starts with `ghr install`,
+quotes arguments for POSIX shells, and includes stored `--bin` filters when
+configured. Source, query configuration, and verification options are the same
+as tagged output.
 
 Report complete machine-readable definitions:
 
@@ -146,8 +159,12 @@ Report complete machine-readable definitions:
 ghr list --json
 ```
 
-`--ids` explicitly selects the default identity-only output. The `--ids`,
-`--tags`, `--full`, and `--json` flags are mutually exclusive.
+`--install` explicitly selects the default shell-ready output. The `--ids`,
+`--tags`, `--install`, `--full`, and `--json` flags are mutually exclusive.
+
+All formats are alphabetical, ignoring ASCII case. Default/`--install` and
+`--tags` sort by displayed source before shell quoting, with install IDs
+breaking ties. `--ids`, `--full`, and `--json` sort by canonical install ID.
 
 Remove exactly one ID:
 
