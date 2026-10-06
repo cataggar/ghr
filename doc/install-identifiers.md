@@ -230,8 +230,8 @@ URL. Digests remain safe to persist and are preferred for provenance.
 The ID is the only identity accepted by install-state operations:
 
 - `ghr install` creates or replaces IDs.
-- `ghr list` reports raw tagged arguments; `--install` reports shell-ready
-  install commands, `--ids` reports IDs, `--full` adds details, and `--json`
+- `ghr list` reports shell-ready install commands; `--tags` reports raw tagged
+  arguments, `--ids` reports IDs, `--full` adds details, and `--json`
   includes definitions.
 - `ghr uninstall <id>` removes exactly that ID.
 
@@ -467,18 +467,18 @@ The separate forms are:
 - a **reproducible install definition** per ID (source intent plus effective
   configuration) suitable for re-running an install.
 
-The default output (also available explicitly with `--tags`) emits compact
-raw install arguments, one unit per line, without quotes or a `ghr install`
-prefix.
+The default output (also available explicitly with `--install`) emits one
+shell-ready `ghr install` command per unit, with POSIX-shell quoting and stored
+binary filters. `--tags` emits compact raw install arguments, one unit per line,
+without quotes, a command prefix, or binary filters.
 `--ids` emits one healthy canonical ID per line. `--full` labels itself as a
 human report and shows each unit's kind, status, source, tag, and commands.
-The default/`--tags` output uses the resolved GitHub tag, stored asset selector,
-necessary ID and query configuration, and non-default verification flags.
+The default/`--install` and `--tags` outputs use the resolved GitHub tag, stored
+asset selector, necessary ID and query configuration, and non-default
+verification flags.
 Binary filters (`--bin`) are intentionally omitted from tagged output but
-remain in the `--json` definition. `--install` emits the same source and query
-as tagged output, prefixed with `ghr install`, with POSIX-shell quoting and
-stored binary filters. For wasm units, the ID argument names the parent request
-so reinstalling does not append the module stem twice.
+remain in the `--json` definition. For wasm units, the ID argument names the
+parent request so reinstalling does not append the module stem twice.
 Raw tagged output is not shell-escaped. Direct URLs retain their source intent;
 tags and URLs cannot guarantee immutable content. Legacy or incomplete
 definitions are best-effort without
@@ -487,8 +487,8 @@ Only policy fields with CLI equivalents are emitted. `--json` emits
 deterministic versioned records with a full definition for each v2 unit. The
 output flags are mutually exclusive. Legacy definitions are explicitly null
 because v1 state does not retain enough source intent to reproduce them.
-All formats are alphabetical, ignoring ASCII case. Default/`--tags` and
-`--install` sort by displayed source before shell quoting, breaking ties by
+All formats are alphabetical, ignoring ASCII case. Default/`--install` and
+`--tags` sort by displayed source before shell quoting, breaking ties by
 canonical install ID. `--ids`, `--full`, and `--json` sort by canonical install ID.
 Damaged units are reported on stderr in the default/`--ids`/`--tags`/`--install`
 output and included in `--full`/`--json` output; all forms exit non-zero when any
@@ -766,9 +766,9 @@ The rollout settled the previously open implementation choices as follows:
 - canonical IDs are limited to 240 bytes with 100-byte segments;
 - per-ID journals coordinate staged, backup, live, and command-publication
   recovery; and
-- `ghr list` (also `ghr list --tags`), `ghr list --install`, `ghr list --ids`,
-  `ghr list --full`, and `ghr list --json` provide raw tagged arguments,
-  shell-ready install commands, identity-only, detailed human, and
+- `ghr list` (also `ghr list --install`), `ghr list --tags`, `ghr list --ids`,
+  `ghr list --full`, and `ghr list --json` provide shell-ready install commands,
+  raw tagged arguments, identity-only, detailed human, and
   machine-readable forms.
 
 These choices preserve the ID safety, ownership, schema-versioning, and

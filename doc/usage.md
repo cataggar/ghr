@@ -66,43 +66,44 @@ Replace one ID:
 ghr install burntsushi/ripgrep@14.1.1 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
 ```
 
-List installed tools with tags and configuration:
+List installed tools as shell-ready install commands:
 
 ```sh
 ghr list
-# burntsushi/ripgrep@14.1.1 ?id=rg-14-1-0&alias=rg:rg-14-1-0
-```
-
-`--tags` explicitly selects the same output. Use `ghr list --ids` for bare
-canonical IDs, `ghr list --install` for shell-ready install commands,
-`ghr list --full` for the detailed human report, or `ghr list --json` for
-machine-readable definitions. These output flags are mutually exclusive.
-
-All formats are alphabetical, ignoring ASCII case. Default/`--tags` and
-`--install` sort by displayed source, with install IDs breaking ties.
-`--ids`, `--full`, and `--json` sort by canonical install ID. Shell quoting does
-not affect the order.
-
-Default/`--tags` output contains raw, unquoted arguments, without a `ghr install`
-prefix. It includes the installed GitHub tag, stored asset selectors, aliases,
-minisign keys, and
-non-default verification options, but omits redundant IDs, default options, and
-binary filters (`--bin`). Use `--json` to inspect the original binary selection.
-Query tokens do not need quotes in the install action's `tools: |` input.
-Raw tagged output is not shell-escaped; use `--install` for shell commands.
-
-Show shell-ready commands with quoting and any stored binary filters:
-
-```sh
-ghr list --install
 # ghr install burntsushi/ripgrep@14.1.1 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
 ```
 
-Each `--install` line starts with `ghr install`, uses POSIX-shell quoting, and
-includes `--bin` for stored binary selections. Legacy or incomplete definitions
-use available recorded information best-effort, without warnings. Direct URLs
-are preserved rather than given an invented tag; release tags and URLs do not
-guarantee immutable content.
+`--install` explicitly selects the same output. Use `ghr list --ids` for bare
+canonical IDs, `ghr list --tags` for raw tagged arguments,
+`ghr list --full` for the detailed human report, or `ghr list --json` for
+machine-readable definitions. These output flags are mutually exclusive.
+
+All formats are alphabetical, ignoring ASCII case. Default/`--install` and
+`--tags` sort by displayed source, with install IDs breaking ties.
+`--ids`, `--full`, and `--json` sort by canonical install ID. Shell quoting does
+not affect the order.
+
+Each default/`--install` line starts with `ghr install`, uses POSIX-shell quoting,
+and includes `--bin` for stored binary selections.
+
+Show raw tagged arguments:
+
+```sh
+ghr list --tags
+# burntsushi/ripgrep@14.1.1 ?id=rg-14-1-0&alias=rg:rg-14-1-0
+```
+
+`--tags` output contains raw, unquoted arguments without a `ghr install` prefix
+or binary filters (`--bin`). Both formats include the installed GitHub tag,
+stored asset selectors, necessary IDs, aliases, minisign keys, and non-default
+verification options. Use `--json` to inspect the original binary selection.
+Query tokens do not need quotes in the install action's `tools: |` input.
+Raw tagged output is not shell-escaped; use the default/`--install` for shell
+commands.
+
+Legacy or incomplete definitions use available recorded information best-effort,
+without warnings. Direct URLs are preserved rather than given an invented tag;
+release tags and URLs do not guarantee immutable content.
 
 Remove only that ID:
 

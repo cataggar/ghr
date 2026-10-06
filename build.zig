@@ -140,7 +140,7 @@ pub fn build(b: *std.Build) void {
         args: []const []const u8,
         stdout: []const u8,
     }{
-        .{ .args = &.{"list"}, .stdout = "example/tool@v1\n" },
+        .{ .args = &.{"list"}, .stdout = "ghr install example/tool@v1\n" },
         .{ .args = &.{ "list", "--ids" }, .stdout = "example/tool\n" },
         .{ .args = &.{ "list", "--tags" }, .stdout = "example/tool@v1\n" },
         .{ .args = &.{ "list", "--install" }, .stdout = "ghr install example/tool@v1\n" },

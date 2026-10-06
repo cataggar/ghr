@@ -133,10 +133,10 @@ Report compact, tagged install arguments:
 ghr list --tags
 ```
 
-This is also the default `ghr list` output. Each line contains arguments only,
-without quotes or a `ghr install` prefix. GitHub sources use the installed tag,
-together with any stored selector, custom ID, aliases, minisign key, and non-default
-verification options. IDs implied by the source, default options, and binary
+Each line contains raw arguments only, without quotes or a `ghr install` prefix.
+GitHub sources use the installed tag, together with any stored selector, custom
+ID, aliases, minisign key, and non-default verification options. IDs implied by
+the source, default options, and binary
 filters (`--bin`) are omitted. `--json` retains the stored binary selection.
 Legacy or incomplete definitions are best-effort without warnings; direct URLs
 remain unchanged. Raw tagged output is not shell-escaped, and tags/URLs do not
@@ -148,9 +148,10 @@ Report shell-ready install commands:
 ghr list --install
 ```
 
-Each line starts with `ghr install`, quotes arguments for POSIX shells, and
-includes stored `--bin` filters when configured. Source, query configuration,
-and verification options are the same as tagged output.
+This is also the default `ghr list` output. Each line starts with `ghr install`,
+quotes arguments for POSIX shells, and includes stored `--bin` filters when
+configured. Source, query configuration, and verification options are the same
+as tagged output.
 
 Report complete machine-readable definitions:
 
@@ -158,11 +159,11 @@ Report complete machine-readable definitions:
 ghr list --json
 ```
 
-`--tags` explicitly selects the default tagged output. The `--ids`,
+`--install` explicitly selects the default shell-ready output. The `--ids`,
 `--tags`, `--install`, `--full`, and `--json` flags are mutually exclusive.
 
-All formats are alphabetical, ignoring ASCII case. Default/`--tags` and
-`--install` sort by displayed source before shell quoting, with install IDs
+All formats are alphabetical, ignoring ASCII case. Default/`--install` and
+`--tags` sort by displayed source before shell quoting, with install IDs
 breaking ties. `--ids`, `--full`, and `--json` sort by canonical install ID.
 
 Remove exactly one ID:

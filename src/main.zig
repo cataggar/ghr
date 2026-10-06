@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
     if (eql(cmd_str, "path")) {
         try cmdPath(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
-        var format: ListFormat = .tags;
+        var format: ListFormat = .install;
         var format_flag: ?[]const u8 = null;
         while (args.next()) |arg| {
             const requested_format: ListFormat = if (eql(arg, "--ids"))
@@ -654,9 +654,9 @@ fn printListUsage(w: *Writer) !void {
         \\USAGE:
         \\    ghr list [--ids | --tags | --install | --full | --json]
         \\
-        \\By default, print raw tagged arguments, one unit per line, without
-        \\quotes, a `ghr install` prefix, or --bin filters. Use --install for
-        \\shell-ready commands or --ids for bare canonical ids.
+        \\By default, print one shell-ready `ghr install` command per unit,
+        \\with POSIX-shell quoting and stored --bin filters when configured.
+        \\Use --tags for raw arguments or --ids for bare canonical ids.
         \\Use --full for a human report, not pasteable install arguments:
         \\each line names the id, whether the unit is v1 (legacy) or v2,
         \\its status, its source and tag, and the commands it publishes.
@@ -667,10 +667,11 @@ fn printListUsage(w: *Writer) !void {
         \\
         \\OPTIONS:
         \\    --ids       Print one healthy canonical install id per line
-        \\    --tags      Print compact install arguments (default), including
+        \\    --tags      Print raw install arguments without a command prefix,
+        \\                quoting, or --bin filters, including
         \\                the installed tag, selector, query, and verification options
-        \\    --install   Print one `ghr install` command per unit, with POSIX-shell
-        \\                quoting and stored --bin filters when configured
+        \\    --install   Print shell-ready `ghr install` commands (default),
+        \\                with quoting and stored --bin filters when configured
         \\    --full      Print the detailed human report
         \\    --json      Print deterministic records, including the reproducible
         \\                install definition (source intent plus configuration)
@@ -798,8 +799,8 @@ fn printVersionUsage(w: *Writer) !void {
 }
 
 /// Output shape for `ghr list`. The forms are deliberately distinct:
-/// the default (also `--tags`) is raw tagged arguments, `--install` is shell-ready
-/// install commands, `--ids` is a bare identity list, `--full` is a human report,
+/// the default (also `--install`) is shell-ready install commands, `--tags` is raw
+/// tagged arguments, `--ids` is a bare identity list, `--full` is a human report,
 /// and `--json` is a machine-readable record set.
 const ListFormat = enum { human, ids, tags, install, json };
 
