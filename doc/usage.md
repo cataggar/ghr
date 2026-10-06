@@ -1,7 +1,7 @@
 # Usage
 
 ```text
-ghr list [--ids|--json]                           Report installed units
+ghr list [--ids|--full|--json]                    List installed IDs
 ghr install <source> ["?<query>"] [<pubkey>] ...  Install or replace tools by stable ID
 ghr uninstall <id>                              Remove exactly one installed ID
 ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
@@ -69,8 +69,12 @@ ghr install burntsushi/ripgrep@14.1.1 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
 List exact identities:
 
 ```sh
-ghr list --ids
+ghr list
 ```
+
+`--ids` explicitly selects the same output. Use `ghr list --full` for the
+detailed human report, or `ghr list --json` for machine-readable definitions.
+These output flags are mutually exclusive.
 
 Remove only that ID:
 

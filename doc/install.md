@@ -118,7 +118,13 @@ ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
 Report stable identities:
 
 ```sh
-ghr list --ids
+ghr list
+```
+
+Report installed units with their status, source, tag, and commands:
+
+```sh
+ghr list --full
 ```
 
 Report complete machine-readable definitions:
@@ -126,6 +132,9 @@ Report complete machine-readable definitions:
 ```sh
 ghr list --json
 ```
+
+`--ids` explicitly selects the default identity-only output. The `--ids`,
+`--full`, and `--json` flags are mutually exclusive.
 
 Remove exactly one ID:
 
