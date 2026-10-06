@@ -471,9 +471,11 @@ install arguments, one unit per line, without a `ghr install` prefix.
 `--ids` emits one healthy canonical ID per line. `--full` labels itself as a
 human report and shows each unit's kind, status, source, tag, and commands.
 The default/`--tags` output uses the resolved GitHub tag, stored asset selector,
-necessary ID and query configuration, binary filters, and non-default
-verification flags. For wasm units, the ID argument names the parent request so
-reinstalling does not append the module stem twice. Arguments use POSIX-shell
+necessary ID and query configuration, and non-default verification flags.
+Binary filters (`--bin`) are intentionally omitted from tagged output but
+remain in the `--json` definition. For wasm units, the ID argument names the
+parent request so reinstalling does not append the module stem twice.
+Arguments use POSIX-shell
 quoting. Direct URLs retain their source intent; tags and URLs cannot guarantee
 immutable content. Legacy or incomplete definitions are best-effort without
 warnings because missing configuration cannot be recovered.

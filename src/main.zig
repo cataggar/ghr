@@ -665,13 +665,14 @@ fn printListUsage(w: *Writer) !void {
         \\OPTIONS:
         \\    --ids       Print one healthy canonical install id per line
         \\    --tags      Print compact install arguments (default), including
-        \\                the installed tag, selector, query, and non-default options
+        \\                the installed tag, selector, query, and verification options
         \\    --full      Print the detailed human report
         \\    --json      Print deterministic records, including the reproducible
         \\                install definition (source intent plus configuration)
         \\                for v2 units; legacy v1 units report a null definition
         \\    -h, --help  Show this help
         \\
+        \\Binary filters (--bin) are omitted; --json retains the stored selection.
         \\Arguments are quoted for POSIX shells. Legacy/incomplete definitions
         \\use recorded information best-effort, without warnings. Direct URLs stay
         \\unchanged; tags and URLs cannot guarantee immutable release contents.
@@ -1023,12 +1024,6 @@ fn writeListTag(allocator: std.mem.Allocator, rec: install_state.InventoryRecord
     if (query.written().len > 0) {
         try w.writeByte(' ');
         try writeShellToken(w, query.written());
-    }
-    if (cfg.selected_commands) |commands| {
-        for (commands) |command| {
-            try w.writeAll(" --bin ");
-            try writeShellToken(w, command);
-        }
     }
     inline for (@typeInfo(VerificationPolicy).@"struct".field_names) |name| {
         if (@field(policy, name)) {
@@ -1405,7 +1400,7 @@ test "list --tags pins the resolved tag and omits a redundant id" {
     try std.testing.expectEqualStrings(records[0].id.?, explicit_parsed.items[0].id);
 }
 
-test "list --tags retains selectors and per-install configuration" {
+test "list --tags retains selectors and query configuration but omits binary filters" {
     var aliases = [_]install_state.OwnedAlias{
         .{ .from = "zig", .to = "zig-dev" },
         .{ .from = "zls", .to = "zls-dev" },
@@ -1429,7 +1424,7 @@ test "list --tags retains selectors and per-install configuration" {
     defer t_list_alloc.free(text);
     try std.testing.expectEqualStrings(
         "cataggar/zig/zig-linux.tar.xz@zigb-0.16.1 \"?id=tools/zig-dev&alias=zig:zig-dev&alias=zls:zls-dev&minisign=" ++
-            key ++ "\" --bin zig --bin zls --skip-checksum --skip-sigstore --skip-attestation --skip-authenticode\n",
+            key ++ "\" --skip-checksum --skip-sigstore --skip-attestation --skip-authenticode\n",
         text,
     );
     var parsed = try tParseTaggedRequest(text);
@@ -1439,6 +1434,16 @@ test "list --tags retains selectors and per-install configuration" {
     try std.testing.expectEqualStrings(key, parsed.items[0].config.minisign.?);
     try std.testing.expectEqual(@as(usize, 2), parsed.items[0].config.aliases.len);
     try std.testing.expectEqualStrings("zls-dev", parsed.items[0].config.aliases[1].published);
+
+    const json = try tListRender(&records, .json);
+    defer t_list_alloc.free(json);
+    var definition = try std.json.parseFromSlice(std.json.Value, t_list_alloc, json, .{});
+    defer definition.deinit();
+    const config = definition.value.object.get("units").?.array.items[0].object.get("definition").?.object.get("config").?.object;
+    const selected_json = config.get("selected_commands").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), selected_json.len);
+    try std.testing.expectEqualStrings("zig", selected_json[0].string);
+    try std.testing.expectEqualStrings("zls", selected_json[1].string);
 }
 
 test "list --tags keeps direct URL intent and includes its required id" {

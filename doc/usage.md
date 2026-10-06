@@ -79,10 +79,11 @@ canonical IDs, `ghr list --full` for the detailed human report, or
 mutually exclusive.
 
 Output contains arguments only, without a `ghr install` prefix. It includes
-the installed GitHub tag, stored asset selectors, aliases, minisign keys, binary
-filters, and non-default verification options, but omits redundant IDs and
-default options. Arguments are quoted for POSIX shells. Legacy or incomplete
-definitions use available recorded information best-effort, without warnings.
+the installed GitHub tag, stored asset selectors, aliases, minisign keys, and
+non-default verification options, but omits redundant IDs, default options, and
+binary filters (`--bin`). Use `--json` to inspect the original binary selection.
+Arguments are quoted for POSIX shells. Legacy or incomplete definitions use
+available recorded information best-effort, without warnings.
 Direct URLs are preserved rather than given an invented tag; release tags and
 URLs do not guarantee immutable content.
 

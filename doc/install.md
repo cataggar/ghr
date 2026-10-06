@@ -127,7 +127,7 @@ Report installed units with their status, source, tag, and commands:
 ghr list --full
 ```
 
-Report compact, tagged arguments to reproduce each install:
+Report compact, tagged install arguments:
 
 ```sh
 ghr list --tags
@@ -135,11 +135,12 @@ ghr list --tags
 
 This is also the default `ghr list` output. Each line contains arguments only,
 without a `ghr install` prefix. GitHub sources use the installed tag, together
-with any stored selector, custom ID, aliases, minisign key, binary filters, and
-non-default verification options. IDs implied by the source and default options
-are omitted. Legacy or incomplete definitions are best-effort without warnings;
-direct URLs remain unchanged. Arguments are quoted for POSIX shells, and
-tags/URLs do not guarantee immutable content.
+with any stored selector, custom ID, aliases, minisign key, and non-default
+verification options. IDs implied by the source, default options, and binary
+filters (`--bin`) are omitted. `--json` retains the stored binary selection.
+Legacy or incomplete definitions are best-effort without warnings; direct URLs
+remain unchanged. Arguments are quoted for POSIX shells, and tags/URLs do not
+guarantee immutable content.
 
 Report complete machine-readable definitions:
 
