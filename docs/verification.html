@@ -428,8 +428,9 @@ full set is visible at install time.</p>
 (inline per-spec or <code>--minisign</code>), the key itself is also recorded in
 <code>ghr.json</code> as <code>&quot;minisign&quot;</code>. For v2 units, <code>ghr list --json</code> includes the key
 in the install definition's configuration so it can be reused on the next
-upgrade. <code>ghr list --tags</code> includes the key in its query token so the arguments
-can follow <code>ghr install</code> directly. Neither the default ID list nor the <code>--full</code>
+upgrade. <code>ghr list</code> (also <code>ghr list --install</code>) includes the key in a quoted,
+shell-ready install command. <code>ghr list --tags</code> includes it in its raw query token,
+without quotes or a command prefix. Neither the <code>--ids</code> list nor the <code>--full</code>
 human report is a pasteable install definition.</p>
 <p>The trust roots embedded in ghr come from three sources:
 <a href="https://github.com/sigstore/root-signing"><code>sigstore/root-signing</code></a>
