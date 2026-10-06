@@ -272,8 +272,9 @@ When the install actually verifies the asset with a minisign key
 `ghr.json` as `"minisign"`. For v2 units, `ghr list --json` includes the key
 in the install definition's configuration so it can be reused on the next
 upgrade. `ghr list` (also `ghr list --tags`) includes the key in its query token,
-without a command prefix. Neither the `--ids` list nor the `--full` human report
-is a pasteable install definition.
+without quotes or a command prefix. `ghr list --install` includes it in a quoted,
+shell-ready install command. Neither the `--ids` list nor the `--full` human
+report is a pasteable install definition.
 
 The trust roots embedded in ghr come from three sources:
 [`sigstore/root-signing`](https://github.com/sigstore/root-signing)

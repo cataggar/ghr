@@ -1,7 +1,7 @@
 # Usage
 
 ```text
-ghr list [--ids|--tags|--full|--json]             List installed tools
+ghr list [--ids|--tags|--install|--full|--json]   List installed tools
 ghr install <source> ["?<query>"] [<pubkey>] ...  Install or replace tools by stable ID
 ghr uninstall <id>                              Remove exactly one installed ID
 ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
@@ -70,22 +70,34 @@ List installed tools with tags and configuration:
 
 ```sh
 ghr list
-# burntsushi/ripgrep@14.1.1 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
+# burntsushi/ripgrep@14.1.1 ?id=rg-14-1-0&alias=rg:rg-14-1-0
 ```
 
 `--tags` explicitly selects the same output. Use `ghr list --ids` for bare
-canonical IDs, `ghr list --full` for the detailed human report, or
-`ghr list --json` for machine-readable definitions. These output flags are
-mutually exclusive.
+canonical IDs, `ghr list --install` for shell-ready install commands,
+`ghr list --full` for the detailed human report, or `ghr list --json` for
+machine-readable definitions. These output flags are mutually exclusive.
 
-Output contains arguments only, without a `ghr install` prefix. It includes
-the installed GitHub tag, stored asset selectors, aliases, minisign keys, and
+Default/`--tags` output contains raw, unquoted arguments, without a `ghr install`
+prefix. It includes the installed GitHub tag, stored asset selectors, aliases,
+minisign keys, and
 non-default verification options, but omits redundant IDs, default options, and
 binary filters (`--bin`). Use `--json` to inspect the original binary selection.
-Arguments are quoted for POSIX shells. Legacy or incomplete definitions use
-available recorded information best-effort, without warnings.
-Direct URLs are preserved rather than given an invented tag; release tags and
-URLs do not guarantee immutable content.
+Query tokens do not need quotes in the install action's `tools: |` input.
+Raw tagged output is not shell-escaped; use `--install` for shell commands.
+
+Show shell-ready commands with quoting and any stored binary filters:
+
+```sh
+ghr list --install
+# ghr install burntsushi/ripgrep@14.1.1 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
+```
+
+Each `--install` line starts with `ghr install`, uses POSIX-shell quoting, and
+includes `--bin` for stored binary selections. Legacy or incomplete definitions
+use available recorded information best-effort, without warnings. Direct URLs
+are preserved rather than given an invented tag; release tags and URLs do not
+guarantee immutable content.
 
 Remove only that ID:
 

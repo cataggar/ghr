@@ -134,13 +134,23 @@ ghr list --tags
 ```
 
 This is also the default `ghr list` output. Each line contains arguments only,
-without a `ghr install` prefix. GitHub sources use the installed tag, together
-with any stored selector, custom ID, aliases, minisign key, and non-default
+without quotes or a `ghr install` prefix. GitHub sources use the installed tag,
+together with any stored selector, custom ID, aliases, minisign key, and non-default
 verification options. IDs implied by the source, default options, and binary
 filters (`--bin`) are omitted. `--json` retains the stored binary selection.
 Legacy or incomplete definitions are best-effort without warnings; direct URLs
-remain unchanged. Arguments are quoted for POSIX shells, and tags/URLs do not
+remain unchanged. Raw tagged output is not shell-escaped, and tags/URLs do not
 guarantee immutable content.
+
+Report shell-ready install commands:
+
+```sh
+ghr list --install
+```
+
+Each line starts with `ghr install`, quotes arguments for POSIX shells, and
+includes stored `--bin` filters when configured. Source, query configuration,
+and verification options are the same as tagged output.
 
 Report complete machine-readable definitions:
 
@@ -149,7 +159,7 @@ ghr list --json
 ```
 
 `--tags` explicitly selects the default tagged output. The `--ids`,
-`--tags`, `--full`, and `--json` flags are mutually exclusive.
+`--tags`, `--install`, `--full`, and `--json` flags are mutually exclusive.
 
 Remove exactly one ID:
 
