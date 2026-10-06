@@ -1,7 +1,7 @@
 # Usage
 
 ```text
-ghr list [--ids|--full|--json]                    List installed IDs
+ghr list [--ids|--tags|--full|--json]             List installed IDs
 ghr install <source> ["?<query>"] [<pubkey>] ...  Install or replace tools by stable ID
 ghr uninstall <id>                              Remove exactly one installed ID
 ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
@@ -72,9 +72,24 @@ List exact identities:
 ghr list
 ```
 
-`--ids` explicitly selects the same output. Use `ghr list --full` for the
-detailed human report, or `ghr list --json` for machine-readable definitions.
+`--ids` explicitly selects the same output. Use `ghr list --tags` for compact
+install arguments pinned to the installed GitHub tag, `ghr list --full` for
+the detailed human report, or `ghr list --json` for machine-readable definitions.
 These output flags are mutually exclusive.
+
+Show the arguments needed to reinstall each unit:
+
+```sh
+ghr list --tags
+# burntsushi/ripgrep@14.1.1 "?id=rg-14-1-0&alias=rg:rg-14-1-0"
+```
+
+Prepend `ghr install` to each line separately. Output includes stored asset
+selectors, aliases, minisign keys, binary filters, and non-default verification
+options, but omits redundant IDs and default options. Arguments are quoted for
+POSIX shells. Legacy or incomplete definitions use available recorded information
+best-effort, without warnings. Direct URLs are preserved rather than given an
+invented tag; release tags and URLs do not guarantee immutable content.
 
 Remove only that ID:
 

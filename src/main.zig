@@ -10,6 +10,8 @@ const minisign_cmd = @import("minisign_cmd.zig");
 const release_mod = @import("release.zig");
 const link = @import("link.zig");
 const install_state = @import("install_state.zig");
+const install_request = @import("install_request.zig");
+const VerificationPolicy = @import("install_state_write.zig").VerificationPolicy;
 const minisign = @import("minisign.zig");
 const http = @import("http.zig");
 
@@ -92,6 +94,8 @@ pub fn main(init: std.process.Init) !void {
         while (args.next()) |arg| {
             const requested_format: ListFormat = if (eql(arg, "--ids"))
                 .ids
+            else if (eql(arg, "--tags"))
+                .tags
             else if (eql(arg, "--full"))
                 .human
             else if (eql(arg, "--json"))
@@ -104,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
             if (format_flag) |previous_flag| {
                 if (format != requested_format) {
                     try stderr.interface.print("error: '{s}' and '{s}' cannot be combined\n", .{ previous_flag, arg });
-                    try stderr.interface.print("  hint: choose '--ids' for bare ids, '--full' for a human report, or '--json' for full records\n", .{});
+                    try stderr.interface.print("  hint: choose '--ids' for bare ids, '--tags' for install arguments, '--full' for a human report, or '--json' for full records\n", .{});
                     try stderr.interface.flush();
                     std.process.exit(1);
                 }
@@ -646,7 +650,7 @@ fn printListUsage(w: *Writer) !void {
         \\ghr list - List installed ids
         \\
         \\USAGE:
-        \\    ghr list [--ids | --full | --json]
+        \\    ghr list [--ids | --tags | --full | --json]
         \\
         \\By default, print one healthy canonical install id per line.
         \\Use --full for a human report, not pasteable install arguments:
@@ -654,18 +658,25 @@ fn printListUsage(w: *Writer) !void {
         \\its status, its source and tag, and the commands it publishes.
         \\
         \\Conflicting, corrupt, and unsupported units are reported on stderr
-        \\in the default/--ids output or included in --full/--json output.
+        \\in the default/--ids/--tags output or included in --full/--json output.
         \\The command exits non-zero when any unit is not healthy.
         \\
         \\OPTIONS:
         \\    --ids       Print one healthy canonical install id per line (default)
+        \\    --tags      Print compact install arguments with the installed tag,
+        \\                selector, query configuration, and non-default options
         \\    --full      Print the detailed human report
         \\    --json      Print deterministic records, including the reproducible
         \\                install definition (source intent plus configuration)
         \\                for v2 units; legacy v1 units report a null definition
         \\    -h, --help  Show this help
         \\
-        \\`--ids`, `--full`, and `--json` are mutually exclusive.
+        \\Prepend `ghr install` to each --tags line separately. Arguments are
+        \\quoted for POSIX shells. Legacy/incomplete definitions use the recorded
+        \\information best-effort, without warnings. Direct URLs stay unchanged;
+        \\tags and URLs cannot guarantee immutable release contents.
+        \\
+        \\`--ids`, `--tags`, `--full`, and `--json` are mutually exclusive.
         \\
     , .{});
 }
@@ -778,12 +789,11 @@ fn printVersionUsage(w: *Writer) !void {
     , .{});
 }
 
-/// Output shape for `ghr list`. The three forms are deliberately distinct:
+/// Output shape for `ghr list`. The forms are deliberately distinct:
 /// the default (also `--ids`) is a bare identity list for scripting, `--full`
-/// is a human report, and `--json` is a machine-readable record set. A definition
-/// line and a bare id are never interchangeable, so no form may be mistaken for
-/// the other.
-const ListFormat = enum { human, ids, json };
+/// is a human report, `--tags` is tagged install arguments, and `--json` is a
+/// machine-readable record set.
+const ListFormat = enum { human, ids, tags, json };
 
 /// List installed units from the inventory reader. Returns true when any record
 /// is not healthy, so the caller can exit non-zero instead of silently
@@ -812,6 +822,9 @@ fn cmdList(
 
     switch (format) {
         .ids => try printListIds(inventory, w, err_w),
+        .tags => if (try printListTags(allocator, inventory, w, err_w)) {
+            damaged = true;
+        },
         .json => try printListJson(inventory, w),
         .human => try printListHuman(inventory, w),
     }
@@ -861,7 +874,7 @@ fn printListHuman(inventory: install_state.Inventory, w: *Writer) !void {
         }
         try w.print("\n", .{});
     }
-    try w.print("\nrun 'ghr list' for bare ids or 'ghr list --json' for definitions\n", .{});
+    try w.print("\nrun 'ghr list' for bare ids, 'ghr list --tags' for install arguments, or 'ghr list --json' for definitions\n", .{});
 }
 
 fn printListIds(inventory: install_state.Inventory, w: *Writer, err_w: *Writer) !void {
@@ -870,9 +883,10 @@ fn printListIds(inventory: install_state.Inventory, w: *Writer, err_w: *Writer) 
         const id = rec.id orelse continue;
         try w.print("{s}\n", .{id});
     }
-    // A damaged record must never be silently dropped: the default/--ids output
-    // feeds scripts that mutate state, so the caller is told and the exit code
-    // is non-zero.
+    try printListErrors(inventory, err_w);
+}
+
+fn printListErrors(inventory: install_state.Inventory, err_w: *Writer) !void {
     for (inventory.records) |rec| {
         if (rec.status == .ok) continue;
         try err_w.print("error: {s}: {t} ({t}) at {s}\n", .{
@@ -882,6 +896,180 @@ fn printListIds(inventory: install_state.Inventory, w: *Writer, err_w: *Writer) 
             rec.path,
         });
     }
+}
+
+fn printListTags(allocator: std.mem.Allocator, inventory: install_state.Inventory, w: *Writer, err_w: *Writer) !bool {
+    var failed = false;
+    for (inventory.records) |rec| {
+        if (rec.status != .ok) continue;
+        var line: Io.Writer.Allocating = .init(allocator);
+        defer line.deinit();
+        writeListTag(allocator, rec, &line.writer) catch |err| switch (err) {
+            error.UnrepresentableInstallSource, error.UnrepresentableInstallId, error.UnsupportedVerificationPolicy => {
+                try err_w.print("error: {s}: cannot format install arguments ({t})\n", .{ rec.id orelse "<unknown id>", err });
+                failed = true;
+                continue;
+            },
+            else => return err,
+        };
+        try w.writeAll(line.written());
+    }
+    try printListErrors(inventory, err_w);
+    return failed;
+}
+
+fn writeListTag(allocator: std.mem.Allocator, rec: install_state.InventoryRecord, w: *Writer) !void {
+    var request_id = rec.id orelse return error.UnrepresentableInstallId;
+    var src = rec.source orelse blk: {
+        const slash = std.mem.indexOfScalar(u8, request_id, '/') orelse return error.UnrepresentableInstallSource;
+        const repo_end = std.mem.indexOfScalarPos(u8, request_id, slash + 1, '/') orelse request_id.len;
+        break :blk install_state.OwnedSource{
+            .kind = .github,
+            .owner = request_id[0..slash],
+            .repo = request_id[slash + 1 .. repo_end],
+            .tag = rec.tag,
+            .asset_selector = if (rec.kind == .v1_wasm) rec.asset else null,
+        };
+    };
+    if (src.kind == .github and src.asset_selector == null) {
+        if (rec.resolved) |resolved| {
+            if (resolved.asset) |asset| {
+                if (release_mod.isWasmAssetName(asset)) src.asset_selector = asset;
+            }
+        }
+    }
+    const cfg = rec.config orelse install_state.OwnedConfig{ .minisign = rec.minisign };
+    var policy: VerificationPolicy = .{};
+    if (cfg.verification_policy_json) |json| {
+        // Best-effort output retains only policy gates with CLI equivalents.
+        var parsed = std.json.parseFromSlice(VerificationPolicy, allocator, json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.UnexpectedToken => return error.UnsupportedVerificationPolicy,
+            else => return err,
+        };
+        defer parsed.deinit();
+        policy = parsed.value;
+    } else if (rec.verified orelse if (rec.verification) |v| v.result else null) |result| {
+        policy.skip_verify = eql(result, "skipped");
+    }
+
+    var source: Io.Writer.Allocating = .init(allocator);
+    defer source.deinit();
+    var query: Io.Writer.Allocating = .init(allocator);
+    defer query.deinit();
+    switch (src.kind) {
+        .github => {
+            const owner = src.owner orelse return error.UnrepresentableInstallSource;
+            const repo = src.repo orelse return error.UnrepresentableInstallSource;
+            const repo_id = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ owner, repo });
+            defer allocator.free(repo_id);
+            const tag = if (rec.resolved) |resolved| resolved.tag orelse src.tag else src.tag;
+            if (src.asset_selector) |selector| {
+                if (release_mod.isWasmAssetName(selector)) {
+                    // A wasm install appends its asset stem to the request ID.
+                    const stem = try install_request.canonicalizeId(allocator, selector[0 .. selector.len - 5]);
+                    defer allocator.free(stem);
+                    if (request_id.len <= stem.len + 1 or
+                        !std.mem.endsWith(u8, request_id, stem) or
+                        request_id[request_id.len - stem.len - 1] != '/')
+                        return error.UnrepresentableInstallId;
+                    request_id = request_id[0 .. request_id.len - stem.len - 1];
+                }
+            }
+            if (!std.ascii.eqlIgnoreCase(request_id, repo_id)) {
+                try beginInstallQueryPair(&query, "id");
+                try writePercentEncoded(&query.writer, request_id, "/:+=");
+            }
+            const selector_needs_url = if (src.asset_selector) |selector|
+                std.mem.indexOfAny(u8, selector, "@?") != null
+            else
+                false;
+            if (selector_needs_url) {
+                const pinned_tag = tag orelse return error.UnrepresentableInstallSource;
+                try source.writer.print("https://github.com/{s}/{s}/releases/download/", .{ owner, repo });
+                try writePercentEncoded(&source.writer, pinned_tag, "");
+                try source.writer.writeByte('/');
+                try writePercentEncoded(&source.writer, src.asset_selector.?, "");
+            } else {
+                try source.writer.writeAll(repo_id);
+                if (src.asset_selector) |selector| {
+                    if (selector.len > 0) try source.writer.print("/{s}", .{selector});
+                }
+                if (tag) |value| {
+                    if (value.len > 0) try source.writer.print("@{s}", .{value});
+                }
+            }
+        },
+        .generic_url => {
+            try source.writer.writeAll(src.url orelse return error.UnrepresentableInstallSource);
+            try beginInstallQueryPair(&query, "id");
+            try writePercentEncoded(&query.writer, request_id, "/:+=");
+        },
+    }
+    for (cfg.aliases) |alias| {
+        try beginInstallQueryPair(&query, "alias");
+        try writePercentEncoded(&query.writer, alias.from, "/:+=");
+        try query.writer.writeByte(':');
+        try writePercentEncoded(&query.writer, alias.to, "/:+=");
+    }
+    const minisign_key = cfg.minisign orelse rec.minisign orelse
+        if (rec.verification) |verification| verification.minisign else null;
+    if (minisign_key) |key| {
+        if (minisign.looksLikePubKey(key)) {
+            try beginInstallQueryPair(&query, "minisign");
+            try writePercentEncoded(&query.writer, key, "/:+=");
+        }
+    }
+    try writeShellToken(w, source.written());
+    if (query.written().len > 0) {
+        try w.writeByte(' ');
+        try writeShellToken(w, query.written());
+    }
+    if (cfg.selected_commands) |commands| {
+        for (commands) |command| {
+            try w.writeAll(" --bin ");
+            try writeShellToken(w, command);
+        }
+    }
+    inline for (@typeInfo(VerificationPolicy).@"struct".field_names) |name| {
+        if (@field(policy, name)) {
+            try w.writeAll(" --");
+            for (name) |c| try w.writeByte(if (c == '_') '-' else c);
+        }
+    }
+    try w.writeByte('\n');
+}
+
+fn beginInstallQueryPair(query: *Io.Writer.Allocating, name: []const u8) !void {
+    try query.writer.writeByte(if (query.written().len == 0) '?' else '&');
+    try query.writer.print("{s}=", .{name});
+}
+
+fn writePercentEncoded(w: *Writer, value: []const u8, extra_safe: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (value) |c| {
+        if (std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "-._~", c) != null or
+            std.mem.indexOfScalar(u8, extra_safe, c) != null)
+        {
+            try w.writeByte(c);
+        } else {
+            try w.writeAll(&.{ '%', hex[c >> 4], hex[c & 15] });
+        }
+    }
+}
+
+fn writeShellToken(w: *Writer, value: []const u8) !void {
+    var quote = value.len == 0;
+    for (value) |c| {
+        if (c < 32 or c == 127) return error.UnrepresentableInstallSource;
+        if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "-_./@:+=%", c) == null) quote = true;
+    }
+    if (!quote) return w.writeAll(value);
+    try w.writeByte('"');
+    for (value) |c| {
+        if (std.mem.indexOfScalar(u8, "\"\\$`", c) != null) try w.writeByte('\\');
+        try w.writeByte(c);
+    }
+    try w.writeByte('"');
 }
 
 fn writeJsonString(w: *Writer, s: []const u8) !void {
@@ -1045,24 +1233,34 @@ fn tListRender(
     switch (format) {
         .human => try printListHuman(inventory, &out.writer),
         .ids => try printListIds(inventory, &out.writer, &errs.writer),
+        .tags => _ = try printListTags(t_list_alloc, inventory, &out.writer, &errs.writer),
         .json => try printListJson(inventory, &out.writer),
     }
     var list = out.toArrayList();
     return list.toOwnedSlice(t_list_alloc);
 }
 
-fn tListRenderIdsErr(records: []install_state.InventoryRecord) !struct { out: []u8, err: []u8 } {
+fn tListRenderWithErr(records: []install_state.InventoryRecord, format: ListFormat) !struct { out: []u8, err: []u8, failed: bool } {
     var out: Io.Writer.Allocating = .init(t_list_alloc);
     errdefer out.deinit();
     var errs: Io.Writer.Allocating = .init(t_list_alloc);
     errdefer errs.deinit();
     const inventory: install_state.Inventory = .{ .records = records };
-    try printListIds(inventory, &out.writer, &errs.writer);
+    var failed = false;
+    for (records) |rec| {
+        if (rec.status != .ok) failed = true;
+    }
+    switch (format) {
+        .ids => try printListIds(inventory, &out.writer, &errs.writer),
+        .tags => failed = try printListTags(t_list_alloc, inventory, &out.writer, &errs.writer) or failed,
+        else => unreachable,
+    }
     var out_list = out.toArrayList();
     var err_list = errs.toArrayList();
     return .{
         .out = try out_list.toOwnedSlice(t_list_alloc),
         .err = try err_list.toOwnedSlice(t_list_alloc),
+        .failed = failed,
     };
 }
 
@@ -1144,6 +1342,10 @@ test "list of empty inventory is unambiguous" {
     defer t_list_alloc.free(ids);
     try std.testing.expectEqualStrings("", ids);
 
+    const tags = try tListRender(&records, .tags);
+    defer t_list_alloc.free(tags);
+    try std.testing.expectEqualStrings("", tags);
+
     const json = try tListRender(&records, .json);
     defer t_list_alloc.free(json);
     try std.testing.expectEqualStrings("{\"schema\":1,\"form\":\"install-records\",\"units\":[]}\n", json);
@@ -1159,7 +1361,7 @@ test "list --ids prints healthy ids and reports damaged ones" {
     };
     var records = [_]install_state.InventoryRecord{ tV2Record(), broken, tV1Record() };
 
-    const result = try tListRenderIdsErr(&records);
+    const result = try tListRenderWithErr(&records, .ids);
     defer t_list_alloc.free(result.out);
     defer t_list_alloc.free(result.err);
     try std.testing.expectEqualStrings("zigb\nburntsushi/ripgrep\n", result.out);
@@ -1167,6 +1369,204 @@ test "list --ids prints healthy ids and reports damaged ones" {
     try std.testing.expect(std.mem.indexOf(u8, result.out, "bad\n") == null);
     try std.testing.expect(std.mem.indexOf(u8, result.err, "conflict") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.err, "duplicate_id") != null);
+}
+
+fn tParseTaggedRequest(text: []const u8) !install_request.ParsedRequests {
+    const options = std.mem.indexOf(u8, text, " --") orelse text.len;
+    const positional = std.mem.trim(u8, text[0..options], "\n");
+    var tokens = std.mem.splitScalar(u8, positional, ' ');
+    const source = std.mem.trim(u8, tokens.next().?, "\"");
+    if (tokens.next()) |query| {
+        return install_request.parse(t_list_alloc, &.{ source, std.mem.trim(u8, query, "\"") });
+    }
+    return install_request.parse(t_list_alloc, &.{source});
+}
+
+test "list --tags pins the resolved tag and omits a redundant id" {
+    var rec = tV2Record();
+    rec.id = "cataggar/zig";
+    rec.source.?.tag = null;
+    var records = [_]install_state.InventoryRecord{rec};
+    const text = try tListRender(&records, .tags);
+    defer t_list_alloc.free(text);
+    try std.testing.expectEqualStrings("cataggar/zig@zigb-0.16.1\n", text);
+    var parsed = try tParseTaggedRequest(text);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(rec.id.?, parsed.items[0].id);
+    try std.testing.expectEqualStrings(rec.resolved.?.tag.?, parsed.items[0].source.github_repo.tag.?);
+
+    records[0].source.?.repo = "_zig";
+    records[0].id = "tools/zig";
+    const explicit = try tListRender(&records, .tags);
+    defer t_list_alloc.free(explicit);
+    try std.testing.expectEqualStrings("cataggar/_zig@zigb-0.16.1 \"?id=tools/zig\"\n", explicit);
+    var explicit_parsed = try tParseTaggedRequest(explicit);
+    defer explicit_parsed.deinit();
+    try std.testing.expectEqualStrings(records[0].id.?, explicit_parsed.items[0].id);
+}
+
+test "list --tags retains selectors and per-install configuration" {
+    var aliases = [_]install_state.OwnedAlias{
+        .{ .from = "zig", .to = "zig-dev" },
+        .{ .from = "zls", .to = "zls-dev" },
+    };
+    var selected = [_][]const u8{ "zig", "zls" };
+    const key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    var rec = tV2Record();
+    rec.id = "tools/zig-dev";
+    rec.source.?.tag = "latest";
+    rec.source.?.asset_selector = "zig-linux.tar.xz";
+    rec.config = .{
+        .aliases = &aliases,
+        .selected_commands = &selected,
+        .minisign = key,
+        .verification_policy_json =
+        \\{"skip_verify":false,"skip_checksum":true,"skip_minisign":false,"skip_sigstore":true,"skip_attestation":true,"skip_authenticode":true}
+        ,
+    };
+    var records = [_]install_state.InventoryRecord{rec};
+    const text = try tListRender(&records, .tags);
+    defer t_list_alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "cataggar/zig/zig-linux.tar.xz@zigb-0.16.1 \"?id=tools/zig-dev&alias=zig:zig-dev&alias=zls:zls-dev&minisign=" ++
+            key ++ "\" --bin zig --bin zls --skip-checksum --skip-sigstore --skip-attestation --skip-authenticode\n",
+        text,
+    );
+    var parsed = try tParseTaggedRequest(text);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(rec.id.?, parsed.items[0].id);
+    try std.testing.expectEqualStrings("zig-linux.tar.xz", parsed.items[0].source.github_file.file);
+    try std.testing.expectEqualStrings(key, parsed.items[0].config.minisign.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.items[0].config.aliases.len);
+    try std.testing.expectEqualStrings("zls-dev", parsed.items[0].config.aliases[1].published);
+}
+
+test "list --tags keeps direct URL intent and includes its required id" {
+    const url = "https://example.com/tool.tar.xz?version=1&variant=a";
+    var rec = tV2Record();
+    rec.id = "example/tool";
+    rec.source = .{ .kind = .generic_url, .url = url };
+    rec.resolved = .{ .asset = "tool.tar.xz", .download_url = "https://cdn.example.com/tool.tar.xz" };
+    var records = [_]install_state.InventoryRecord{rec};
+    const text = try tListRender(&records, .tags);
+    defer t_list_alloc.free(text);
+    try std.testing.expectEqualStrings("\"" ++ url ++ "\" \"?id=example/tool\"\n", text);
+    var parsed = try tParseTaggedRequest(text);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(url, parsed.items[0].source.generic_url);
+    try std.testing.expectEqualStrings(rec.id.?, parsed.items[0].id);
+}
+
+test "list --tags reproduces wasm parent IDs instead of appending the stem twice" {
+    var aliases = [_]install_state.OwnedAlias{.{ .from = "mod", .to = "mod-dev" }};
+    var rec = tV2Record();
+    rec.id = "custom/root/mod";
+    rec.source.?.asset_selector = "mod.wasm";
+    rec.config.?.aliases = &aliases;
+    var records = [_]install_state.InventoryRecord{rec};
+    const text = try tListRender(&records, .tags);
+    defer t_list_alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "cataggar/zig/mod.wasm@zigb-0.16.1 \"?id=custom/root&alias=mod:mod-dev\"\n",
+        text,
+    );
+    var parsed = try tParseTaggedRequest(text);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("custom/root", parsed.items[0].id);
+
+    records[0].id = "cataggar/zig/mod";
+    records[0].config.?.aliases = &.{};
+    records[0].source.?.asset_selector = null;
+    records[0].resolved.?.asset = "mod.wasm";
+    const derived = try tListRender(&records, .tags);
+    defer t_list_alloc.free(derived);
+    try std.testing.expectEqualStrings("cataggar/zig/mod.wasm@zigb-0.16.1\n", derived);
+}
+
+test "list --tags falls back to release URLs for selectors not supported by file specs" {
+    var rec = tV2Record();
+    rec.id = "cataggar/zig";
+    rec.source.?.asset_selector = "tool@special?.tar.gz";
+    rec.resolved.?.tag = "releases/v1";
+    var records = [_]install_state.InventoryRecord{rec};
+    const text = try tListRender(&records, .tags);
+    defer t_list_alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "https://github.com/cataggar/zig/releases/download/releases%2Fv1/tool%40special%3F.tar.gz\n",
+        text,
+    );
+    var parsed = try tParseTaggedRequest(text);
+    defer parsed.deinit();
+    var github = (try release_mod.parseGitHubReleaseUrl(t_list_alloc, parsed.items[0].source.github_release_url)).?;
+    defer github.deinit(t_list_alloc);
+    try std.testing.expectEqualStrings(rec.source.?.asset_selector.?, github.file);
+    try std.testing.expectEqualStrings(rec.resolved.?.tag.?, github.tag);
+}
+
+test "list --tags percent-encodes query values and quotes shell-sensitive source values" {
+    var aliases = [_]install_state.OwnedAlias{.{ .from = "zig&tool", .to = "zig$tool" }};
+    var rec = tV2Record();
+    rec.id = "cataggar/zig";
+    rec.config.?.aliases = &aliases;
+    var records = [_]install_state.InventoryRecord{rec};
+    const text = try tListRender(&records, .tags);
+    defer t_list_alloc.free(text);
+    try std.testing.expectEqualStrings("cataggar/zig@zigb-0.16.1 \"?alias=zig%26tool:zig%24tool\"\n", text);
+    var parsed = try tParseTaggedRequest(text);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("zig&tool", parsed.items[0].config.aliases[0].source);
+    try std.testing.expectEqualStrings("zig$tool", parsed.items[0].config.aliases[0].published);
+
+    records[0].config.?.aliases = &.{};
+    records[0].resolved.?.tag = "v1\"$`\\";
+    const quoted = try tListRender(&records, .tags);
+    defer t_list_alloc.free(quoted);
+    try std.testing.expectEqualStrings("\"cataggar/zig@v1\\\"\\$\\`\\\\\"\n", quoted);
+}
+
+test "list --tags emits best-effort legacy definitions without warnings" {
+    const key = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+    var legacy = tV1Record();
+    legacy.minisign = key;
+    legacy.verified = "skipped";
+    var wasm = tV1Record();
+    wasm.kind = .v1_wasm;
+    wasm.id = "burntsushi/ripgrep/mod";
+    wasm.asset = "mod.wasm";
+    var incomplete = tV2Record();
+    incomplete.config.?.verification_policy_json = "{\"require\":{\"checksum\":true},\"skip_checksum\":true}";
+    var records = [_]install_state.InventoryRecord{ legacy, wasm, incomplete };
+    const result = try tListRenderWithErr(&records, .tags);
+    defer t_list_alloc.free(result.out);
+    defer t_list_alloc.free(result.err);
+    try std.testing.expectEqualStrings(
+        "burntsushi/ripgrep@14.1.0 \"?minisign=" ++ key ++ "\" --skip-verify\n" ++
+            "burntsushi/ripgrep/mod.wasm@14.1.0\n" ++
+            "cataggar/zig@zigb-0.16.1 \"?id=zigb\" --skip-checksum\n",
+        result.out,
+    );
+    try std.testing.expectEqualStrings("", result.err);
+    try std.testing.expect(!result.failed);
+}
+
+test "list --tags reports damaged state and unsupported policy without partial definitions" {
+    var unsupported = tV2Record();
+    unsupported.config.?.verification_policy_json = "{\"skip_verify\":\"yes\"}";
+    const broken: install_state.InventoryRecord = .{
+        .kind = .v2,
+        .status = .corrupt,
+        .reason = .malformed_json,
+        .path = "_v2/units/u-bad/_unit",
+        .id = "bad",
+    };
+    var records = [_]install_state.InventoryRecord{ tV1Record(), unsupported, broken };
+    const result = try tListRenderWithErr(&records, .tags);
+    defer t_list_alloc.free(result.out);
+    defer t_list_alloc.free(result.err);
+    try std.testing.expectEqualStrings("burntsushi/ripgrep@14.1.0\n", result.out);
+    try std.testing.expect(std.mem.indexOf(u8, result.err, "UnsupportedVerificationPolicy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.err, "malformed_json") != null);
+    try std.testing.expect(result.failed);
 }
 
 test "list --json separates source intent from resolved provenance" {
@@ -1273,7 +1673,7 @@ fn printUsage(w: *Writer) !void {
         \\    ghr <COMMAND> [OPTIONS]
         \\
         \\COMMANDS:
-        \\    list [--ids|--full|--json]           List installed ids
+        \\    list [--ids|--tags|--full|--json]    List installed ids
         \\    install <source> [<source> ...]      Install one or more tools by install id
         \\    uninstall <id>                       Remove one installed unit by id
         \\    download <spec> [<spec> ...]         Download one or more release assets

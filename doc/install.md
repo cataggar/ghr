@@ -127,6 +127,19 @@ Report installed units with their status, source, tag, and commands:
 ghr list --full
 ```
 
+Report compact, tagged arguments to reproduce each install:
+
+```sh
+ghr list --tags
+```
+
+Each line can follow `ghr install` in a separate invocation. GitHub sources
+use the installed tag, together with any stored selector, custom ID, aliases,
+minisign key, binary filters, and non-default verification options. IDs implied
+by the source and default options are omitted. Legacy or incomplete definitions
+are best-effort without warnings; direct URLs remain unchanged. Arguments are
+quoted for POSIX shells, and tags/URLs do not guarantee immutable content.
+
 Report complete machine-readable definitions:
 
 ```sh
@@ -134,7 +147,7 @@ ghr list --json
 ```
 
 `--ids` explicitly selects the default identity-only output. The `--ids`,
-`--full`, and `--json` flags are mutually exclusive.
+`--tags`, `--full`, and `--json` flags are mutually exclusive.
 
 Remove exactly one ID:
 
