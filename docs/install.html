@@ -228,11 +228,16 @@ without a key):</p>
 <pre><code class="language-sh">ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
 </code></pre>
 <p>Report stable identities:</p>
-<pre><code class="language-sh">ghr list --ids
+<pre><code class="language-sh">ghr list
+</code></pre>
+<p>Report installed units with their status, source, tag, and commands:</p>
+<pre><code class="language-sh">ghr list --full
 </code></pre>
 <p>Report complete machine-readable definitions:</p>
 <pre><code class="language-sh">ghr list --json
 </code></pre>
+<p><code>--ids</code> explicitly selects the default identity-only output. The <code>--ids</code>,
+<code>--full</code>, and <code>--json</code> flags are mutually exclusive.</p>
 <p>Remove exactly one ID:</p>
 <pre><code class="language-sh">ghr uninstall rg-14-1-0
 </code></pre>

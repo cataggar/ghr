@@ -163,7 +163,7 @@
 </ul></nav></details></aside>
 <main id="main-content" tabindex="-1" class="prose docs">
 <h1><a href="#usage" id="usage"></a>Usage</h1>
-<pre><code class="language-text">ghr list [--ids|--json]                           Report installed units
+<pre><code class="language-text">ghr list [--ids|--full|--json]                    List installed IDs
 ghr install &lt;source&gt; [&quot;?&lt;query&gt;&quot;] [&lt;pubkey&gt;] ...  Install or replace tools by stable ID
 ghr uninstall &lt;id&gt;                              Remove exactly one installed ID
 ghr download &lt;spec&gt; [&lt;pubkey&gt;] [&lt;spec&gt; ...]       Download one or more release assets
@@ -209,8 +209,11 @@ aliases were removed. Replace <code>ghr help</code> with <code>ghr --help</code>
 <pre><code class="language-sh">ghr install burntsushi/ripgrep@14.1.1 &quot;?id=rg-14-1-0&amp;alias=rg:rg-14-1-0&quot;
 </code></pre>
 <p>List exact identities:</p>
-<pre><code class="language-sh">ghr list --ids
+<pre><code class="language-sh">ghr list
 </code></pre>
+<p><code>--ids</code> explicitly selects the same output. Use <code>ghr list --full</code> for the
+detailed human report, or <code>ghr list --json</code> for machine-readable definitions.
+These output flags are mutually exclusive.</p>
 <p>Remove only that ID:</p>
 <pre><code class="language-sh">ghr uninstall rg-14-1-0
 </code></pre>
