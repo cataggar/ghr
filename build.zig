@@ -140,14 +140,14 @@ pub fn build(b: *std.Build) void {
         args: []const []const u8,
         stdout: []const u8,
     }{
-        .{ .args = &.{"list"}, .stdout = "example/tool\n" },
+        .{ .args = &.{"list"}, .stdout = "example/tool@v1\n" },
         .{ .args = &.{ "list", "--ids" }, .stdout = "example/tool\n" },
         .{ .args = &.{ "list", "--tags" }, .stdout = "example/tool@v1\n" },
         .{
             .args = &.{ "list", "--full" },
             .stdout = "installed units (report, not install arguments):\n" ++
                 "  example/tool  [v1] ok  source: legacy:example/tool  tag: v1\n" ++
-                "\nrun 'ghr list' for bare ids, 'ghr list --tags' for install arguments, or 'ghr list --json' for definitions\n",
+                "\nrun 'ghr list --ids' for bare ids, 'ghr list' for install arguments, or 'ghr list --json' for definitions\n",
         },
     };
     for (list_cases) |case| {

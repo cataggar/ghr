@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
     if (eql(cmd_str, "path")) {
         try cmdPath(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
-        var format: ListFormat = .ids;
+        var format: ListFormat = .tags;
         var format_flag: ?[]const u8 = null;
         while (args.next()) |arg| {
             const requested_format: ListFormat = if (eql(arg, "--ids"))
@@ -647,12 +647,13 @@ fn printPathDirectoryUsage(w: *Writer, subcommand: []const u8, description: []co
 
 fn printListUsage(w: *Writer) !void {
     try w.print(
-        \\ghr list - List installed ids
+        \\ghr list - List installed tools
         \\
         \\USAGE:
         \\    ghr list [--ids | --tags | --full | --json]
         \\
-        \\By default, print one healthy canonical install id per line.
+        \\By default, print compact tagged install arguments, one unit per line.
+        \\Output has no `ghr install` prefix. Use --ids for bare canonical ids.
         \\Use --full for a human report, not pasteable install arguments:
         \\each line names the id, whether the unit is v1 (legacy) or v2,
         \\its status, its source and tag, and the commands it publishes.
@@ -662,19 +663,18 @@ fn printListUsage(w: *Writer) !void {
         \\The command exits non-zero when any unit is not healthy.
         \\
         \\OPTIONS:
-        \\    --ids       Print one healthy canonical install id per line (default)
-        \\    --tags      Print compact install arguments with the installed tag,
-        \\                selector, query configuration, and non-default options
+        \\    --ids       Print one healthy canonical install id per line
+        \\    --tags      Print compact install arguments (default), including
+        \\                the installed tag, selector, query, and non-default options
         \\    --full      Print the detailed human report
         \\    --json      Print deterministic records, including the reproducible
         \\                install definition (source intent plus configuration)
         \\                for v2 units; legacy v1 units report a null definition
         \\    -h, --help  Show this help
         \\
-        \\Prepend `ghr install` to each --tags line separately. Arguments are
-        \\quoted for POSIX shells. Legacy/incomplete definitions use the recorded
-        \\information best-effort, without warnings. Direct URLs stay unchanged;
-        \\tags and URLs cannot guarantee immutable release contents.
+        \\Arguments are quoted for POSIX shells. Legacy/incomplete definitions
+        \\use recorded information best-effort, without warnings. Direct URLs stay
+        \\unchanged; tags and URLs cannot guarantee immutable release contents.
         \\
         \\`--ids`, `--tags`, `--full`, and `--json` are mutually exclusive.
         \\
@@ -790,8 +790,8 @@ fn printVersionUsage(w: *Writer) !void {
 }
 
 /// Output shape for `ghr list`. The forms are deliberately distinct:
-/// the default (also `--ids`) is a bare identity list for scripting, `--full`
-/// is a human report, `--tags` is tagged install arguments, and `--json` is a
+/// the default (also `--tags`) is tagged install arguments, `--ids` is a bare
+/// identity list for scripting, `--full` is a human report, and `--json` is a
 /// machine-readable record set.
 const ListFormat = enum { human, ids, tags, json };
 
@@ -874,7 +874,7 @@ fn printListHuman(inventory: install_state.Inventory, w: *Writer) !void {
         }
         try w.print("\n", .{});
     }
-    try w.print("\nrun 'ghr list' for bare ids, 'ghr list --tags' for install arguments, or 'ghr list --json' for definitions\n", .{});
+    try w.print("\nrun 'ghr list --ids' for bare ids, 'ghr list' for install arguments, or 'ghr list --json' for definitions\n", .{});
 }
 
 fn printListIds(inventory: install_state.Inventory, w: *Writer, err_w: *Writer) !void {
@@ -1673,7 +1673,7 @@ fn printUsage(w: *Writer) !void {
         \\    ghr <COMMAND> [OPTIONS]
         \\
         \\COMMANDS:
-        \\    list [--ids|--tags|--full|--json]    List installed ids
+        \\    list [--ids|--tags|--full|--json]    List installed tools
         \\    install <source> [<source> ...]      Install one or more tools by install id
         \\    uninstall <id>                       Remove one installed unit by id
         \\    download <spec> [<spec> ...]         Download one or more release assets

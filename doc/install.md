@@ -118,7 +118,7 @@ ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
 Report stable identities:
 
 ```sh
-ghr list
+ghr list --ids
 ```
 
 Report installed units with their status, source, tag, and commands:
@@ -133,12 +133,13 @@ Report compact, tagged arguments to reproduce each install:
 ghr list --tags
 ```
 
-Each line can follow `ghr install` in a separate invocation. GitHub sources
-use the installed tag, together with any stored selector, custom ID, aliases,
-minisign key, binary filters, and non-default verification options. IDs implied
-by the source and default options are omitted. Legacy or incomplete definitions
-are best-effort without warnings; direct URLs remain unchanged. Arguments are
-quoted for POSIX shells, and tags/URLs do not guarantee immutable content.
+This is also the default `ghr list` output. Each line contains arguments only,
+without a `ghr install` prefix. GitHub sources use the installed tag, together
+with any stored selector, custom ID, aliases, minisign key, binary filters, and
+non-default verification options. IDs implied by the source and default options
+are omitted. Legacy or incomplete definitions are best-effort without warnings;
+direct URLs remain unchanged. Arguments are quoted for POSIX shells, and
+tags/URLs do not guarantee immutable content.
 
 Report complete machine-readable definitions:
 
@@ -146,7 +147,7 @@ Report complete machine-readable definitions:
 ghr list --json
 ```
 
-`--ids` explicitly selects the default identity-only output. The `--ids`,
+`--tags` explicitly selects the default tagged output. The `--ids`,
 `--tags`, `--full`, and `--json` flags are mutually exclusive.
 
 Remove exactly one ID:
