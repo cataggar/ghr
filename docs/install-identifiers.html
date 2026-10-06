@@ -371,7 +371,8 @@ URL. Digests remain safe to persist and are preferred for provenance.</p>
 <p>The ID is the only identity accepted by install-state operations:</p>
 <ul>
 <li><code>ghr install</code> creates or replaces IDs.</li>
-<li><code>ghr list</code> reports IDs; <code>--full</code> adds details and <code>--json</code> includes definitions.</li>
+<li><code>ghr list</code> reports IDs; <code>--tags</code> adds reinstall arguments, <code>--full</code> adds
+details, and <code>--json</code> includes definitions.</li>
 <li><code>ghr uninstall &lt;id&gt;</code> removes exactly that ID.</li>
 </ul>
 <p>Canonical IDs follow deliberately portable rules:</p>
@@ -582,12 +583,21 @@ configuration) suitable for re-running an install.</li>
 </ul>
 <p>The default output (also available explicitly with <code>--ids</code>) emits one healthy
 ID per line. <code>--full</code> labels itself as a human report and shows each unit's
-kind, status, source, tag, and commands. <code>--json</code> emits deterministic versioned
-records with a full definition for each v2 unit. The output flags are mutually
-exclusive. Legacy definitions are explicitly null because v1 state does not
-retain enough source intent to reproduce them. Damaged units are reported on
-stderr in the default/<code>--ids</code> output and included in <code>--full</code>/<code>--json</code> output;
-all forms exit non-zero when any unit is not healthy.</p>
+kind, status, source, tag, and commands. <code>--tags</code> emits compact install arguments
+using the resolved GitHub tag, stored asset selector, necessary ID and query
+configuration, binary filters, and non-default verification flags. For wasm
+units, the ID argument names the parent request so reinstalling does not append
+the module stem twice. Each line is for a separate <code>ghr install</code> invocation and
+uses POSIX-shell quoting. Direct URLs retain their source intent; tags and URLs
+cannot guarantee immutable content. Legacy or incomplete definitions are
+best-effort without warnings because missing configuration cannot be recovered.
+Only policy fields with CLI equivalents are emitted. <code>--json</code> emits
+deterministic versioned records with a full definition for each v2 unit. The
+output flags are mutually exclusive. Legacy definitions are explicitly null
+because v1 state does not retain enough source intent to reproduce them.
+Damaged units are reported on stderr in the default/<code>--ids</code>/<code>--tags</code> output and
+included in <code>--full</code>/<code>--json</code> output; all forms exit non-zero when any unit is
+not healthy.</p>
 <p><code>ghr uninstall &lt;id&gt;</code> removes exactly the canonical ID and its owned commands,
 apps, metadata, and unit directory. It must inventory and validate ownership
 before mutation. Prefixes are not recursive: uninstalling <code>owner/repo</code> does not
@@ -881,8 +891,9 @@ smoke jobs additionally exercise the full native install lifecycle.</p>
 <li>canonical IDs are limited to 240 bytes with 100-byte segments;</li>
 <li>per-ID journals coordinate staged, backup, live, and command-publication
 recovery; and</li>
-<li><code>ghr list</code> (also <code>ghr list --ids</code>), <code>ghr list --full</code>, and <code>ghr list --json</code>
-provide identity-only, detailed human, and machine-readable forms.</li>
+<li><code>ghr list</code> (also <code>ghr list --ids</code>), <code>ghr list --tags</code>, <code>ghr list --full</code>, and
+<code>ghr list --json</code> provide identity-only, tagged install arguments, detailed
+human, and machine-readable forms.</li>
 </ul>
 <p>These choices preserve the ID safety, ownership, schema-versioning, and
 rollback requirements above.</p>

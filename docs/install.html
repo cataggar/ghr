@@ -233,11 +233,20 @@ without a key):</p>
 <p>Report installed units with their status, source, tag, and commands:</p>
 <pre><code class="language-sh">ghr list --full
 </code></pre>
+<p>Report compact, tagged arguments to reproduce each install:</p>
+<pre><code class="language-sh">ghr list --tags
+</code></pre>
+<p>Each line can follow <code>ghr install</code> in a separate invocation. GitHub sources
+use the installed tag, together with any stored selector, custom ID, aliases,
+minisign key, binary filters, and non-default verification options. IDs implied
+by the source and default options are omitted. Legacy or incomplete definitions
+are best-effort without warnings; direct URLs remain unchanged. Arguments are
+quoted for POSIX shells, and tags/URLs do not guarantee immutable content.</p>
 <p>Report complete machine-readable definitions:</p>
 <pre><code class="language-sh">ghr list --json
 </code></pre>
 <p><code>--ids</code> explicitly selects the default identity-only output. The <code>--ids</code>,
-<code>--full</code>, and <code>--json</code> flags are mutually exclusive.</p>
+<code>--tags</code>, <code>--full</code>, and <code>--json</code> flags are mutually exclusive.</p>
 <p>Remove exactly one ID:</p>
 <pre><code class="language-sh">ghr uninstall rg-14-1-0
 </code></pre>
