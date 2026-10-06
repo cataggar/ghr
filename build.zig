@@ -134,6 +134,57 @@ pub fn build(b: *std.Build) void {
         removed_help.expectStdErrMatch(case.stderr);
         test_step.dependOn(&removed_help.step);
     }
+
+    const list_fixture_dir = b.root.joinString(b.allocator, "src/testdata/list") catch @panic("OOM");
+    const list_cases = [_]struct {
+        args: []const []const u8,
+        stdout: []const u8,
+    }{
+        .{ .args = &.{"list"}, .stdout = "example/tool\n" },
+        .{ .args = &.{ "list", "--ids" }, .stdout = "example/tool\n" },
+        .{
+            .args = &.{ "list", "--full" },
+            .stdout = "installed units (report, not install arguments):\n" ++
+                "  example/tool  [v1] ok  source: legacy:example/tool  tag: v1\n" ++
+                "\nrun 'ghr list' for bare ids or 'ghr list --json' for definitions\n",
+        },
+    };
+    for (list_cases) |case| {
+        const list = b.addRunArtifact(exe);
+        list.addArgs(case.args);
+        list.setEnvironmentVariable("GHR_TOOL_DIR", list_fixture_dir);
+        list.setEnvironmentVariable("GHR_BIN_DIR", list_fixture_dir);
+        list.setEnvironmentVariable("GHR_CACHE_DIR", list_fixture_dir);
+        list.addFileInput(b.path("src/testdata/list/example/tool/ghr.json"));
+        list.expectExitCode(0);
+        list.expectStdOutEqual(case.stdout);
+        list.expectStdErrEqual("");
+        test_step.dependOn(&list.step);
+    }
+
+    const list_json = b.addRunArtifact(exe);
+    list_json.addArgs(&.{ "list", "--json" });
+    list_json.setEnvironmentVariable("GHR_TOOL_DIR", list_fixture_dir);
+    list_json.setEnvironmentVariable("GHR_BIN_DIR", list_fixture_dir);
+    list_json.setEnvironmentVariable("GHR_CACHE_DIR", list_fixture_dir);
+    list_json.addFileInput(b.path("src/testdata/list/example/tool/ghr.json"));
+    list_json.expectExitCode(0);
+    list_json.expectStdOutMatch("\"form\":\"install-records\"");
+    list_json.expectStdErrEqual("");
+    test_step.dependOn(&list_json.step);
+
+    const list_format_flags = [_][]const u8{ "--ids", "--full", "--json" };
+    for (list_format_flags) |first| {
+        for (list_format_flags) |second| {
+            if (std.mem.eql(u8, first, second)) continue;
+            const conflict = b.addRunArtifact(exe);
+            conflict.addArgs(&.{ "list", first, second });
+            conflict.expectExitCode(1);
+            conflict.expectStdOutEqual("");
+            conflict.expectStdErrMatch(b.fmt("error: '{s}' and '{s}' cannot be combined", .{ first, second }));
+            test_step.dependOn(&conflict.step);
+        }
+    }
 }
 
 fn addHelpFlagTests(

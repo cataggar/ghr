@@ -87,29 +87,31 @@ pub fn main(init: std.process.Init) !void {
     if (eql(cmd_str, "path")) {
         try cmdPath(allocator, io, environ, &args, &stdout.interface, &stderr.interface);
     } else if (eql(cmd_str, "list")) {
-        var format: ListFormat = .human;
+        var format: ListFormat = .ids;
+        var format_flag: ?[]const u8 = null;
         while (args.next()) |arg| {
-            if (eql(arg, "--ids")) {
-                if (format == .json) {
-                    try stderr.interface.print("error: '--ids' and '--json' cannot be combined\n", .{});
-                    try stderr.interface.print("  hint: '--ids' prints bare ids; '--json' prints full records\n", .{});
-                    try stderr.interface.flush();
-                    std.process.exit(1);
-                }
-                format = .ids;
-            } else if (eql(arg, "--json")) {
-                if (format == .ids) {
-                    try stderr.interface.print("error: '--ids' and '--json' cannot be combined\n", .{});
-                    try stderr.interface.print("  hint: '--ids' prints bare ids; '--json' prints full records\n", .{});
-                    try stderr.interface.flush();
-                    std.process.exit(1);
-                }
-                format = .json;
-            } else {
+            const requested_format: ListFormat = if (eql(arg, "--ids"))
+                .ids
+            else if (eql(arg, "--full"))
+                .human
+            else if (eql(arg, "--json"))
+                .json
+            else {
                 try stderr.interface.print("error: unexpected argument '{s}' for 'ghr list'\n", .{arg});
                 try stderr.interface.flush();
                 std.process.exit(1);
+            };
+            if (format_flag) |previous_flag| {
+                if (format != requested_format) {
+                    try stderr.interface.print("error: '{s}' and '{s}' cannot be combined\n", .{ previous_flag, arg });
+                    try stderr.interface.print("  hint: choose '--ids' for bare ids, '--full' for a human report, or '--json' for full records\n", .{});
+                    try stderr.interface.flush();
+                    std.process.exit(1);
+                }
+            } else {
+                format_flag = arg;
             }
+            format = requested_format;
         }
         const damaged = try cmdList(allocator, environ, io, &stdout.interface, &stderr.interface, format);
         try stdout.interface.flush();
@@ -641,27 +643,29 @@ fn printPathDirectoryUsage(w: *Writer, subcommand: []const u8, description: []co
 
 fn printListUsage(w: *Writer) !void {
     try w.print(
-        \\ghr list - Report installed units
+        \\ghr list - List installed ids
         \\
         \\USAGE:
-        \\    ghr list [--ids | --json]
+        \\    ghr list [--ids | --full | --json]
         \\
-        \\The default output is a human report, not pasteable install arguments:
-        \\each line names the install id, whether the unit is v1 (legacy) or v2,
+        \\By default, print one healthy canonical install id per line.
+        \\Use --full for a human report, not pasteable install arguments:
+        \\each line names the id, whether the unit is v1 (legacy) or v2,
         \\its status, its source and tag, and the commands it publishes.
         \\
-        \\Conflicting, corrupt, and unsupported units are always shown, and
-        \\`ghr list` exits non-zero when any unit is not healthy.
+        \\Conflicting, corrupt, and unsupported units are reported on stderr
+        \\in the default/--ids output or included in --full/--json output.
+        \\The command exits non-zero when any unit is not healthy.
         \\
         \\OPTIONS:
-        \\    --ids       Print one healthy canonical install id per line
+        \\    --ids       Print one healthy canonical install id per line (default)
+        \\    --full      Print the detailed human report
         \\    --json      Print deterministic records, including the reproducible
         \\                install definition (source intent plus configuration)
         \\                for v2 units; legacy v1 units report a null definition
         \\    -h, --help  Show this help
         \\
-        \\`--ids` and `--json` cannot be combined: a bare id and a full
-        \\definition are not interchangeable.
+        \\`--ids`, `--full`, and `--json` are mutually exclusive.
         \\
     , .{});
 }
@@ -775,10 +779,10 @@ fn printVersionUsage(w: *Writer) !void {
 }
 
 /// Output shape for `ghr list`. The three forms are deliberately distinct:
-/// the default is a human report, `--ids` is a bare identity list for
-/// scripting, and `--json` is a machine-readable record set. A definition line
-/// and a bare id are never interchangeable, so no form may be mistaken for the
-/// other.
+/// the default (also `--ids`) is a bare identity list for scripting, `--full`
+/// is a human report, and `--json` is a machine-readable record set. A definition
+/// line and a bare id are never interchangeable, so no form may be mistaken for
+/// the other.
 const ListFormat = enum { human, ids, json };
 
 /// List installed units from the inventory reader. Returns true when any record
@@ -857,7 +861,7 @@ fn printListHuman(inventory: install_state.Inventory, w: *Writer) !void {
         }
         try w.print("\n", .{});
     }
-    try w.print("\nrun 'ghr list --ids' for bare ids or 'ghr list --json' for definitions\n", .{});
+    try w.print("\nrun 'ghr list' for bare ids or 'ghr list --json' for definitions\n", .{});
 }
 
 fn printListIds(inventory: install_state.Inventory, w: *Writer, err_w: *Writer) !void {
@@ -866,9 +870,9 @@ fn printListIds(inventory: install_state.Inventory, w: *Writer, err_w: *Writer) 
         const id = rec.id orelse continue;
         try w.print("{s}\n", .{id});
     }
-    // A damaged record must never be silently dropped: `--ids` output feeds
-    // scripts that mutate state, so the caller is told and the exit code is
-    // non-zero.
+    // A damaged record must never be silently dropped: the default/--ids output
+    // feeds scripts that mutate state, so the caller is told and the exit code
+    // is non-zero.
     for (inventory.records) |rec| {
         if (rec.status == .ok) continue;
         try err_w.print("error: {s}: {t} ({t}) at {s}\n", .{
@@ -1269,7 +1273,7 @@ fn printUsage(w: *Writer) !void {
         \\    ghr <COMMAND> [OPTIONS]
         \\
         \\COMMANDS:
-        \\    list [--ids|--json]                  Report installed units
+        \\    list [--ids|--full|--json]           List installed ids
         \\    install <source> [<source> ...]      Install one or more tools by install id
         \\    uninstall <id>                       Remove one installed unit by id
         \\    download <spec> [<spec> ...]         Download one or more release assets
