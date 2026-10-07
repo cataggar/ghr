@@ -21,6 +21,7 @@ const navigation = [_]NavigationGroup{
         .{ .source = "getting-started.md", .label = "Quick start" },
         .{ .source = "README.md", .label = "Overview" },
         .{ .source = "install.md", .label = "Installation" },
+        .{ .source = "examples.md", .label = "Examples" },
     } },
     .{ .label = "Guides", .pages = &.{
         .{ .source = "download.md", .label = "Download assets" },
@@ -352,22 +353,26 @@ test "documentation navigation expands all groups and keeps reading order and cu
     defer index.ast.deinit();
     const install = try parseDocument(allocator, "install.md", "# Install\n");
     defer install.ast.deinit();
+    const examples = try parseDocument(allocator, "examples.md", "# Examples\n");
+    defer examples.ast.deinit();
     const start = try parseDocument(allocator, "getting-started.md", "# Getting started\n");
     defer start.ast.deinit();
     const verify = try parseDocument(allocator, "verification.md", "# Verification\n");
     defer verify.ast.deinit();
     var html: std.Io.Writer.Allocating = .init(allocator);
-    try renderNavigation(allocator, &html.writer, verify.source, &.{ index, install, start, verify });
+    try renderNavigation(allocator, &html.writer, verify.source, &.{ index, install, examples, start, verify });
     const output = html.written();
     try std.testing.expect(std.mem.find(u8, output, "class=\"docs-group\" open><summary>Getting started") != null);
     try std.testing.expect(std.mem.find(u8, output, "class=\"docs-group\" open><summary>Reference") != null);
     try std.testing.expect(std.mem.find(u8, output, "/ghr/docs/verification.html\" aria-current=\"page\"") != null);
     try std.testing.expect(std.mem.find(u8, output, ">Quick start<").? < std.mem.find(u8, output, ">Overview<").?);
     try std.testing.expect(std.mem.find(u8, output, ">Overview<").? < std.mem.find(u8, output, ">Installation<").?);
+    try std.testing.expect(std.mem.find(u8, output, "<li><a href=\"/ghr/docs/install.html\">Installation</a></li>\n<li><a href=\"/ghr/docs/examples.html\">Examples</a></li>\n") != null);
+    try std.testing.expect(std.mem.find(u8, output, "<summary>More documentation") == null);
     try std.testing.expect(std.mem.find(u8, output, "<summary>Guides") == null);
     try std.testing.expect(std.mem.find(u8, output, "/ghr/docs/directories.html") == null);
     html.clearRetainingCapacity();
-    try renderNavigation(allocator, &html.writer, "", &.{ index, install, start, verify });
+    try renderNavigation(allocator, &html.writer, "", &.{ index, install, examples, start, verify });
     try std.testing.expect(std.mem.find(u8, html.written(), "class=\"docs-group\"><summary>") == null);
     try std.testing.expect(std.mem.find(u8, html.written(), "aria-current=\"page\"") == null);
 }

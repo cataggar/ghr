@@ -9,7 +9,8 @@ your first tool.
 ## Topics
 
 - [Usage](usage.md) — command syntax and examples.
-- [Install](install.md) — install ghr, see CLI examples, and uninstall it.
+- [Install](install.md) — install ghr and uninstall it.
+- [Examples](examples.md) — install and manage tools from the command line.
 - [Download](download.md) — fetch, extract, authenticate, and verify release assets.
 - [Caching in GitHub Actions](github-actions.md) — cache ghr installs and downloads in workflows.
 - [Directories](directories.md) — default directories and `ghr path add` behavior.
@@ -65,7 +66,7 @@ files; see [Name resolution on Linux](troubleshooting.md).
 ## Uninstall
 
 Uninstall ghr from the package manager that installed it; see
-[Uninstall](install.md#uninstall-ghr-itself).
+[Uninstall](install.md#uninstall).
 
 ## Verification
 

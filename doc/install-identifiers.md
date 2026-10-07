@@ -7,6 +7,55 @@ syntax and v2 install state introduced in ghr v0.8.0. The ordered rollout is
 complete. Older ghr releases continue to understand untouched legacy installs,
 but they cannot safely mutate v2 state.
 
+## Stable IDs and replacement
+
+Install IDs are ownership keys, separate from release sources and published
+command names. GitHub sources default to lowercase `owner/repo`; an optional
+quoted query token overrides the ID and configures aliases:
+
+```text
+"?id=<id>&alias=<source-command>:<published-command>&minisign=<public-key>"
+```
+
+`alias=` is repeatable. Query names and values use percent encoding, and `+`
+remains a literal plus so base64 minisign keys round-trip unchanged. An ID does
+not rename a command implicitly.
+
+Installing an existing ID is the upgrade operation: ghr stages the replacement
+and publishes its complete command set transactionally, or restores the prior
+unit. `ghr uninstall <id>` removes exactly that ID; ID prefixes are not
+recursive.
+
+On Windows, publishing a staged unit briefly retries directory renames that
+fail with `AccessDenied` or `FileBusy`, as an extracted file may be temporarily
+held open. Persistent failures still stop the install and preserve the previous
+unit; close programs using the tool and check directory permissions or
+file-scanning software before retrying the command.
+
+Legacy owner/repo installs remain readable in place. Reinstalling the same
+derived ID migrates one unambiguous legacy unit only after the replacement is
+durable. Use an ID-capable ghr for later mutations; older releases do not
+understand v2 install state.
+
+For `.zip`, `.tar.gz`, `.tgz`, `.tar.xz`, `.txz`, `.tar.zst`, `.tzst`, and
+`.deb` assets, `ghr install` exposes executable candidates from the shallowest
+directory level containing any executables. It searches deeper only when no
+shallower candidates exist, so nested-only package layouts still work without
+putting executable-looking firmware or data files on `PATH`.
+
+Relative symlink aliases at that level are exposed under their own command
+names when their chains resolve to executable files inside the extracted
+package. For example, `bin/llvm-readelf -> llvm-readobj` publishes
+`llvm-readelf` as well as `llvm-readobj`, without rewriting or copying the
+package's links. Absolute links, escaping paths, broken links, cycles, and
+chains longer than 40 symlinks are ignored. Symlinked directories are not
+searched recursively.
+
+These archive-provided aliases are ordinary owned commands: `--bin llvm-readelf`
+can select an alias without publishing its target's command, and replacement
+and uninstall manage it normally. They are distinct from the `alias=` query
+option, which explicitly renames a discovered command.
+
 ## Goals
 
 An install needs a stable name that does not change when its release, selected
