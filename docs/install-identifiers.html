@@ -144,6 +144,7 @@
 <li><a href="/ghr/docs/getting-started.html">Quick start</a></li>
 <li><a href="/ghr/docs.html">Overview</a></li>
 <li><a href="/ghr/docs/install.html">Installation</a></li>
+<li><a href="/ghr/docs/examples.html">Examples</a></li>
 </ul></details></li>
 <li><details class="docs-group" open><summary>Guides</summary><ul>
 <li><a href="/ghr/docs/download.html">Download assets</a></li>
@@ -168,6 +169,44 @@
 syntax and v2 install state introduced in ghr v0.8.0. The ordered rollout is
 complete. Older ghr releases continue to understand untouched legacy installs,
 but they cannot safely mutate v2 state.</p>
+<h2><a href="#stable-ids-and-replacement" id="stable-ids-and-replacement"></a>Stable IDs and replacement</h2>
+<p>Install IDs are ownership keys, separate from release sources and published
+command names. GitHub sources default to lowercase <code>owner/repo</code>; an optional
+quoted query token overrides the ID and configures aliases:</p>
+<pre><code class="language-text">&quot;?id=&lt;id&gt;&amp;alias=&lt;source-command&gt;:&lt;published-command&gt;&amp;minisign=&lt;public-key&gt;&quot;
+</code></pre>
+<p><code>alias=</code> is repeatable. Query names and values use percent encoding, and <code>+</code>
+remains a literal plus so base64 minisign keys round-trip unchanged. An ID does
+not rename a command implicitly.</p>
+<p>Installing an existing ID is the upgrade operation: ghr stages the replacement
+and publishes its complete command set transactionally, or restores the prior
+unit. <code>ghr uninstall &lt;id&gt;</code> removes exactly that ID; ID prefixes are not
+recursive.</p>
+<p>On Windows, publishing a staged unit briefly retries directory renames that
+fail with <code>AccessDenied</code> or <code>FileBusy</code>, as an extracted file may be temporarily
+held open. Persistent failures still stop the install and preserve the previous
+unit; close programs using the tool and check directory permissions or
+file-scanning software before retrying the command.</p>
+<p>Legacy owner/repo installs remain readable in place. Reinstalling the same
+derived ID migrates one unambiguous legacy unit only after the replacement is
+durable. Use an ID-capable ghr for later mutations; older releases do not
+understand v2 install state.</p>
+<p>For <code>.zip</code>, <code>.tar.gz</code>, <code>.tgz</code>, <code>.tar.xz</code>, <code>.txz</code>, <code>.tar.zst</code>, <code>.tzst</code>, and
+<code>.deb</code> assets, <code>ghr install</code> exposes executable candidates from the shallowest
+directory level containing any executables. It searches deeper only when no
+shallower candidates exist, so nested-only package layouts still work without
+putting executable-looking firmware or data files on <code>PATH</code>.</p>
+<p>Relative symlink aliases at that level are exposed under their own command
+names when their chains resolve to executable files inside the extracted
+package. For example, <code>bin/llvm-readelf -&gt; llvm-readobj</code> publishes
+<code>llvm-readelf</code> as well as <code>llvm-readobj</code>, without rewriting or copying the
+package's links. Absolute links, escaping paths, broken links, cycles, and
+chains longer than 40 symlinks are ignored. Symlinked directories are not
+searched recursively.</p>
+<p>These archive-provided aliases are ordinary owned commands: <code>--bin llvm-readelf</code>
+can select an alias without publishing its target's command, and replacement
+and uninstall manage it normally. They are distinct from the <code>alias=</code> query
+option, which explicitly renames a discovered command.</p>
 <h2><a href="#goals" id="goals"></a>Goals</h2>
 <p>An install needs a stable name that does not change when its release, selected
 asset, download URL, or executable names change. That stable name is the

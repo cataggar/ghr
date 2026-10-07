@@ -144,6 +144,7 @@
 <li><a href="/ghr/docs/getting-started.html" aria-current="page">Quick start</a></li>
 <li><a href="/ghr/docs.html">Overview</a></li>
 <li><a href="/ghr/docs/install.html">Installation</a></li>
+<li><a href="/ghr/docs/examples.html">Examples</a></li>
 </ul></details></li>
 <li><details class="docs-group" open><summary>Guides</summary><ul>
 <li><a href="/ghr/docs/download.html">Download assets</a></li>
@@ -180,11 +181,14 @@ commands from one shared bin directory.</p>
 <p>See <a href="/ghr/docs/install.html">Installation</a> for package managers, direct release downloads,
 and uninstall instructions.</p>
 <h2><a href="#install-your-first-tool" id="install-your-first-tool"></a>Install your first tool</h2>
-<p>Install ripgrep from its latest GitHub release:</p>
-<pre><code class="language-sh">ghr install burntsushi/ripgrep
+<p>Install bottom, a terminal system monitor:</p>
+<pre><code class="language-sh">ghr install clementtsang/bottom
 </code></pre>
-<p>Run the tool:</p>
-<pre><code class="language-sh">rg --version
+<p>Without a tag, ghr installs the latest release:
+<a href="https://github.com/ClementTsang/bottom/releases/latest">https://github.com/ClementTsang/bottom/releases/latest</a>.</p>
+<p>Check the version, then launch it:</p>
+<pre><code class="language-sh">btm --version
+btm
 </code></pre>
 <p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/getting-started.md">View Markdown source</a></p></main>
 </div>

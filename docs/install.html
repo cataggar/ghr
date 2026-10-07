@@ -144,6 +144,7 @@
 <li><a href="/ghr/docs/getting-started.html">Quick start</a></li>
 <li><a href="/ghr/docs.html">Overview</a></li>
 <li><a href="/ghr/docs/install.html" aria-current="page">Installation</a></li>
+<li><a href="/ghr/docs/examples.html">Examples</a></li>
 </ul></details></li>
 <li><details class="docs-group" open><summary>Guides</summary><ul>
 <li><a href="/ghr/docs/download.html">Download assets</a></li>
@@ -172,159 +173,31 @@
 </code></pre>
 <p>Open a new terminal after installation so the updated <code>PATH</code> is available.</p>
 <h2><a href="#package-managers" id="package-managers"></a>Package managers</h2>
-<p>ghr is also available through winget, pipx, uv, and pip. You can download it
+<p>ghr is also available through winget, uv, pipx, and pip. You can download it
 directly from a <a href="https://github.com/cataggar/ghr/releases">GitHub release</a>.</p>
 <p>winget:</p>
 <pre><code class="language-sh">winget install ghr
 </code></pre>
-<p>pipx:</p>
-<pre><code class="language-sh">pipx install ghr-bin
-</code></pre>
 <p>uv:</p>
 <pre><code class="language-sh">uv tool install ghr-bin
+</code></pre>
+<p>pipx:</p>
+<pre><code class="language-sh">pipx install ghr-bin
 </code></pre>
 <p>pip:</p>
 <pre><code class="language-sh">python3 -m pip install ghr-bin
 </code></pre>
-<p><code>pipx</code> is preinstalled on GitHub-hosted runner images, but a job-level
-<code>container:</code> replaces that user space and does not inherit hosted-image tools.
-Official Ubuntu, Debian slim, and Python containers do not promise <code>pipx</code>.
-Use the first-party <a href="https://github.com/cataggar/ghr/blob/main/actions/setup/README.md"><code>actions/setup</code></a>,
-<a href="https://github.com/cataggar/ghr/blob/main/actions/install/README.md"><code>actions/install</code></a>, or
-<a href="https://github.com/cataggar/ghr/blob/main/actions/download/README.md"><code>actions/download</code></a> action for a verified
-static bootstrap that does not require Python or a package manager. A manual
-<code>pipx install</code> remains useful in development environments where Python tooling
-is already present.</p>
-<p>For HTTPS on a minimal system without a conventional CA bundle, set
-<code>SSL_CERT_FILE</code> to the absolute path of a nonempty PEM root bundle. The
-first-party setup action supplies this automatically from the maintained Node
-24 runtime when a bare Linux image has no system trust store.</p>
-<h2><a href="#examples" id="examples"></a>Examples</h2>
-<p>Install the latest release:</p>
-<pre><code class="language-sh">ghr install burntsushi/ripgrep
-</code></pre>
-<p>Install ghr itself (a published Minisign signature is noted, not verified
-without a key):</p>
-<pre><code class="language-sh">ghr install cataggar/ghr
-</code></pre>
-<p>Install a specific tag:</p>
-<pre><code class="language-sh">ghr install burntsushi/ripgrep@15.1.0
-</code></pre>
-<p>Install several tools in one invocation (shared HTTP client and authentication):</p>
-<pre><code class="language-sh">ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
-</code></pre>
-<p>Install a specific asset by name (exact match or unique substring):</p>
-<pre><code class="language-sh">ghr install webassembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
-</code></pre>
-<p>Keep two releases from the same repository under independent IDs:</p>
-<pre><code class="language-sh">ghr install burntsushi/ripgrep@14.1.0 &quot;?id=rg-14-1-0&amp;alias=rg:rg-14-1-0&quot;
-</code></pre>
-<pre><code class="language-sh">ghr install burntsushi/ripgrep@14.1.1 &quot;?id=rg-14-1-1&amp;alias=rg:rg-14-1-1&quot;
-</code></pre>
-<p>A direct URL has no repository identity, so its ID is explicit:</p>
-<pre><code class="language-sh">ghr install https://example.com/tool.tar.xz &quot;?id=example/tool&quot;
-</code></pre>
-<p>Install only a selected binary from a release:</p>
-<pre><code class="language-sh">ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
-</code></pre>
-<p>Report stable identities:</p>
-<pre><code class="language-sh">ghr list --ids
-</code></pre>
-<p>Report installed units with their status, source, tag, and commands:</p>
-<pre><code class="language-sh">ghr list --full
-</code></pre>
-<p>Report compact, tagged install arguments:</p>
-<pre><code class="language-sh">ghr list --tags
-</code></pre>
-<p>Each line contains raw arguments only, without quotes or a <code>ghr install</code> prefix.
-GitHub sources use the installed tag, together with any stored selector, custom
-ID, aliases, minisign key, and non-default verification options. IDs implied by
-the source, default options, and binary
-filters (<code>--bin</code>) are omitted. <code>--json</code> retains the stored binary selection.
-Legacy or incomplete definitions are best-effort without warnings; direct URLs
-remain unchanged. Raw tagged output is not shell-escaped, and tags/URLs do not
-guarantee immutable content.</p>
-<p>Report shell-ready install commands:</p>
-<pre><code class="language-sh">ghr list --install
-</code></pre>
-<p>This is also the default <code>ghr list</code> output. Each line starts with <code>ghr install</code>,
-quotes arguments for POSIX shells, and includes stored <code>--bin</code> filters when
-configured. Source, query configuration, and verification options are the same
-as tagged output.</p>
-<p>Report complete machine-readable definitions:</p>
-<pre><code class="language-sh">ghr list --json
-</code></pre>
-<p><code>--install</code> explicitly selects the default shell-ready output. The <code>--ids</code>,
-<code>--tags</code>, <code>--install</code>, <code>--full</code>, and <code>--json</code> flags are mutually exclusive.</p>
-<p>All formats are alphabetical, ignoring ASCII case. Default/<code>--install</code> and
-<code>--tags</code> sort by displayed source before shell quoting, with install IDs
-breaking ties. <code>--ids</code>, <code>--full</code>, and <code>--json</code> sort by canonical install ID.</p>
-<p>Remove exactly one ID:</p>
-<pre><code class="language-sh">ghr uninstall rg-14-1-0
-</code></pre>
-<p>Show where tools are stored:</p>
-<pre><code class="language-sh">ghr path tools
-</code></pre>
-<p>Show where binaries are symlinked:</p>
-<pre><code class="language-sh">ghr path bin
-</code></pre>
-<h2><a href="#stable-ids-and-replacement" id="stable-ids-and-replacement"></a>Stable IDs and replacement</h2>
-<p>Install IDs are ownership keys, separate from release sources and published
-command names. GitHub sources default to lowercase <code>owner/repo</code>; an optional
-quoted query token overrides the ID and configures aliases:</p>
-<pre><code class="language-text">&quot;?id=&lt;id&gt;&amp;alias=&lt;source-command&gt;:&lt;published-command&gt;&amp;minisign=&lt;public-key&gt;&quot;
-</code></pre>
-<p><code>alias=</code> is repeatable. Query names and values use percent encoding, and <code>+</code>
-remains a literal plus so base64 minisign keys round-trip unchanged. An ID does
-not rename a command implicitly.</p>
-<p>Installing an existing ID is the upgrade operation: ghr stages the replacement
-and publishes its complete command set transactionally, or restores the prior
-unit. <code>ghr uninstall &lt;id&gt;</code> removes exactly that ID; ID prefixes are not
-recursive.</p>
-<p>On Windows, publishing a staged unit briefly retries directory renames that
-fail with <code>AccessDenied</code> or <code>FileBusy</code>, as an extracted file may be temporarily
-held open. Persistent failures still stop the install and preserve the previous
-unit; close programs using the tool and check directory permissions or
-file-scanning software before retrying the command.</p>
-<p>Legacy owner/repo installs remain readable in place. Reinstalling the same
-derived ID migrates one unambiguous legacy unit only after the replacement is
-durable. Use an ID-capable ghr for later mutations; older releases do not
-understand v2 install state.</p>
-<p>For <code>.zip</code>, <code>.tar.gz</code>, <code>.tgz</code>, <code>.tar.xz</code>, <code>.txz</code>, <code>.tar.zst</code>, <code>.tzst</code>, and
-<code>.deb</code> assets, <code>ghr install</code> exposes executable candidates from the shallowest
-directory level containing any executables. It searches deeper only when no
-shallower candidates exist, so nested-only package layouts still work without
-putting executable-looking firmware or data files on <code>PATH</code>.</p>
-<p>Relative symlink aliases at that level are exposed under their own command
-names when their chains resolve to executable files inside the extracted
-package. For example, <code>bin/llvm-readelf -&gt; llvm-readobj</code> publishes
-<code>llvm-readelf</code> as well as <code>llvm-readobj</code>, without rewriting or copying the
-package's links. Absolute links, escaping paths, broken links, cycles, and
-chains longer than 40 symlinks are ignored. Symlinked directories are not
-searched recursively.</p>
-<p>These archive-provided aliases are ordinary owned commands: <code>--bin llvm-readelf</code>
-can select an alias without publishing its target's command, and replacement
-and uninstall manage it normally. They are distinct from the <code>alias=</code> query
-option, which explicitly renames a discovered command.</p>
 <h2><a href="#filtering-installed-binaries" id="filtering-installed-binaries"></a>Filtering installed binaries</h2>
 <p><code>--bin &lt;name&gt;</code> is repeatable. When present, only the selected executable
-candidates are linked into ghr's bin directory and recorded in <code>ghr.json</code>. The
+candidates are linked into ghr's bin directory and recorded. The
 release archive is still fully extracted; download verification and extraction
 are unchanged.</p>
-<p>A filtered reinstall reconciles existing links, removing ghr-owned binaries
-excluded by the new selection. If a name does not match, ghr reports an error
-with the available binary names and leaves the existing installation unchanged.
-Filters currently require exactly one install spec; combining them with
-multiple specs is rejected.</p>
-<p>This install-time filtering is separate from WSL-specific <code>ghr link --bin</code>,
-which filters links for a tool already installed on Windows. See
-<a href="/ghr/docs/wsl-linking.html">WSL linking</a>.</p>
-<h2><a href="#uninstall-ghr-itself" id="uninstall-ghr-itself"></a>Uninstall ghr itself</h2>
-<p>pipx:</p>
-<pre><code class="language-sh">pipx uninstall ghr-bin
-</code></pre>
+<h2><a href="#uninstall" id="uninstall"></a>Uninstall</h2>
 <p>uv:</p>
 <pre><code class="language-sh">uv tool uninstall ghr-bin
+</code></pre>
+<p>pipx:</p>
+<pre><code class="language-sh">pipx uninstall ghr-bin
 </code></pre>
 <p>pip:</p>
 <pre><code class="language-sh">python -m pip uninstall ghr-bin -y

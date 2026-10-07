@@ -9,9 +9,9 @@
   <link rel="icon" href="/ghr/favicon.ico" sizes="any">
   <link rel="icon" href="/ghr/favicon-32x32.png" type="image/png" sizes="32x32">
   <script src="/ghr/site.js" defer></script>
-  <title>Download — ghr</title>
+  <title>Examples — ghr</title>
   <meta name="description" content="A toolkit for GitHub releases.">
-  <meta property="og:title" content="Download">
+  <meta property="og:title" content="Examples">
   <meta property="og:description" content="A toolkit for GitHub releases.">
   <meta property="og:type" content="website">
   <style>
@@ -144,10 +144,10 @@
 <li><a href="/ghr/docs/getting-started.html">Quick start</a></li>
 <li><a href="/ghr/docs.html">Overview</a></li>
 <li><a href="/ghr/docs/install.html">Installation</a></li>
-<li><a href="/ghr/docs/examples.html">Examples</a></li>
+<li><a href="/ghr/docs/examples.html" aria-current="page">Examples</a></li>
 </ul></details></li>
 <li><details class="docs-group" open><summary>Guides</summary><ul>
-<li><a href="/ghr/docs/download.html" aria-current="page">Download assets</a></li>
+<li><a href="/ghr/docs/download.html">Download assets</a></li>
 <li><a href="/ghr/docs/github-actions.html">GitHub Actions</a></li>
 <li><a href="/ghr/docs/wsl-linking.html">WSL linking</a></li>
 <li><a href="/ghr/docs/troubleshooting.html">Troubleshooting</a></li>
@@ -163,66 +163,76 @@
 </ul></details></li>
 </ul></nav></details></aside>
 <main id="main-content" tabindex="-1" class="prose docs">
-<h1><a href="#download" id="download"></a>Download</h1>
-<p><code>ghr download</code> fetches a release asset using the same discovery logic as
-<code>ghr install</code>, then drops the file in the current directory (or the path
-given by <code>-o</code>). Use it as a cross-platform replacement for the common
-<code>wget -O ... &amp;&amp; tar -xf ...</code> pattern in CI — same syntax on Ubuntu,
-macOS, and Windows; no <code>choco install wget</code> step needed.</p>
-<pre><code>ghr download &lt;spec&gt; [&lt;pubkey&gt;] [&lt;spec&gt; [&lt;pubkey&gt;] ...] [options]
-
-OPTIONS:
-    -o, --output &lt;path&gt;        Output file path (single-spec only)
-        --extract &lt;dir&gt;        Extract archive(s) into &lt;dir&gt; after download
-        --strip-components &lt;N&gt; Strip N leading path components when extracting
-        --sha256 &lt;hex&gt;         Verify download against SHA-256 digest (single-spec only)
-        --minisign &lt;pubkey&gt;    Default minisign key, applied to specs without an inline key
-        --skip-verify          Skip every verification step (checksum, minisign, sigstore, attestation, authenticode)
-        --skip-checksum        Skip checksum verification (GitHub asset digest + .sha256/.sha512 sidecar)
-        --skip-minisign        Skip just the minisign verification step
-        --skip-sigstore        Skip just the published .sigstore.json sidecar verification step
-        --skip-attestation     Skip just the GitHub-native artifact attestation verification step
-        --skip-authenticode    Skip just the Authenticode (Windows PE) verification step
-        --keep-archive         Keep archive on disk after extraction
-        --keep-going           For multi-spec, continue past per-spec failures
-        --quiet                Suppress progress output
-        --no-auth              Do not send GitHub auth even for github.com URLs
-        --debug                Verbose diagnostic output
+<h1><a href="#examples" id="examples"></a>Examples</h1>
+<p>Install the latest release:</p>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep
 </code></pre>
-<p>Each <code>&lt;spec&gt;</code> is <code>owner/repo[@tag]</code> (auto-pick asset for the current
-OS/arch) or <code>owner/repo/file[@tag]</code> (exact match wins, otherwise a
-unique case-insensitive substring wins; multiple matches print the
-candidates). A 56-char <code>RW</code>/<code>RU</code>-prefixed base64 token immediately
-after a spec is treated as that spec's minisign public key (overriding
-the global <code>--minisign &lt;pubkey&gt;</code> default for that single spec).
-Recognised archive formats: <code>.zip</code>, <code>.tar.gz</code>, <code>.tgz</code>, <code>.tar.xz</code>,
-<code>.txz</code>, <code>.tar.zst</code>, and <code>.tzst</code>. Format is detected from the filename.
-When <code>--extract</code> is used the archive is deleted after extraction unless
-<code>--keep-archive</code> (or <code>-o</code>) is set.</p>
-<p>Multi-spec invocations share a single HTTP client + auth context, so
-adding more specs costs little beyond the per-asset bytes. <code>-o</code> and
-<code>--sha256</code> are inherently single-target and are rejected when more
-than one spec is supplied — use <code>--extract &lt;dir&gt;</code> for &quot;land each
-archive in a shared directory&quot;, or invoke <code>ghr download</code> once per
-spec for distinct outputs. <code>--keep-going</code> continues past per-spec
-failures and exits non-zero with a summary if any spec failed.</p>
-<p>GitHub auth is attached automatically (using <code>GH_TOKEN</code>,
-<code>GITHUB_TOKEN</code>, or <code>gh auth token</code>); pass <code>--no-auth</code> to skip it.
-When a token is present, release assets are fetched through the
-GitHub asset API endpoint rather than the public download URL, so
-private and SSO-protected enterprise releases work as long as the
-token is authorized for the organization.
-Downloads are auto-verified against any sigstore bundle or checksum
-sidecar published with the release, and against any GitHub artifact
-attestation covering the downloaded digest; pass <code>--minisign &lt;pubkey&gt;</code> to
-also require a minisign signature (or attach an inline key to a
-spec). Without a key, a published <code>.minisig</code> is noted but not verified;
-other enabled verifiers still run. Use <code>--skip-&lt;step&gt;</code> to bypass one
-verifier individually, or <code>--skip-verify</code> to bypass all checks. Exit
-codes: <code>0</code> success, <code>1</code> argument/IO error, <code>2</code> HTTP error after retries,
-<code>3</code> checksum or minisign mismatch. Multi-spec invocations exit with
-the most-severe code observed across the batch.</p>
-<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/download.md">View Markdown source</a></p></main>
+<p>Install ghr itself (a published Minisign signature is noted, not verified
+without a key):</p>
+<pre><code class="language-sh">ghr install cataggar/ghr
+</code></pre>
+<p>Install a specific tag:</p>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep@15.1.0
+</code></pre>
+<p>Install several tools in one invocation (shared HTTP client and authentication):</p>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep@15.1.0 sharkdp/fd@v10.2.0
+</code></pre>
+<p>Install a specific asset by name (exact match or unique substring):</p>
+<pre><code class="language-sh">ghr install webassembly/wasi-sdk/wasi-sdk-25.0-x86_64-linux.tar.gz@wasi-sdk-25
+</code></pre>
+<p>Keep two releases from the same repository under independent IDs:</p>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep@14.1.0 &quot;?id=rg-14-1-0&amp;alias=rg:rg-14-1-0&quot;
+</code></pre>
+<pre><code class="language-sh">ghr install burntsushi/ripgrep@14.1.1 &quot;?id=rg-14-1-1&amp;alias=rg:rg-14-1-1&quot;
+</code></pre>
+<p>A direct URL has no repository identity, so its ID is explicit:</p>
+<pre><code class="language-sh">ghr install https://example.com/tool.tar.xz &quot;?id=example/tool&quot;
+</code></pre>
+<p>Install only a selected binary from a release:</p>
+<pre><code class="language-sh">ghr install azuread/microsoft-authentication-cli@0.9.6 --bin azureauth
+</code></pre>
+<p>Report stable identities:</p>
+<pre><code class="language-sh">ghr list --ids
+</code></pre>
+<p>Report installed units with their status, source, tag, and commands:</p>
+<pre><code class="language-sh">ghr list --full
+</code></pre>
+<p>Report compact, tagged install arguments:</p>
+<pre><code class="language-sh">ghr list --tags
+</code></pre>
+<p>Each line contains raw arguments only, without quotes or a <code>ghr install</code> prefix.
+GitHub sources use the installed tag, together with any stored selector, custom
+ID, aliases, minisign key, and non-default verification options. IDs implied by
+the source, default options, and binary
+filters (<code>--bin</code>) are omitted. <code>--json</code> retains the stored binary selection.
+Legacy or incomplete definitions are best-effort without warnings; direct URLs
+remain unchanged. Raw tagged output is not shell-escaped, and tags/URLs do not
+guarantee immutable content.</p>
+<p>Report shell-ready install commands:</p>
+<pre><code class="language-sh">ghr list --install
+</code></pre>
+<p>This is also the default <code>ghr list</code> output. Each line starts with <code>ghr install</code>,
+quotes arguments for POSIX shells, and includes stored <code>--bin</code> filters when
+configured. Source, query configuration, and verification options are the same
+as tagged output.</p>
+<p>Report complete machine-readable definitions:</p>
+<pre><code class="language-sh">ghr list --json
+</code></pre>
+<p><code>--install</code> explicitly selects the default shell-ready output. The <code>--ids</code>,
+<code>--tags</code>, <code>--install</code>, <code>--full</code>, and <code>--json</code> flags are mutually exclusive.</p>
+<p>All formats are alphabetical, ignoring ASCII case. Default/<code>--install</code> and
+<code>--tags</code> sort by displayed source before shell quoting, with install IDs
+breaking ties. <code>--ids</code>, <code>--full</code>, and <code>--json</code> sort by canonical install ID.</p>
+<p>Remove exactly one ID:</p>
+<pre><code class="language-sh">ghr uninstall rg-14-1-0
+</code></pre>
+<p>Show where tools are stored:</p>
+<pre><code class="language-sh">ghr path tools
+</code></pre>
+<p>Show where binaries are symlinked:</p>
+<pre><code class="language-sh">ghr path bin
+</code></pre>
+<p class="doc-source"><a href="https://github.com/cataggar/ghr/blob/main/doc/examples.md">View Markdown source</a></p></main>
 </div>
 
   <footer class="layout-footer">
