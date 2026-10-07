@@ -29,8 +29,24 @@ iwr -useb https://raw.githubusercontent.com/cataggar/ghr/main/install.ps1 | iex
 
 Open a new terminal after installation.
 
+Install bottom, a terminal system monitor:
+
+```sh
+ghr install clementtsang/bottom
+```
+
+Without a tag, ghr installs the latest release:
+[https://github.com/ClementTsang/bottom/releases/latest](https://github.com/ClementTsang/bottom/releases/latest).
+
+Check the version, then launch it:
+
+```sh
+btm --version
+btm
+```
+
 See [Quick start](https://cataggar.github.io/ghr/docs/getting-started.html)
-to install your first tool, and
+for a step-by-step guide, and
 [Installation](https://cataggar.github.io/ghr/docs/install.html)
 for package managers and uninstall instructions.
 

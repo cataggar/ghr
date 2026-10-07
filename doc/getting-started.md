@@ -31,14 +31,18 @@ and uninstall instructions.
 
 ## Install your first tool
 
-Install ripgrep from its latest GitHub release:
+Install bottom, a terminal system monitor:
 
 ```sh
-ghr install burntsushi/ripgrep
+ghr install clementtsang/bottom
 ```
 
-Run the tool:
+Without a tag, ghr installs the latest release:
+[https://github.com/ClementTsang/bottom/releases/latest](https://github.com/ClementTsang/bottom/releases/latest).
+
+Check the version, then launch it:
 
 ```sh
-rg --version
+btm --version
+btm
 ```
