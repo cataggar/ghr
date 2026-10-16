@@ -14,6 +14,29 @@ zig build test
 (cd website && zig build prod)
 ```
 
+## Incremental development watch loop
+
+During iterative Zig development in `src/` or `build.zig`, use the bounded
+watcher helper under `.github/skills/zig-incremental-dev/` to supervise a
+single per-worktree `zig build ... -Doptimize=debug -fincremental --watch`
+process with isolated cache (`.zig-cache/copilot-watch`) and output
+(`zig-out/copilot-watch`) directories:
+
+```sh
+# Start (or reuse) the incremental watcher and wait for the initial build
+.github/skills/zig-incremental-dev/scripts/watcher-helper start --step install
+
+# After editing src/*.zig, wait for the generation matching current sources
+.github/skills/zig-incremental-dev/scripts/watcher-helper wait
+
+# Check status or stop the watcher when finished
+.github/skills/zig-incremental-dev/scripts/watcher-helper status
+.github/skills/zig-incremental-dev/scripts/watcher-helper stop
+```
+
+Omit `--step install` on `start` to watch the full `test` step on every change,
+and run the standard one-shot `zig build test` check before pushing.
+
 ## Website generation
 
 Website regression checks: `cd website && zig build test prod check`.

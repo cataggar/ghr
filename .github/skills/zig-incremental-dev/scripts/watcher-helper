@@ -1,0 +1,1542 @@
+#!/usr/bin/env python3
+"""
+watcher-helper: Bounded process-management and build-synchronization helper
+for `zig build ... -Doptimize=debug -fincremental --watch`.
+
+Commands:
+  start   Start or reuse the per-worktree incremental watcher and wait for a
+          completed build/test cycle matching the current source tree.
+  status  Report current watcher health, build generation, and source freshness.
+  wait    Wait for a completed build/test cycle matching the current source tree.
+  stop    Stop the watcher owned by this worktree/session.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+SUMMARY_RE = re.compile(
+    r"^Build Summary:\s+(?P<steps_succeeded>\d+)/(?P<steps_total>\d+)\s+steps succeeded"
+    r"(?:\s+\((?P<steps_detail>[^)]+)\))?"
+    r"(?:;\s+(?P<tests_passed>\d+)/(?P<tests_total>\d+)\s+tests passed"
+    r"(?:\s+\((?P<tests_detail>[^)]+)\))?)?\s*$"
+)
+
+WATCHED_TOP_FILES = ("build.zig", "build.zig.zon")
+WATCHED_DIRS = ("src",)
+MAX_HISTORY_GENERATIONS = 20
+MAX_DIAGNOSTIC_CHARS = 64 * 1024
+
+
+def now_wall_ns() -> int:
+    return time.time_ns()
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def resolve_worktree(worktree_arg: str | None) -> Path:
+    base = Path(worktree_arg).expanduser() if worktree_arg else Path.cwd()
+    base = base.resolve()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(base), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip()).resolve()
+    except Exception:
+        pass
+    return base
+
+
+def get_git_head(worktree: Path) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def resolve_zig_info(zig_arg: str | None) -> dict[str, str]:
+    zig_bin = zig_arg or os.environ.get("ZIG") or shutil.which("zig")
+    if not zig_bin:
+        raise RuntimeError("Could not find 'zig' executable in PATH (or via --zig / ZIG).")
+    zig_path = str(Path(zig_bin).expanduser().resolve())
+    proc = subprocess.run(
+        [zig_path, "version"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"Failed to run '{zig_path} version': {proc.stderr.strip()}")
+    version = proc.stdout.strip()
+    machine = platform.machine().lower()
+    sysname = platform.system().lower()
+    return {
+        "path": zig_path,
+        "version": version,
+        "host": f"{machine}-{sysname}",
+    }
+
+
+def snapshot_worktree(worktree: Path) -> dict[str, Any]:
+    """Compute a deterministic source revision snapshot across build.zig, build.zig.zon, and src/**."""
+    files_meta: dict[str, dict[str, Any]] = {}
+    overall = hashlib.sha256()
+    max_mtime_ns = 0
+    file_count = 0
+
+    candidates: list[Path] = []
+    for name in WATCHED_TOP_FILES:
+        p = worktree / name
+        if p.is_file():
+            candidates.append(p)
+
+    for dname in WATCHED_DIRS:
+        root = worktree / dname
+        if not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for fname in sorted(filenames):
+                if fname.startswith("."):
+                    continue
+                candidates.append(Path(dirpath) / fname)
+
+    for path in sorted(candidates, key=lambda p: p.relative_to(worktree).as_posix()):
+        rel = path.relative_to(worktree).as_posix()
+        try:
+            st = path.stat()
+            data = path.read_bytes()
+        except FileNotFoundError:
+            continue
+        fhash = hashlib.sha256(data).hexdigest()
+        mtime_ns = st.st_mtime_ns
+        if mtime_ns > max_mtime_ns:
+            max_mtime_ns = mtime_ns
+        file_count += 1
+        files_meta[rel] = {
+            "sha256": fhash,
+            "mtime_ns": mtime_ns,
+            "size": st.st_size,
+        }
+        overall.update(f"{rel}\0{st.st_size}\0{fhash}\n".encode("utf-8"))
+
+    return {
+        "source_digest": overall.hexdigest(),
+        "max_mtime_ns": max_mtime_ns,
+        "file_count": file_count,
+        "git_head": get_git_head(worktree),
+        "files": files_meta,
+    }
+
+
+def proc_stat_info(pid: int) -> dict[str, Any] | None:
+    """Read Linux /proc/<pid>/stat (with fallback) to verify process identity and CPU progress."""
+    if pid <= 0:
+        return None
+    stat_path = Path(f"/proc/{pid}/stat")
+    if stat_path.exists():
+        try:
+            raw = stat_path.read_text(encoding="utf-8", errors="replace")
+            rparen = raw.rfind(")")
+            if rparen == -1:
+                return None
+            comm = raw[raw.find("(") + 1 : rparen]
+            rest = raw[rparen + 2 :].split()
+            state_char = rest[0]
+            if state_char == "Z":
+                return None
+            ppid = int(rest[1])
+            pgrp = int(rest[2])
+            utime = int(rest[11])
+            stime = int(rest[12])
+            cutime = int(rest[13])
+            cstime = int(rest[14])
+            starttime = int(rest[19])
+            cmdline = ""
+            try:
+                raw_cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+                cmdline = " ".join(
+                    part.decode("utf-8", errors="replace")
+                    for part in raw_cmd.split(b"\0")
+                    if part
+                )
+            except Exception:
+                pass
+            return {
+                "pid": pid,
+                "comm": comm,
+                "state": state_char,
+                "ppid": ppid,
+                "pgrp": pgrp,
+                "starttime": starttime,
+                "cpu_ticks": utime + stime + cutime + cstime,
+                "cmdline": cmdline,
+            }
+        except Exception:
+            return None
+
+    try:
+        os.kill(pid, 0)
+        return {
+            "pid": pid,
+            "comm": "",
+            "state": "R",
+            "ppid": 0,
+            "pgrp": 0,
+            "starttime": 0,
+            "cpu_ticks": 0,
+            "cmdline": "",
+        }
+    except OSError:
+        return None
+
+
+def is_verified_process(pid: int | None, expected_starttime: int | None = None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    info = proc_stat_info(pid)
+    if info is None:
+        return False
+    if expected_starttime and info["starttime"] and info["starttime"] != expected_starttime:
+        return False
+    return True
+
+
+def list_process_group_members(pgid: int) -> list[dict[str, Any]]:
+    if pgid <= 0:
+        return []
+    members: list[dict[str, Any]] = []
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            info = proc_stat_info(int(entry.name))
+            if info and info["pgrp"] == pgid:
+                members.append(info)
+    else:
+        info = proc_stat_info(pgid)
+        if info:
+            members.append(info)
+    return members
+
+
+def total_pgroup_cpu_ticks(pgid: int) -> int:
+    return sum(m.get("cpu_ticks", 0) for m in list_process_group_members(pgid))
+
+
+def terminate_process_group(pgid: int, timeout_sec: float = 10.0) -> list[int]:
+    """Terminate all processes in pgid cleanly with SIGTERM, escalating to SIGKILL if needed."""
+    if pgid <= 0:
+        return []
+    members = list_process_group_members(pgid)
+    if not members:
+        return []
+    stopped_pids = [m["pid"] for m in members]
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        for m in members:
+            try:
+                os.kill(m["pid"], signal.SIGTERM)
+            except OSError:
+                pass
+
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        remaining = list_process_group_members(pgid)
+        if not remaining:
+            return stopped_pids
+        time.sleep(0.05)
+
+    remaining = list_process_group_members(pgid)
+    if remaining:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            for m in remaining:
+                try:
+                    os.kill(m["pid"], signal.SIGKILL)
+                except OSError:
+                    pass
+        time.sleep(0.05)
+    return stopped_pids
+
+
+def parse_detail_counts(detail: str | None) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not detail:
+        return counts
+    for part in detail.split(","):
+        tokens = part.strip().split()
+        if len(tokens) >= 2 and tokens[0].isdigit():
+            counts[tokens[1]] = int(tokens[0])
+    return counts
+
+
+def parse_summary_line(line: str) -> dict[str, Any] | None:
+    m = SUMMARY_RE.match(line.strip())
+    if not m:
+        return None
+    steps_succeeded = int(m.group("steps_succeeded"))
+    steps_total = int(m.group("steps_total"))
+    step_counts = parse_detail_counts(m.group("steps_detail"))
+    steps_failed = step_counts.get("failed", 0)
+    steps_skipped = step_counts.get("skipped", 0)
+
+    tests_passed = int(m.group("tests_passed")) if m.group("tests_passed") is not None else None
+    tests_total = int(m.group("tests_total")) if m.group("tests_total") is not None else None
+    test_counts = parse_detail_counts(m.group("tests_detail"))
+    tests_failed = (
+        test_counts.get("failed", 0)
+        + test_counts.get("crashed", 0)
+        + test_counts.get("timed", 0)
+    )
+    tests_skipped = test_counts.get("skipped", 0)
+
+    succeeded = (
+        steps_succeeded == steps_total
+        and steps_failed == 0
+        and tests_failed == 0
+        and (tests_passed is None or tests_total is None or tests_passed + tests_skipped == tests_total)
+    )
+    return {
+        "summary_line": line.strip(),
+        "steps_succeeded": steps_succeeded,
+        "steps_total": steps_total,
+        "steps_failed": steps_failed,
+        "steps_skipped": steps_skipped,
+        "tests_passed": tests_passed,
+        "tests_total": tests_total,
+        "tests_failed": tests_failed,
+        "tests_skipped": tests_skipped,
+        "succeeded": succeeded,
+    }
+
+
+def resolve_paths(worktree: Path, cache_dir_arg: str | None, prefix_arg: str | None, global_cache_arg: str | None = None) -> dict[str, Path]:
+    cache_dir = Path(cache_dir_arg) if cache_dir_arg else Path(".zig-cache/copilot-watch")
+    if not cache_dir.is_absolute():
+        cache_dir = (worktree / cache_dir).resolve()
+    else:
+        cache_dir = cache_dir.resolve()
+
+    prefix_dir = Path(prefix_arg) if prefix_arg else Path("zig-out/copilot-watch")
+    if not prefix_dir.is_absolute():
+        prefix_dir = (worktree / prefix_dir).resolve()
+    else:
+        prefix_dir = prefix_dir.resolve()
+
+    if global_cache_arg:
+        global_cache_dir = Path(global_cache_arg).expanduser().resolve()
+    else:
+        env_global = os.environ.get("ZIG_GLOBAL_CACHE_DIR")
+        if env_global and not env_global.startswith("/home/"):
+            global_cache_dir = Path(env_global).expanduser().resolve()
+        else:
+            global_cache_dir = (cache_dir.parent / f"{cache_dir.name}-global").resolve()
+
+    state_dir = (cache_dir.parent / f"{cache_dir.name}-state").resolve()
+    tmp_dir = (state_dir / "tmp").resolve()
+    return {
+        "cache_dir": cache_dir,
+        "prefix_dir": prefix_dir,
+        "global_cache_dir": global_cache_dir,
+        "state_dir": state_dir,
+        "tmp_dir": tmp_dir,
+        "state_file": state_dir / "state.json",
+        "log_file": state_dir / "watcher.log",
+        "lock_file": state_dir / "coord.lock",
+    }
+
+
+class FileLock:
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        self.fd: int | None = None
+
+    def __enter__(self) -> "FileLock":
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+def read_state(state_file: Path) -> dict[str, Any] | None:
+    if not state_file.is_file():
+        return None
+    for _ in range(3):
+        try:
+            return json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            time.sleep(0.01)
+    return None
+
+
+def write_state_atomic(state_file: Path, data: dict[str, Any]) -> None:
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = state_file.with_name(f".{state_file.name}.{os.getpid()}.tmp")
+    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    tmp_path.write_text(payload, encoding="utf-8")
+    os.replace(tmp_path, state_file)
+
+
+def compute_config_spec(
+    worktree: Path,
+    zig_info: dict[str, str],
+    steps: list[str],
+    optimize: str,
+    target: str | None,
+    extra_args: list[str],
+    paths: dict[str, Path],
+    debounce_ms: int,
+) -> dict[str, Any]:
+    norm_steps = steps if steps else ["test"]
+    cmd: list[str] = [zig_info["path"], "build", *norm_steps]
+    cmd.append(f"-Doptimize={optimize}")
+    if target:
+        cmd.append(f"-Dtarget={target}")
+    cmd.extend(extra_args)
+    cmd.extend(
+        [
+            "-fincremental",
+            "--watch",
+            "--debounce",
+            str(debounce_ms),
+            "--cache-dir",
+            str(paths["cache_dir"]),
+            "--prefix",
+            str(paths["prefix_dir"]),
+            "--summary",
+            "all",
+            "--color",
+            "off",
+        ]
+    )
+    config_payload = {
+        "worktree": str(worktree),
+        "zig_path": zig_info["path"],
+        "zig_version": zig_info["version"],
+        "zig_host": zig_info["host"],
+        "steps": norm_steps,
+        "optimize": optimize,
+        "target": target,
+        "extra_args": extra_args,
+        "cache_dir": str(paths["cache_dir"]),
+        "prefix_dir": str(paths["prefix_dir"]),
+        "global_cache_dir": str(paths["global_cache_dir"]),
+        "debounce_ms": debounce_ms,
+        "command": cmd,
+    }
+    config_hash = hashlib.sha256(
+        json.dumps(config_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+    config_payload["config_hash"] = config_hash
+    return config_payload
+
+
+def nudge_fanotify(worktree: Path, changed_rel_paths: list[str] | None = None) -> list[str]:
+    """
+    Open watched input file(s) with O_RDWR and close immediately without writing.
+    On Linux, this emits FAN_CLOSE_WRITE to `zig build --watch` without modifying
+    file contents or mtime.
+    """
+    targets: list[Path] = []
+    if changed_rel_paths:
+        for rel in changed_rel_paths:
+            candidate = worktree / rel
+            if candidate.is_file():
+                targets.append(candidate)
+
+    for fallback in ("src/main.zig", "src/shim.zig", "build.zig"):
+        p = worktree / fallback
+        if p.is_file() and p not in targets:
+            targets.append(p)
+
+    nudged: list[str] = []
+    for target in targets:
+        try:
+            fd = os.open(str(target), os.O_RDWR)
+            os.close(fd)
+            nudged.append(target.relative_to(worktree).as_posix())
+        except OSError:
+            continue
+    return nudged
+
+
+def evaluate_freshness(
+    state: dict[str, Any] | None,
+    snap: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    """
+    Determine whether the latest completed generation in `state` is current,
+    building, stale, or none relative to `snap`.
+    """
+    if not state:
+        return "none", None
+
+    sup_alive = is_verified_process(
+        state.get("supervisor_pid"), state.get("supervisor_starttime")
+    )
+    zig_alive = is_verified_process(
+        state.get("watcher_pid"), state.get("watcher_starttime")
+    )
+    latest = state.get("latest_generation")
+    if not sup_alive or not zig_alive:
+        return "none", latest
+
+    if state.get("cycle_in_progress"):
+        return "building", latest
+
+    if not latest:
+        return "building", None
+
+    debounce_ns = int(state.get("config", {}).get("debounce_ms", 50)) * 1_000_000
+    same_digest = latest.get("source_digest") == snap["source_digest"]
+    same_mtime = latest.get("max_mtime_ns") == snap["max_mtime_ns"]
+    clean_cycle = not bool(latest.get("dirty_during_build", False))
+    completed_after_edit = int(latest.get("completed_wall_ns", 0)) >= (
+        int(snap["max_mtime_ns"]) + debounce_ns
+    )
+
+    if same_digest and same_mtime and clean_cycle and completed_after_edit:
+        return "current", latest
+    return "stale", latest
+
+
+def run_supervisor(state_dir: Path) -> int:
+    """
+    Background supervisor process:
+    - Spawns `zig build ... --watch` in its own process group.
+    - Parses stderr build cycles (`Build Summary:` + step status tree + diagnostics).
+    - Records completed generations tied to exact worktree `source_digest` and `max_mtime_ns`.
+    - Monitors `--owner-pid` (if configured) and stops the watcher when the owner exits.
+    """
+    state_file = state_dir / "state.json"
+    log_file = state_dir / "watcher.log"
+    state = read_state(state_file)
+    if not state:
+        return 2
+
+    worktree = Path(state["worktree"])
+    config = state["config"]
+    cmd = config["command"]
+    debounce_ns = int(config.get("debounce_ms", 50)) * 1_000_000
+
+    Path(config["cache_dir"]).mkdir(parents=True, exist_ok=True)
+    Path(config["prefix_dir"]).mkdir(parents=True, exist_ok=True)
+    Path(config["global_cache_dir"]).mkdir(parents=True, exist_ok=True)
+    (state_dir / "tmp").mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    env["ZIG_GLOBAL_CACHE_DIR"] = config["global_cache_dir"]
+    env["TMPDIR"] = str(state_dir / "tmp")
+
+    sup_info = proc_stat_info(os.getpid())
+    state["supervisor_pid"] = os.getpid()
+    state["supervisor_starttime"] = sup_info["starttime"] if sup_info else 0
+
+    log_fp = open(log_file, "a", encoding="utf-8", buffering=1)
+    log_fp.write(f"[{now_iso()}] Starting watcher: {' '.join(cmd)}\n")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(worktree),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=env,
+        start_new_session=True,
+    )
+
+    zig_info = proc_stat_info(proc.pid)
+    state["watcher_pid"] = proc.pid
+    state["watcher_pgid"] = proc.pid
+    state["watcher_starttime"] = zig_info["starttime"] if zig_info else 0
+    state["state"] = "running"
+    state["started_at"] = now_iso()
+    state["started_wall_ns"] = now_wall_ns()
+    state["cycle_in_progress"] = True
+    state["updated_at"] = now_iso()
+    write_state_atomic(state_file, state)
+
+    stop_requested = False
+    stop_reason = "exited"
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        nonlocal stop_requested, stop_reason
+        stop_requested = True
+        stop_reason = f"signal_{signum}"
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    stdout_fd = proc.stdout.fileno() if proc.stdout else -1
+    os.set_blocking(stdout_fd, False)
+
+    initial_snap = snapshot_worktree(worktree)
+    cycle_start_wall_ns = now_wall_ns()
+    cycle_start_snap = initial_snap
+    pre_summary_lines: list[str] = []
+    in_summary_tree = False
+    current_summary: dict[str, Any] | None = None
+    tree_lines: list[str] = []
+    generation_counter = int(state.get("generation_count", 0))
+    line_buf = ""
+
+    def finalize_generation() -> None:
+        nonlocal generation_counter, in_summary_tree, current_summary, tree_lines
+        nonlocal pre_summary_lines, cycle_start_wall_ns, cycle_start_snap
+        if current_summary is None:
+            return
+        completed_ns = now_wall_ns()
+        end_snap = snapshot_worktree(worktree)
+        generation_counter += 1
+
+        # A generation is marked dirty_during_build if files were modified after the
+        # cycle started or within `debounce_ns` of completion.
+        dirty_during_build = (
+            end_snap["source_digest"] != cycle_start_snap["source_digest"]
+            or end_snap["max_mtime_ns"] != cycle_start_snap["max_mtime_ns"]
+            or end_snap["max_mtime_ns"] > (completed_ns - debounce_ns)
+        )
+
+        diagnostics_text = "\n".join(pre_summary_lines).strip()
+        if len(diagnostics_text) > MAX_DIAGNOSTIC_CHARS:
+            diagnostics_text = diagnostics_text[-MAX_DIAGNOSTIC_CHARS:]
+
+        prev_completed_ns = int(
+            (state.get("latest_generation") or {}).get("completed_wall_ns", 0)
+        )
+        effective_start_ns = cycle_start_wall_ns
+        if (
+            prev_completed_ns > 0
+            and int(end_snap["max_mtime_ns"]) > prev_completed_ns
+            and int(end_snap["max_mtime_ns"]) < effective_start_ns
+        ):
+            effective_start_ns = int(end_snap["max_mtime_ns"])
+        duration_ms = max(0, int((completed_ns - effective_start_ns) / 1_000_000))
+        child_procs = [
+            {"pid": m["pid"], "comm": m["comm"], "cmdline": m["cmdline"]}
+            for m in list_process_group_members(proc.pid)
+        ]
+
+        gen_record: dict[str, Any] = {
+            "generation": generation_counter,
+            "started_wall_ns": cycle_start_wall_ns,
+            "completed_wall_ns": completed_ns,
+            "completed_at": now_iso(),
+            "duration_ms": duration_ms,
+            "source_digest": end_snap["source_digest"],
+            "max_mtime_ns": end_snap["max_mtime_ns"],
+            "file_count": end_snap["file_count"],
+            "git_head": end_snap["git_head"],
+            "dirty_during_build": dirty_during_build,
+            "succeeded": current_summary["succeeded"],
+            "summary_line": current_summary["summary_line"],
+            "steps_succeeded": current_summary["steps_succeeded"],
+            "steps_total": current_summary["steps_total"],
+            "steps_failed": current_summary["steps_failed"],
+            "steps_skipped": current_summary["steps_skipped"],
+            "tests_passed": current_summary["tests_passed"],
+            "tests_total": current_summary["tests_total"],
+            "tests_failed": current_summary["tests_failed"],
+            "tests_skipped": current_summary["tests_skipped"],
+            "step_tree": list(tree_lines),
+            "diagnostics": diagnostics_text,
+        }
+
+        history: list[dict[str, Any]] = list(state.get("history", []))
+        history.append(gen_record)
+        if len(history) > MAX_HISTORY_GENERATIONS:
+            history = history[-MAX_HISTORY_GENERATIONS:]
+
+        state["generation_count"] = generation_counter
+        state["latest_generation"] = gen_record
+        state["latest_snapshot_files"] = end_snap["files"]
+        state["history"] = history
+        state["child_processes"] = child_procs
+        state["cycle_in_progress"] = False
+        state["live_diagnostics"] = ""
+        state["updated_at"] = now_iso()
+        write_state_atomic(state_file, state)
+
+        in_summary_tree = False
+        current_summary = None
+        tree_lines = []
+        pre_summary_lines = []
+
+    def process_line(raw_line: str) -> None:
+        nonlocal in_summary_tree, current_summary, tree_lines
+        nonlocal pre_summary_lines, cycle_start_wall_ns, cycle_start_snap
+        line = raw_line.rstrip("\r\n")
+        log_fp.write(f"{line}\n")
+
+        if in_summary_tree:
+            if line.strip() == "":
+                finalize_generation()
+                return
+            parsed_nested = parse_summary_line(line)
+            if parsed_nested is not None:
+                finalize_generation()
+                cycle_start_wall_ns = now_wall_ns()
+                cycle_start_snap = snapshot_worktree(worktree)
+                current_summary = parsed_nested
+                in_summary_tree = True
+                return
+            tree_lines.append(line)
+            return
+
+        parsed = parse_summary_line(line)
+        if parsed is not None:
+            if not state.get("cycle_in_progress"):
+                cycle_start_wall_ns = now_wall_ns()
+                cycle_start_snap = snapshot_worktree(worktree)
+            current_summary = parsed
+            in_summary_tree = True
+            tree_lines = []
+            return
+
+        if line.strip():
+            if not state.get("cycle_in_progress"):
+                state["cycle_in_progress"] = True
+                cycle_start_wall_ns = now_wall_ns()
+                cycle_start_snap = snapshot_worktree(worktree)
+            pre_summary_lines.append(line)
+            live_diag = "\n".join(pre_summary_lines[-80:])
+            state["live_diagnostics"] = live_diag
+            state["updated_at"] = now_iso()
+            write_state_atomic(state_file, state)
+
+    owner_pid = state.get("owner_pid")
+    owner_starttime = state.get("owner_starttime")
+    last_housekeeping = time.monotonic()
+
+    try:
+        while not stop_requested:
+            try:
+                chunk = os.read(stdout_fd, 8192)
+            except BlockingIOError:
+                chunk = b""
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    chunk = b""
+                else:
+                    break
+
+            if chunk:
+                text = chunk.decode("utf-8", errors="replace")
+                line_buf += text
+                while "\n" in line_buf:
+                    one_line, line_buf = line_buf.split("\n", 1)
+                    process_line(one_line)
+                continue
+
+            if proc.poll() is not None:
+                break
+
+            now_mono = time.monotonic()
+            if now_mono - last_housekeeping >= 0.25:
+                last_housekeeping = now_mono
+                if owner_pid and not is_verified_process(owner_pid, owner_starttime):
+                    stop_requested = True
+                    stop_reason = "owner_exited"
+                    break
+
+                # Detect if source tree changed while watcher was idle so cycle_start_snap
+                # captures the new revision prior to Build Summary emission.
+                latest_gen = state.get("latest_generation")
+                if latest_gen and not state.get("cycle_in_progress") and not in_summary_tree:
+                    snap_check = snapshot_worktree(worktree)
+                    if (
+                        snap_check["source_digest"] != latest_gen.get("source_digest")
+                        or snap_check["max_mtime_ns"] != latest_gen.get("max_mtime_ns")
+                    ):
+                        cycle_start_wall_ns = now_wall_ns()
+                        cycle_start_snap = snap_check
+
+            time.sleep(0.02)
+
+        # Drain any remaining buffered output
+        while True:
+            try:
+                chunk = os.read(stdout_fd, 8192)
+                if not chunk:
+                    break
+                line_buf += chunk.decode("utf-8", errors="replace")
+            except OSError:
+                break
+        if line_buf:
+            for rem_line in line_buf.splitlines():
+                process_line(rem_line)
+        if in_summary_tree and current_summary is not None:
+            finalize_generation()
+    finally:
+        if proc.poll() is None:
+            terminate_process_group(proc.pid, timeout_sec=5.0)
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
+        else:
+            # Ensure any lingering child compiler processes in the group are cleaned up
+            terminate_process_group(proc.pid, timeout_sec=2.0)
+
+        exit_code = proc.returncode
+        tail_diag = "\n".join(pre_summary_lines).strip()
+        state["state"] = "stopped" if stop_requested else "exited"
+        state["stop_reason"] = stop_reason if stop_requested else "process_exited"
+        state["exit_code"] = exit_code
+        state["ended_at"] = now_iso()
+        state["cycle_in_progress"] = False
+        if tail_diag:
+            state["exit_diagnostics"] = tail_diag[-MAX_DIAGNOSTIC_CHARS:]
+        state["child_processes"] = []
+        state["updated_at"] = now_iso()
+        write_state_atomic(state_file, state)
+        log_fp.write(
+            f"[{now_iso()}] Watcher ended: state={state['state']} reason={state['stop_reason']} exit_code={exit_code}\n"
+        )
+        log_fp.close()
+
+    return 0
+
+
+def format_report(payload: dict[str, Any], as_json: bool) -> str:
+    if as_json:
+        return json.dumps(payload, indent=2, sort_keys=True)
+
+    lines: list[str] = []
+    status = payload.get("status", "unknown")
+    action = payload.get("action")
+    header = f"status: {status}" + (f" ({action})" if action else "")
+    lines.append(header)
+    lines.append(f"worktree: {payload.get('worktree')}")
+    if payload.get("compiler"):
+        comp = payload["compiler"]
+        lines.append(f"compiler: zig {comp.get('version')} ({comp.get('host')}) [{comp.get('path')}]")
+    if payload.get("command"):
+        lines.append(f"command: {' '.join(payload['command'])}")
+    if payload.get("watcher_pid"):
+        lines.append(
+            f"pids: supervisor={payload.get('supervisor_pid')} watcher={payload.get('watcher_pid')}"
+        )
+    if payload.get("cache_dir"):
+        lines.append(f"cache_dir: {payload.get('cache_dir')}")
+    if payload.get("prefix_dir"):
+        lines.append(f"prefix_dir: {payload.get('prefix_dir')}")
+    if payload.get("owner_session"):
+        owner_str = str(payload.get("owner_session"))
+        if payload.get("owner_pid"):
+            owner_str += f" (pid={payload.get('owner_pid')})"
+        lines.append(f"owner: {owner_str}")
+    if payload.get("freshness"):
+        lines.append(f"freshness: {payload.get('freshness')}")
+    if payload.get("source_digest"):
+        git_head = payload.get("git_head") or "none"
+        lines.append(f"source_revision: digest={payload['source_digest'][:16]} git_head={git_head}")
+
+    gen = payload.get("generation_result")
+    if gen:
+        lines.append(
+            f"generation: {gen.get('generation')} "
+            f"({'succeeded' if gen.get('succeeded') else 'failed'} in {gen.get('duration_ms')}ms)"
+        )
+        lines.append(f"summary: {gen.get('summary_line')}")
+        step_tree = gen.get("step_tree", [])
+        if gen.get("succeeded") and len(step_tree) > 16:
+            for tline in step_tree[:12]:
+                lines.append(f"  {tline}")
+            lines.append(f"  ... ({len(step_tree) - 12} more step lines; use --json for full tree)")
+        else:
+            for tline in step_tree:
+                lines.append(f"  {tline}")
+        if gen.get("diagnostics"):
+            lines.append("diagnostics:")
+            for dline in str(gen["diagnostics"]).splitlines():
+                lines.append(f"  {dline}")
+    elif payload.get("diagnostics"):
+        lines.append("diagnostics:")
+        for dline in str(payload["diagnostics"]).splitlines():
+            lines.append(f"  {dline}")
+
+    if payload.get("message"):
+        lines.append(f"message: {payload['message']}")
+
+    return "\n".join(lines)
+
+
+def build_status_payload(
+    worktree: Path,
+    paths: dict[str, Path],
+    state: dict[str, Any] | None,
+    snap: dict[str, Any],
+    action: str | None = None,
+) -> tuple[dict[str, Any], int]:
+    if not state:
+        payload = {
+            "status": "not_running",
+            "action": action,
+            "worktree": str(worktree),
+            "cache_dir": str(paths["cache_dir"]),
+            "prefix_dir": str(paths["prefix_dir"]),
+            "freshness": "none",
+            "source_digest": snap["source_digest"],
+            "git_head": snap["git_head"],
+            "message": "No active Zig incremental watcher for this worktree.",
+        }
+        return payload, 1
+
+    sup_alive = is_verified_process(
+        state.get("supervisor_pid"), state.get("supervisor_starttime")
+    )
+    zig_alive = is_verified_process(
+        state.get("watcher_pid"), state.get("watcher_starttime")
+    )
+    config = state.get("config", {})
+    compiler = {
+        "path": config.get("zig_path"),
+        "version": config.get("zig_version"),
+        "host": config.get("zig_host"),
+    }
+
+    if not sup_alive or not zig_alive:
+        recorded_state = state.get("state", "exited")
+        status_name = "stopped" if recorded_state == "stopped" else "exited"
+        exit_diag = state.get("exit_diagnostics") or state.get("live_diagnostics") or ""
+        payload = {
+            "status": status_name,
+            "action": action,
+            "worktree": str(worktree),
+            "compiler": compiler,
+            "command": config.get("command"),
+            "supervisor_pid": state.get("supervisor_pid"),
+            "watcher_pid": state.get("watcher_pid"),
+            "owner_session": state.get("owner_session"),
+            "owner_pid": state.get("owner_pid"),
+            "cache_dir": config.get("cache_dir"),
+            "prefix_dir": config.get("prefix_dir"),
+            "global_cache_dir": config.get("global_cache_dir"),
+            "freshness": "none",
+            "source_digest": snap["source_digest"],
+            "git_head": snap["git_head"],
+            "exit_code": state.get("exit_code"),
+            "generation_result": state.get("latest_generation"),
+            "diagnostics": exit_diag,
+            "message": f"Watcher is not running (state={status_name}, exit_code={state.get('exit_code')}).",
+        }
+        return payload, (1 if status_name == "stopped" else 2)
+
+    freshness, latest = evaluate_freshness(state, snap)
+    child_procs = [
+        {"pid": m["pid"], "comm": m["comm"], "cmdline": m["cmdline"]}
+        for m in list_process_group_members(int(state.get("watcher_pid") or 0))
+    ]
+
+    if freshness == "current" and latest is not None:
+        succeeded = bool(latest.get("succeeded"))
+        status_name = "ready" if succeeded else "build_failed"
+        exit_code = 0 if succeeded else 1
+    elif freshness == "building":
+        status_name = "building"
+        exit_code = 3
+    else:
+        status_name = "stale"
+        exit_code = 3
+
+    payload = {
+        "status": status_name,
+        "action": action,
+        "worktree": str(worktree),
+        "compiler": compiler,
+        "command": config.get("command"),
+        "config_hash": config.get("config_hash"),
+        "supervisor_pid": state.get("supervisor_pid"),
+        "watcher_pid": state.get("watcher_pid"),
+        "child_processes": child_procs,
+        "owner_session": state.get("owner_session"),
+        "owner_pid": state.get("owner_pid"),
+        "cache_dir": config.get("cache_dir"),
+        "prefix_dir": config.get("prefix_dir"),
+        "global_cache_dir": config.get("global_cache_dir"),
+        "freshness": freshness,
+        "source_digest": snap["source_digest"],
+        "max_mtime_ns": snap["max_mtime_ns"],
+        "git_head": snap["git_head"],
+        "generation_count": state.get("generation_count", 0),
+        "generation_result": latest,
+        "diagnostics": (latest.get("diagnostics") if latest else state.get("live_diagnostics")) or "",
+    }
+    return payload, exit_code
+
+
+def stop_existing_watcher(state: dict[str, Any], timeout_sec: float = 10.0) -> list[int]:
+    stopped: list[int] = []
+    zig_pid = state.get("watcher_pid")
+    zig_start = state.get("watcher_starttime")
+    sup_pid = state.get("supervisor_pid")
+    sup_start = state.get("supervisor_starttime")
+
+    if is_verified_process(sup_pid, sup_start) and sup_pid:
+        try:
+            os.kill(int(sup_pid), signal.SIGTERM)
+        except OSError:
+            pass
+
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        sup_alive = is_verified_process(sup_pid, sup_start)
+        zig_alive = is_verified_process(zig_pid, zig_start)
+        if not sup_alive and not zig_alive:
+            break
+        time.sleep(0.05)
+
+    if is_verified_process(zig_pid, zig_start) and zig_pid:
+        stopped.extend(terminate_process_group(int(zig_pid), timeout_sec=3.0))
+
+    if is_verified_process(sup_pid, sup_start) and sup_pid:
+        try:
+            os.kill(int(sup_pid), signal.SIGKILL)
+            stopped.append(int(sup_pid))
+        except OSError:
+            pass
+
+    return stopped
+
+
+def wait_for_settled_build(
+    worktree: Path,
+    paths: dict[str, Path],
+    timeout_sec: float,
+    min_generation: int = 1,
+    force_fresh: bool = False,
+    action_label: str | None = None,
+) -> tuple[dict[str, Any], int]:
+    state_file = paths["state_file"]
+    deadline = time.monotonic() + timeout_sec
+
+    state = read_state(state_file)
+    if not state:
+        snap = snapshot_worktree(worktree)
+        return build_status_payload(worktree, paths, None, snap, action=action_label)
+
+    debounce_ms = int(state.get("config", {}).get("debounce_ms", 50))
+    debounce_ns = debounce_ms * 1_000_000
+    settle_sleep_sec = max(0.06, (debounce_ms + 30) / 1000.0)
+    nudge_grace_sec = max(0.25, (debounce_ms * 4) / 1000.0)
+
+    if force_fresh:
+        current_gen = int(state.get("generation_count", 0))
+        min_generation = max(min_generation, current_gen + 1)
+        nudge_fanotify(worktree)
+
+    last_seen_digest: str | None = None
+    digest_waiting_since = time.monotonic()
+    last_nudge_mono = 0.0
+    last_cpu_ticks = -1
+    last_cpu_advance_mono = time.monotonic()
+
+    while time.monotonic() < deadline:
+        state = read_state(state_file)
+        snap = snapshot_worktree(worktree)
+        if not state:
+            payload, _ = build_status_payload(worktree, paths, None, snap, action=action_label)
+            payload["status"] = "exited"
+            payload["message"] = "Watcher state disappeared while waiting."
+            return payload, 2
+
+        sup_alive = is_verified_process(
+            state.get("supervisor_pid"), state.get("supervisor_starttime")
+        )
+        zig_alive = is_verified_process(
+            state.get("watcher_pid"), state.get("watcher_starttime")
+        )
+        if not sup_alive or not zig_alive:
+            for _ in range(10):
+                state = read_state(state_file) or state
+                if state.get("state") in ("exited", "stopped"):
+                    break
+                time.sleep(0.03)
+            snap = snapshot_worktree(worktree)
+            payload, _ = build_status_payload(worktree, paths, state, snap, action=action_label)
+            payload["status"] = "exited"
+            return payload, 2
+
+        latest = state.get("latest_generation")
+        freshness, _ = evaluate_freshness(state, snap)
+
+        if (
+            freshness == "current"
+            and latest is not None
+            and int(latest.get("generation", 0)) >= min_generation
+        ):
+            # If the generation completed very recently, wait one debounce window and
+            # re-verify so a rapid back-to-back file save cannot slip through.
+            age_ns = now_wall_ns() - int(latest.get("completed_wall_ns", 0))
+            if age_ns < (debounce_ns + 40_000_000):
+                time.sleep(settle_sleep_sec)
+                state2 = read_state(state_file)
+                snap2 = snapshot_worktree(worktree)
+                freshness2, latest2 = evaluate_freshness(state2, snap2)
+                if (
+                    state2
+                    and freshness2 == "current"
+                    and latest2 is not None
+                    and latest2.get("generation") == latest.get("generation")
+                    and snap2["source_digest"] == snap["source_digest"]
+                ):
+                    return build_status_payload(worktree, paths, state2, snap2, action=action_label)
+                continue
+            return build_status_payload(worktree, paths, state, snap, action=action_label)
+
+        # Track whether the compiler process group is actively consuming CPU ticks.
+        zig_pid = int(state.get("watcher_pid") or 0)
+        cpu_now = total_pgroup_cpu_ticks(zig_pid)
+        now_mono = time.monotonic()
+        if cpu_now != last_cpu_ticks:
+            last_cpu_ticks = cpu_now
+            last_cpu_advance_mono = now_mono
+
+        if snap["source_digest"] != last_seen_digest:
+            last_seen_digest = snap["source_digest"]
+            digest_waiting_since = now_mono
+
+        # If the source tree differs from the latest completed generation (or a fresh
+        # generation was requested) and the watcher has been completely idle for longer
+        # than `nudge_grace_sec`, perform a zero-byte O_RDWR close nudge on the changed
+        # files and root entrypoints so fanotify wakes `zig build --watch`.
+        idle_sec = now_mono - last_cpu_advance_mono
+        waiting_sec = now_mono - digest_waiting_since
+        if (
+            not state.get("cycle_in_progress")
+            and waiting_sec >= nudge_grace_sec
+            and idle_sec >= nudge_grace_sec
+            and (now_mono - last_nudge_mono) >= 1.0
+        ):
+            prev_files = state.get("latest_snapshot_files") or {}
+            changed_rels = [
+                rel
+                for rel, meta in snap["files"].items()
+                if prev_files.get(rel, {}).get("sha256") != meta["sha256"]
+                or prev_files.get(rel, {}).get("mtime_ns") != meta["mtime_ns"]
+            ]
+            nudge_fanotify(worktree, changed_rels)
+            last_nudge_mono = now_mono
+
+        time.sleep(0.03)
+
+    state = read_state(state_file)
+    snap = snapshot_worktree(worktree)
+    payload, _ = build_status_payload(worktree, paths, state, snap, action=action_label)
+    payload["status"] = "timeout"
+    payload["message"] = (
+        f"Timed out after {timeout_sec:.1f}s waiting for a clean build matching source digest "
+        f"{snap['source_digest'][:16]}."
+    )
+    return payload, 124
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    worktree = resolve_worktree(args.worktree)
+    zig_info = resolve_zig_info(args.zig)
+    paths = resolve_paths(worktree, args.cache_dir, args.prefix, args.global_cache_dir)
+
+    steps: list[str] = []
+    if args.step:
+        steps.extend(args.step)
+    if args.steps_pos:
+        steps.extend(args.steps_pos)
+    if not steps:
+        steps = ["test"]
+
+    config = compute_config_spec(
+        worktree=worktree,
+        zig_info=zig_info,
+        steps=steps,
+        optimize=args.optimize,
+        target=args.target,
+        extra_args=args.arg or [],
+        paths=paths,
+        debounce_ms=args.debounce,
+    )
+
+    session_id = (
+        args.session
+        or os.environ.get("COPILOT_SESSION_ID")
+        or os.environ.get("WT_SESSION")
+        or os.environ.get("TERM_SESSION_ID")
+        or "default"
+    )
+    owner_pid = args.owner_pid
+    owner_starttime = None
+    if owner_pid is not None:
+        oinfo = proc_stat_info(owner_pid)
+        if oinfo is None:
+            print(f"error: --owner-pid {owner_pid} is not a running process", file=sys.stderr)
+            return 2
+        owner_starttime = oinfo["starttime"]
+
+    action = "started"
+    with FileLock(paths["lock_file"]):
+        existing = read_state(paths["state_file"])
+        if existing:
+            sup_alive = is_verified_process(
+                existing.get("supervisor_pid"), existing.get("supervisor_starttime")
+            )
+            zig_alive = is_verified_process(
+                existing.get("watcher_pid"), existing.get("watcher_starttime")
+            )
+            existing_hash = existing.get("config", {}).get("config_hash")
+            if sup_alive and zig_alive and existing_hash == config["config_hash"]:
+                action = "reused"
+                if owner_pid is not None:
+                    existing["owner_pid"] = owner_pid
+                    existing["owner_starttime"] = owner_starttime
+                    existing["owner_session"] = session_id
+                    write_state_atomic(paths["state_file"], existing)
+            else:
+                if sup_alive or zig_alive:
+                    stop_existing_watcher(existing, timeout_sec=10.0)
+                    action = "restarted"
+                else:
+                    action = "started"
+
+        if action in ("started", "restarted"):
+            paths["state_dir"].mkdir(parents=True, exist_ok=True)
+            initial_state: dict[str, Any] = {
+                "worktree": str(worktree),
+                "config": config,
+                "owner_session": session_id,
+                "owner_pid": owner_pid,
+                "owner_starttime": owner_starttime,
+                "state": "starting",
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+                "generation_count": 0,
+                "latest_generation": None,
+                "history": [],
+                "cycle_in_progress": True,
+            }
+            write_state_atomic(paths["state_file"], initial_state)
+
+            sup_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "_supervise",
+                    "--state-dir",
+                    str(paths["state_dir"]),
+                ],
+                cwd=str(worktree),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+
+            # Wait briefly for supervisor to populate watcher_pid
+            start_wait = time.monotonic() + 5.0
+            while time.monotonic() < start_wait:
+                st = read_state(paths["state_file"])
+                if st and st.get("watcher_pid"):
+                    break
+                if sup_proc.poll() is not None:
+                    break
+                time.sleep(0.02)
+
+    payload, exit_code = wait_for_settled_build(
+        worktree=worktree,
+        paths=paths,
+        timeout_sec=args.timeout,
+        min_generation=1,
+        force_fresh=False,
+        action_label=action,
+    )
+    print(format_report(payload, args.json))
+    return exit_code
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    worktree = resolve_worktree(args.worktree)
+    paths = resolve_paths(worktree, args.cache_dir, args.prefix, None)
+    state = read_state(paths["state_file"])
+    snap = snapshot_worktree(worktree)
+    payload, exit_code = build_status_payload(worktree, paths, state, snap)
+    print(format_report(payload, args.json))
+    return exit_code
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    worktree = resolve_worktree(args.worktree)
+    paths = resolve_paths(worktree, args.cache_dir, args.prefix, None)
+    min_gen = args.since_generation if args.since_generation is not None else 1
+    payload, exit_code = wait_for_settled_build(
+        worktree=worktree,
+        paths=paths,
+        timeout_sec=args.timeout,
+        min_generation=min_gen,
+        force_fresh=args.fresh,
+        action_label="waited",
+    )
+    print(format_report(payload, args.json))
+    return exit_code
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    worktree = resolve_worktree(args.worktree)
+    paths = resolve_paths(worktree, args.cache_dir, args.prefix, None)
+    with FileLock(paths["lock_file"]):
+        state = read_state(paths["state_file"])
+        snap = snapshot_worktree(worktree)
+        if not state:
+            payload = {
+                "status": "stopped",
+                "action": "already_stopped",
+                "worktree": str(worktree),
+                "cache_dir": str(paths["cache_dir"]),
+                "prefix_dir": str(paths["prefix_dir"]),
+                "message": "No watcher state found; nothing to stop.",
+            }
+            print(format_report(payload, args.json))
+            return 0
+
+        if (
+            args.session
+            and not args.force
+            and state.get("owner_session")
+            and state.get("owner_session") != args.session
+        ):
+            payload = {
+                "status": "error",
+                "action": "stop_refused",
+                "worktree": str(worktree),
+                "owner_session": state.get("owner_session"),
+                "message": (
+                    f"Watcher is owned by session '{state.get('owner_session')}', "
+                    f"not '{args.session}'. Pass --force to override."
+                ),
+            }
+            print(format_report(payload, args.json))
+            return 1
+
+        sup_alive = is_verified_process(
+            state.get("supervisor_pid"), state.get("supervisor_starttime")
+        )
+        zig_alive = is_verified_process(
+            state.get("watcher_pid"), state.get("watcher_starttime")
+        )
+        if not sup_alive and not zig_alive:
+            state["state"] = "stopped"
+            state["stop_reason"] = "already_stopped"
+            state["updated_at"] = now_iso()
+            write_state_atomic(paths["state_file"], state)
+            payload = {
+                "status": "stopped",
+                "action": "already_stopped",
+                "worktree": str(worktree),
+                "cache_dir": state.get("config", {}).get("cache_dir"),
+                "prefix_dir": state.get("config", {}).get("prefix_dir"),
+                "source_digest": snap["source_digest"],
+                "git_head": snap["git_head"],
+                "message": "Watcher process was already stopped.",
+            }
+            print(format_report(payload, args.json))
+            return 0
+
+        stopped_pids = stop_existing_watcher(state, timeout_sec=args.timeout)
+        state = read_state(paths["state_file"]) or state
+        state["state"] = "stopped"
+        state["stop_reason"] = "explicit_stop"
+        state["ended_at"] = now_iso()
+        state["cycle_in_progress"] = False
+        state["child_processes"] = []
+        state["updated_at"] = now_iso()
+        write_state_atomic(paths["state_file"], state)
+
+        payload = {
+            "status": "stopped",
+            "action": "stopped",
+            "worktree": str(worktree),
+            "supervisor_pid": state.get("supervisor_pid"),
+            "watcher_pid": state.get("watcher_pid"),
+            "stopped_pids": stopped_pids,
+            "owner_session": state.get("owner_session"),
+            "cache_dir": state.get("config", {}).get("cache_dir"),
+            "prefix_dir": state.get("config", {}).get("prefix_dir"),
+            "source_digest": snap["source_digest"],
+            "git_head": snap["git_head"],
+            "message": "Stopped owned Zig incremental watcher cleanly.",
+        }
+        print(format_report(payload, args.json))
+        return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="watcher-helper",
+        description="Bounded helper for Zig incremental --watch builds.",
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    def add_common_flags(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--worktree", help="Git worktree path (default: current worktree)")
+        p.add_argument(
+            "--cache-dir",
+            default=".zig-cache/copilot-watch",
+            help="Isolated local Zig cache directory (default: .zig-cache/copilot-watch)",
+        )
+        p.add_argument(
+            "--prefix",
+            default="zig-out/copilot-watch",
+            help="Isolated Zig output prefix directory (default: zig-out/copilot-watch)",
+        )
+        p.add_argument("--json", action="store_true", help="Output structured JSON")
+
+    p_start = sub.add_parser("start", help="Start or reuse the incremental watcher and wait for initial build")
+    add_common_flags(p_start)
+    p_start.add_argument(
+        "--step",
+        action="append",
+        help="Build step to watch (repeatable; default: test). Use --step install for compile-only loops.",
+    )
+    p_start.add_argument("steps_pos", nargs="*", metavar="STEP", help="Optional positional build steps")
+    p_start.add_argument(
+        "--optimize",
+        default="debug",
+        choices=["debug", "safe", "fast", "small"],
+        help="Optimization mode for -Doptimize=<mode> (default: debug)",
+    )
+    p_start.add_argument("--target", help="Optional target triple for -Dtarget=<triple>")
+    p_start.add_argument(
+        "--arg",
+        action="append",
+        help="Additional argument to pass to zig build (repeatable)",
+    )
+    p_start.add_argument(
+        "--global-cache-dir",
+        help="Explicit Zig global cache directory (default: isolated alongside cache-dir)",
+    )
+    p_start.add_argument(
+        "--debounce",
+        type=int,
+        default=50,
+        help="Zig watcher debounce in milliseconds (default: 50)",
+    )
+    p_start.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="Seconds to wait for initial build/test completion (default: 180)",
+    )
+    p_start.add_argument("--session", help="Owning session identifier")
+    p_start.add_argument(
+        "--owner-pid",
+        type=int,
+        help="Optional PID of owning session process; watcher auto-stops when this PID exits",
+    )
+    p_start.add_argument("--zig", help="Path to zig binary")
+
+    p_status = sub.add_parser("status", help="Inspect current watcher status and source freshness")
+    add_common_flags(p_status)
+
+    p_wait = sub.add_parser("wait", help="Wait for a completed build/test cycle matching current sources")
+    add_common_flags(p_wait)
+    p_wait.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Maximum seconds to wait for a matching build generation (default: 120)",
+    )
+    p_wait.add_argument(
+        "--since-generation",
+        type=int,
+        help="Require build generation >= N",
+    )
+    p_wait.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Trigger and wait for a new build generation even if current sources already match",
+    )
+
+    p_stop = sub.add_parser("stop", help="Stop the watcher owned by this worktree/session")
+    add_common_flags(p_stop)
+    p_stop.add_argument("--session", help="Verify owning session ID before stopping")
+    p_stop.add_argument("--force", action="store_true", help="Stop regardless of session ID mismatch")
+    p_stop.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="Seconds to wait for graceful stop before SIGKILL (default: 15)",
+    )
+
+    p_sup = sub.add_parser("_supervise", help=argparse.SUPPRESS)
+    p_sup.add_argument("--state-dir", required=True)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.subcommand == "start":
+            return cmd_start(args)
+        if args.subcommand == "status":
+            return cmd_status(args)
+        if args.subcommand == "wait":
+            return cmd_wait(args)
+        if args.subcommand == "stop":
+            return cmd_stop(args)
+        if args.subcommand == "_supervise":
+            return run_supervisor(Path(args.state_dir))
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
