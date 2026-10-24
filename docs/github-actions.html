@@ -165,9 +165,10 @@
 <main id="main-content" tabindex="-1" class="prose docs">
 <h1><a href="#caching-in-github-actions" id="caching-in-github-actions"></a>Caching in GitHub Actions</h1>
 <p>The first-party actions bootstrap an exact static <code>ghr</code> release with the
-runner-provided Node action runtime, then cache downloaded or installed tools
-under user-writable <code>$RUNNER_TEMP</code> paths. They do not require Python, <code>pipx</code>,
-<code>curl</code>, <code>gh</code>, or package-manager setup.</p>
+runner-provided Node action runtime, then cache installed tools under
+<code>$HOME/.cache/ghr-action</code> (or downloaded assets under <code>$RUNNER_TEMP</code> or a
+configured destination). They do not require Python, <code>pipx</code>, <code>curl</code>, <code>gh</code>, or
+package-manager setup.</p>
 <p>Official minimal Linux images can also omit <code>ca-certificates</code>. If no standard
 Linux CA bundle exists, <code>actions/setup</code> materializes the runner's maintained
 Node 24 TLS roots under <code>$RUNNER_TEMP</code> and exports <code>SSL_CERT_FILE</code> for <code>ghr</code>.
@@ -232,18 +233,17 @@ manual recipe remains possible:</p>
 - name: Point ghr at a cacheable directory
   shell: bash
   run: |
-    echo &quot;GHR_TOOL_DIR=$RUNNER_TEMP/ghr-tools&quot;  &gt;&gt; &quot;$GITHUB_ENV&quot;
-    echo &quot;GHR_BIN_DIR=$RUNNER_TEMP/ghr-bin&quot;     &gt;&gt; &quot;$GITHUB_ENV&quot;
-    echo &quot;GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache&quot; &gt;&gt; &quot;$GITHUB_ENV&quot;
-    echo &quot;$RUNNER_TEMP/ghr-bin&quot; &gt;&gt; &quot;$GITHUB_PATH&quot;
+    echo &quot;GHR_TOOL_DIR=$HOME/.cache/ghr-action/tools&quot; &gt;&gt; &quot;$GITHUB_ENV&quot;
+    echo &quot;GHR_BIN_DIR=$HOME/.cache/ghr-action/bin&quot;    &gt;&gt; &quot;$GITHUB_ENV&quot;
+    echo &quot;GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache&quot;       &gt;&gt; &quot;$GITHUB_ENV&quot;
+    echo &quot;$HOME/.cache/ghr-action/bin&quot; &gt;&gt; &quot;$GITHUB_PATH&quot;
 
 - uses: actions/cache@v4
   id: ghr-cache
   with:
     path: |
-      ${{ runner.temp }}/ghr-tools
-      ${{ runner.temp }}/ghr-bin
-      ${{ runner.temp }}/ghr-cache
+      ~/.cache/ghr-action/tools
+      ~/.cache/ghr-action/bin
     key: ghr-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0
 
 - if: steps.ghr-cache.outputs.cache-hit != 'true'
