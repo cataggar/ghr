@@ -3017,6 +3017,7 @@ fn stageArchiveUnit(
             d.cache, std.fs.path.sep, asset.name,
         });
         defer allocator.free(download_path);
+        defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
         const asset_dl = release_mod.assetDownload(asset, ctx.auth_header != null);
         debugLog(debug_w, "debug: ghr {s}\n", .{version});
@@ -3034,7 +3035,6 @@ fn stageArchiveUnit(
             try err_w.flush();
             return error.InstallStepFailed;
         };
-        defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
         {
             const stat = Dir.openFileAbsolute(io, download_path, .{}) catch null;
@@ -3167,6 +3167,7 @@ fn stageWasmUnit(
         d.cache, std.fs.path.sep, asset.name,
     });
     defer allocator.free(download_path);
+    defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
     const asset_dl = release_mod.assetDownload(asset, ctx.auth_header != null);
     debugLog(debug_w, "debug: url: {s}\n", .{asset_dl.url});
@@ -3180,7 +3181,6 @@ fn stageWasmUnit(
         try err_w.flush();
         return error.InstallStepFailed;
     };
-    defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
     const vr = try verifyDownloadedAsset(
         ctx,
@@ -3552,6 +3552,7 @@ fn stageGenericUrlRequest(
         d.cache, std.fs.path.sep, asset_name,
     });
     defer allocator.free(download_path);
+    defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
     try w.print("downloading {s} ...\n", .{url});
     try w.flush();
@@ -3566,7 +3567,6 @@ fn stageGenericUrlRequest(
         try err_w.flush();
         return error.InstallStepFailed;
     };
-    defer Dir.deleteFileAbsolute(io, download_path) catch {};
 
     const vr = try verifyGenericUrlAsset(ctx, url, asset_name, download_path, minisign_pubkey_b64, debug_w);
 
@@ -8813,4 +8813,396 @@ test "an attestation outranks every other verifier in recorded metadata" {
             .authenticode_verified,
         })).?,
     );
+}
+
+const TestHttpServer = struct {
+    server: Io.net.Server,
+    responses: []const []const u8,
+    served: std.atomic.Value(usize),
+    thread: std.Thread,
+
+    fn start(srv: *TestHttpServer, responses: []const []const u8) !void {
+        const io = std.testing.io;
+        const addr = try Io.net.IpAddress.parse("127.0.0.1", 0);
+        srv.* = .{
+            .server = try addr.listen(io, .{ .reuse_address = true }),
+            .responses = responses,
+            .served = .init(0),
+            .thread = undefined,
+        };
+        srv.thread = try std.Thread.spawn(.{}, run, .{srv});
+    }
+
+    fn port(self: *const TestHttpServer) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    fn finish(self: *TestHttpServer) void {
+        const io = std.testing.io;
+        while (self.served.load(.acquire) < self.responses.len) {
+            const addr = Io.net.IpAddress.parse("127.0.0.1", self.port()) catch break;
+            var stream = addr.connect(io, .{ .mode = .stream }) catch break;
+            stream.close(io);
+        }
+        self.thread.join();
+        self.server.deinit(io);
+    }
+
+    fn run(self: *TestHttpServer) void {
+        const io = std.testing.io;
+        for (self.responses) |raw_response| {
+            var stream = self.server.accept(io) catch {
+                _ = self.served.fetchAdd(1, .release);
+                return;
+            };
+            defer {
+                stream.close(io);
+                _ = self.served.fetchAdd(1, .release);
+            }
+            var req_buf: [1024]u8 = undefined;
+            var total_read: usize = 0;
+            while (total_read < req_buf.len) {
+                var slices = [_][]u8{req_buf[total_read..]};
+                const res = stream.readWithControl(io, &slices, &.{}) catch break;
+                if (res.data_len == 0) break;
+                total_read += res.data_len;
+                if (std.mem.indexOf(u8, req_buf[0..total_read], "\r\n\r\n") != null) break;
+            }
+            var write_buf: [1024]u8 = undefined;
+            var w = stream.writer(io, &write_buf);
+            w.interface.writeAll(raw_response) catch {};
+            w.interface.flush() catch {};
+            stream.shutdown(io, .both) catch {};
+        }
+    }
+};
+
+fn tExpectCacheEmpty(store: *TestStore) !void {
+    var cache_dir = try Dir.openDirAbsolute(std.testing.io, store.dirs.cache, .{ .iterate = true });
+    defer cache_dir.close(std.testing.io);
+    var it = cache_dir.iterate();
+    if (try it.next(std.testing.io)) |entry| {
+        std.debug.print("unexpected cache entry: {s}\n", .{entry.name});
+        return error.TestExpectedEqual;
+    }
+}
+
+fn tDestroyStagedUnits(units: *std.ArrayListUnmanaged(*StagedUnit)) void {
+    for (units.items) |u| u.destroy();
+    units.deinit(t_alloc);
+}
+
+test "stageArchiveUnit cleans up cache on download, verification, extraction failure and after install" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    const broken_body_resp = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 7\r\nConnection: close\r\n\r\npartial";
+    const script_resp = "HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n#!/bin/sh\nexit 0\n";
+    const corrupt_tar_resp = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nnot-an-archive";
+
+    var srv: TestHttpServer = undefined;
+    try srv.start(&.{
+        broken_body_resp,
+        script_resp,
+        corrupt_tar_resp,
+        script_resp,
+    });
+    defer srv.finish();
+
+    const spec: Spec = .{ .owner = "example", .repo = "tool", .tag = "v1.0.0" };
+    const repo: attestation.Repository = .{ .owner = "example", .repo = "tool" };
+    const req: install_request.InstallRequest = .{
+        .id = @constCast("example/tool"),
+        .id_origin = .derived,
+        .source = .{ .github_repo = spec },
+        .config = .{ .aliases = &.{}, .minisign = null },
+        .original_tokens = .{ .source = 0 },
+    };
+
+    const bin_url = try t_alloc.print("http://127.0.0.1:{d}/tool", .{srv.port()});
+    defer t_alloc.free(bin_url);
+    const tar_url = try t_alloc.print("http://127.0.0.1:{d}/tool.tar.gz", .{srv.port()});
+    defer t_alloc.free(tar_url);
+
+    // 1. Download fails after writing partial bytes into d.cache.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        const assets = [_]release_mod.Asset{
+            .{ .name = "tool", .browser_download_url = bin_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageArchiveUnit(&ctx, req, spec, null, "v1.0.0", &assets, &assets, null, repo, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 2. Verification fails (digest mismatch).
+    {
+        var ctx = store.ctx();
+        const assets = [_]release_mod.Asset{
+            .{
+                .name = "tool",
+                .browser_download_url = bin_url,
+                .digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageArchiveUnit(&ctx, req, spec, null, "v1.0.0", &assets, &assets, null, repo, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 3. Extraction fails (corrupt archive).
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        const assets = [_]release_mod.Asset{
+            .{ .name = "tool.tar.gz", .browser_download_url = tar_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageArchiveUnit(&ctx, req, spec, null, "v1.0.0", &assets, &assets, null, repo, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 4. Successful staging and commit leaves d.cache empty.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        const assets = [_]release_mod.Asset{
+            .{ .name = "tool", .browser_download_url = bin_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try stageArchiveUnit(&ctx, req, spec, null, "v1.0.0", &assets, &assets, null, repo, &staged);
+        try tExpectCacheEmpty(&store);
+        try tCommit(&ctx, staged.items);
+        try tExpectCacheEmpty(&store);
+        try std.testing.expect(store.binEntryExists("tool"));
+    }
+}
+
+test "stageWasmUnit cleans up cache on download, verification, manifest failure and after install" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    const broken_body_resp = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 7\r\nConnection: close\r\n\r\npartial";
+    const wasm_resp = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n\x00asm\x01\x00\x00\x00";
+    const bad_ghr_resp = "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n.{ .version =";
+    const good_ghr_resp = "HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n.{ .version = 1 }";
+
+    var srv: TestHttpServer = undefined;
+    try srv.start(&.{
+        broken_body_resp,
+        wasm_resp,
+        wasm_resp,
+        broken_body_resp,
+        wasm_resp,
+        bad_ghr_resp,
+        wasm_resp,
+        good_ghr_resp,
+    });
+    defer srv.finish();
+
+    const spec: Spec = .{ .owner = "example", .repo = "plugins", .tag = "v1.0.0" };
+    const repo: attestation.Repository = .{ .owner = "example", .repo = "plugins" };
+    const req: install_request.InstallRequest = .{
+        .id = @constCast("example/plugins"),
+        .id_origin = .derived,
+        .source = .{ .github_repo = spec },
+        .config = .{ .aliases = &.{}, .minisign = null },
+        .original_tokens = .{ .source = 0 },
+    };
+
+    const wasm_url = try t_alloc.print("http://127.0.0.1:{d}/plugin.wasm", .{srv.port()});
+    defer t_alloc.free(wasm_url);
+    const ghr_url = try t_alloc.print("http://127.0.0.1:{d}/plugin.wasm.ghr", .{srv.port()});
+    defer t_alloc.free(ghr_url);
+
+    // 1. Wasm download fails after writing partial bytes into d.cache.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        const assets = [_]release_mod.Asset{
+            .{ .name = "plugin.wasm", .browser_download_url = wasm_url },
+            .{ .name = "plugin.wasm.ghr", .browser_download_url = ghr_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageWasmUnit(&ctx, req, spec, "v1.0.0", &assets, assets[0], null, repo, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 2. Verification fails (digest mismatch).
+    {
+        var ctx = store.ctx();
+        const assets = [_]release_mod.Asset{
+            .{
+                .name = "plugin.wasm",
+                .browser_download_url = wasm_url,
+                .digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            },
+            .{ .name = "plugin.wasm.ghr", .browser_download_url = ghr_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageWasmUnit(&ctx, req, spec, "v1.0.0", &assets, assets[0], null, repo, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 3. Companion .ghr manifest download fails mid-stream after .wasm succeeded.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        const assets = [_]release_mod.Asset{
+            .{ .name = "plugin.wasm", .browser_download_url = wasm_url },
+            .{ .name = "plugin.wasm.ghr", .browser_download_url = ghr_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageWasmUnit(&ctx, req, spec, "v1.0.0", &assets, assets[0], null, repo, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 4. Companion .ghr manifest validation fails.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        const assets = [_]release_mod.Asset{
+            .{ .name = "plugin.wasm", .browser_download_url = wasm_url },
+            .{ .name = "plugin.wasm.ghr", .browser_download_url = ghr_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageWasmUnit(&ctx, req, spec, "v1.0.0", &assets, assets[0], null, repo, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 5. Successful staging and commit leaves d.cache empty.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        const assets = [_]release_mod.Asset{
+            .{ .name = "plugin.wasm", .browser_download_url = wasm_url },
+            .{ .name = "plugin.wasm.ghr", .browser_download_url = ghr_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try stageWasmUnit(&ctx, req, spec, "v1.0.0", &assets, assets[0], null, repo, &staged);
+        try tExpectCacheEmpty(&store);
+        try tCommit(&ctx, staged.items);
+        try tExpectCacheEmpty(&store);
+        try std.testing.expect(store.binEntryExists("plugin"));
+        try std.testing.expect(store.binEntryExists("plugin.ghr"));
+    }
+}
+
+test "stageGenericUrlRequest cleans up cache on download, verification, extraction failure and after install" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    const broken_body_resp = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 7\r\nConnection: close\r\n\r\npartial";
+    const script_resp = "HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n#!/bin/sh\nexit 0\n";
+    const bad_sig_resp = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbad-sig";
+    const corrupt_tar_resp = "HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nnot-an-archive";
+
+    var srv: TestHttpServer = undefined;
+    try srv.start(&.{
+        broken_body_resp,
+        script_resp,
+        bad_sig_resp,
+        corrupt_tar_resp,
+        script_resp,
+    });
+    defer srv.finish();
+
+    const bin_url = try t_alloc.print("http://127.0.0.1:{d}/generic-tool", .{srv.port()});
+    defer t_alloc.free(bin_url);
+    const tar_url = try t_alloc.print("http://127.0.0.1:{d}/generic-tool.tar.gz", .{srv.port()});
+    defer t_alloc.free(tar_url);
+
+    const req: install_request.InstallRequest = .{
+        .id = @constCast("custom/generic-tool"),
+        .id_origin = .explicit,
+        .source = .{ .generic_url = bin_url },
+        .config = .{ .aliases = &.{}, .minisign = null },
+        .original_tokens = .{ .source = 0 },
+    };
+
+    // 1. Download fails after writing partial bytes into d.cache.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageGenericUrlRequest(&ctx, req, bin_url, null, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 2. Verification fails (minisign sidecar parse error).
+    {
+        var ctx = store.ctx();
+        const pubkey = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageGenericUrlRequest(&ctx, req, bin_url, pubkey, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 3. Extraction fails (corrupt archive).
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageGenericUrlRequest(&ctx, req, tar_url, null, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 4. Successful staging and commit leaves d.cache empty.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try stageGenericUrlRequest(&ctx, req, bin_url, null, &staged);
+        try tExpectCacheEmpty(&store);
+        try tCommit(&ctx, staged.items);
+        try tExpectCacheEmpty(&store);
+        try std.testing.expect(store.binEntryExists("generic-tool"));
+    }
 }
