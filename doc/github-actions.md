@@ -1,9 +1,10 @@
 # Caching in GitHub Actions
 
 The first-party actions bootstrap an exact static `ghr` release with the
-runner-provided Node action runtime, then cache downloaded or installed tools
-under user-writable `$RUNNER_TEMP` paths. They do not require Python, `pipx`,
-`curl`, `gh`, or package-manager setup.
+runner-provided Node action runtime, then cache installed tools under
+`$HOME/.cache/ghr-action` (or downloaded assets under `$RUNNER_TEMP` or a
+configured destination). They do not require Python, `pipx`, `curl`, `gh`, or
+package-manager setup.
 
 Official minimal Linux images can also omit `ca-certificates`. If no standard
 Linux CA bundle exists, `actions/setup` materializes the runner's maintained
@@ -85,18 +86,17 @@ manual recipe remains possible:
 - name: Point ghr at a cacheable directory
   shell: bash
   run: |
-    echo "GHR_TOOL_DIR=$RUNNER_TEMP/ghr-tools"  >> "$GITHUB_ENV"
-    echo "GHR_BIN_DIR=$RUNNER_TEMP/ghr-bin"     >> "$GITHUB_ENV"
-    echo "GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache" >> "$GITHUB_ENV"
-    echo "$RUNNER_TEMP/ghr-bin" >> "$GITHUB_PATH"
+    echo "GHR_TOOL_DIR=$HOME/.cache/ghr-action/tools" >> "$GITHUB_ENV"
+    echo "GHR_BIN_DIR=$HOME/.cache/ghr-action/bin"    >> "$GITHUB_ENV"
+    echo "GHR_CACHE_DIR=$RUNNER_TEMP/ghr-cache"       >> "$GITHUB_ENV"
+    echo "$HOME/.cache/ghr-action/bin" >> "$GITHUB_PATH"
 
 - uses: actions/cache@v4
   id: ghr-cache
   with:
     path: |
-      ${{ runner.temp }}/ghr-tools
-      ${{ runner.temp }}/ghr-bin
-      ${{ runner.temp }}/ghr-cache
+      ~/.cache/ghr-action/tools
+      ~/.cache/ghr-action/bin
     key: ghr-${{ runner.os }}-${{ runner.arch }}-ripgrep14.1.1_fdv10.2.0
 
 - if: steps.ghr-cache.outputs.cache-hit != 'true'

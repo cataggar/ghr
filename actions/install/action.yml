@@ -131,10 +131,21 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        tool_dir="${RUNNER_TEMP}/ghr-tools"
-        bin_dir="${RUNNER_TEMP}/ghr-bin"
+        base_dir="${HOME}/.cache/ghr-action"
+        tool_dir="${base_dir}/tools"
+        bin_dir="${base_dir}/bin"
         cache_dir="${RUNNER_TEMP}/ghr-cache"
+        rm -rf "$tool_dir" "$bin_dir" "$cache_dir"
         mkdir -p "$tool_dir" "$bin_dir" "$cache_dir"
+        if [[ "${RUNNER_OS}" == "Windows" ]]; then
+          tool_dir="$(cygpath -aw "$tool_dir")"
+          bin_dir="$(cygpath -aw "$bin_dir")"
+          cache_dir="$(cygpath -aw "$cache_dir")"
+        else
+          tool_dir="$(cd "$tool_dir" && pwd)"
+          bin_dir="$(cd "$bin_dir" && pwd)"
+          cache_dir="$(cd "$cache_dir" && pwd)"
+        fi
         echo "GHR_TOOL_DIR=$tool_dir"   >> "$GITHUB_ENV"
         echo "GHR_BIN_DIR=$bin_dir"     >> "$GITHUB_ENV"
         echo "GHR_CACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
@@ -227,7 +238,7 @@ runs:
           echo "error: ghr returned an invalid install cache fingerprint" >&2
           exit 1
         fi
-        key="ghr-${RUNNER_OS}-${RUNNER_ARCH}-${ghr_target}-layout2-ghrv${ghr_version}-${definition_hash:0:16}"
+        key="ghr-${RUNNER_OS}-${RUNNER_ARCH}-${ghr_target}-layout3-ghrv${ghr_version}-${definition_hash:0:16}"
         {
           echo "key=$key"
           echo "ghr_version=$ghr_version"
@@ -244,7 +255,6 @@ runs:
         path: |
           ${{ steps.ghr-dirs.outputs.tool_dir }}
           ${{ steps.ghr-dirs.outputs.bin_dir }}
-          ${{ steps.ghr-dirs.outputs.cache_dir }}
         key: ${{ steps.cache-key.outputs.key }}
 
     - name: Install tools with ghr
