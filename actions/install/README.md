@@ -29,7 +29,7 @@ The bootstrap uses the runner-provided Node 24 action runtime. It works in bare
 Ubuntu and Debian job containers without Python, `pipx`, `curl`, `gh`, or
 package-manager setup.
 
-A cache-hit on subsequent runs restores the complete tool, command, cache, and
+A cache-hit on subsequent runs restores the complete tool, command, and
 transaction state and skips installation. The ID-capable CLI parses and hashes
 normalized complete definitions, so request reordering is stable while a
 changed source, ID, alias, selection, verification policy, minisign key, state
@@ -67,9 +67,10 @@ predates stable-ID cache fingerprints.
 1. Resolves one exact static ghr release and verifies its GitHub digest plus
    Sigstore provenance (or an explicit trusted SHA-256), then safely extracts
    it below `$RUNNER_TEMP`.
-2. Sets `GHR_TOOL_DIR`, `GHR_BIN_DIR`, `GHR_CACHE_DIR` to user-writable
-   subdirectories of `$RUNNER_TEMP`, and prepends `GHR_BIN_DIR` to
-   `$GITHUB_PATH`.
+2. Sets `GHR_TOOL_DIR` and `GHR_BIN_DIR` to `$HOME/.cache/ghr-action/tools`
+   and `$HOME/.cache/ghr-action/bin` (so cache paths and symlink targets
+   remain stable across runner instances), sets `GHR_CACHE_DIR` to
+   `$RUNNER_TEMP/ghr-cache`, and prepends `GHR_BIN_DIR` to `$GITHUB_PATH`.
 3. Keeps every source, query token, and optional bare key attached as one
    request, then asks the installed CLI to validate and normalize them.
 4. Computes a stable cache key from complete normalized definitions, the state

@@ -303,17 +303,32 @@ jobs:
           "$bin/ghr" version
 
       - name: Point ghr at a cacheable directory
+        id: ghr-dirs
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p \
-            "$RUNNER_TEMP/ghr-smoke-tools" \
-            "$RUNNER_TEMP/ghr-smoke-bin" \
-            "$RUNNER_TEMP/ghr-smoke-cache"
-          echo "GHR_TOOL_DIR=$RUNNER_TEMP/ghr-smoke-tools"   >> "$GITHUB_ENV"
-          echo "GHR_BIN_DIR=$RUNNER_TEMP/ghr-smoke-bin"      >> "$GITHUB_ENV"
-          echo "GHR_CACHE_DIR=$RUNNER_TEMP/ghr-smoke-cache"  >> "$GITHUB_ENV"
-          echo "$RUNNER_TEMP/ghr-smoke-bin" >> "$GITHUB_PATH"
+          base_dir="${HOME}/.cache/ghr-smoke"
+          tool_dir="${base_dir}/tools"
+          bin_dir="${base_dir}/bin"
+          cache_dir="${RUNNER_TEMP}/ghr-smoke-cache"
+          rm -rf "$tool_dir" "$bin_dir" "$cache_dir"
+          mkdir -p "$tool_dir" "$bin_dir" "$cache_dir"
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            tool_dir="$(cygpath -aw "$tool_dir")"
+            bin_dir="$(cygpath -aw "$bin_dir")"
+            cache_dir="$(cygpath -aw "$cache_dir")"
+          else
+            tool_dir="$(cd "$tool_dir" && pwd)"
+            bin_dir="$(cd "$bin_dir" && pwd)"
+            cache_dir="$(cd "$cache_dir" && pwd)"
+          fi
+          echo "GHR_TOOL_DIR=$tool_dir"   >> "$GITHUB_ENV"
+          echo "GHR_BIN_DIR=$bin_dir"     >> "$GITHUB_ENV"
+          echo "GHR_CACHE_DIR=$cache_dir" >> "$GITHUB_ENV"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+          echo "tool_dir=$tool_dir"   >> "$GITHUB_OUTPUT"
+          echo "bin_dir=$bin_dir"     >> "$GITHUB_OUTPUT"
+          echo "cache_dir=$cache_dir" >> "$GITHUB_OUTPUT"
 
       - name: Resolve stable-ID cache key
         id: stable-id-key
@@ -347,10 +362,9 @@ jobs:
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
-            ${{ runner.temp }}/ghr-smoke-tools
-            ${{ runner.temp }}/ghr-smoke-bin
-            ${{ runner.temp }}/ghr-smoke-cache
-          key: ghr-smoke-${{ runner.os }}-${{ runner.arch }}-layout2-${{ steps.stable-id-key.outputs.key }}-${{ github.sha }}
+            ${{ steps.ghr-dirs.outputs.tool_dir }}
+            ${{ steps.ghr-dirs.outputs.bin_dir }}
+          key: ghr-smoke-${{ runner.os }}-${{ runner.arch }}-layout3-${{ steps.stable-id-key.outputs.key }}-${{ github.sha }}
 
       - name: Install two ripgrep releases + fd in one invocation
         if: steps.ghr-cache.outputs.cache-hit != 'true'
@@ -379,6 +393,7 @@ jobs:
           rg-14-1-0 --version | grep -F 'ripgrep 14.1.0'
           rg-14-1-1 --version | grep -F 'ripgrep 14.1.1'
           fd --version
+          test -z "$(ls -A "$GHR_CACHE_DIR")"
 
       - name: Replace, reject collision, and uninstall by exact ID
         shell: bash
