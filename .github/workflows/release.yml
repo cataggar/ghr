@@ -70,7 +70,7 @@ jobs:
           printf 'version=%s\noptimize=%s\n' "$version" "$optimize" >> "$GITHUB_OUTPUT"
 
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@v0.6.1
+        uses: cataggar/ghr/actions/install@v0.9.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -195,7 +195,7 @@ jobs:
           ls -la ghr-*.sigstore.json
 
       - name: Install ghr
-        run: pipx install ghr-bin==0.6.1
+        uses: cataggar/ghr/actions/setup@v0.9.1
 
       - name: Sign archives with minisign (per-asset .minisig sidecars)
         env:
