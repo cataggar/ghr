@@ -12,6 +12,7 @@ on:
 permissions:
   contents: write
   pages: write
+  attestations: read
 
 concurrency:
   group: website
@@ -33,9 +34,8 @@ jobs:
           persist-credentials: false
 
       - name: Install Zig
-        uses: cataggar/ghr/actions/install@ab95a8ea0632291f6b2a1ec0a7e81b11ec8ac01b
+        uses: cataggar/ghr/actions/install@v0.9.1
         with:
-          ghr-version: v0.8.1
           tools: cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build static website

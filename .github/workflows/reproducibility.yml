@@ -28,6 +28,7 @@ on:
 
 permissions:
   contents: read
+  attestations: read
 
 jobs:
   resolve-tag:
@@ -112,7 +113,7 @@ jobs:
           printf 'version=%s\noptimize=%s\n' "$version" "$optimize" >> "$GITHUB_OUTPUT"
 
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@v0.6.1
+        uses: cataggar/ghr/actions/install@v0.9.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -300,7 +301,7 @@ jobs:
           printf 'version=%s\noptimize=%s\n' "$version" "$optimize" >> "$GITHUB_OUTPUT"
 
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@v0.6.1
+        uses: cataggar/ghr/actions/install@v0.9.1
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
