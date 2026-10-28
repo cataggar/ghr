@@ -44,6 +44,32 @@ pub const http_write_buffer_size = 4096;
 /// User-Agent used by all `ghr` HTTP requests.
 pub const default_user_agent = "ghr/" ++ build_options.version;
 
+/// Retry a rejected token once without auth so public resources remain accessible.
+pub fn fetchWithAuthFallback(
+    client: *std.http.Client,
+    url: []const u8,
+    accept: []const u8,
+    auth_header: ?[]const u8,
+    body: *Writer.Allocating,
+) !std.http.Client.FetchResult {
+    const headers = [_]std.http.Header{
+        .{ .name = "Accept", .value = accept },
+        .{ .name = "Authorization", .value = auth_header orelse "" },
+    };
+    var options: std.http.Client.FetchOptions = .{
+        .location = .{ .url = url },
+        .headers = .{ .user_agent = .{ .override = default_user_agent } },
+        .extra_headers = if (auth_header != null) &headers else headers[0..1],
+        .response_writer = &body.writer,
+    };
+    const result = try client.fetch(options);
+    if (result.status != .unauthorized or auth_header == null) return result;
+
+    body.clearRetainingCapacity();
+    options.extra_headers = headers[0..1];
+    return client.fetch(options);
+}
+
 /// Optional callback invoked while a body is streamed to disk so callers
 /// can render progress. `total` is `null` when the server didn't send a
 /// `Content-Length`. Called frequently; implementations should rate-limit.
@@ -85,8 +111,9 @@ pub fn downloadToFile(
     opts: DownloadOptions,
 ) !void {
     const max_retries = opts.max_retries;
+    var auth_header = opts.auth_header;
     var attempts: u8 = 0;
-    while (attempts < max_retries) : (attempts += 1) {
+    attempts_loop: while (attempts < max_retries) : (attempts += 1) {
         if (attempts > 0) {
             const delay_s: i64 = @as(i64, 1) << @intCast(attempts - 1);
             debugLog(opts.debug_w, "  retrying in {d}s ...\n", .{delay_s});
@@ -109,7 +136,7 @@ pub fn downloadToFile(
         // cross-domain redirect to a CDN.
         var header_buf: [2]std.http.Header = undefined;
         var header_count: usize = 0;
-        if (opts.auth_header) |a| {
+        if (auth_header) |a| {
             header_buf[header_count] = .{ .name = "Authorization", .value = a };
             header_count += 1;
         }
@@ -117,7 +144,7 @@ pub fn downloadToFile(
             header_buf[header_count] = .{ .name = "Accept", .value = ac };
             header_count += 1;
         }
-        const extra_headers = header_buf[0..header_count];
+        var extra_headers = header_buf[0..header_count];
 
         const uri = std.Uri.parse(url) catch {
             debugLog(opts.debug_w, "  invalid URL: {s}\n", .{url});
@@ -127,30 +154,40 @@ pub fn downloadToFile(
         // Use unhandled redirects so we can strip Authorization on
         // cross-domain redirect (github.com -> CDN). Zig 0.17's
         // privileged_headers field is not written by sendHead.
-        var req = client.request(.GET, uri, .{
-            .redirect_behavior = .unhandled,
-            .headers = .{ .user_agent = .{ .override = default_user_agent } },
-            .extra_headers = extra_headers,
-        }) catch |err| {
-            debugLog(opts.debug_w, "  attempt {d}/{d} request error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
-        };
-        req.sendBodiless() catch |err| {
-            req.deinit();
-            debugLog(opts.debug_w, "  attempt {d}/{d} send error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
-        };
-
         const head_buf = allocator.alloc(u8, 8 * 1024) catch return error.DownloadFailed;
         defer allocator.free(head_buf);
 
-        var response = req.receiveHead(head_buf) catch |err| {
+        var req: std.http.Client.Request = undefined;
+        var response = response: while (true) {
+            req = client.request(.GET, uri, .{
+                .redirect_behavior = .unhandled,
+                .headers = .{ .user_agent = .{ .override = default_user_agent } },
+                .extra_headers = extra_headers,
+            }) catch |err| {
+                debugLog(opts.debug_w, "  attempt {d}/{d} request error: {}\n", .{ attempts + 1, max_retries, err });
+                if (attempts + 1 < max_retries) continue :attempts_loop;
+                return error.DownloadFailed;
+            };
+            req.sendBodiless() catch |err| {
+                req.deinit();
+                debugLog(opts.debug_w, "  attempt {d}/{d} send error: {}\n", .{ attempts + 1, max_retries, err });
+                if (attempts + 1 < max_retries) continue :attempts_loop;
+                return error.DownloadFailed;
+            };
+            var received = req.receiveHead(head_buf) catch |err| {
+                req.deinit();
+                debugLog(opts.debug_w, "  attempt {d}/{d} receiveHead error: {}\n", .{ attempts + 1, max_retries, err });
+                if (attempts + 1 < max_retries) continue :attempts_loop;
+                return error.DownloadFailed;
+            };
+            if (received.head.status != .unauthorized or auth_header == null) break :response received;
+
+            var discard_buf: [64]u8 = undefined;
+            _ = received.reader(&discard_buf).discardRemaining() catch {};
             req.deinit();
-            debugLog(opts.debug_w, "  attempt {d}/{d} receiveHead error: {}\n", .{ attempts + 1, max_retries, err });
-            if (attempts + 1 < max_retries) continue;
-            return error.DownloadFailed;
+            auth_header = null;
+            extra_headers = extra_headers[1..];
+            debugLog(opts.debug_w, "  token rejected; retrying without authentication\n", .{});
         };
 
         if (response.head.status.class() != .redirect) {

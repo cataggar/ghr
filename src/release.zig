@@ -17,7 +17,6 @@ const sigstore = @import("sigstore.zig");
 const minisign = @import("minisign.zig");
 const authenticode = @import("authenticode.zig");
 const attestation = @import("attestation.zig");
-const version = @import("build_options").version;
 
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -498,24 +497,13 @@ pub fn getRelease(
     var body_writer = std.Io.Writer.Allocating.init(allocator);
     errdefer body_writer.deinit();
 
-    const headers_with_auth = [_]std.http.Header{
-        .{ .name = "Accept", .value = "application/vnd.github+json" },
-        .{ .name = "Authorization", .value = auth_header orelse "" },
-    };
-    const headers_without_auth = [_]std.http.Header{
-        .{ .name = "Accept", .value = "application/vnd.github+json" },
-    };
-    const headers: []const std.http.Header = if (auth_header != null)
-        &headers_with_auth
-    else
-        &headers_without_auth;
-
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .headers = .{ .user_agent = .{ .override = "ghr/" ++ version } },
-        .extra_headers = headers,
-        .response_writer = &body_writer.writer,
-    });
+    const result = try http.fetchWithAuthFallback(
+        client,
+        url,
+        "application/vnd.github+json",
+        auth_header,
+        &body_writer,
+    );
 
     if (result.status != .ok) {
         const err_body = body_writer.toOwnedSlice() catch null;
