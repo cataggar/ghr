@@ -84,12 +84,13 @@ pub fn build(b: *std.Build) void {
     const help_cases = [_]struct {
         args: []const []const u8,
         usage: []const u8,
+        short_help: bool = true,
     }{
         .{ .args = &.{}, .usage = "    ghr <COMMAND> [OPTIONS]" },
         .{ .args = &.{"list"}, .usage = "    ghr list" },
-        .{ .args = &.{"install"}, .usage = "    ghr install <source>" },
+        .{ .args = &.{"install"}, .usage = "    ghr install <source>", .short_help = false },
         .{ .args = &.{"uninstall"}, .usage = "    ghr uninstall <id>" },
-        .{ .args = &.{"download"}, .usage = "    ghr download <spec>" },
+        .{ .args = &.{"download"}, .usage = "    ghr download <spec>", .short_help = false },
         .{ .args = &.{"link"}, .usage = "    ghr link <id>" },
         .{ .args = &.{"unlink"}, .usage = "    ghr unlink <id>" },
         .{ .args = &.{"path"}, .usage = "    ghr path <SUBCOMMAND> [OPTIONS]" },
@@ -100,21 +101,53 @@ pub fn build(b: *std.Build) void {
         .{ .args = &.{"validate"}, .usage = "    ghr validate <SUBCOMMAND> [OPTIONS]" },
         .{ .args = &.{ "validate", "strip-authenticode" }, .usage = "    ghr validate strip-authenticode <input.exe> <output.exe>" },
         .{ .args = &.{"minisign"}, .usage = "    ghr minisign <SUBCOMMAND> [OPTIONS]" },
-        .{ .args = &.{ "minisign", "generate" }, .usage = "    ghr minisign generate" },
+        .{ .args = &.{ "minisign", "generate" }, .usage = "    ghr minisign generate", .short_help = false },
         .{ .args = &.{ "minisign", "sign" }, .usage = "    ghr minisign sign <file>" },
         .{ .args = &.{"version"}, .usage = "    ghr version" },
         // Help must win after positional arguments so no command reaches IO.
-        .{ .args = &.{ "install", "example/tool" }, .usage = "    ghr install <source>" },
-        .{ .args = &.{ "download", "example/tool" }, .usage = "    ghr download <spec>" },
+        .{ .args = &.{ "install", "example/tool" }, .usage = "    ghr install <source>", .short_help = false },
+        .{ .args = &.{ "download", "example/tool" }, .usage = "    ghr download <spec>", .short_help = false },
         .{ .args = &.{ "link", "example/tool" }, .usage = "    ghr link <id>" },
         .{ .args = &.{ "uninstall", "example/tool" }, .usage = "    ghr uninstall <id>" },
         .{ .args = &.{ "validate", "strip-authenticode", "input.exe", "output.exe" }, .usage = "    ghr validate strip-authenticode <input.exe> <output.exe>" },
         .{ .args = &.{ "minisign", "sign", "input" }, .usage = "    ghr minisign sign <file>" },
-        .{ .args = &.{ "minisign", "generate", "--repo", "example/tool" }, .usage = "    ghr minisign generate" },
+        .{ .args = &.{ "minisign", "generate", "--repo", "example/tool" }, .usage = "    ghr minisign generate", .short_help = false },
     };
     for (help_cases) |case| {
-        addHelpFlagTests(b, test_step, exe, case.args, case.usage);
+        addHelpFlagTests(b, test_step, exe, case.args, case.usage, case.short_help);
     }
+
+    const hostname_flag_cases = [_]struct {
+        args: []const []const u8,
+        stderr: []const u8,
+    }{
+        .{ .args = &.{ "install", "-h" }, .stderr = "error: '-h' requires a hostname value" },
+        .{ .args = &.{ "install", "--hostname" }, .stderr = "error: '--hostname' requires a hostname value" },
+        .{ .args = &.{ "download", "-h" }, .stderr = "error: '-h' requires a value" },
+        .{ .args = &.{ "download", "--hostname" }, .stderr = "error: '--hostname' requires a value" },
+        .{ .args = &.{ "minisign", "generate", "-h" }, .stderr = "error: -h requires HOST" },
+        .{ .args = &.{ "minisign", "generate", "--hostname" }, .stderr = "error: --hostname requires HOST" },
+    };
+    for (hostname_flag_cases) |case| {
+        const hostname_cmd = b.addRunArtifact(exe);
+        hostname_cmd.addArgs(case.args);
+        hostname_cmd.expectExitCode(1);
+        hostname_cmd.expectStdOutEqual("");
+        hostname_cmd.expectStdErrMatch(case.stderr);
+        test_step.dependOn(&hostname_cmd.step);
+    }
+
+    const install_ghe_cache_key = b.addRunArtifact(exe);
+    install_ghe_cache_key.addArgs(&.{
+        "install",
+        "--print-cache-key",
+        "-h",
+        "example.ghe.com",
+        "https://example.ghe.com/octocat/hello-world/releases/download/v0.1.0/readme.zip",
+    });
+    install_ghe_cache_key.expectExitCode(0);
+    install_ghe_cache_key.expectStdErrEqual("");
+    test_step.dependOn(&install_ghe_cache_key.step);
 
     const removed_help_cases = [_]struct {
         args: []const []const u8,
@@ -195,8 +228,10 @@ fn addHelpFlagTests(
     exe: *std.Build.Step.Compile,
     args: []const []const u8,
     usage: []const u8,
+    short_help: bool,
 ) void {
-    for ([_][]const u8{ "-h", "--help" }) |flag| {
+    const flags: []const []const u8 = if (short_help) &.{ "-h", "--help" } else &.{"--help"};
+    for (flags) |flag| {
         const help = b.addRunArtifact(exe);
         help.addArgs(args);
         help.addArg(flag);

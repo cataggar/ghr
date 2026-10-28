@@ -14,6 +14,7 @@ const install_request = @import("install_request.zig");
 const VerificationPolicy = @import("install_state_write.zig").VerificationPolicy;
 const minisign = @import("minisign.zig");
 const http = @import("http.zig");
+const auth = @import("auth.zig");
 
 pub const version = build_options.version;
 
@@ -135,6 +136,7 @@ pub fn main(init: std.process.Init) !void {
         var keep_going = false;
         var print_cache_key = false;
         var single_request = false;
+        var cli_hostname: ?[]const u8 = null;
         var minisign_pubkey: ?[]const u8 = null;
         // Positional tokens are handed to `install_request` verbatim: sources,
         // quoted query tokens, and bare minisign keys are classified there so
@@ -146,6 +148,13 @@ pub fn main(init: std.process.Init) !void {
         while (args.next()) |arg| {
             if (eql(arg, "--debug")) {
                 debug = true;
+            } else if (eql(arg, "-h") or eql(arg, "--hostname")) {
+                const v = args.next() orelse {
+                    try stderr.interface.print("error: '{s}' requires a hostname value\n", .{arg});
+                    try stderr.interface.flush();
+                    std.process.exit(1);
+                };
+                cli_hostname = v;
             } else if (eql(arg, "--no-auth")) {
                 no_auth = true;
             } else if (eql(arg, "--skip-verify")) {
@@ -210,9 +219,18 @@ pub fn main(init: std.process.Init) !void {
             try stderr.interface.flush();
             std.process.exit(1);
         }
+        const github_host = auth.resolveGithubHost(cli_hostname, environ) catch {
+            try stderr.interface.print(
+                "error: invalid GitHub hostname '{s}'\n",
+                .{cli_hostname orelse (environ.get("GH_HOST") orelse "")},
+            );
+            try stderr.interface.flush();
+            std.process.exit(1);
+        };
         const install_options: install.InstallOptions = .{
             .debug = debug,
             .no_auth = no_auth,
+            .github_host = github_host,
             .gates = gates,
             .minisign_pubkey_b64 = minisign_pubkey,
             .bin_filters = bin_filters.items,
@@ -330,17 +348,24 @@ fn detectHelpTopic(args: []const []const u8) ?HelpTopic {
         }, .validate);
     }
     if (eql(command, "minisign")) {
+        if (args.len >= 2 and eql(args[1], "generate")) {
+            return if (containsLongHelpFlag(args[2..])) .minisign_generate else null;
+        }
         return detectNestedHelpTopic(args[1..], &.{
             .{ "generate", .minisign_generate },
             .{ "sign", .minisign_sign },
         }, .minisign);
     }
+    if (eql(command, "install")) {
+        return if (containsLongHelpFlag(args[1..])) .install else null;
+    }
+    if (eql(command, "download")) {
+        return if (containsLongHelpFlag(args[1..])) .download else null;
+    }
     if (!containsHelpFlag(args[1..])) return null;
 
     if (eql(command, "list")) return .list;
-    if (eql(command, "install")) return .install;
     if (eql(command, "uninstall")) return .uninstall;
-    if (eql(command, "download")) return .download;
     if (eql(command, "link")) return .link;
     if (eql(command, "unlink")) return .unlink;
     if (eql(command, "version")) return .version;
@@ -365,6 +390,13 @@ fn detectNestedHelpTopic(
 fn containsHelpFlag(args: []const []const u8) bool {
     for (args) |arg| {
         if (isHelpFlag(arg)) return true;
+    }
+    return false;
+}
+
+fn containsLongHelpFlag(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (eql(arg, "--help")) return true;
     }
     return false;
 }
@@ -726,6 +758,7 @@ fn printInstallUsage(w: *Writer) !void {
         \\does not manage, are reported before anything is changed.
         \\
         \\OPTIONS:
+        \\    -h, --hostname <host>   GitHub hostname (overrides GH_HOST; default: github.com)
         \\    --bin <name>            Publish and record only this discovered command
         \\                            (repeatable, applied before aliases); requires
         \\                            exactly one source and is not supported for wasm
@@ -745,7 +778,7 @@ fn printInstallUsage(w: *Writer) !void {
         \\    --print-cache-key       Print a normalized state/cache fingerprint and exit
         \\                            without network or filesystem access
         \\    --single-request        With --print-cache-key, require exactly one request
-        \\    -h, --help              Show this help
+        \\    --help                  Show this help
         \\
         \\A direct URL publishes no GitHub digest, sigstore sidecar, or
         \\attestation, so those steps report that they cannot run instead of
@@ -1839,10 +1872,12 @@ fn printUsage(w: *Writer) !void {
         \\Run 'ghr <COMMAND> --help' to show help for a specific command.
         \\
         \\ENVIRONMENT:
+        \\    GH_HOST                 Default GitHub hostname (for install, download, minisign generate)
         \\    SSL_CERT_FILE           Absolute path to a PEM CA bundle for HTTPS
         \\
         \\OPTIONS:
         \\    -h, --help              Show this help
+        \\    -h, --hostname <host>   GitHub hostname for install/download/minisign generate
         \\    --debug                 Show diagnostic output for debugging
         \\    --no-auth               Skip GitHub authentication
         \\    --skip-verify           Skip every verification step: checksum, minisign,

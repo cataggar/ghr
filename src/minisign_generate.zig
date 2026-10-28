@@ -17,6 +17,7 @@ const output_limit = 64 * 1024;
 
 const Options = struct {
     repo: ?[]const u8 = null,
+    hostname: ?[]const u8 = null,
     encrypt: bool = false,
     replace: bool = false,
     reuse: bool = false,
@@ -54,13 +55,18 @@ fn parseOptions(args: anytype, err_w: *Writer) !Options {
             const repo = args.next() orelse return fail(err_w, "--repo requires OWNER/REPO", .{});
             if (!validRepo(repo)) return fail(err_w, "--repo must be a valid OWNER/REPO", .{});
             options.repo = repo;
+        } else if (std.mem.eql(u8, arg, "--hostname") or std.mem.eql(u8, arg, "-h")) {
+            if (options.hostname != null) return fail(err_w, "--hostname may only be specified once", .{});
+            const host = args.next() orelse return fail(err_w, "{s} requires HOST", .{arg});
+            if (!validHost(host)) return fail(err_w, "{s} must be a valid hostname", .{arg});
+            options.hostname = host;
         } else if (std.mem.eql(u8, arg, "--encrypt")) {
             options.encrypt = true;
         } else if (std.mem.eql(u8, arg, "--force")) {
             options.replace = true;
         } else if (std.mem.eql(u8, arg, "--reuse-existing-local-pair")) {
             options.reuse = true;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        } else if (std.mem.eql(u8, arg, "--help")) {
             options.help = true;
         } else {
             return fail(err_w, "unknown option for 'ghr minisign generate'; run with --help", .{});
@@ -74,16 +80,17 @@ pub fn printUsage(w: *Writer) !void {
         \\ghr minisign generate - generate recovery keys and provision Actions secrets
         \\
         \\USAGE:
-        \\    ghr minisign generate [--repo OWNER/REPO] [--encrypt]
+        \\    ghr minisign generate [-h HOST] [--repo OWNER/REPO] [--encrypt]
         \\        [--force] [--reuse-existing-local-pair]
         \\
+        \\-h, --hostname HOST        GitHub hostname (overrides GH_HOST; default: github.com)
         \\--repo OWNER/REPO          Override gh's current repository context
         \\--encrypt                  Encrypt with nonempty MINISIGN_PASSWORD;
         \\                           also upload that password as an Actions secret
         \\--force                    Explicitly allow remote secret replacement
         \\--reuse-existing-local-pair Retry with minisign.key and minisign.pub;
         \\                           never generate or replace a private key
-        \\-h, --help                  Show this help
+        \\--help                     Show this help
         \\
         \\Default: unencrypted minisign.pub/minisign.key; only MINISIGN_SECRET_KEY
         \\is uploaded. MINISIGN_PASSWORD is not required, read, or modified.
@@ -190,7 +197,22 @@ const Target = struct {
     }
 };
 
-fn resolveTarget(allocator: Allocator, io: Io, environ: *const Environ, options: Options, runner: Runner, err_w: *Writer) !Target {
+fn resolveExpectedHost(environ: *const Environ, options: Options, err_w: *Writer) !?[]const u8 {
+    if (options.hostname) |host| {
+        if (!validHost(host)) return fail(err_w, "--hostname must be a valid hostname", .{});
+        return host;
+    }
+    if (environ.get("GH_HOST")) |env_host| {
+        const trimmed = std.mem.trim(u8, env_host, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (!validHost(trimmed)) return fail(err_w, "GH_HOST must be a valid hostname", .{});
+            return trimmed;
+        }
+    }
+    return null;
+}
+
+fn resolveTarget(allocator: Allocator, io: Io, environ: *const Environ, options: Options, expected_host: ?[]const u8, runner: Runner, err_w: *Writer) !Target {
     if (options.repo) |repo| if (!validRepo(repo)) return fail(err_w, "--repo must be a valid OWNER/REPO", .{});
     const result = try checked(allocator, io, environ, runner, if (options.repo) |repo|
         &.{ "gh", "repo", "view", repo, "--json", "nameWithOwner,url,viewerPermission" }
@@ -214,6 +236,10 @@ fn resolveTarget(allocator: Allocator, io: Io, environ: *const Environ, options:
     const host = info.url[prefix.len..host_end];
     if (!validHost(host) or !std.ascii.eqlIgnoreCase(info.url[host_end + 1 ..], info.nameWithOwner))
         return fail(err_w, "gh returned an inconsistent repository URL/name", .{});
+    if (expected_host) |expected| {
+        if (!std.ascii.eqlIgnoreCase(host, expected))
+            return fail(err_w, "gh resolved a different host than expected; refusing to provision", .{});
+    }
     if (!std.mem.eql(u8, info.viewerPermission, "ADMIN") and
         !std.mem.eql(u8, info.viewerPermission, "MAINTAIN") and
         !std.mem.eql(u8, info.viewerPermission, "WRITE"))
@@ -278,9 +304,13 @@ fn generate(allocator: Allocator, io: Io, environ: *const Environ, dir: Dir, opt
         std.crypto.secureZero(u8, bytes);
         allocator.free(bytes);
     };
+    const expected_host = try resolveExpectedHost(environ, options, err_w);
     var gh_environ = try childEnviron(allocator, environ);
     defer gh_environ.deinit();
-    const target = try resolveTarget(allocator, io, &gh_environ, options, runner, err_w);
+    if (expected_host) |host| {
+        try gh_environ.put("GH_HOST", host);
+    }
+    const target = try resolveTarget(allocator, io, &gh_environ, options, expected_host, runner, err_w);
     defer target.deinit(allocator);
     try preflight(allocator, io, &gh_environ, target, options, runner, err_w);
 
@@ -1028,6 +1058,11 @@ test "generate parser rejects malformed overrides, missing values, duplicate rep
         &.{ "--repo", "../repo" },
         &.{ "--repo", "owner/repo;bad" },
         &.{ "--repo", "owner/repo", "--repo", "owner/other" },
+        &.{"--hostname"},
+        &.{"-h"},
+        &.{ "--hostname", "-bad.host" },
+        &.{ "-h", "bad/host" },
+        &.{ "-h", "example.ghe.com", "--hostname", "other.ghe.com" },
         &.{"--replace-existing-secrets"},
         &.{"--unknown"},
     };
@@ -1037,8 +1072,9 @@ test "generate parser rejects malformed overrides, missing values, duplicate rep
         var args: ListArgs = .{ .values = values };
         try std.testing.expectError(error.GenerateFailed, parseOptions(&args, &err.writer));
     }
-    var args: ListArgs = .{ .values = &.{ "--repo", "owner/valid.repo", "--encrypt", "--force", "--reuse-existing-local-pair" } };
+    var args: ListArgs = .{ .values = &.{ "-h", "example.ghe.com", "--repo", "owner/valid.repo", "--encrypt", "--force", "--reuse-existing-local-pair" } };
     const options = try parseOptions(&args, &err.writer);
+    try std.testing.expectEqualStrings("example.ghe.com", options.hostname.?);
     try std.testing.expectEqualStrings("owner/valid.repo", options.repo.?);
     try std.testing.expect(options.encrypt and options.replace and options.reuse);
 }

@@ -28,7 +28,8 @@ Run `ghr <command> --help` for complete syntax and examples.
 > [!IMPORTANT]
 > **Breaking change in v0.8.0:** the `help` command and positional help
 > aliases were removed. Replace `ghr help` with `ghr --help`, and replace
-> `ghr <command> help` with `ghr <command> --help` or `ghr <command> -h`.
+> `ghr <command> help` with `ghr <command> --help` (on `install`, `download`,
+> and `minisign generate`, `-h` is the short flag for `--hostname <host>`).
 
 ## Examples
 

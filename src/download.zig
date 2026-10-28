@@ -108,6 +108,9 @@ pub const Options = struct {
     /// Continue past per-spec failures, then exit non-zero with a summary
     /// if any spec failed.
     keep_going: bool = false,
+    /// Optional GitHub hostname override (`-h` / `--hostname`). Falls back to
+    /// `GH_HOST`, then `github.com`.
+    hostname: ?[]const u8 = null,
 
     /// Free the targets list. Target slices themselves borrow from argv.
     pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
@@ -182,6 +185,8 @@ pub const DownloadContext = struct {
     io: Io,
     environ: *const EnvironMap,
     client: *std.http.Client,
+    /// Target GitHub hostname (`github.com` by default, or `--hostname`/`GH_HOST`).
+    github_host: []const u8 = auth.default_github_host,
     /// GitHub auth resolved once. Per-spec downloads attach it only when
     /// the URL points at a github-owned host.
     auth_resolved: auth.Resolved,
@@ -220,9 +225,16 @@ pub fn cmdDownloadMany(
 ) !void {
     if (opts.targets.items.len == 0) return;
 
+    const github_host = auth.resolveGithubHost(opts.hostname, environ) catch {
+        const bad = opts.hostname orelse environ.get("GH_HOST") orelse "";
+        try err_w.print("error: invalid GitHub hostname '{s}'\n", .{bad});
+        try err_w.flush();
+        std.process.exit(exit_arg_error);
+    };
+
     // GitHub auth resolved once and reused across all specs. Borrowing
     // the resolved token avoids re-invoking `gh auth token` per spec.
-    const auth_resolved = auth.resolveGithubToken(allocator, io, environ, opts.no_auth);
+    const auth_resolved = auth.resolveGithubTokenForHost(allocator, io, environ, opts.no_auth, github_host);
     defer auth_resolved.deinit(allocator);
     const auth_header = try auth.bearerHeader(allocator, auth_resolved);
     defer if (auth_header) |h| allocator.free(h);
@@ -240,6 +252,7 @@ pub fn cmdDownloadMany(
         .io = io,
         .environ = environ,
         .client = &client,
+        .github_host = github_host,
         .auth_resolved = auth_resolved,
         .auth_header = auth_header,
         .w = w,
@@ -335,7 +348,7 @@ fn downloadOne(
 
     // 3) Per-spec host check: only attach auth for github-owned hosts.
     const uri = std.Uri.parse(target.download_url) catch unreachable; // already validated
-    const github_host = auth.isGithubUri(uri);
+    const github_host = auth.isGithubUriFor(uri, ctx.github_host);
     const per_spec_auth_header: ?[]const u8 = if (github_host) ctx.auth_header else null;
     const per_spec_auth_source: []const u8 = if (github_host) ctx.auth_resolved.source else "skipped";
 
@@ -428,7 +441,7 @@ fn downloadOne(
             Dir.createDirAbsolute(io, parent, .default_dir) catch {};
         }
         Dir.createDirAbsolute(io, d.cache, .default_dir) catch {};
-        const outcome = release_mod.verifyAssetOnDisk(
+        const outcome = release_mod.verifyAssetOnDiskForHost(
             allocator,
             io,
             d.cache,
@@ -440,6 +453,7 @@ fn downloadOne(
             gates,
             effective_minisign_pubkey,
             target.repository,
+            ctx.github_host,
             w,
             err_w,
         ) catch |verr| {
@@ -463,13 +477,14 @@ fn downloadOne(
             try w.print("note: github attestation verification skipped (--skip-attestation)\n", .{});
             try w.flush();
         } else {
-            const outcome = release_mod.verifyDownloadedAssetAttestation(
+            const outcome = release_mod.verifyDownloadedAssetAttestationForHost(
                 allocator,
                 io,
                 repo,
                 part_path,
                 debug_w,
                 per_spec_auth_header,
+                ctx.github_host,
                 w,
                 err_w,
             ) catch |verr| {
@@ -570,7 +585,7 @@ fn resolveTarget(
             // Try to extract a github release context for opportunistic
             // verification. Failure is silent — non-github URLs and odd
             // shapes simply skip verification.
-            const gh_opt = release_mod.parseGitHubReleaseUrl(allocator, u) catch null;
+            const gh_opt = release_mod.parseGitHubReleaseUrlForHost(allocator, u, ctx.github_host) catch null;
             if (gh_opt == null) {
                 return .{
                     .download_url = u,
@@ -581,7 +596,7 @@ fn resolveTarget(
                     // Not a release-download URL, but if it points at a
                     // repository we can still verify by digest instead of
                     // downloading with no verification at all.
-                    .repository = release_mod.repositoryFromGitHubUrl(u),
+                    .repository = release_mod.repositoryFromGitHubUrlForHost(u, ctx.github_host),
                 };
             }
             const gh = gh_opt.?;
@@ -615,7 +630,7 @@ fn resolveTarget(
                     // Prefer the canonical name from the release body (it
                     // borrows from `rel`); fall back to the URL's slug,
                     // which borrows from `gh`, retained in `url_decoded`.
-                    .repository = release_mod.canonicalRepository(rel.parsed.value) orelse
+                    .repository = release_mod.canonicalRepositoryForHost(rel.parsed.value, ctx.github_host) orelse
                         .{ .owner = gh.owner, .repo = gh.repo },
                 };
             }
@@ -652,7 +667,7 @@ fn resolveTarget(
                 .release = rel,
                 .asset_name = asset.name,
                 .url_decoded = null,
-                .repository = release_mod.canonicalRepository(rel.parsed.value) orelse
+                .repository = release_mod.canonicalRepositoryForHost(rel.parsed.value, ctx.github_host) orelse
                     .{ .owner = rs.owner, .repo = rs.repo },
             };
         },
@@ -675,7 +690,7 @@ fn resolveTarget(
                         .release = rel,
                         .asset_name = asset.name,
                         .url_decoded = null,
-                        .repository = release_mod.canonicalRepository(rel.parsed.value) orelse
+                        .repository = release_mod.canonicalRepositoryForHost(rel.parsed.value, ctx.github_host) orelse
                             .{ .owner = fs.owner, .repo = fs.repo },
                     };
                 },
@@ -722,7 +737,7 @@ fn fetchRelease(
         try w.flush();
     }
 
-    const rel = release_mod.getRelease(ctx.allocator, ctx.client, owner, repo, tag, ctx.auth_header) catch |err| {
+    const rel = release_mod.getReleaseForHost(ctx.allocator, ctx.client, owner, repo, tag, ctx.auth_header, ctx.github_host) catch |err| {
         switch (err) {
             error.GitHubApiError => {
                 try err_w.print("error: release not found for {s}/{s}", .{ owner, repo });
@@ -865,6 +880,14 @@ fn parseArgs(allocator: std.mem.Allocator, args: *Args.Iterator, err_w: *Writer)
     while (args.next()) |arg| {
         if (eql(arg, "-o") or eql(arg, "--output")) {
             opts.output = try takeValue(args, "-o", err_w);
+        } else if (eql(arg, "-h") or eql(arg, "--hostname")) {
+            const v = try takeValue(args, arg, err_w);
+            if (!auth.isValidGithubHost(v)) {
+                try err_w.print("error: invalid GitHub hostname '{s}'\n", .{v});
+                try err_w.flush();
+                return error.InvalidArgument;
+            }
+            opts.hostname = v;
         } else if (eql(arg, "--extract")) {
             opts.extract = try takeValue(args, "--extract", err_w);
         } else if (eql(arg, "--strip-components")) {
@@ -1020,6 +1043,7 @@ pub fn printDownloadUsage(w: *Writer) !void {
         \\Multi-spec invocations share a single HTTP client + auth context.
         \\
         \\OPTIONS:
+        \\    -h, --hostname <host>      GitHub hostname (default: GH_HOST or github.com)
         \\    -o, --output <path>        Output file path (single-spec only)
         \\        --extract <dir>        Extract archive(s) into <dir> after download
         \\        --strip-components <N> Strip N leading path components when extracting
@@ -1036,7 +1060,7 @@ pub fn printDownloadUsage(w: *Writer) !void {
         \\        --quiet                Suppress progress output
         \\        --no-auth              Do not send GitHub auth even for github.com URLs
         \\        --debug                Verbose diagnostic output
-        \\    -h, --help                  Show this help
+        \\        --help                 Show this help
         \\
         \\EXAMPLES:
         \\    ghr download burntsushi/ripgrep@15.1.0

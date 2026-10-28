@@ -223,6 +223,15 @@ pub fn parseWithDiagnostic(
     tokens: []const []const u8,
     diagnostic: *Diagnostic,
 ) Error!ParsedRequests {
+    return parseWithDiagnosticForHost(allocator, tokens, "github.com", diagnostic);
+}
+
+pub fn parseWithDiagnosticForHost(
+    allocator: std.mem.Allocator,
+    tokens: []const []const u8,
+    github_host: []const u8,
+    diagnostic: *Diagnostic,
+) Error!ParsedRequests {
     diagnostic.* = .{};
     if (tokens.len == 0) {
         setDiagnostic(diagnostic, null, null, .source);
@@ -289,7 +298,7 @@ pub fn parseWithDiagnostic(
             };
             current = null;
         }
-        current = try startRequest(allocator, token, token_index, diagnostic);
+        current = try startRequest(allocator, token, token_index, github_host, diagnostic);
     }
 
     if (current) |*builder| {
@@ -345,6 +354,7 @@ fn startRequest(
     allocator: std.mem.Allocator,
     token: []const u8,
     token_index: usize,
+    github_host: []const u8,
     diagnostic: *Diagnostic,
 ) Error!Builder {
     if (!std.mem.startsWith(u8, token, "http://") and
@@ -396,7 +406,7 @@ fn startRequest(
             };
         },
         .url => |url| {
-            const parsed = release.parseGitHubReleaseUrl(allocator, url) catch |err| {
+            const parsed = release.parseGitHubReleaseUrlForHost(allocator, url, github_host) catch |err| {
                 setDiagnostic(diagnostic, token_index, null, .source);
                 return err;
             };
@@ -720,6 +730,22 @@ test "canonical GitHub release URLs derive lowercase IDs" {
     try std.testing.expectEqualStrings("owner/repo", parsed.items[0].id);
     switch (parsed.items[0].source) {
         .github_release_url => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var diag: Diagnostic = .{};
+    var ghe_parsed = try parseWithDiagnosticForHost(std.testing.allocator, &.{
+        "https://example.ghe.com/OctoCat/Hello-World/releases/download/v0.1.0/readme.zip",
+    }, "example.ghe.com", &diag);
+    defer ghe_parsed.deinit();
+    try std.testing.expectEqualStrings("octocat/hello-world", ghe_parsed.items[0].id);
+    switch (ghe_parsed.items[0].source) {
+        .github_release_url => |url| {
+            try std.testing.expectEqualStrings(
+                "https://example.ghe.com/OctoCat/Hello-World/releases/download/v0.1.0/readme.zip",
+                url,
+            );
+        },
         else => return error.TestUnexpectedResult,
     }
 }
