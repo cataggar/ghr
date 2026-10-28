@@ -215,6 +215,7 @@ fn fetchApiBody(
         .identity_limit = max_api_body,
         .encoded_limit = max_api_body,
         .extra_headers = headers[0..header_count],
+        .retry_without_auth = header_count == 3,
     });
 }
 
@@ -239,6 +240,8 @@ const FetchOptions = struct {
     require_https: bool = false,
     follow_redirects: bool = false,
     extra_headers: []const std.http.Header = &.{},
+    /// The API request's optional Authorization header is the final extra header.
+    retry_without_auth: bool = false,
 };
 
 fn fetchRaw(
@@ -313,6 +316,13 @@ fn fetchOnce(
 
     try request.sendBodiless();
     var response = try request.receiveHead(&.{});
+
+    if (response.head.status == .unauthorized and options.retry_without_auth) {
+        var unauthenticated = options;
+        unauthenticated.retry_without_auth = false;
+        unauthenticated.extra_headers = options.extra_headers[0 .. options.extra_headers.len - 1];
+        return fetchOnce(client, allocator, url, unauthenticated);
+    }
 
     if (response.head.status.class() == .redirect) {
         const location = response.head.location orelse

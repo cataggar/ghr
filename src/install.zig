@@ -8819,6 +8819,9 @@ const TestHttpServer = struct {
     server: Io.net.Server,
     responses: []const []const u8,
     served: std.atomic.Value(usize),
+    requests: std.atomic.Value(usize),
+    authenticated_requests: std.atomic.Value(usize),
+    accept_requests: std.atomic.Value(usize),
     thread: std.Thread,
 
     fn start(srv: *TestHttpServer, responses: []const []const u8) !void {
@@ -8828,6 +8831,9 @@ const TestHttpServer = struct {
             .server = try addr.listen(io, .{ .reuse_address = true }),
             .responses = responses,
             .served = .init(0),
+            .requests = .init(0),
+            .authenticated_requests = .init(0),
+            .accept_requests = .init(0),
             .thread = undefined,
         };
         srv.thread = try std.Thread.spawn(.{}, run, .{srv});
@@ -8868,6 +8874,15 @@ const TestHttpServer = struct {
                 total_read += res.data_len;
                 if (std.mem.indexOf(u8, req_buf[0..total_read], "\r\n\r\n") != null) break;
             }
+            if (total_read > 0) {
+                _ = self.requests.fetchAdd(1, .release);
+                if (std.mem.indexOf(u8, req_buf[0..total_read], "\r\nAuthorization: ") != null) {
+                    _ = self.authenticated_requests.fetchAdd(1, .release);
+                }
+                if (std.mem.indexOf(u8, req_buf[0..total_read], "\r\nAccept: application/") != null) {
+                    _ = self.accept_requests.fetchAdd(1, .release);
+                }
+            }
             var write_buf: [1024]u8 = undefined;
             var w = stream.writer(io, &write_buf);
             w.interface.writeAll(raw_response) catch {};
@@ -8876,6 +8891,81 @@ const TestHttpServer = struct {
         }
     }
 };
+
+test "release HTTP fetch retries only authenticated 401 responses without the rejected token" {
+    const allocator = std.testing.allocator;
+    const unauthorized = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 15\r\nConnection: close\r\n\r\nBad credentials";
+    const forbidden = "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nForbidden";
+    const success = "HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"tag_name\":\"v1\"}";
+    const cases = [_]struct {
+        responses: []const []const u8,
+        auth_header: ?[]const u8 = "Bearer invalid-test-token",
+        status: std.http.Status,
+        body: []const u8,
+    }{
+        .{ .responses = &.{ unauthorized, success }, .status = .ok, .body = "{\"tag_name\":\"v1\"}" },
+        .{ .responses = &.{ unauthorized, unauthorized }, .status = .unauthorized, .body = "Bad credentials" },
+        .{ .responses = &.{unauthorized}, .auth_header = null, .status = .unauthorized, .body = "Bad credentials" },
+        .{ .responses = &.{forbidden}, .status = .forbidden, .body = "Forbidden" },
+        .{ .responses = &.{success}, .status = .ok, .body = "{\"tag_name\":\"v1\"}" },
+    };
+    for (cases) |case| {
+        var srv: TestHttpServer = undefined;
+        try srv.start(case.responses);
+        defer srv.finish();
+        const url = try allocator.print("http://127.0.0.1:{d}/releases/latest", .{srv.port()});
+        defer allocator.free(url);
+        var client: std.http.Client = .{ .allocator = allocator, .io = std.testing.io };
+        defer client.deinit();
+        var body: Writer.Allocating = .init(allocator);
+        defer body.deinit();
+
+        const result = try http.fetchWithAuthFallback(&client, url, "application/vnd.github+json", case.auth_header, &body);
+
+        try std.testing.expectEqual(case.status, result.status);
+        try std.testing.expectEqualStrings(case.body, body.written());
+        try std.testing.expectEqual(case.responses.len, srv.requests.load(.acquire));
+        try std.testing.expectEqual(@as(usize, @intFromBool(case.auth_header != null)), srv.authenticated_requests.load(.acquire));
+        try std.testing.expectEqual(case.responses.len, srv.accept_requests.load(.acquire));
+    }
+}
+
+test "asset download retries rejected auth without consuming a transient retry or hashing the error body" {
+    const allocator = std.testing.allocator;
+    const unauthorized = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 15\r\nConnection: close\r\n\r\nBad credentials";
+    const success = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ntool\n";
+    var srv: TestHttpServer = undefined;
+    try srv.start(&.{ unauthorized, success });
+    defer srv.finish();
+    const url = try allocator.print("http://127.0.0.1:{d}/asset", .{srv.port()});
+    defer allocator.free(url);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const dest = try std.fs.path.join(allocator, &.{ path_buf[0..path_len], "tool" });
+    defer allocator.free(dest);
+    var hasher: std.crypto.hash.sha2.Sha256 = .init(.{});
+
+    try http.downloadToFile(allocator, std.testing.io, url, dest, .{
+        .auth_header = "Bearer invalid-test-token",
+        .accept = "application/octet-stream",
+        .max_retries = 1,
+        .hasher = &hasher,
+    });
+
+    const downloaded = try tmp.dir.readFileAlloc(std.testing.io, "tool", allocator, .limited(1024));
+    defer allocator.free(downloaded);
+    try std.testing.expectEqualStrings("tool\n", downloaded);
+    var actual_hash: [32]u8 = undefined;
+    hasher.final(&actual_hash);
+    var expected_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("tool\n", &expected_hash, .{});
+    try std.testing.expectEqualSlices(u8, &expected_hash, &actual_hash);
+    try std.testing.expectEqual(@as(usize, 2), srv.requests.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), srv.authenticated_requests.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), srv.accept_requests.load(.acquire));
+}
 
 fn tExpectCacheEmpty(store: *TestStore) !void {
     var cache_dir = try Dir.openDirAbsolute(std.testing.io, store.dirs.cache, .{ .iterate = true });
