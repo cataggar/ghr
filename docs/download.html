@@ -172,6 +172,7 @@ macOS, and Windows; no <code>choco install wget</code> step needed.</p>
 <pre><code>ghr download &lt;spec&gt; [&lt;pubkey&gt;] [&lt;spec&gt; [&lt;pubkey&gt;] ...] [options]
 
 OPTIONS:
+    -h, --hostname &lt;host&gt;      GitHub hostname (default: GH_HOST or github.com)
     -o, --output &lt;path&gt;        Output file path (single-spec only)
         --extract &lt;dir&gt;        Extract archive(s) into &lt;dir&gt; after download
         --strip-components &lt;N&gt; Strip N leading path components when extracting
@@ -188,6 +189,7 @@ OPTIONS:
         --quiet                Suppress progress output
         --no-auth              Do not send GitHub auth even for github.com URLs
         --debug                Verbose diagnostic output
+        --help                 Show this help
 </code></pre>
 <p>Each <code>&lt;spec&gt;</code> is <code>owner/repo[@tag]</code> (auto-pick asset for the current
 OS/arch) or <code>owner/repo/file[@tag]</code> (exact match wins, otherwise a
@@ -206,8 +208,7 @@ than one spec is supplied — use <code>--extract &lt;dir&gt;</code> for &quot;l
 archive in a shared directory&quot;, or invoke <code>ghr download</code> once per
 spec for distinct outputs. <code>--keep-going</code> continues past per-spec
 failures and exits non-zero with a summary if any spec failed.</p>
-<p>GitHub auth is attached automatically (using <code>GH_TOKEN</code>,
-<code>GITHUB_TOKEN</code>, or <code>gh auth token</code>); pass <code>--no-auth</code> to skip it.
+<p>GitHub auth is attached automatically (using <code>GH_ENTERPRISE_TOKEN</code> / <code>GITHUB_ENTERPRISE_TOKEN</code> on custom hosts, <code>GH_TOKEN</code>, <code>GITHUB_TOKEN</code>, or <code>gh auth token --hostname &lt;host&gt;</code>); pass <code>--no-auth</code> to skip it. Use <code>-h</code> / <code>--hostname &lt;host&gt;</code> or set <code>GH_HOST</code> to target GitHub Enterprise Cloud with Data Residency (<code>*.ghe.com</code>, e.g. <code>example.ghe.com</code>) or GitHub Enterprise Server.
 When a token is present, release assets are fetched through the
 GitHub asset API endpoint rather than the public download URL, so
 private and SSO-protected enterprise releases work as long as the
