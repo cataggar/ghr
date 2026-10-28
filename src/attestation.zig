@@ -1,5 +1,6 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const auth = @import("auth.zig");
 const snappy = @import("snappy.zig");
 
 const api_base = "https://api.github.com";
@@ -86,7 +87,20 @@ pub fn lookup(
     sha256_hex: []const u8,
     auth_header: ?[]const u8,
 ) !LookupResult {
-    const url = try buildApiUrl(allocator, api_base, repository, sha256_hex);
+    return lookupForHost(client, allocator, repository, sha256_hex, auth_header, auth.default_github_host);
+}
+
+pub fn lookupForHost(
+    client: *std.http.Client,
+    allocator: std.mem.Allocator,
+    repository: Repository,
+    sha256_hex: []const u8,
+    auth_header: ?[]const u8,
+    github_host: []const u8,
+) !LookupResult {
+    const host_api_base = try auth.githubApiBaseUrl(allocator, github_host);
+    defer allocator.free(host_api_base);
+    const url = try buildApiUrl(allocator, host_api_base, repository, sha256_hex);
     defer allocator.free(url);
 
     // Two distinct signals mean "no attestation for this digest", and both

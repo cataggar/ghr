@@ -12,6 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const archive = @import("archive.zig");
+const auth = @import("auth.zig");
 const http = @import("http.zig");
 const sigstore = @import("sigstore.zig");
 const minisign = @import("minisign.zig");
@@ -264,6 +265,14 @@ pub const ParsedReleaseUrl = struct {
 };
 
 pub fn parseGitHubReleaseUrl(allocator: std.mem.Allocator, url: []const u8) !?ParsedReleaseUrl {
+    return parseGitHubReleaseUrlForHost(allocator, url, auth.default_github_host);
+}
+
+pub fn parseGitHubReleaseUrlForHost(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    expected_host: []const u8,
+) !?ParsedReleaseUrl {
     const uri = std.Uri.parse(url) catch return null;
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "https") and
         !std.ascii.eqlIgnoreCase(uri.scheme, "http")) return null;
@@ -271,7 +280,7 @@ pub fn parseGitHubReleaseUrl(allocator: std.mem.Allocator, url: []const u8) !?Pa
         .raw => |h| h,
         .percent_encoded => |h| h,
     };
-    if (!std.ascii.eqlIgnoreCase(host, "github.com")) return null;
+    if (!std.ascii.eqlIgnoreCase(host, expected_host)) return null;
     const path = switch (uri.path) {
         .raw => |p| p,
         .percent_encoded => |p| p,
@@ -407,9 +416,17 @@ pub const Release = struct {
 /// Returns null for non-github.com URLs and anything without two path
 /// segments. Slices borrow from `url`.
 pub fn repositoryFromGitHubUrl(url: []const u8) ?attestation.Repository {
-    const prefix = "https://github.com/";
-    if (!std.mem.startsWith(u8, url, prefix)) return null;
-    var rest = url[prefix.len..];
+    return repositoryFromGitHubUrlForHost(url, auth.default_github_host);
+}
+
+pub fn repositoryFromGitHubUrlForHost(url: []const u8, expected_host: []const u8) ?attestation.Repository {
+    const scheme = "https://";
+    if (!std.mem.startsWith(u8, url, scheme)) return null;
+    var rest = url[scheme.len..];
+    if (rest.len <= expected_host.len) return null;
+    if (!std.ascii.eqlIgnoreCase(rest[0..expected_host.len], expected_host)) return null;
+    if (rest[expected_host.len] != '/') return null;
+    rest = rest[expected_host.len + 1 ..];
 
     const owner_end = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
     const owner = rest[0..owner_end];
@@ -434,10 +451,18 @@ pub fn repositoryFromGitHubUrl(url: []const u8) ?attestation.Repository {
 /// Returns null when `html_url` is absent or not a github.com release URL,
 /// leaving the caller to fall back to the requested slug.
 pub fn canonicalRepository(release: Release) ?attestation.Repository {
+    return canonicalRepositoryForHost(release, auth.default_github_host);
+}
+
+pub fn canonicalRepositoryForHost(release: Release, expected_host: []const u8) ?attestation.Repository {
     const url = release.html_url orelse return null;
-    const prefix = "https://github.com/";
-    if (!std.mem.startsWith(u8, url, prefix)) return null;
-    var rest = url[prefix.len..];
+    const scheme = "https://";
+    if (!std.mem.startsWith(u8, url, scheme)) return null;
+    var rest = url[scheme.len..];
+    if (rest.len <= expected_host.len) return null;
+    if (!std.ascii.eqlIgnoreCase(rest[0..expected_host.len], expected_host)) return null;
+    if (rest[expected_host.len] != '/') return null;
+    rest = rest[expected_host.len + 1 ..];
 
     const owner_end = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
     const owner = rest[0..owner_end];
@@ -487,11 +512,25 @@ pub fn getRelease(
     tag: ?[]const u8,
     auth_header: ?[]const u8,
 ) !ParsedRelease {
+    return getReleaseForHost(allocator, client, owner, repo, tag, auth_header, auth.default_github_host);
+}
+
+pub fn getReleaseForHost(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    owner: []const u8,
+    repo: []const u8,
+    tag: ?[]const u8,
+    auth_header: ?[]const u8,
+    github_host: []const u8,
+) !ParsedRelease {
+    const api_base = try auth.githubApiBaseUrl(allocator, github_host);
+    defer allocator.free(api_base);
     const url = if (tag) |t| blk: {
         const encoded_tag = try urlEncode(allocator, t);
         defer allocator.free(encoded_tag);
-        break :blk try allocator.print("https://api.github.com/repos/{s}/{s}/releases/tags/{s}", .{ owner, repo, encoded_tag });
-    } else try allocator.print("https://api.github.com/repos/{s}/{s}/releases/latest", .{ owner, repo });
+        break :blk try allocator.print("{s}/repos/{s}/{s}/releases/tags/{s}", .{ api_base, owner, repo, encoded_tag });
+    } else try allocator.print("{s}/repos/{s}/{s}/releases/latest", .{ api_base, owner, repo });
     defer allocator.free(url);
 
     var body_writer = std.Io.Writer.Allocating.init(allocator);
@@ -1624,6 +1663,30 @@ pub fn verifyDownloadedAssetAttestation(
     w: *Writer,
     err_w: *Writer,
 ) !VerifyOutcome {
+    return verifyDownloadedAssetAttestationForHost(
+        allocator,
+        io,
+        repository,
+        download_path,
+        debug_w,
+        auth_header,
+        auth.default_github_host,
+        w,
+        err_w,
+    );
+}
+
+pub fn verifyDownloadedAssetAttestationForHost(
+    allocator: std.mem.Allocator,
+    io: Io,
+    repository: ?attestation.Repository,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    auth_header: ?[]const u8,
+    github_host: []const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
     // Attestations are keyed by owner/repo. A bare-URL download with no
     // release context has nothing to query against.
     const repo = repository orelse {
@@ -1643,12 +1706,13 @@ pub fn verifyDownloadedAssetAttestation(
     defer client.deinit();
     try http.configureClientCaBundle(&client);
 
-    const result = attestation.lookup(
+    const result = attestation.lookupForHost(
         &client,
         allocator,
         repo,
         &digest_hex,
         auth_header,
+        github_host,
     ) catch |err| {
         try err_w.print(
             "error: GitHub attestation lookup failed for '{s}/{s}': {s}\n",
@@ -1678,13 +1742,13 @@ pub fn verifyDownloadedAssetAttestation(
     debugLog(debug_w, "debug: attestation: {d} candidate(s)\n", .{bundles.len});
 
     const repository_uri = try allocator.print(
-        "https://github.com/{s}/{s}",
-        .{ repo.owner, repo.repo },
+        "https://{s}/{s}/{s}",
+        .{ github_host, repo.owner, repo.repo },
     );
     defer allocator.free(repository_uri);
     const owner_uri = try allocator.print(
-        "https://github.com/{s}",
-        .{repo.owner},
+        "https://{s}/{s}",
+        .{ github_host, repo.owner },
     );
     defer allocator.free(owner_uri);
 
@@ -2303,6 +2367,40 @@ pub fn verifyAssetOnDisk(
     w: *Writer,
     err_w: *Writer,
 ) !VerifyOutcome {
+    return verifyAssetOnDiskForHost(
+        allocator,
+        io,
+        cache_dir,
+        assets,
+        asset_name,
+        download_path,
+        debug_w,
+        auth_header,
+        gates,
+        minisign_pubkey_b64,
+        repository,
+        auth.default_github_host,
+        w,
+        err_w,
+    );
+}
+
+pub fn verifyAssetOnDiskForHost(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_dir: []const u8,
+    assets: []const Asset,
+    asset_name: []const u8,
+    download_path: []const u8,
+    debug_w: ?*Writer,
+    auth_header: ?[]const u8,
+    gates: VerifyGates,
+    minisign_pubkey_b64: ?[]const u8,
+    repository: ?attestation.Repository,
+    github_host: []const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !VerifyOutcome {
     if (gates.skip_verify) {
         try w.print("note: verification skipped (--skip-verify)\n", .{});
         try w.flush();
@@ -2394,13 +2492,14 @@ pub fn verifyAssetOnDisk(
     const att_outcome: VerifyOutcome = if (gates.shouldSkip(.attestation)) blk: {
         try w.print("note: github attestation verification skipped (--skip-attestation)\n", .{});
         break :blk .no_verification;
-    } else try verifyDownloadedAssetAttestation(
+    } else try verifyDownloadedAssetAttestationForHost(
         allocator,
         io,
         repository,
         download_path,
         debug_w,
         auth_header,
+        github_host,
         w,
         err_w,
     );
@@ -2456,13 +2555,48 @@ test "assetDownload prefers API url with octet-stream when authenticated" {
         .browser_download_url = "https://github.com/o/r/releases/download/v1/tool-linux.tar.xz",
         .url = "https://api.github.com/repos/o/r/releases/assets/123",
     };
-    const auth = assetDownload(asset, true);
-    try std.testing.expectEqualStrings("https://api.github.com/repos/o/r/releases/assets/123", auth.url);
-    try std.testing.expectEqualStrings(asset_octet_accept, auth.accept.?);
+    const authed = assetDownload(asset, true);
+    try std.testing.expectEqualStrings("https://api.github.com/repos/o/r/releases/assets/123", authed.url);
+    try std.testing.expectEqualStrings(asset_octet_accept, authed.accept.?);
 
     const anon = assetDownload(asset, false);
     try std.testing.expectEqualStrings(asset.browser_download_url, anon.url);
     try std.testing.expect(anon.accept == null);
+}
+
+test "parseGitHubReleaseUrlForHost and repositoryFromGitHubUrlForHost support custom hosts" {
+    const allocator = std.testing.allocator;
+    const rel = (try parseGitHubReleaseUrlForHost(
+        allocator,
+        "https://example.ghe.com/octocat/hello-world/releases/download/v0.1.0/readme.zip",
+        "example.ghe.com",
+    )).?;
+    defer rel.deinit(allocator);
+    try std.testing.expectEqualStrings("octocat", rel.owner);
+    try std.testing.expectEqualStrings("hello-world", rel.repo);
+    try std.testing.expectEqualStrings("v0.1.0", rel.tag);
+    try std.testing.expectEqualStrings("readme.zip", rel.file);
+
+    try std.testing.expect((try parseGitHubReleaseUrlForHost(
+        allocator,
+        "https://github.com/octocat/hello-world/releases/download/v0.1.0/readme.zip",
+        "example.ghe.com",
+    )) == null);
+
+    const repo_html = repositoryFromGitHubUrlForHost(
+        "https://example.ghe.com/octocat/hello-world/releases/tag/v0.1.0",
+        "example.ghe.com",
+    ).?;
+    try std.testing.expectEqualStrings("octocat", repo_html.owner);
+    try std.testing.expectEqualStrings("hello-world", repo_html.repo);
+
+    const canonical = canonicalRepositoryForHost(.{
+        .tag_name = "v0.1.0",
+        .assets = &.{},
+        .html_url = "https://example.ghe.com/octocat/hello-world/releases/tag/v0.1.0",
+    }, "example.ghe.com").?;
+    try std.testing.expectEqualStrings("octocat", canonical.owner);
+    try std.testing.expectEqualStrings("hello-world", canonical.repo);
 }
 
 test "assetDownload falls back to browser url when API url is absent" {

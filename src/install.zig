@@ -1778,6 +1778,7 @@ pub const InstallContext = struct {
     /// Installed command names selected by repeatable `--bin` options.
     /// Validation guarantees this is non-empty only for a single-spec run.
     bin_filters: []const []const u8,
+    github_host: []const u8 = auth.default_github_host,
 };
 
 /// True when `abs_dir` is a directory containing a `ghr.json` — i.e. an
@@ -1966,13 +1967,14 @@ fn verifyDownloadedAsset(
         const att_outcome: release_mod.VerifyOutcome = if (gates.shouldSkip(.attestation)) blk: {
             try w.print("note: github attestation verification skipped (--skip-attestation)\n", .{});
             break :blk .no_verification;
-        } else release_mod.verifyDownloadedAssetAttestation(
+        } else release_mod.verifyDownloadedAssetAttestationForHost(
             allocator,
             io,
             repository,
             download_path,
             debug_w,
             auth_header,
+            ctx.github_host,
             w,
             err_w,
         ) catch {
@@ -2033,6 +2035,7 @@ pub const InstallOptions = struct {
     /// one request.
     bin_filters: []const []const u8 = &.{},
     keep_going: bool = false,
+    github_host: []const u8 = auth.default_github_host,
 };
 
 pub const InstallRunError = error{
@@ -2201,6 +2204,7 @@ fn parseInstallRequests(
     allocator: std.mem.Allocator,
     tokens: []const []const u8,
     bin_filters: []const []const u8,
+    github_host: []const u8,
     err_w: *Writer,
 ) !install_request.ParsedRequests {
     if (tokens.len == 0) {
@@ -2209,7 +2213,7 @@ fn parseInstallRequests(
     }
 
     var diagnostic: install_request.Diagnostic = .{};
-    var parsed = install_request.parseWithDiagnostic(allocator, tokens, &diagnostic) catch |err| switch (err) {
+    var parsed = install_request.parseWithDiagnosticForHost(allocator, tokens, github_host, &diagnostic) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             try reportRequestParseError(err_w, err, diagnostic, tokens);
@@ -2267,12 +2271,18 @@ fn writeCacheOptionalString(w: *Writer, value: ?[]const u8) !void {
 
 fn writeCacheGithubSource(
     w: *Writer,
+    github_host: []const u8,
     owner: []const u8,
     repo: []const u8,
     tag: ?[]const u8,
     asset_selector: ?[]const u8,
 ) !void {
-    try w.writeAll("{\"kind\":\"github\",\"owner\":");
+    try w.writeAll("{\"kind\":\"github\"");
+    if (!auth.isDefaultGithubHost(github_host)) {
+        try w.writeAll(",\"host\":");
+        try writeCacheJsonString(w, github_host, true);
+    }
+    try w.writeAll(",\"owner\":");
     try writeCacheJsonString(w, owner, true);
     try w.writeAll(",\"repo\":");
     try writeCacheJsonString(w, repo, true);
@@ -2287,10 +2297,12 @@ fn writeCacheSource(
     allocator: std.mem.Allocator,
     w: *Writer,
     source: install_request.Source,
+    github_host: []const u8,
 ) !void {
     switch (source) {
         .github_repo => |repo| try writeCacheGithubSource(
             w,
+            github_host,
             repo.owner,
             repo.repo,
             repo.tag,
@@ -2298,17 +2310,19 @@ fn writeCacheSource(
         ),
         .github_file => |file| try writeCacheGithubSource(
             w,
+            github_host,
             file.owner,
             file.repo,
             file.tag,
             file.file,
         ),
         .github_release_url => |url| {
-            const parsed = (try release_mod.parseGitHubReleaseUrl(allocator, url)) orelse
+            const parsed = (try release_mod.parseGitHubReleaseUrlForHost(allocator, url, github_host)) orelse
                 return error.InvalidInstallRequest;
             defer parsed.deinit(allocator);
             try writeCacheGithubSource(
                 w,
+                github_host,
                 parsed.owner,
                 parsed.repo,
                 parsed.tag,
@@ -2374,7 +2388,7 @@ fn writeInstallCacheMaterial(
         try w.writeAll("{\"id\":");
         try writeCacheJsonString(w, request.id, false);
         try w.writeAll(",\"source\":");
-        try writeCacheSource(allocator, w, request.source);
+        try writeCacheSource(allocator, w, request.source, options.github_host);
         try w.writeAll(",\"config\":{\"aliases\":[");
 
         const aliases = try allocator.alloc(install_request.Alias, request.config.aliases.len);
@@ -2426,7 +2440,12 @@ pub fn cmdInstallCacheKey(
     options: InstallOptions,
     require_single_request: bool,
 ) !void {
-    var parsed = try parseInstallRequests(allocator, tokens, options.bin_filters, err_w);
+    if (!auth.isValidGithubHost(options.github_host)) {
+        try err_w.print("error: invalid GitHub hostname '{s}'\n", .{options.github_host});
+        try err_w.flush();
+        return error.InvalidInstallRequest;
+    }
+    var parsed = try parseInstallRequests(allocator, tokens, options.bin_filters, options.github_host, err_w);
     defer parsed.deinit();
     if (require_single_request and parsed.items.len != 1) {
         try err_w.print(
@@ -2456,13 +2475,18 @@ pub fn cmdInstallRequests(
     err_w: *Writer,
     options: InstallOptions,
 ) !void {
-    var parsed = try parseInstallRequests(allocator, tokens, options.bin_filters, err_w);
+    if (!auth.isValidGithubHost(options.github_host)) {
+        try err_w.print("error: invalid GitHub hostname '{s}'\n", .{options.github_host});
+        try err_w.flush();
+        return error.InvalidInstallRequest;
+    }
+    var parsed = try parseInstallRequests(allocator, tokens, options.bin_filters, options.github_host, err_w);
     defer parsed.deinit();
 
     const dirs = try Dirs.detect(allocator, environ);
     defer dirs.deinit();
 
-    const auth_resolved = auth.resolveGithubToken(allocator, io, environ, options.no_auth);
+    const auth_resolved = auth.resolveGithubTokenForHost(allocator, io, environ, options.no_auth, options.github_host);
     defer auth_resolved.deinit(allocator);
     const auth_header = try auth.bearerHeader(allocator, auth_resolved);
     defer if (auth_header) |h| allocator.free(h);
@@ -2490,6 +2514,7 @@ pub fn cmdInstallRequests(
         .gates = options.gates,
         .minisign_pubkey_b64 = options.minisign_pubkey_b64,
         .bin_filters = options.bin_filters,
+        .github_host = options.github_host,
     };
 
     // Finish or roll back whatever a previous run left behind BEFORE any
@@ -2600,13 +2625,13 @@ fn stageRequest(
             requested_file = fs.file;
         },
         .github_release_url => |u| {
-            const parsed_opt = release_mod.parseGitHubReleaseUrl(allocator, u) catch {
+            const parsed_opt = release_mod.parseGitHubReleaseUrlForHost(allocator, u, ctx.github_host) catch {
                 try err_w.print("error: failed to parse URL '{s}'\n", .{u});
                 try err_w.flush();
                 return error.InstallStepFailed;
             };
             const parsed = parsed_opt orelse {
-                try err_w.print("error: '{s}' is not a github.com release-download URL\n", .{u});
+                try err_w.print("error: '{s}' is not a {s} release-download URL\n", .{ u, ctx.github_host });
                 try err_w.flush();
                 return error.InstallStepFailed;
             };
@@ -2622,7 +2647,7 @@ fn stageRequest(
     try w.print(" ...\n", .{});
     try w.flush();
 
-    var release = getRelease(allocator, ctx.client, spec.owner, spec.repo, spec.tag, ctx.auth_header) catch |err| {
+    var release = release_mod.getReleaseForHost(allocator, ctx.client, spec.owner, spec.repo, spec.tag, ctx.auth_header, ctx.github_host) catch |err| {
         switch (err) {
             error.GitHubApiError => {
                 try err_w.print("error: release not found for {s}/{s}", .{ spec.owner, spec.repo });
@@ -2643,7 +2668,7 @@ fn stageRequest(
     defer primary_assets.deinit(allocator);
     try selectPrimaryAssets(ctx, spec, release.parsed.value, requested_file, tag_name, &primary_assets);
 
-    const repository: attestation.Repository = release_mod.canonicalRepository(release.parsed.value) orelse
+    const repository: attestation.Repository = release_mod.canonicalRepositoryForHost(release.parsed.value, ctx.github_host) orelse
         .{ .owner = spec.owner, .repo = spec.repo };
 
     if (release_mod.isWasmAssetName(primary_assets.items[0].name)) {

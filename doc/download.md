@@ -10,6 +10,7 @@ macOS, and Windows; no `choco install wget` step needed.
 ghr download <spec> [<pubkey>] [<spec> [<pubkey>] ...] [options]
 
 OPTIONS:
+    -h, --hostname <host>      GitHub hostname (default: GH_HOST or github.com)
     -o, --output <path>        Output file path (single-spec only)
         --extract <dir>        Extract archive(s) into <dir> after download
         --strip-components <N> Strip N leading path components when extracting
@@ -26,6 +27,7 @@ OPTIONS:
         --quiet                Suppress progress output
         --no-auth              Do not send GitHub auth even for github.com URLs
         --debug                Verbose diagnostic output
+        --help                 Show this help
 ```
 
 Each `<spec>` is `owner/repo[@tag]` (auto-pick asset for the current
@@ -47,8 +49,7 @@ archive in a shared directory", or invoke `ghr download` once per
 spec for distinct outputs. `--keep-going` continues past per-spec
 failures and exits non-zero with a summary if any spec failed.
 
-GitHub auth is attached automatically (using `GH_TOKEN`,
-`GITHUB_TOKEN`, or `gh auth token`); pass `--no-auth` to skip it.
+GitHub auth is attached automatically (using `GH_ENTERPRISE_TOKEN` / `GITHUB_ENTERPRISE_TOKEN` on custom hosts, `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token --hostname <host>`); pass `--no-auth` to skip it. Use `-h` / `--hostname <host>` or set `GH_HOST` to target GitHub Enterprise Cloud with Data Residency (`*.ghe.com`, e.g. `example.ghe.com`) or GitHub Enterprise Server.
 When a token is present, release assets are fetched through the
 GitHub asset API endpoint rather than the public download URL, so
 private and SSO-protected enterprise releases work as long as the
