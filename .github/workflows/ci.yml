@@ -165,19 +165,40 @@ jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-22.04
-    needs: [native-build-and-test, cross-compile, site]
+    needs:
+      - setup-action-unit
+      - setup-action-native
+      - action-hosted-linux
+      - action-bare-container
+      - native-build-and-test
+      - cross-compile
+      - site
+      - action-install-smoke
+      - action-download-smoke
     if: always()
     steps:
-      - name: Require successful native, cross-target and site validation
+      - name: Require all CI jobs to succeed
         env:
+          SETUP_UNIT_RESULT: ${{ needs.setup-action-unit.result }}
+          SETUP_NATIVE_RESULT: ${{ needs.setup-action-native.result }}
+          HOSTED_LINUX_RESULT: ${{ needs.action-hosted-linux.result }}
+          BARE_CONTAINER_RESULT: ${{ needs.action-bare-container.result }}
           NATIVE_RESULT: ${{ needs.native-build-and-test.result }}
           CROSS_RESULT: ${{ needs.cross-compile.result }}
           SITE_RESULT: ${{ needs.site.result }}
+          INSTALL_SMOKE_RESULT: ${{ needs.action-install-smoke.result }}
+          DOWNLOAD_SMOKE_RESULT: ${{ needs.action-download-smoke.result }}
         run: |
           set -euo pipefail
+          test "$SETUP_UNIT_RESULT" = success
+          test "$SETUP_NATIVE_RESULT" = success
+          test "$HOSTED_LINUX_RESULT" = success
+          test "$BARE_CONTAINER_RESULT" = success
           test "$NATIVE_RESULT" = success
           test "$CROSS_RESULT" = success
           test "$SITE_RESULT" = success
+          test "$INSTALL_SMOKE_RESULT" = success
+          test "$DOWNLOAD_SMOKE_RESULT" = success
 
   native-build-and-test:
     name: Native build, unit tests & help (${{ matrix.os }})
