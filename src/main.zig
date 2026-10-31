@@ -990,6 +990,17 @@ fn printListArguments(allocator: std.mem.Allocator, inventory: install_state.Inv
     return failed;
 }
 
+fn hasWasmCommand(rec: install_state.InventoryRecord) bool {
+    if (rec.kind == .v1_wasm) return true;
+    for (rec.commands) |cmd| {
+        if (cmd.kind) |k| {
+            if (std.mem.eql(u8, k, "wasm")) return true;
+        }
+        if (install_state.isWasmTarget(cmd.relative_target)) return true;
+    }
+    return false;
+}
+
 fn renderListArguments(allocator: std.mem.Allocator, rec: install_state.InventoryRecord, format: ListFormat) !ListArgumentLine {
     const id = rec.id orelse return error.UnrepresentableInstallId;
     var request_id = id;
@@ -1004,10 +1015,11 @@ fn renderListArguments(allocator: std.mem.Allocator, rec: install_state.Inventor
             .asset_selector = if (rec.kind == .v1_wasm) rec.asset else null,
         };
     };
+    const is_wasm_unit = hasWasmCommand(rec);
     if (src.kind == .github and src.asset_selector == null) {
         if (rec.resolved) |resolved| {
             if (resolved.asset) |asset| {
-                if (release_mod.isWasmAssetName(asset)) src.asset_selector = asset;
+                if (release_mod.isWasmAssetName(asset) or is_wasm_unit) src.asset_selector = asset;
             }
         }
     }
@@ -1037,9 +1049,13 @@ fn renderListArguments(allocator: std.mem.Allocator, rec: install_state.Inventor
             defer allocator.free(repo_id);
             const tag = if (rec.resolved) |resolved| resolved.tag orelse src.tag else src.tag;
             if (src.asset_selector) |selector| {
-                if (release_mod.wasmAssetStem(selector)) |raw_stem| {
+                const raw_stem = if (is_wasm_unit)
+                    release_mod.wasmBundleStem(selector)
+                else
+                    release_mod.wasmAssetStem(selector);
+                if (raw_stem) |s| {
                     // A wasm install appends its asset stem to the request ID.
-                    const stem = try install_request.canonicalizeId(allocator, raw_stem);
+                    const stem = try install_request.canonicalizeId(allocator, s);
                     defer allocator.free(stem);
                     if (request_id.len <= stem.len + 1 or
                         !std.mem.endsWith(u8, request_id, stem) or
@@ -1647,6 +1663,17 @@ test "list --tags reproduces wasm parent IDs instead of appending the stem twice
     const compressed = try tListRender(&records, .tags);
     defer t_list_alloc.free(compressed);
     try std.testing.expectEqualStrings("cataggar/zig/mod.wasm.zst@zigb-0.16.1\n", compressed);
+
+    var wasm_cmds = [_]install_state.OwnedCommand{
+        .{ .name = "wazig", .source_name = "wazig", .relative_target = "wazig.wasm", .kind = "wasm" },
+    };
+    records[0].id = "cataggar/zig/wazig";
+    records[0].commands = &wasm_cmds;
+    records[0].source.?.asset_selector = "wazig.tar.zst";
+    records[0].resolved.?.asset = "wazig.tar.zst";
+    const bundle = try tListRender(&records, .tags);
+    defer t_list_alloc.free(bundle);
+    try std.testing.expectEqualStrings("cataggar/zig/wazig.tar.zst@zigb-0.16.1\n", bundle);
 }
 
 test "list --tags falls back to release URLs for selectors not supported by file specs" {
