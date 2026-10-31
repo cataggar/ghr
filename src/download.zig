@@ -531,7 +531,7 @@ fn downloadOne(
         const fmt = archive.detectFormat(paths.archive_name);
         if (fmt == .unknown) {
             try err_w.print("error: cannot extract '{s}': unrecognised archive format\n", .{paths.archive_name});
-            try err_w.print("  supported formats: .zip, .tar.gz, .tgz, .tar.xz, .txz, .tar.zst, .tzst\n", .{});
+            try err_w.print("  supported formats: .zip, .tar.gz, .tgz, .tar.xz, .txz, .tar.zst, .tzst, .wasm.gz, .wasm.xz, .wasm.zst\n", .{});
             try err_w.flush();
             return step.fail(exit_arg_error);
         }

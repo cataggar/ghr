@@ -1043,11 +1043,11 @@ fn scanAppBundle(
     }
 }
 
-/// Strip the trailing `.wasm` from a wasm asset basename to get the command
-/// stem (e.g. `hello.wasm` -> `hello`).
+/// Strip the trailing `.wasm[.gz|.xz|.zst]` from a wasm asset basename to get
+/// the command stem (e.g. `hello.wasm` or `hello.wasm.zst` -> `hello`).
 fn wasmStem(wasm_rel_path: []const u8) []const u8 {
     const base = std.fs.path.basename(wasm_rel_path);
-    return base[0 .. base.len - ".wasm".len];
+    return release_mod.wasmAssetStem(base) orelse base[0 .. base.len - ".wasm".len];
 }
 
 /// Shape of a `.ghr` manifest (ZON). The release ships `<wasm>.ghr` with
@@ -3217,12 +3217,14 @@ fn stageWasmUnit(
         debug_w,
     );
 
-    const ghr_name = try allocator.print("{s}.ghr", .{asset.name});
+    const wasm_filename = try allocator.print("{s}.wasm", .{stem});
+    defer allocator.free(wasm_filename);
+    const ghr_name = try allocator.print("{s}.ghr", .{wasm_filename});
     defer allocator.free(ghr_name);
     const ghr_asset = release_mod.findGhrManifestAsset(assets, asset.name) orelse {
         try err_w.print(
-            "error: wasm asset '{s}' has no companion '{s}.ghr' manifest in this release\n",
-            .{ asset.name, asset.name },
+            "error: wasm asset '{s}' has no companion '{s}' manifest in this release\n",
+            .{ asset.name, ghr_name },
         );
         try err_w.flush();
         return error.InstallStepFailed;
@@ -3255,11 +3257,19 @@ fn stageWasmUnit(
             return error.InstallStepFailed;
         };
         defer cache_dir.close(io);
-        cache_dir.copyFile(asset.name, stage_dir, asset.name, io, .{}) catch |err| {
-            try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
-            try err_w.flush();
-            return error.InstallStepFailed;
-        };
+        if (archive.detectFormat(asset.name) != .unknown) {
+            archive.extractAuto(allocator, io, stage_dir, download_path, 0) catch |err| {
+                try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
+        } else {
+            cache_dir.copyFile(asset.name, stage_dir, wasm_filename, io, .{}) catch |err| {
+                try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
+        }
         cache_dir.copyFile(ghr_name, stage_dir, ghr_name, io, .{}) catch |err| {
             try err_w.print("error: failed to stage manifest '{s}': {t}\n", .{ ghr_name, err });
             try err_w.flush();
@@ -3267,7 +3277,7 @@ fn stageWasmUnit(
         };
     }
 
-    const target = try a.dupe(u8, asset.name);
+    const target = try a.dupe(u8, wasm_filename);
     const commands = try a.alloc(command_plan.Command, 1);
     commands[0] = .{ .relative_target = target, .kind = .wasm };
     unit.commands = commands;
@@ -6900,8 +6910,13 @@ test "commit survives allocation failure without leaving live state behind" {
 
 test "wasmStem strips the .wasm extension from the basename" {
     try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm"));
+    try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm.gz"));
+    try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm.xz"));
+    try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm.zst"));
     try std.testing.expectEqualStrings("hello", wasmStem("sub/dir/hello.wasm"));
+    try std.testing.expectEqualStrings("hello", wasmStem("sub/dir/hello.wasm.zst"));
     try std.testing.expectEqualStrings("a.b", wasmStem("a.b.wasm"));
+    try std.testing.expectEqualStrings("a.b", wasmStem("a.b.wasm.xz"));
 }
 
 test "validateInstallOptions requires one spec when bin filters are present" {
@@ -9234,6 +9249,60 @@ test "stageWasmUnit cleans up cache on download, verification, manifest failure 
         try std.testing.expect(store.binEntryExists("plugin"));
         try std.testing.expect(store.binEntryExists("plugin.ghr"));
     }
+}
+
+test "stageWasmUnit decompresses .wasm.zst into <stem>.wasm and links companion <stem>.wasm.ghr" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    const wasm_zst_resp = "HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n\x28\xb5\x2f\xfd\x20\x08\x41\x00\x00\x00\x61\x73\x6d\x01\x00\x00\x00";
+    const good_ghr_resp = "HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n.{ .version = 1 }";
+
+    var srv: TestHttpServer = undefined;
+    try srv.start(&.{
+        wasm_zst_resp,
+        good_ghr_resp,
+    });
+    defer srv.finish();
+
+    const spec: Spec = .{ .owner = "example", .repo = "plugins", .tag = "v1.0.0" };
+    const repo: attestation.Repository = .{ .owner = "example", .repo = "plugins" };
+    const req: install_request.InstallRequest = .{
+        .id = @constCast("example/plugins"),
+        .id_origin = .derived,
+        .source = .{ .github_repo = spec },
+        .config = .{ .aliases = &.{}, .minisign = null },
+        .original_tokens = .{ .source = 0 },
+    };
+
+    const wasm_zst_url = try t_alloc.print("http://127.0.0.1:{d}/plugin.wasm.zst", .{srv.port()});
+    defer t_alloc.free(wasm_zst_url);
+    const ghr_url = try t_alloc.print("http://127.0.0.1:{d}/plugin.wasm.ghr", .{srv.port()});
+    defer t_alloc.free(ghr_url);
+
+    var ctx = store.ctx();
+    ctx.gates.skip_verify = true;
+    const assets = [_]release_mod.Asset{
+        .{ .name = "plugin.wasm.zst", .browser_download_url = wasm_zst_url },
+        .{ .name = "plugin.wasm.ghr", .browser_download_url = ghr_url },
+    };
+    var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+    defer tDestroyStagedUnits(&staged);
+    try stageWasmUnit(&ctx, req, spec, "v1.0.0", &assets, assets[0], null, repo, &staged);
+    try tExpectCacheEmpty(&store);
+    try tCommit(&ctx, staged.items);
+    try tExpectCacheEmpty(&store);
+
+    try std.testing.expect(store.binEntryExists("plugin"));
+    try std.testing.expect(store.binEntryExists("plugin.ghr"));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    const rec = tFindRecord(inv, "example/plugins/plugin").?;
+    try std.testing.expectEqualStrings("plugin.wasm", rec.commands[0].relative_target);
+    try std.testing.expectEqualStrings("plugin.wasm.zst", rec.source.?.asset_selector.?);
+    try std.testing.expectEqualStrings("plugin.wasm.zst", rec.resolved.?.asset.?);
 }
 
 test "stageGenericUrlRequest cleans up cache on download, verification, extraction failure and after install" {

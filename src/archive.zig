@@ -67,6 +67,52 @@ pub fn extractTarZst(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: 
     try extractTarZstReader(allocator, io, dest_dir, &file_reader.interface, strip_components);
 }
 
+fn writeStreamToFile(io: Io, dest_dir: Dir, out_name: []const u8, reader: *std.Io.Reader) !void {
+    var out_file = try dest_dir.createFile(io, out_name, .{});
+    errdefer dest_dir.deleteFile(io, out_name) catch {};
+    defer out_file.close(io);
+    var out_buf: [8192]u8 = undefined;
+    var file_writer = out_file.writer(io, &out_buf);
+    _ = try reader.streamRemaining(&file_writer.interface);
+    try file_writer.end();
+}
+
+pub fn extractWasmGz(io: Io, dest_dir: Dir, file: *File, out_name: []const u8) !void {
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_buf);
+    var decompress_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress: std.compress.flate.Decompress = .init(
+        &file_reader.interface,
+        .gzip,
+        &decompress_buf,
+    );
+    try writeStreamToFile(io, dest_dir, out_name, &decompress.reader);
+}
+
+pub fn extractWasmXz(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *File, out_name: []const u8) !void {
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_buf);
+    const xz_buf = try allocator.alloc(u8, 8192);
+    var xz_decompress = std.compress.xz.Decompress.init(&file_reader.interface, allocator, xz_buf) catch |err| {
+        allocator.free(xz_buf);
+        return err;
+    };
+    defer xz_decompress.deinit();
+    try writeStreamToFile(io, dest_dir, out_name, &xz_decompress.reader);
+}
+
+pub fn extractWasmZst(allocator: std.mem.Allocator, io: Io, dest_dir: Dir, file: *File, out_name: []const u8) !void {
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_buf);
+    const zstd_buf = try allocator.alloc(
+        u8,
+        std.compress.zstd.default_window_len + std.compress.zstd.block_size_max,
+    );
+    defer allocator.free(zstd_buf);
+    var zstd_stream = std.compress.zstd.Decompress.init(&file_reader.interface, zstd_buf, .{});
+    try writeStreamToFile(io, dest_dir, out_name, &zstd_stream.reader);
+}
+
 fn parseDebMember(bytes: []const u8, member_name: []const u8) ![]const u8 {
     if (!std.mem.startsWith(u8, bytes, "!<arch>\n")) return error.InvalidDebArchive;
 
@@ -115,6 +161,9 @@ pub const Format = enum {
     tar_gz,
     tar_xz,
     tar_zst,
+    wasm_gz,
+    wasm_xz,
+    wasm_zst,
     deb,
     unknown,
 };
@@ -126,8 +175,25 @@ pub fn detectFormat(name: []const u8) Format {
     if (endsWithIgnoreCase(name, ".tar.gz") or endsWithIgnoreCase(name, ".tgz")) return .tar_gz;
     if (endsWithIgnoreCase(name, ".tar.xz") or endsWithIgnoreCase(name, ".txz")) return .tar_xz;
     if (endsWithIgnoreCase(name, ".tar.zst") or endsWithIgnoreCase(name, ".tzst")) return .tar_zst;
+    if (endsWithIgnoreCase(name, ".wasm.gz")) return .wasm_gz;
+    if (endsWithIgnoreCase(name, ".wasm.xz")) return .wasm_xz;
+    if (endsWithIgnoreCase(name, ".wasm.zst")) return .wasm_zst;
     if (endsWithIgnoreCase(name, ".deb")) return .deb;
     return .unknown;
+}
+
+fn wasmDecompressedName(archive_path: []const u8, format: Format) ![]const u8 {
+    const base = std.fs.path.basename(archive_path);
+    const suffix_len: usize = switch (format) {
+        .wasm_gz => ".gz".len,
+        .wasm_xz => ".xz".len,
+        .wasm_zst => ".zst".len,
+        else => return error.UnknownArchiveFormat,
+    };
+    if (base.len <= suffix_len) return error.UnknownArchiveFormat;
+    const out_name = base[0 .. base.len - suffix_len];
+    if (!isSafePath(out_name)) return error.UnknownArchiveFormat;
+    return out_name;
 }
 
 fn endsWithIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
@@ -157,6 +223,9 @@ pub fn extractAuto(
         .tar_gz => try extractTarGz(io, dest_dir, &file, strip_components),
         .tar_xz => try extractTarXz(allocator, io, dest_dir, &file, strip_components),
         .tar_zst => try extractTarZst(allocator, io, dest_dir, &file, strip_components),
+        .wasm_gz => try extractWasmGz(io, dest_dir, &file, try wasmDecompressedName(archive_path, format)),
+        .wasm_xz => try extractWasmXz(allocator, io, dest_dir, &file, try wasmDecompressedName(archive_path, format)),
+        .wasm_zst => try extractWasmZst(allocator, io, dest_dir, &file, try wasmDecompressedName(archive_path, format)),
         .deb => try extractDeb(allocator, io, dest_dir, &file),
         .unknown => return error.UnknownArchiveFormat,
     }
@@ -173,8 +242,15 @@ test "detectFormat recognises common archive suffixes" {
     try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.tar.zst"));
     try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.tzst"));
     try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.TAR.ZST"));
+    try std.testing.expectEqual(Format.wasm_gz, detectFormat("foo.wasm.gz"));
+    try std.testing.expectEqual(Format.wasm_gz, detectFormat("foo.WASM.GZ"));
+    try std.testing.expectEqual(Format.wasm_xz, detectFormat("foo.wasm.xz"));
+    try std.testing.expectEqual(Format.wasm_xz, detectFormat("foo.WASM.XZ"));
+    try std.testing.expectEqual(Format.wasm_zst, detectFormat("foo.wasm.zst"));
+    try std.testing.expectEqual(Format.wasm_zst, detectFormat("foo.WASM.ZST"));
     try std.testing.expectEqual(Format.deb, detectFormat("foo.deb"));
     try std.testing.expectEqual(Format.deb, detectFormat("FOO.DEB"));
+    try std.testing.expectEqual(Format.unknown, detectFormat("foo.wasm"));
     try std.testing.expectEqual(Format.unknown, detectFormat("foo.exe"));
     try std.testing.expectEqual(Format.unknown, detectFormat("foo"));
     try std.testing.expectEqual(Format.unknown, detectFormat(""));
@@ -477,4 +553,53 @@ test "extractAuto rejects unknown formats" {
     const abs_len = try tmp.dir.realPathFile(std.testing.io, "blob.bin", &path_buf);
     const abs = path_buf[0..abs_len];
     try std.testing.expectError(error.UnknownArchiveFormat, extractAuto(std.testing.allocator, std.testing.io, tmp.dir, abs, 0));
+}
+
+test "extractAuto decompresses .wasm.gz, .wasm.xz, and .wasm.zst to .wasm" {
+    const wasm_magic = "\x00asm\x01\x00\x00\x00";
+    const cases = [_]struct {
+        filename: []const u8,
+        expected_out: []const u8,
+        payload: []const u8,
+    }{
+        .{
+            .filename = "hello.wasm.gz",
+            .expected_out = "hello.wasm",
+            .payload = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x63\x48\x2c\xce\x65\x64\x60\x60\x00\x00\xce\x33\x4b\x1c\x08\x00\x00\x00",
+        },
+        .{
+            .filename = "mod.wasm.xz",
+            .expected_out = "mod.wasm",
+            .payload = "\xfd\x37\x7a\x58\x5a\x00\x00\x01\x69\x22\xde\x36\x02\x00\x21\x01\x16\x00\x00\x00\x74\x2f\xe5\xa3\x01\x00\x07\x00\x61\x73\x6d\x01\x00\x00\x00\x00\xce\x33\x4b\x1c\x00\x01\x1c\x08\x44\x60\x2a\xc8\x90\x42\x99\x0d\x01\x00\x00\x00\x00\x01\x59\x5a",
+        },
+        .{
+            .filename = "plugin.wasm.zst",
+            .expected_out = "plugin.wasm",
+            .payload = "\x28\xb5\x2f\xfd\x20\x08\x41\x00\x00\x00\x61\x73\x6d\x01\x00\x00\x00",
+        },
+    };
+
+    for (cases) |tc| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var f = try tmp.dir.createFile(std.testing.io, tc.filename, .{});
+        try f.writeStreamingAll(std.testing.io, tc.payload);
+        f.close(std.testing.io);
+
+        var path_buf: [Dir.max_path_bytes]u8 = undefined;
+        const abs_len = try tmp.dir.realPathFile(std.testing.io, tc.filename, &path_buf);
+        const abs = path_buf[0..abs_len];
+
+        try extractAuto(std.testing.allocator, std.testing.io, tmp.dir, abs, 0);
+
+        const content = try tmp.dir.readFileAlloc(
+            std.testing.io,
+            tc.expected_out,
+            std.testing.allocator,
+            Io.Limit.limited(64),
+        );
+        defer std.testing.allocator.free(content);
+        try std.testing.expectEqualSlices(u8, wasm_magic, content);
+    }
 }

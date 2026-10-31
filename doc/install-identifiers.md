@@ -43,6 +43,13 @@ directory level containing any executables. It searches deeper only when no
 shallower candidates exist, so nested-only package layouts still work without
 putting executable-looking firmware or data files on `PATH`.
 
+For `.wasm`, `.wasm.gz`, `.wasm.xz`, and `.wasm.zst` assets accompanied by a
+`<stem>.wasm.ghr` manifest, `ghr install` verifies the downloaded asset,
+decompresses compressed `.wasm.{gz,xz,zst}` payloads into `<stem>.wasm`, and
+stages each module as its own unit (`<request-id>/<stem>`). When a release
+publishes multiple variants for the same wasm stem, bare `ghr install owner/repo`
+prefers `.wasm.zst > .wasm.xz > .wasm.gz > .wasm`.
+
 Relative symlink aliases at that level are exposed under their own command
 names when their chains resolve to executable files inside the extracted
 package. For example, `bin/llvm-readelf -> llvm-readobj` publishes
