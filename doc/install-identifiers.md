@@ -43,12 +43,19 @@ directory level containing any executables. It searches deeper only when no
 shallower candidates exist, so nested-only package layouts still work without
 putting executable-looking firmware or data files on `PATH`.
 
-For `.wasm`, `.wasm.gz`, `.wasm.xz`, and `.wasm.zst` assets accompanied by a
-`<stem>.wasm.ghr` manifest, `ghr install` verifies the downloaded asset,
-decompresses compressed `.wasm.{gz,xz,zst}` payloads into `<stem>.wasm`, and
-stages each module as its own unit (`<request-id>/<stem>`). When a release
-publishes multiple variants for the same wasm stem, bare `ghr install owner/repo`
-prefers `.wasm.zst > .wasm.xz > .wasm.gz > .wasm`.
+For `.wasm`, `.wasm.gz`, `.wasm.xz`, and `.wasm.zst` assets, as well as archive
+bundles (`.tar.zst`, `.tzst`, `.tar.xz`, `.txz`, `.tar.gz`, `.tgz`, `.zip`)
+containing `<stem>.wasm` at the archive root, accompanied by an exact
+`<asset.name>.ghr` sidecar manifest (for example `plugin.wasm.zst.ghr` for
+`plugin.wasm.zst` or `wazig.tar.zst.ghr` for `wazig.tar.zst`), `ghr install`
+verifies the downloaded asset, extracts or decompresses it so `<stem>.wasm` (and
+any bundled files such as `lib/`) is staged alongside `<stem>.wasm.ghr`, and
+stages each module as its own unit (`<request-id>/<stem>`). Any
+`${GHR_TOOL_DIR}` placeholder in `runtimeArgs` is expanded to the installed unit
+directory (`unit_path`) when writing the command's `.ghr` manifest (and by the
+shim at runtime if present). When a release publishes multiple variants for the
+same wasm stem, bare `ghr install owner/repo` prefers
+`.tar.zst > .tar.xz > .tar.gz > .zip > .wasm.zst > .wasm.xz > .wasm.gz > .wasm`.
 
 Relative symlink aliases at that level are exposed under their own command
 names when their chains resolve to executable files inside the extracted

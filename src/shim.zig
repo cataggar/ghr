@@ -174,6 +174,14 @@ fn spawnDirectAndExit(io: Io, stderr: *Io.Writer, argv: []const []const u8) nore
     }
 }
 
+/// Expand `${GHR_TOOL_DIR}` placeholders in a runtime argument to `tool_dir`.
+/// Returns a borrowed slice of `arg` when no placeholder is present, or an
+/// owned slice allocated from `allocator` when expanded.
+fn expandToolDir(allocator: std.mem.Allocator, arg: []const u8, tool_dir: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, arg, "${GHR_TOOL_DIR}") == null) return arg;
+    return std.mem.replaceOwned(u8, allocator, arg, "${GHR_TOOL_DIR}", tool_dir);
+}
+
 /// Run a wasm target named in the manifest:
 /// `<runtime> <runtimeArgs...> <targetWasm> <user args...>`. Never returns.
 fn runWasm(
@@ -201,8 +209,12 @@ fn runWasm(
     argv.append(allocator, runtime_path) catch {
         exitWithError(stderr, "shim: out of memory\n", .{});
     };
+    const tool_dir = std.fs.path.dirname(manifest.targetWasm) orelse ".";
     for (manifest.runtimeArgs) |a| {
-        argv.append(allocator, a) catch {
+        const expanded = expandToolDir(allocator, a, tool_dir) catch {
+            exitWithError(stderr, "shim: out of memory\n", .{});
+        };
+        argv.append(allocator, expanded) catch {
             exitWithError(stderr, "shim: out of memory\n", .{});
         };
     }
@@ -365,4 +377,14 @@ test "manifest parser releases arena allocations when parsing runs out of memory
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.parse, .{});
+}
+
+test "expandToolDir expands ${GHR_TOOL_DIR} including paths with spaces" {
+    const allocator = std.testing.allocator;
+    const unchanged = try expandToolDir(allocator, "--dir=.", "/tools/my unit");
+    try std.testing.expectEqualStrings("--dir=.", unchanged);
+
+    const expanded = try expandToolDir(allocator, "--dir=${GHR_TOOL_DIR}/lib::/lib", "/tools/my unit/_unit");
+    defer allocator.free(expanded);
+    try std.testing.expectEqualStrings("--dir=/tools/my unit/_unit/lib::/lib", expanded);
 }

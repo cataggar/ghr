@@ -1043,11 +1043,12 @@ fn scanAppBundle(
     }
 }
 
-/// Strip the trailing `.wasm[.gz|.xz|.zst]` from a wasm asset basename to get
-/// the command stem (e.g. `hello.wasm` or `hello.wasm.zst` -> `hello`).
+/// Strip the trailing `.wasm[.gz|.xz|.zst]` or archive bundle suffix from a
+/// wasm asset basename to get the command stem (e.g. `hello.wasm`,
+/// `hello.wasm.zst`, or `wazig.tar.zst` -> `hello` / `wazig`).
 fn wasmStem(wasm_rel_path: []const u8) []const u8 {
     const base = std.fs.path.basename(wasm_rel_path);
-    return release_mod.wasmAssetStem(base) orelse base[0 .. base.len - ".wasm".len];
+    return release_mod.wasmBundleStem(base) orelse base[0 .. base.len - ".wasm".len];
 }
 
 /// Shape of a `.ghr` manifest (ZON). The release ships `<wasm>.ghr` with
@@ -2671,7 +2672,7 @@ fn stageRequest(
     const repository: attestation.Repository = release_mod.canonicalRepositoryForHost(release.parsed.value, ctx.github_host) orelse
         .{ .owner = spec.owner, .repo = spec.repo };
 
-    if (release_mod.isWasmAssetName(primary_assets.items[0].name)) {
+    if (release_mod.isWasmReleaseAsset(release.parsed.value.assets, primary_assets.items[0].name)) {
         if (ctx.bin_filters.len > 0) {
             try err_w.print("error: '--bin' is not supported when installing wasm modules\n", .{});
             try err_w.print("  hint: omit --bin; each wasm module installs its manifest-defined command\n", .{});
@@ -3219,17 +3220,19 @@ fn stageWasmUnit(
 
     const wasm_filename = try allocator.print("{s}.wasm", .{stem});
     defer allocator.free(wasm_filename);
-    const ghr_name = try allocator.print("{s}.ghr", .{wasm_filename});
-    defer allocator.free(ghr_name);
+    const staged_ghr_name = try allocator.print("{s}.ghr", .{wasm_filename});
+    defer allocator.free(staged_ghr_name);
+    const expected_ghr_name = try allocator.print("{s}.ghr", .{asset.name});
+    defer allocator.free(expected_ghr_name);
     const ghr_asset = release_mod.findGhrManifestAsset(assets, asset.name) orelse {
         try err_w.print(
             "error: wasm asset '{s}' has no companion '{s}' manifest in this release\n",
-            .{ asset.name, ghr_name },
+            .{ asset.name, expected_ghr_name },
         );
         try err_w.flush();
         return error.InstallStepFailed;
     };
-    const ghr_path = try allocator.print("{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_name });
+    const ghr_path = try allocator.print("{s}{c}{s}", .{ d.cache, std.fs.path.sep, ghr_asset.name });
     defer allocator.free(ghr_path);
     defer Dir.deleteFileAbsolute(io, ghr_path) catch {};
     const ghr_dl = release_mod.assetDownload(ghr_asset, ctx.auth_header != null);
@@ -3263,6 +3266,22 @@ fn stageWasmUnit(
                 try err_w.flush();
                 return error.InstallStepFailed;
             };
+            const stat = stage_dir.statFile(io, wasm_filename, .{}) catch {
+                try err_w.print(
+                    "error: wasm bundle '{s}' did not contain '{s}' at archive root\n",
+                    .{ asset.name, wasm_filename },
+                );
+                try err_w.flush();
+                return error.InstallStepFailed;
+            };
+            if (stat.kind != .file) {
+                try err_w.print(
+                    "error: wasm bundle '{s}' did not contain regular file '{s}' at archive root\n",
+                    .{ asset.name, wasm_filename },
+                );
+                try err_w.flush();
+                return error.InstallStepFailed;
+            }
         } else {
             cache_dir.copyFile(asset.name, stage_dir, wasm_filename, io, .{}) catch |err| {
                 try err_w.print("error: failed to stage wasm '{s}': {t}\n", .{ asset.name, err });
@@ -3270,8 +3289,8 @@ fn stageWasmUnit(
                 return error.InstallStepFailed;
             };
         }
-        cache_dir.copyFile(ghr_name, stage_dir, ghr_name, io, .{}) catch |err| {
-            try err_w.print("error: failed to stage manifest '{s}': {t}\n", .{ ghr_name, err });
+        cache_dir.copyFile(ghr_asset.name, stage_dir, staged_ghr_name, io, .{}) catch |err| {
+            try err_w.print("error: failed to stage manifest '{s}': {t}\n", .{ ghr_asset.name, err });
             try err_w.flush();
             return error.InstallStepFailed;
         };
@@ -4807,9 +4826,13 @@ fn publishWasmCommand(
         writeZonEscaped(gw, manifest.runtime) catch return error.WriteFailed;
         gw.print("\",\n    .runtimeArgs = .{{", .{}) catch return error.WriteFailed;
         for (manifest.runtimeArgs, 0..) |arg, i| {
+            const expanded = if (std.mem.indexOf(u8, arg, "${GHR_TOOL_DIR}") != null)
+                try std.mem.replaceOwned(u8, arena.allocator(), arg, "${GHR_TOOL_DIR}", unit_path)
+            else
+                arg;
             if (i > 0) gw.print(",", .{}) catch return error.WriteFailed;
             gw.print(" \"", .{}) catch return error.WriteFailed;
-            writeZonEscaped(gw, arg) catch return error.WriteFailed;
+            writeZonEscaped(gw, expanded) catch return error.WriteFailed;
             gw.print("\"", .{}) catch return error.WriteFailed;
         }
         if (manifest.runtimeArgs.len > 0) gw.print(" ", .{}) catch return error.WriteFailed;
@@ -6908,11 +6931,16 @@ test "commit survives allocation failure without leaving live state behind" {
     try std.testing.expect(!store.binEntryExists("tool"));
 }
 
-test "wasmStem strips the .wasm extension from the basename" {
+test "wasmStem strips the .wasm or bundle archive extension from the basename" {
     try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm"));
     try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm.gz"));
     try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm.xz"));
     try std.testing.expectEqualStrings("hello", wasmStem("hello.wasm.zst"));
+    try std.testing.expectEqualStrings("wazig", wasmStem("wazig.tar.zst"));
+    try std.testing.expectEqualStrings("wazig", wasmStem("wazig.tzst"));
+    try std.testing.expectEqualStrings("wazig", wasmStem("wazig.tar.xz"));
+    try std.testing.expectEqualStrings("wazig", wasmStem("wazig.tar.gz"));
+    try std.testing.expectEqualStrings("wazig", wasmStem("wazig.zip"));
     try std.testing.expectEqualStrings("hello", wasmStem("sub/dir/hello.wasm"));
     try std.testing.expectEqualStrings("hello", wasmStem("sub/dir/hello.wasm.zst"));
     try std.testing.expectEqualStrings("a.b", wasmStem("a.b.wasm"));
@@ -9251,7 +9279,7 @@ test "stageWasmUnit cleans up cache on download, verification, manifest failure 
     }
 }
 
-test "stageWasmUnit decompresses .wasm.zst into <stem>.wasm and links companion <stem>.wasm.ghr" {
+test "stageWasmUnit decompresses .wasm.zst into <stem>.wasm and links companion <asset.name>.ghr" {
     if (host_is_windows) return error.SkipZigTest;
     var store = try TestStore.init();
     defer store.deinit();
@@ -9261,6 +9289,7 @@ test "stageWasmUnit decompresses .wasm.zst into <stem>.wasm and links companion 
 
     var srv: TestHttpServer = undefined;
     try srv.start(&.{
+        wasm_zst_resp,
         wasm_zst_resp,
         good_ghr_resp,
     });
@@ -9278,14 +9307,32 @@ test "stageWasmUnit decompresses .wasm.zst into <stem>.wasm and links companion 
 
     const wasm_zst_url = try t_alloc.print("http://127.0.0.1:{d}/plugin.wasm.zst", .{srv.port()});
     defer t_alloc.free(wasm_zst_url);
-    const ghr_url = try t_alloc.print("http://127.0.0.1:{d}/plugin.wasm.ghr", .{srv.port()});
+    const ghr_url = try t_alloc.print("http://127.0.0.1:{d}/plugin.wasm.zst.ghr", .{srv.port()});
     defer t_alloc.free(ghr_url);
 
+    // 1. A `.wasm.zst` asset requires `plugin.wasm.zst.ghr`, not `plugin.wasm.ghr`.
+    {
+        var ctx = store.ctx();
+        ctx.gates.skip_verify = true;
+        const wrong_assets = [_]release_mod.Asset{
+            .{ .name = "plugin.wasm.zst", .browser_download_url = wasm_zst_url },
+            .{ .name = "plugin.wasm.ghr", .browser_download_url = ghr_url },
+        };
+        var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+        defer tDestroyStagedUnits(&staged);
+        try std.testing.expectError(
+            error.InstallStepFailed,
+            stageWasmUnit(&ctx, req, spec, "v1.0.0", &wrong_assets, wrong_assets[0], null, repo, &staged),
+        );
+        try tExpectCacheEmpty(&store);
+    }
+
+    // 2. With `plugin.wasm.zst.ghr`, staging decompresses `plugin.wasm.zst` into `plugin.wasm` and stages `plugin.wasm.ghr`.
     var ctx = store.ctx();
     ctx.gates.skip_verify = true;
     const assets = [_]release_mod.Asset{
         .{ .name = "plugin.wasm.zst", .browser_download_url = wasm_zst_url },
-        .{ .name = "plugin.wasm.ghr", .browser_download_url = ghr_url },
+        .{ .name = "plugin.wasm.zst.ghr", .browser_download_url = ghr_url },
     };
     var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
     defer tDestroyStagedUnits(&staged);
@@ -9303,6 +9350,159 @@ test "stageWasmUnit decompresses .wasm.zst into <stem>.wasm and links companion 
     try std.testing.expectEqualStrings("plugin.wasm", rec.commands[0].relative_target);
     try std.testing.expectEqualStrings("plugin.wasm.zst", rec.source.?.asset_selector.?);
     try std.testing.expectEqualStrings("plugin.wasm.zst", rec.resolved.?.asset.?);
+}
+
+fn tAppendTarFileEntry(list: *std.ArrayListUnmanaged(u8), name: []const u8, data: []const u8) !void {
+    var hdr: [512]u8 = @splat(0);
+    @memcpy(hdr[0..name.len], name);
+    _ = try std.fmt.bufPrint(hdr[100..108], "{o:0>7}\x00", .{@as(u32, 0o644)});
+    _ = try std.fmt.bufPrint(hdr[108..116], "{o:0>7}\x00", .{@as(u32, 0)});
+    _ = try std.fmt.bufPrint(hdr[116..124], "{o:0>7}\x00", .{@as(u32, 0)});
+    _ = try std.fmt.bufPrint(hdr[124..136], "{o:0>11}\x00", .{data.len});
+    _ = try std.fmt.bufPrint(hdr[136..148], "{o:0>11}\x00", .{@as(u32, 0)});
+    @memset(hdr[148..156], ' ');
+    hdr[156] = '0';
+    @memcpy(hdr[257..263], "ustar\x00");
+    @memcpy(hdr[263..265], "00");
+    var sum: u32 = 0;
+    for (hdr) |b| sum += b;
+    _ = try std.fmt.bufPrint(hdr[148..156], "{o:0>6}\x00 ", .{sum});
+    try list.appendSlice(t_alloc, &hdr);
+    try list.appendSlice(t_alloc, data);
+    const rem = data.len % 512;
+    if (rem != 0) {
+        try list.appendNTimes(t_alloc, 0, 512 - rem);
+    }
+}
+
+fn tBuildUncompressedTarZst(entries: []const struct { name: []const u8, data: []const u8 }) ![]u8 {
+    var tar_bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer tar_bytes.deinit(t_alloc);
+    for (entries) |e| {
+        try tAppendTarFileEntry(&tar_bytes, e.name, e.data);
+    }
+    try tar_bytes.appendNTimes(t_alloc, 0, 1024);
+
+    // Wrap `tar_bytes` in a single-segment uncompressed Zstandard frame:
+    // magic (4B) + FHD=0x60 (Single_Segment=1, FCS=2B) + FCS(u16le, len - 256)
+    // + raw block header u24le((len << 3) | 1) + payload.
+    var zst: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer zst.deinit(t_alloc);
+    try zst.appendSlice(t_alloc, "\x28\xb5\x2f\xfd\x60");
+    const fcs: u16 = @intCast(tar_bytes.items.len - 256);
+    var fcs_bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &fcs_bytes, fcs, .little);
+    try zst.appendSlice(t_alloc, &fcs_bytes);
+    const blk_hdr: u24 = (@as(u24, @intCast(tar_bytes.items.len)) << 3) | 1;
+    var blk_bytes: [3]u8 = undefined;
+    std.mem.writeInt(u24, &blk_bytes, blk_hdr, .little);
+    try zst.appendSlice(t_alloc, &blk_bytes);
+    try zst.appendSlice(t_alloc, tar_bytes.items);
+    return zst.toOwnedSlice(t_alloc);
+}
+
+test "stageWasmUnit extracts .tar.zst wasm bundle with sibling lib/ and expands ${GHR_TOOL_DIR}" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    const bundle_zst = try tBuildUncompressedTarZst(&.{
+        .{ .name = "wazig.wasm", .data = "\x00asm\x01\x00\x00\x00" },
+        .{ .name = "lib/std/std.zig", .data = "pub const std = 1;\n" },
+    });
+    defer t_alloc.free(bundle_zst);
+
+    const bundle_resp = try t_alloc.print(
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ bundle_zst.len, bundle_zst },
+    );
+    defer t_alloc.free(bundle_resp);
+
+    const ghr_body =
+        \\.{
+        \\    .version = 1,
+        \\    .runtime = "wasmtime",
+        \\    .runtimeArgs = .{
+        \\        "run",
+        \\        "--dir=${GHR_TOOL_DIR}/lib::/lib",
+        \\        "--dir=.",
+        \\    },
+        \\}
+    ;
+    const ghr_resp = try t_alloc.print(
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ ghr_body.len, ghr_body },
+    );
+    defer t_alloc.free(ghr_resp);
+
+    var srv: TestHttpServer = undefined;
+    try srv.start(&.{
+        bundle_resp,
+        ghr_resp,
+    });
+    defer srv.finish();
+
+    const spec: Spec = .{ .owner = "cataggar", .repo = "zig", .tag = "v0.17.0-wazig.2" };
+    const repo: attestation.Repository = .{ .owner = "cataggar", .repo = "zig" };
+    const req: install_request.InstallRequest = .{
+        .id = @constCast("cataggar/zig"),
+        .id_origin = .derived,
+        .source = .{ .github_repo = spec },
+        .config = .{ .aliases = &.{}, .minisign = null },
+        .original_tokens = .{ .source = 0 },
+    };
+
+    const bundle_url = try t_alloc.print("http://127.0.0.1:{d}/wazig.tar.zst", .{srv.port()});
+    defer t_alloc.free(bundle_url);
+    const ghr_url = try t_alloc.print("http://127.0.0.1:{d}/wazig.tar.zst.ghr", .{srv.port()});
+    defer t_alloc.free(ghr_url);
+
+    var ctx = store.ctx();
+    ctx.gates.skip_verify = true;
+    const assets = [_]release_mod.Asset{
+        .{ .name = "wazig.tar.zst", .browser_download_url = bundle_url },
+        .{ .name = "wazig.tar.zst.ghr", .browser_download_url = ghr_url },
+    };
+    var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+    defer tDestroyStagedUnits(&staged);
+    try stageWasmUnit(&ctx, req, spec, "v0.17.0-wazig.2", &assets, assets[0], null, repo, &staged);
+    try tExpectCacheEmpty(&store);
+    try tCommit(&ctx, staged.items);
+    try tExpectCacheEmpty(&store);
+
+    try std.testing.expect(store.binEntryExists("wazig"));
+    try std.testing.expect(store.binEntryExists("wazig.ghr"));
+
+    const unit_path = try install_state.encodeUnitPath(t_alloc, ctx.dirs.tools, "cataggar/zig/wazig", .posix);
+    defer t_alloc.free(unit_path);
+
+    // Verify both `wazig.wasm` and sibling `lib/std/std.zig` were extracted into the installed unit dir.
+    {
+        var unit_dir = try Dir.openDirAbsolute(ctx.io, unit_path, .{});
+        defer unit_dir.close(ctx.io);
+        try std.testing.expect((try unit_dir.statFile(ctx.io, "wazig.wasm", .{})).kind == .file);
+        try std.testing.expect((try unit_dir.statFile(ctx.io, "wazig.wasm.ghr", .{})).kind == .file);
+        const std_zig = try unit_dir.readFileAlloc(ctx.io, "lib/std/std.zig", t_alloc, Io.Limit.limited(256));
+        defer t_alloc.free(std_zig);
+        try std.testing.expectEqualStrings("pub const std = 1;\n", std_zig);
+    }
+
+    // Verify `${GHR_TOOL_DIR}` was expanded to `unit_path` in the published `<bin_dir>/wazig.ghr`.
+    {
+        var bin_dir = try Dir.openDirAbsolute(ctx.io, ctx.dirs.bin, .{});
+        defer bin_dir.close(ctx.io);
+        const published_ghr = try bin_dir.readFileAlloc(ctx.io, "wazig.ghr", t_alloc, Io.Limit.limited(4096));
+        defer t_alloc.free(published_ghr);
+        const expected_mount = try t_alloc.print("--dir={s}/lib::/lib", .{unit_path});
+        defer t_alloc.free(expected_mount);
+        try std.testing.expect(std.mem.indexOf(u8, published_ghr, expected_mount) != null);
+        try std.testing.expect(std.mem.indexOf(u8, published_ghr, "${GHR_TOOL_DIR}") == null);
+    }
+
+    // Verify uninstall removes the command, `.ghr`, and unit directory.
+    try uninstallUnit(&ctx, "cataggar/zig/wazig");
+    try std.testing.expect(!store.binEntryExists("wazig"));
+    try std.testing.expect(!store.binEntryExists("wazig.ghr"));
 }
 
 test "stageGenericUrlRequest cleans up cache on download, verification, extraction failure and after install" {
