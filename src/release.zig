@@ -662,6 +662,7 @@ fn containsIgnoreCaseBounded(haystack: []const u8, needle: []const u8) bool {
 /// Returns true if the asset looks installable: archives, Windows .exe, wasm
 /// modules, or bare binaries (extensionless files common in Go/Rust releases).
 fn isInstallableAsset(name: []const u8) bool {
+    if (isSidecarAsset(name)) return false;
     if (isWasmAssetName(name)) return true;
     if (archive.detectFormat(name) != .unknown) return true;
     if (name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe")) return true;
@@ -1374,45 +1375,343 @@ fn isChecksumFile(name: []const u8) bool {
     return false;
 }
 
-/// Locate the sidecar checksum asset for `asset_name` whose name is
-/// `<asset_name>` plus `suffix_a` (e.g. `.sha256`) or `suffix_b` (e.g.
-/// `.sha256sum`). Returns null when no matching sidecar is published.
+const sha256_sidecar_suffixes = [_][]const u8{
+    ".sha256sums.txt",
+    ".sha256sum.txt",
+    ".sha256.txt",
+    ".sha256sums",
+    ".sha256sum",
+    ".sha256",
+};
+
+const sha512_sidecar_suffixes = [_][]const u8{
+    ".sha512sums.txt",
+    ".sha512sum.txt",
+    ".sha512.txt",
+    ".sha512sums",
+    ".sha512sum",
+    ".sha512",
+};
+
+const archive_stem_suffixes = [_][]const u8{
+    ".tar.gz",
+    ".tar.xz",
+    ".tar.zst",
+    ".tar.bz2",
+    ".wasm.gz",
+    ".wasm.xz",
+    ".wasm.zst",
+    ".tgz",
+    ".txz",
+    ".tzst",
+    ".tbz2",
+    ".zip",
+    ".deb",
+    ".rpm",
+    ".apk",
+    ".msi",
+    ".pkg",
+    ".dmg",
+    ".exe",
+    ".wasm",
+};
+
+fn checksumSidecarStem(name: []const u8, suffixes: []const []const u8) ?[]const u8 {
+    for (suffixes) |s| {
+        if (name.len > s.len and std.ascii.endsWithIgnoreCase(name, s)) {
+            return name[0 .. name.len - s.len];
+        }
+    }
+    return null;
+}
+
+fn assetArchiveStem(asset_name: []const u8) ?[]const u8 {
+    for (archive_stem_suffixes) |s| {
+        if (asset_name.len > s.len and std.ascii.endsWithIgnoreCase(asset_name, s)) {
+            return asset_name[0 .. asset_name.len - s.len];
+        }
+    }
+    return null;
+}
+
+fn isChecksumSidecarForAsset(checksum_name: []const u8, asset_name: []const u8) bool {
+    const stem = checksumSidecarStem(checksum_name, &sha256_sidecar_suffixes) orelse
+        checksumSidecarStem(checksum_name, &sha512_sidecar_suffixes) orelse
+        return false;
+    if (std.ascii.eqlIgnoreCase(stem, asset_name)) return true;
+    if (assetArchiveStem(asset_name)) |archive_stem| {
+        if (std.ascii.eqlIgnoreCase(stem, archive_stem)) return true;
+    }
+    return false;
+}
+
+fn isChecksumSidecarForAnyAsset(assets: []const Asset, checksum_name: []const u8) bool {
+    for (assets) |other| {
+        if (std.mem.eql(u8, other.name, checksum_name)) continue;
+        if (isSidecarAsset(other.name)) continue;
+        if (isChecksumSidecarForAsset(checksum_name, other.name)) return true;
+    }
+    return false;
+}
+
+/// Locate the sidecar checksum asset for `asset_name` matching any suffix in
+/// `suffixes`. Prefers an exact `<asset_name><suffix>` sidecar (e.g.
+/// `foo.tar.gz.sha256`), then falls back to `<archive_stem><suffix>` (e.g.
+/// `foo.sha256` or `foo.sha256sum` for `foo.tar.gz`, as published by
+/// `reubeno/brush` and `zellij-org/zellij`) unless `<archive_stem>` is the
+/// exact name of a sibling asset in `assets`.
 fn findSidecarChecksumAsset(
     assets: []const Asset,
     asset_name: []const u8,
-    suffix_a: []const u8,
-    suffix_b: []const u8,
+    suffixes: []const []const u8,
 ) ?Asset {
     for (assets) |a| {
         if (std.mem.eql(u8, a.name, asset_name)) continue;
-        if (std.ascii.endsWithIgnoreCase(a.name, suffix_a) or
-            std.ascii.endsWithIgnoreCase(a.name, suffix_b))
-        {
-            const dot = std.mem.lastIndexOfScalar(u8, a.name, '.').?;
-            const stem = a.name[0..dot];
-            const final_stem = if (std.ascii.endsWithIgnoreCase(stem, suffix_a))
-                stem[0 .. stem.len - suffix_a.len]
-            else
-                stem;
-            if (std.ascii.eqlIgnoreCase(final_stem, asset_name)) return a;
+        const stem = checksumSidecarStem(a.name, suffixes) orelse continue;
+        if (std.ascii.eqlIgnoreCase(stem, asset_name)) return a;
+    }
+    if (assetArchiveStem(asset_name)) |archive_stem| {
+        for (assets) |a| {
+            if (std.mem.eql(u8, a.name, asset_name)) continue;
+            const stem = checksumSidecarStem(a.name, suffixes) orelse continue;
+            if (!std.ascii.eqlIgnoreCase(stem, archive_stem)) continue;
+            var matches_exact_sibling = false;
+            for (assets) |other| {
+                if (std.mem.eql(u8, other.name, asset_name)) continue;
+                if (std.ascii.eqlIgnoreCase(other.name, stem)) {
+                    matches_exact_sibling = true;
+                    break;
+                }
+            }
+            if (!matches_exact_sibling) return a;
         }
     }
     return null;
 }
 
 /// Locate the best checksum asset for `asset_name` in the release's asset
-/// list. Prefers a `<asset>.sha256`/`.sha256sum` sidecar, then a
-/// `<asset>.sha512`/`.sha512sum` sidecar, then falls back to an aggregate
-/// checksum file (`checksums.txt`, `SHA256SUMS`, `SHA512SUMS`, ...).
-/// Returns null when none is available.
+/// list. Prefers a `<asset>.sha256`/`.sha256sum` (or `<stem>.sha256[sum]`)
+/// sidecar, then a `<asset>.sha512`/`.sha512sum` (or `<stem>.sha512[sum]`)
+/// sidecar, then falls back to a release-wide aggregate checksum file
+/// (`checksums.txt`, `SHA256SUMS`, `SHA512SUMS`, ...) while skipping per-asset
+/// sidecars that belong to sibling assets. Returns null when none is available.
 fn findChecksumAsset(assets: []const Asset, asset_name: []const u8) ?Asset {
-    if (findSidecarChecksumAsset(assets, asset_name, ".sha256", ".sha256sum")) |a| return a;
-    if (findSidecarChecksumAsset(assets, asset_name, ".sha512", ".sha512sum")) |a| return a;
+    if (findSidecarChecksumAsset(assets, asset_name, &sha256_sidecar_suffixes)) |a| return a;
+    if (findSidecarChecksumAsset(assets, asset_name, &sha512_sidecar_suffixes)) |a| return a;
     for (assets) |a| {
         if (std.mem.eql(u8, a.name, asset_name)) continue;
+        if (isChecksumSidecarForAnyAsset(assets, a.name)) continue;
         if (isChecksumFile(a.name)) return a;
     }
     return null;
+}
+
+fn collectChecksumEntries(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+) !std.ArrayListUnmanaged(ChecksumEntry) {
+    var list: std.ArrayListUnmanaged(ChecksumEntry) = .empty;
+    errdefer list.deinit(allocator);
+
+    const certutil_prefix = "SHA256 hash of ";
+    var pending_certutil_name: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw_line| {
+        var line = raw_line;
+        while (line.len > 0 and (line[line.len - 1] == '\r' or
+            line[line.len - 1] == ' ' or line[line.len - 1] == '\t'))
+        {
+            line = line[0 .. line.len - 1];
+        }
+
+        if (std.mem.startsWith(u8, line, certutil_prefix) and
+            std.mem.endsWith(u8, line, ":"))
+        {
+            pending_certutil_name = line[certutil_prefix.len .. line.len - 1];
+            continue;
+        }
+
+        if (pending_certutil_name) |name| {
+            if (line.len == 64 and isHex64(line)) {
+                try list.append(allocator, .{ .hex = line, .name = name, .algo = .sha256 });
+                pending_certutil_name = null;
+                continue;
+            }
+            if (line.len > 0) pending_certutil_name = null;
+        }
+
+        const entry = parseChecksumLine(line) orelse continue;
+        try list.append(allocator, entry);
+    }
+    return list;
+}
+
+fn collectExtractedFilesRecursive(
+    allocator: std.mem.Allocator,
+    io: Io,
+    dir: Dir,
+    prefix: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "__MACOSX") or std.mem.startsWith(u8, entry.name, "._")) continue;
+        const rel = if (prefix.len > 0)
+            try allocator.print("{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name })
+        else
+            try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(rel);
+
+        switch (entry.kind) {
+            .file => try out.append(allocator, rel),
+            .directory => {
+                defer allocator.free(rel);
+                var sub = try dir.openDir(io, entry.name, .{ .iterate = true });
+                defer sub.close(io);
+                try collectExtractedFilesRecursive(allocator, io, sub, rel, out);
+            },
+            else => allocator.free(rel),
+        }
+    }
+}
+
+fn pathEqualsNormalizedIgnoreCase(a_raw: []const u8, b_raw: []const u8) bool {
+    const a = stripDotSlash(a_raw);
+    const b = stripDotSlash(b_raw);
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        const na = if (ca == '\\') '/' else std.ascii.toLower(ca);
+        const nb = if (cb == '\\') '/' else std.ascii.toLower(cb);
+        if (na != nb) return false;
+    }
+    return true;
+}
+
+fn matchExtractedFileForEntry(
+    extracted_files: []const []const u8,
+    entry_name: []const u8,
+) ?[]const u8 {
+    for (extracted_files) |rel| {
+        if (pathEqualsNormalizedIgnoreCase(rel, entry_name)) return rel;
+    }
+    var matched: ?[]const u8 = null;
+    for (extracted_files) |rel| {
+        const rel_base = std.fs.path.basename(rel);
+        if (checksumNameMatches(entry_name, rel_base)) {
+            if (matched != null) return null;
+            matched = rel;
+        }
+    }
+    return matched;
+}
+
+/// Verify a per-asset checksum sidecar whose entries name files inside the
+/// archive rather than the outer archive filename (e.g. `zellij-org/zellij`
+/// publishes `zellij-<target>.sha256sum` containing
+/// `<sha256>  target/<target>/release/zellij` for `zellij-<target>.tar.gz`).
+fn verifyArchiveMemberChecksums(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cache_dir: []const u8,
+    checksum_asset_name: []const u8,
+    asset_name: []const u8,
+    download_path: []const u8,
+    checksum_bytes: []const u8,
+    w: *Writer,
+    err_w: *Writer,
+) !?VerifyOutcome {
+    if (!isChecksumSidecarForAsset(checksum_asset_name, asset_name)) return null;
+    if (archive.detectFormat(asset_name) == .unknown) return null;
+
+    var entries = try collectChecksumEntries(allocator, checksum_bytes);
+    defer entries.deinit(allocator);
+    if (entries.items.len == 0) return null;
+
+    const extract_dir_name = try allocator.print(".verify-extract-{s}", .{asset_name});
+    defer allocator.free(extract_dir_name);
+    const extract_dir_path = try allocator.print("{s}{c}{s}", .{
+        cache_dir, std.fs.path.sep, extract_dir_name,
+    });
+    defer allocator.free(extract_dir_path);
+
+    var cache_dir_handle = try Dir.openDirAbsolute(io, cache_dir, .{});
+    defer cache_dir_handle.close(io);
+    cache_dir_handle.deleteTree(io, extract_dir_name) catch {};
+    defer cache_dir_handle.deleteTree(io, extract_dir_name) catch {};
+
+    try cache_dir_handle.createDir(io, extract_dir_name, .default_dir);
+    var extract_dir = try cache_dir_handle.openDir(io, extract_dir_name, .{ .iterate = true });
+    defer extract_dir.close(io);
+
+    archive.extractAuto(allocator, io, extract_dir, download_path, 0) catch return null;
+
+    var extracted_files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (extracted_files.items) |rel| allocator.free(rel);
+        extracted_files.deinit(allocator);
+    }
+    try collectExtractedFilesRecursive(allocator, io, extract_dir, "", &extracted_files);
+    if (extracted_files.items.len == 0) return null;
+
+    for (entries.items) |entry| {
+        if (matchExtractedFileForEntry(extracted_files.items, entry.name) == null) {
+            return null;
+        }
+    }
+
+    var first_algo: ChecksumAlgo = entries.items[0].algo;
+    var first_hex_buf: [12]u8 = undefined;
+    for (entries.items, 0..) |entry, idx| {
+        const rel = matchExtractedFileForEntry(extracted_files.items, entry.name).?;
+        const member_path = try allocator.print("{s}{c}{s}", .{
+            extract_dir_path, std.fs.path.sep, rel,
+        });
+        defer allocator.free(member_path);
+
+        var actual_hex_buf: [128]u8 = undefined;
+        const actual_hex: []const u8 = switch (entry.algo) {
+            .sha256 => blk: {
+                const digest = computeFileSha256(io, member_path) catch |err| {
+                    try err_w.print("error: failed to hash '{s}': {}\n", .{ member_path, err });
+                    try err_w.flush();
+                    return err;
+                };
+                sha256ToHex(digest, actual_hex_buf[0..64]);
+                break :blk actual_hex_buf[0..64];
+            },
+            .sha512 => blk: {
+                const digest = computeFileSha512(io, member_path) catch |err| {
+                    try err_w.print("error: failed to hash '{s}': {}\n", .{ member_path, err });
+                    try err_w.flush();
+                    return err;
+                };
+                sha512ToHex(digest, actual_hex_buf[0..128]);
+                break :blk actual_hex_buf[0..128];
+            },
+        };
+
+        if (!hexEqIgnoreCase(entry.hex, actual_hex)) {
+            try err_w.print(
+                "error: {s} mismatch for {s}\n  expected: {s}\n  actual:   {s}\n  source:   {s}\n",
+                .{ entry.algo.label(), asset_name, entry.hex, actual_hex, checksum_asset_name },
+            );
+            try err_w.flush();
+            return error.ChecksumMismatch;
+        }
+
+        if (idx == 0) {
+            first_algo = entry.algo;
+            @memcpy(&first_hex_buf, actual_hex[0..12]);
+        }
+    }
+
+    try w.print("verified {s} {s}... ({s})\n", .{
+        first_algo.label(),
+        first_hex_buf[0..],
+        checksum_asset_name,
+    });
+    try w.flush();
+    return .sha256_verified;
 }
 
 /// Stream the file at `path` through SHA-256 and return the 32-byte digest.
@@ -1501,6 +1800,19 @@ pub fn verifyDownloadedAssetSha256(
     defer allocator.free(checksum_bytes);
 
     const expected = lookupChecksum(checksum_bytes, asset_name) orelse {
+        if (try verifyArchiveMemberChecksums(
+            allocator,
+            io,
+            cache_dir,
+            checksum_asset.name,
+            asset_name,
+            download_path,
+            checksum_bytes,
+            w,
+            err_w,
+        )) |outcome| {
+            return outcome;
+        }
         try err_w.print("error: checksum file '{s}' has no entry for '{s}'\n", .{ checksum_asset.name, asset_name });
         try err_w.flush();
         return error.ChecksumEntryMissing;
@@ -3596,6 +3908,173 @@ test "findChecksumAsset finds a sha512-only sidecar" {
     };
     const got = findChecksumAsset(&assets, "app-linux.tar.gz") orelse return error.TestUnexpectedNull;
     try std.testing.expectEqualStrings("app-linux.tar.gz.sha512", got.name);
+}
+
+test "findChecksumAsset matches archive-stem sidecar and ignores sibling sidecars" {
+    // Shape of zellij-org/zellij and reubeno/brush releases: per-target
+    // `.sha256sum` / `.sha256` files named `<stem>.sha256[sum]` (replacing
+    // `.tar.gz` / `.zip` rather than appending to it).
+    const zellij_assets = [_]Asset{
+        .{ .name = "zellij-aarch64-apple-darwin.sha256sum", .browser_download_url = "" },
+        .{ .name = "zellij-aarch64-apple-darwin.tar.gz", .browser_download_url = "" },
+        .{ .name = "zellij-aarch64-unknown-linux-musl.sha256sum", .browser_download_url = "" },
+        .{ .name = "zellij-aarch64-unknown-linux-musl.tar.gz", .browser_download_url = "" },
+        .{ .name = "zellij-x86_64-pc-windows-msvc.sha256sum", .browser_download_url = "" },
+        .{ .name = "zellij-x86_64-pc-windows-msvc.zip", .browser_download_url = "" },
+    };
+    const got_linux = findChecksumAsset(&zellij_assets, "zellij-aarch64-unknown-linux-musl.tar.gz") orelse
+        return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("zellij-aarch64-unknown-linux-musl.sha256sum", got_linux.name);
+
+    const got_win = findChecksumAsset(&zellij_assets, "zellij-x86_64-pc-windows-msvc.zip") orelse
+        return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("zellij-x86_64-pc-windows-msvc.sha256sum", got_win.name);
+
+    // When a sibling asset has no sidecar and there is no aggregate checksum
+    // file, another platform's sidecar must never be borrowed as an aggregate.
+    const partial_assets = [_]Asset{
+        .{ .name = "app-aarch64-apple-darwin.tar.gz.sha256", .browser_download_url = "" },
+        .{ .name = "app-aarch64-apple-darwin.tar.gz", .browser_download_url = "" },
+        .{ .name = "app-x86_64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+    };
+    try std.testing.expect(findChecksumAsset(&partial_assets, "app-x86_64-unknown-linux-gnu.tar.gz") == null);
+}
+
+fn writeSingleEntryStoredZip(
+    allocator: std.mem.Allocator,
+    entry_name: []const u8,
+    payload: []const u8,
+) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    const crc = std.hash.Crc32.hash(payload);
+    const name_len: u16 = @intCast(entry_name.len);
+    const data_len: u32 = @intCast(payload.len);
+
+    // Local file header (30 bytes)
+    try out.appendSlice(allocator, "PK\x03\x04");
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 20))); // version needed
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // flags
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // compression = store
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // mod time
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // mod date
+    try out.appendSlice(allocator, &std.mem.toBytes(crc));
+    try out.appendSlice(allocator, &std.mem.toBytes(data_len));
+    try out.appendSlice(allocator, &std.mem.toBytes(data_len));
+    try out.appendSlice(allocator, &std.mem.toBytes(name_len));
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // extra len
+    try out.appendSlice(allocator, entry_name);
+    try out.appendSlice(allocator, payload);
+
+    const cd_offset: u32 = @intCast(out.items.len);
+    // Central directory header (46 bytes)
+    try out.appendSlice(allocator, "PK\x01\x02");
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 20))); // version made by
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 20))); // version needed
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // flags
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // compression = store
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // mod time
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // mod date
+    try out.appendSlice(allocator, &std.mem.toBytes(crc));
+    try out.appendSlice(allocator, &std.mem.toBytes(data_len));
+    try out.appendSlice(allocator, &std.mem.toBytes(data_len));
+    try out.appendSlice(allocator, &std.mem.toBytes(name_len));
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // extra len
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // comment len
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // disk number
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // internal attrs
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u32, 0))); // external attrs
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u32, 0))); // local header offset
+    try out.appendSlice(allocator, entry_name);
+
+    const cd_size: u32 = @intCast(out.items.len - cd_offset);
+    // End of central directory record (22 bytes)
+    try out.appendSlice(allocator, "PK\x05\x06");
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // disk number
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // cd start disk
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 1))); // entries on disk
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 1))); // total entries
+    try out.appendSlice(allocator, &std.mem.toBytes(cd_size));
+    try out.appendSlice(allocator, &std.mem.toBytes(cd_offset));
+    try out.appendSlice(allocator, &std.mem.toBytes(@as(u16, 0))); // comment len
+
+    return out.toOwnedSlice(allocator);
+}
+
+test "verifyArchiveMemberChecksums verifies zellij-shaped inner binary checksum" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const binary_payload = "zellij-synthetic-binary-payload\n";
+    var expected_digest: [32]u8 = undefined;
+    Sha256.hash(binary_payload, &expected_digest, .{});
+    var expected_hex: [64]u8 = undefined;
+    sha256ToHex(expected_digest, &expected_hex);
+
+    const asset_name = "zellij-aarch64-unknown-linux-musl.zip";
+    const checksum_name = "zellij-aarch64-unknown-linux-musl.sha256sum";
+
+    const zip_bytes = try writeSingleEntryStoredZip(allocator, "zellij", binary_payload);
+    defer allocator.free(zip_bytes);
+
+    var f = try tmp.dir.createFile(tio, asset_name, .{});
+    try f.writeStreamingAll(tio, zip_bytes);
+    f.close(tio);
+
+    var cache_path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const cache_len = try tmp.dir.realPath(tio, &cache_path_buf);
+    const cache_dir = cache_path_buf[0..cache_len];
+
+    var archive_path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const archive_len = try tmp.dir.realPathFile(tio, asset_name, &archive_path_buf);
+    const archive_path = archive_path_buf[0..archive_len];
+
+    const checksum_line = try allocator.print(
+        "{s}  target/aarch64-unknown-linux-musl/release/zellij\n",
+        .{expected_hex},
+    );
+    defer allocator.free(checksum_line);
+
+    var out_buf: [1024]u8 = undefined;
+    var err_buf: [1024]u8 = undefined;
+    var out_w: Writer = .fixed(&out_buf);
+    var err_w: Writer = .fixed(&err_buf);
+
+    const outcome = (try verifyArchiveMemberChecksums(
+        allocator,
+        tio,
+        cache_dir,
+        checksum_name,
+        asset_name,
+        archive_path,
+        checksum_line,
+        &out_w,
+        &err_w,
+    )) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqual(VerifyOutcome.sha256_verified, outcome);
+
+    // Mismatched inner binary digest must fail with error.ChecksumMismatch.
+    const bad_line = "0000000000000000000000000000000000000000000000000000000000000000  target/aarch64-unknown-linux-musl/release/zellij\n";
+    var out_w2: Writer = .fixed(&out_buf);
+    var err_w2: Writer = .fixed(&err_buf);
+    try std.testing.expectError(
+        error.ChecksumMismatch,
+        verifyArchiveMemberChecksums(
+            allocator,
+            tio,
+            cache_dir,
+            checksum_name,
+            asset_name,
+            archive_path,
+            bad_line,
+            &out_w2,
+            &err_w2,
+        ),
+    );
 }
 
 test "lookupAssetDigest extracts the GitHub sha256 digest" {
