@@ -196,6 +196,12 @@ understand v2 install state.</p>
 directory level containing any executables. It searches deeper only when no
 shallower candidates exist, so nested-only package layouts still work without
 putting executable-looking firmware or data files on <code>PATH</code>.</p>
+<p>For <code>.wasm</code>, <code>.wasm.gz</code>, <code>.wasm.xz</code>, and <code>.wasm.zst</code> assets accompanied by a
+<code>&lt;stem&gt;.wasm.ghr</code> manifest, <code>ghr install</code> verifies the downloaded asset,
+decompresses compressed <code>.wasm.{gz,xz,zst}</code> payloads into <code>&lt;stem&gt;.wasm</code>, and
+stages each module as its own unit (<code>&lt;request-id&gt;/&lt;stem&gt;</code>). When a release
+publishes multiple variants for the same wasm stem, bare <code>ghr install owner/repo</code>
+prefers <code>.wasm.zst &gt; .wasm.xz &gt; .wasm.gz &gt; .wasm</code>.</p>
 <p>Relative symlink aliases at that level are exposed under their own command
 names when their chains resolve to executable files inside the extracted
 package. For example, <code>bin/llvm-readelf -&gt; llvm-readobj</code> publishes
