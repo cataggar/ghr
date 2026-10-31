@@ -37,7 +37,7 @@ candidates). A 56-char `RW`/`RU`-prefixed base64 token immediately
 after a spec is treated as that spec's minisign public key (overriding
 the global `--minisign <pubkey>` default for that single spec).
 Recognised archive formats: `.zip`, `.tar.gz`, `.tgz`, `.tar.xz`,
-`.txz`, `.tar.zst`, and `.tzst`. Format is detected from the filename.
+`.txz`, `.tar.zst`, `.tzst`, `.wasm.gz`, `.wasm.xz`, and `.wasm.zst`. Format is detected from the filename.
 When `--extract` is used the archive is deleted after extraction unless
 `--keep-archive` (or `-o`) is set.
 

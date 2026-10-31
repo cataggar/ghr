@@ -1087,8 +1087,8 @@ fn basenameSlice(raw: []const u8) []const u8 {
 /// distinct published names.
 pub fn sourceCommandSlice(raw: []const u8, platform: Platform) []const u8 {
     var base = basenameSlice(raw);
-    if (release.isWasmAssetName(base)) {
-        base = base[0 .. base.len - ".wasm".len];
+    if (release.wasmAssetStem(base)) |stem| {
+        base = stem;
     } else if (platform == .windows and base.len >= 4 and std.ascii.endsWithIgnoreCase(base, ".exe")) {
         base = base[0 .. base.len - 4];
     }
