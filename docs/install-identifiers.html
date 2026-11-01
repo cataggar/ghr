@@ -180,8 +180,8 @@ remains a literal plus so base64 minisign keys round-trip unchanged. An ID does
 not rename a command implicitly.</p>
 <p>Installing an existing ID is the upgrade operation: ghr stages the replacement
 and publishes its complete command set transactionally, or restores the prior
-unit. <code>ghr uninstall &lt;id&gt;</code> removes exactly that ID; ID prefixes are not
-recursive.</p>
+unit. <code>ghr uninstall &lt;id&gt; [&lt;id&gt; ...]</code> removes only the named IDs; ID prefixes
+are not recursive.</p>
 <p>On Windows, publishing a staged unit briefly retries directory renames that
 fail with <code>AccessDenied</code> or <code>FileBusy</code>, as an extracted file may be temporarily
 held open. Persistent failures still stop the install and preserve the previous
@@ -426,7 +426,7 @@ URL. Digests remain safe to persist and are preferred for provenance.</p>
 <li><code>ghr list</code> reports shell-ready install commands; <code>--tags</code> reports raw tagged
 arguments, <code>--ids</code> reports IDs, <code>--full</code> adds details, and <code>--json</code>
 includes definitions.</li>
-<li><code>ghr uninstall &lt;id&gt;</code> removes exactly that ID.</li>
+<li><code>ghr uninstall &lt;id&gt; [&lt;id&gt; ...]</code> removes only the named IDs.</li>
 </ul>
 <p>Canonical IDs follow deliberately portable rules:</p>
 <ul>
@@ -660,10 +660,10 @@ canonical install ID. <code>--ids</code>, <code>--full</code>, and <code>--json<
 Damaged units are reported on stderr in the default/<code>--ids</code>/<code>--tags</code>/<code>--install</code>
 output and included in <code>--full</code>/<code>--json</code> output; all forms exit non-zero when any
 unit is not healthy.</p>
-<p><code>ghr uninstall &lt;id&gt;</code> removes exactly the canonical ID and its owned commands,
-apps, metadata, and unit directory. It must inventory and validate ownership
-before mutation. Prefixes are not recursive: uninstalling <code>owner/repo</code> does not
-implicitly remove <code>owner/repo/module</code>.</p>
+<p><code>ghr uninstall &lt;id&gt; [&lt;id&gt; ...]</code> removes each canonical ID and its owned
+commands, apps, metadata, and unit directory. It must inventory and validate
+ownership before mutation. Prefixes are not recursive: uninstalling
+<code>owner/repo</code> does not implicitly remove <code>owner/repo/module</code>.</p>
 <p>If an ID is missing, conflicted, corrupt, or uses an unsupported schema,
 uninstall refuses mutation and reports the state. There is no fallback to
 deleting a path constructed directly from user input.</p>
