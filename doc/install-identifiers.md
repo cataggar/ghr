@@ -23,8 +23,8 @@ not rename a command implicitly.
 
 Installing an existing ID is the upgrade operation: ghr stages the replacement
 and publishes its complete command set transactionally, or restores the prior
-unit. `ghr uninstall <id>` removes exactly that ID; ID prefixes are not
-recursive.
+unit. `ghr uninstall <id> [<id> ...]` removes only the named IDs; ID prefixes
+are not recursive.
 
 On Windows, publishing a staged unit briefly retries directory renames that
 fail with `AccessDenied` or `FileBusy`, as an extracted file may be temporarily
@@ -296,7 +296,7 @@ The ID is the only identity accepted by install-state operations:
 - `ghr list` reports shell-ready install commands; `--tags` reports raw tagged
   arguments, `--ids` reports IDs, `--full` adds details, and `--json`
   includes definitions.
-- `ghr uninstall <id>` removes exactly that ID.
+- `ghr uninstall <id> [<id> ...]` removes only the named IDs.
 
 Canonical IDs follow deliberately portable rules:
 
@@ -557,10 +557,10 @@ Damaged units are reported on stderr in the default/`--ids`/`--tags`/`--install`
 output and included in `--full`/`--json` output; all forms exit non-zero when any
 unit is not healthy.
 
-`ghr uninstall <id>` removes exactly the canonical ID and its owned commands,
-apps, metadata, and unit directory. It must inventory and validate ownership
-before mutation. Prefixes are not recursive: uninstalling `owner/repo` does not
-implicitly remove `owner/repo/module`.
+`ghr uninstall <id> [<id> ...]` removes each canonical ID and its owned
+commands, apps, metadata, and unit directory. It must inventory and validate
+ownership before mutation. Prefixes are not recursive: uninstalling
+`owner/repo` does not implicitly remove `owner/repo/module`.
 
 If an ID is missing, conflicted, corrupt, or uses an unsupported schema,
 uninstall refuses mutation and reports the state. There is no fallback to

@@ -4882,9 +4882,9 @@ pub const UninstallError = error{
     UninstallFailed,
 };
 
-/// Remove exactly one canonical install ID.
+/// Remove one or more canonical install IDs.
 ///
-/// The ID is resolved ONLY through the inventory: no deletion target is ever
+/// Each ID is resolved ONLY through the inventory: no deletion target is ever
 /// constructed from the argument. Prefixes are not recursive -- removing
 /// `owner/repo` never touches `owner/repo/module`. Old `owner/repo[/stem]`
 /// arguments keep working because they canonicalize to the same legacy IDs.
@@ -4892,7 +4892,7 @@ pub fn cmdUninstall(
     allocator: std.mem.Allocator,
     io: Io,
     environ: *const EnvironMap,
-    spec_str: []const u8,
+    specs: []const []const u8,
     w: *Writer,
     err_w: *Writer,
 ) !void {
@@ -4915,30 +4915,57 @@ pub fn cmdUninstall(
         .minisign_pubkey_b64 = null,
         .bin_filters = &.{},
     };
-    return uninstallUnit(&ctx, spec_str);
+    return uninstallUnits(&ctx, specs);
 }
 
-/// Uninstall against an already-resolved context. Split out so the transaction
-/// can be driven against a test store without going through directory
-/// detection.
+/// Uninstall one ID against an already-resolved context.
 fn uninstallUnit(ctx: *const InstallContext, spec_str: []const u8) !void {
+    return uninstallUnits(ctx, &.{spec_str});
+}
+
+/// Uninstall one or more IDs against an already-resolved context. Split out so
+/// the transaction can be driven against a test store without going through
+/// directory detection. Every requested ID is validated and resolved against a
+/// healthy inventory before any unit is mutated.
+fn uninstallUnits(ctx: *const InstallContext, specs: []const []const u8) !void {
     const allocator = ctx.allocator;
     const io = ctx.io;
     const d = ctx.dirs;
-    const w = ctx.w;
     const err_w = ctx.err_w;
 
-    const canonical = install_request.canonicalizeId(allocator, spec_str) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            try err_w.print("error: '{s}' is not a valid install id ({t})\n", .{ spec_str, err });
-            try err_w.print("  hint: ids are lowercase, slash-separated, e.g. owner/repo or a custom id\n", .{});
-            try err_w.print("  hint: list installed ids with 'ghr list --ids'\n", .{});
-            try err_w.flush();
-            return error.UninstallTargetNotFound;
-        },
-    };
-    defer allocator.free(canonical);
+    if (specs.len == 0) return error.UninstallTargetNotFound;
+
+    var canonical_ids: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (canonical_ids.items) |id| allocator.free(id);
+        canonical_ids.deinit(allocator);
+    }
+
+    for (specs) |spec_str| {
+        const canonical = install_request.canonicalizeId(allocator, spec_str) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try err_w.print("error: '{s}' is not a valid install id ({t})\n", .{ spec_str, err });
+                try err_w.print("  hint: ids are lowercase, slash-separated, e.g. owner/repo or a custom id\n", .{});
+                try err_w.print("  hint: list installed ids with 'ghr list --ids'\n", .{});
+                try err_w.flush();
+                return error.UninstallTargetNotFound;
+            },
+        };
+        var duplicate = false;
+        for (canonical_ids.items) |existing| {
+            if (std.mem.eql(u8, existing, canonical)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            allocator.free(canonical);
+            continue;
+        }
+        errdefer allocator.free(canonical);
+        try canonical_ids.append(allocator, canonical);
+    }
 
     recoverPendingTransactions(ctx) catch |err| {
         try err_w.print("error: could not recover a pending install transaction: {t}\n", .{err});
@@ -4956,7 +4983,6 @@ fn uninstallUnit(ctx: *const InstallContext, spec_str: []const u8) !void {
     // Ownership must be knowable globally before anything is removed: a
     // damaged record anywhere can claim commands, so a damaged inventory fails
     // closed instead of guessing.
-    var target: ?install_state.InventoryRecord = null;
     for (inventory.records) |rec| {
         if (rec.status != .ok) {
             const id_text = rec.id orelse "<unknown id>";
@@ -4966,16 +4992,40 @@ fn uninstallUnit(ctx: *const InstallContext, spec_str: []const u8) !void {
             try err_w.flush();
             return error.UninstallStateUnusable;
         }
-        const rid = rec.id orelse continue;
-        if (std.mem.eql(u8, rid, canonical)) target = rec;
     }
 
-    const record = target orelse {
-        try err_w.print("error: '{s}' is not installed\n", .{canonical});
-        try err_w.print("  hint: list installed ids with 'ghr list --ids'\n", .{});
-        try err_w.flush();
-        return error.UninstallTargetNotFound;
+    const ResolvedTarget = struct {
+        canonical: []const u8,
+        record: install_state.InventoryRecord,
     };
+    var targets: std.ArrayListUnmanaged(ResolvedTarget) = .empty;
+    defer targets.deinit(allocator);
+
+    for (canonical_ids.items) |canonical| {
+        const record = findRecord(inventory, canonical) orelse {
+            try err_w.print("error: '{s}' is not installed\n", .{canonical});
+            try err_w.print("  hint: list installed ids with 'ghr list --ids'\n", .{});
+            try err_w.flush();
+            return error.UninstallTargetNotFound;
+        };
+        try targets.append(allocator, .{ .canonical = canonical, .record = record });
+    }
+
+    for (targets.items) |target| {
+        try removeResolvedUnit(ctx, target.canonical, target.record);
+    }
+}
+
+fn removeResolvedUnit(
+    ctx: *const InstallContext,
+    canonical: []const u8,
+    record: install_state.InventoryRecord,
+) !void {
+    const allocator = ctx.allocator;
+    const io = ctx.io;
+    const d = ctx.dirs;
+    const w = ctx.w;
+    const err_w = ctx.err_w;
 
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();
@@ -6153,6 +6203,62 @@ test "uninstall rejects an argument that is not a valid id" {
         uninstallUnit(&store.ctx(), "../escape"),
     );
     try std.testing.expect(std.mem.indexOf(u8, store.errText(), "is not a valid install id") != null);
+}
+
+test "uninstall removes multiple ids in one invocation and preserves remaining units" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const first = try tStageUnit(&ctx, "cataggar/wabt/petstore-serve", &.{"bin/petstore-serve"}, &.{});
+    defer first.destroy();
+    const second = try tStageUnit(&ctx, "cataggar/wabt/petstore-test", &.{"bin/petstore-test"}, &.{});
+    defer second.destroy();
+    const third = try tStageUnit(&ctx, "rikeda71/ghostty-pane-splitter", &.{"bin/ghostty-pane-splitter"}, &.{});
+    defer third.destroy();
+    const keeper = try tStageUnit(&ctx, "example/keeper", &.{"bin/keeper"}, &.{});
+    defer keeper.destroy();
+    try tCommit(&ctx, &.{ first, second, third, keeper });
+
+    try uninstallUnits(&ctx, &.{
+        "cataggar/wabt/petstore-serve",
+        "cataggar/wabt/petstore-test",
+        "rikeda71/ghostty-pane-splitter",
+        "Cataggar/Wabt/Petstore-Serve",
+    });
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    try std.testing.expectEqual(@as(usize, 1), inv.records.len);
+    try std.testing.expectEqualStrings("example/keeper", inv.records[0].id.?);
+    try std.testing.expect(!store.binEntryExists("petstore-serve"));
+    try std.testing.expect(!store.binEntryExists("petstore-test"));
+    try std.testing.expect(!store.binEntryExists("ghostty-pane-splitter"));
+    try std.testing.expect(store.binEntryExists("keeper"));
+}
+
+test "uninstall with multiple ids validates all targets before mutating anything" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+    const ctx = store.ctx();
+
+    const unit = try tStageUnit(&ctx, "example/tool", &.{"bin/tool"}, &.{});
+    defer unit.destroy();
+    try tCommit(&ctx, &.{unit});
+
+    try std.testing.expectError(
+        error.UninstallTargetNotFound,
+        uninstallUnits(&ctx, &.{ "example/tool", "example/absent" }),
+    );
+    try std.testing.expect(store.binEntryExists("tool"));
+
+    try std.testing.expectError(
+        error.UninstallTargetNotFound,
+        uninstallUnits(&ctx, &.{ "example/tool", "../escape" }),
+    );
+    try std.testing.expect(store.binEntryExists("tool"));
 }
 
 test "an interrupted uninstall is finished, never resurrected" {

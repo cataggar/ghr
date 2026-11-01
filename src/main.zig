@@ -269,17 +269,17 @@ pub fn main(init: std.process.Init) !void {
             else => return err,
         };
     } else if (eql(cmd_str, "uninstall")) {
-        const spec = args.next() orelse {
+        var specs: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer specs.deinit(allocator);
+        while (args.next()) |arg| {
+            try specs.append(allocator, arg);
+        }
+        if (specs.items.len == 0) {
             try stderr.interface.print("error: 'ghr uninstall' requires <id>\n", .{});
             try stderr.interface.flush();
             std.process.exit(1);
-        };
-        if (args.next()) |arg| {
-            try stderr.interface.print("error: unexpected argument '{s}' for 'ghr uninstall'\n", .{arg});
-            try stderr.interface.flush();
-            std.process.exit(1);
         }
-        install.cmdUninstall(allocator, io, environ, spec, &stdout.interface, &stderr.interface) catch |err| switch (err) {
+        install.cmdUninstall(allocator, io, environ, specs.items, &stdout.interface, &stderr.interface) catch |err| switch (err) {
             error.UninstallTargetNotFound,
             error.UninstallStateUnusable,
             error.UninstallFailed,
@@ -797,19 +797,19 @@ fn printInstallUsage(w: *Writer) !void {
 
 fn printUninstallUsage(w: *Writer) !void {
     try w.print(
-        \\ghr uninstall - remove one installed unit by id
+        \\ghr uninstall - remove one or more installed units by id
         \\
         \\USAGE:
-        \\    ghr uninstall <id>
+        \\    ghr uninstall <id> [<id> ...]
         \\
-        \\<id> is a canonical install id, not a source spec or a path. GitHub
+        \\Each <id> is a canonical install id, not a source spec or a path. GitHub
         \\installs derive `owner/repo`, so existing `ghr uninstall owner/repo`
         \\and `ghr uninstall owner/repo/<wasm-stem>` commands keep working.
         \\
-        \\Exactly that id is removed: its commands, its app bundles, and its unit
-        \\directory. Prefixes are not recursive, so removing `owner/repo` leaves
-        \\`owner/repo/<module>` installed. Missing, conflicting, corrupt, and
-        \\unsupported state is reported instead of guessed at.
+        \\Exactly the named ids are removed: their commands, their app bundles, and
+        \\their unit directories. Prefixes are not recursive, so removing
+        \\`owner/repo` leaves `owner/repo/<module>` installed. Missing, conflicting,
+        \\corrupt, and unsupported state is reported instead of guessed at.
         \\
         \\OPTIONS:
         \\    -h, --help  Show this help
@@ -1890,7 +1890,7 @@ fn printUsage(w: *Writer) !void {
         \\COMMANDS:
         \\    list [--ids|--tags|--install|--full|--json]  List installed tools
         \\    install <source> [<source> ...]      Install one or more tools by install id
-        \\    uninstall <id>                       Remove one installed unit by id
+        \\    uninstall <id> [<id> ...]            Remove one or more installed units by id
         \\    download <spec> [<spec> ...]         Download one or more release assets
         \\    link <id>|[--path] <name>            (WSL) Link Windows install/PATH commands by ID or name
         \\    unlink <id>|[--path] <name>          (WSL) Remove ghr-created WSL links by ID or name

@@ -3,7 +3,7 @@
 ```text
 ghr list [--ids|--tags|--install|--full|--json]   List installed tools
 ghr install <source> ["?<query>"] [<pubkey>] ...  Install or replace tools by stable ID
-ghr uninstall <id>                              Remove exactly one installed ID
+ghr uninstall <id> [<id> ...]                   Remove one or more installed IDs
 ghr download <spec> [<pubkey>] [<spec> ...]       Download one or more release assets
 ghr link <id>|[--path] <name>                     Link Windows commands into WSL
 ghr unlink <id>|[--path] <name>                   Remove ghr-created WSL links
