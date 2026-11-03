@@ -1026,6 +1026,7 @@ fn scanAppBundle(
 
     var iter = macos_dir.iterate();
     while (try iter.next(io)) |entry| {
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         const rel_name = try allocator.print("{s}{c}{s}", .{ prefix, std.fs.path.sep, entry.name });
         const is_exe = isExecutableCandidate(allocator, io, root, rel_name, windows) catch |err| {
@@ -1323,8 +1324,18 @@ fn scanForAppBundles(
     }
 }
 
-/// Marker file placed inside copied .app bundles to track ghr ownership.
+/// Legacy marker file placed inside copied .app bundles by older ghr versions.
 const ghr_marker = "Contents/.ghr-source";
+
+/// Extended attribute set on copied .app bundle directories on Darwin to
+/// track ghr ownership without mutating `Contents/` (which breaks sealed
+/// macOS code signatures and triggers Gatekeeper "is damaged" alerts).
+const ghr_source_xattr = "com.github.cataggar.ghr.source";
+
+const darwin_xattr = struct {
+    extern "c" fn fsetxattr(fd: std.c.fd_t, name: [*:0]const u8, value: ?*const anyopaque, size: usize, position: u32, options: c_int) c_int;
+    extern "c" fn fgetxattr(fd: std.c.fd_t, name: [*:0]const u8, value: ?*anyopaque, size: usize, position: u32, options: c_int) isize;
+};
 
 /// On macOS, copy .app bundles into ~/Applications for Spotlight and Launchpad discovery.
 /// Symlinks are not indexed by Spotlight, so a real copy is required.
@@ -1401,9 +1412,9 @@ fn installAppBundles(
             return err;
         };
 
-        // Write ownership marker (remove first in case archive contained one as a symlink)
-        staging_dir.deleteFile(io, ghr_marker) catch {};
-        writeMarkerFile(io, staging_dir, tool_dir_path) catch |err| {
+        // Record ownership without mutating Contents/ on Darwin (which would
+        // break the bundle's sealed code signature).
+        writeAppOwnership(io, staging_dir, tool_dir_path) catch |err| {
             apps_dir.deleteTree(io, staging_name) catch {};
             return err;
         };
@@ -1458,7 +1469,19 @@ fn uninstallAppBundles(
 
 /// Check if an .app bundle in ~/Applications is owned by ghr for the given tool path.
 fn isOwnedAppBundle(io: Io, apps_dir: Dir, app_name: []const u8, tool_dir_path: []const u8) bool {
-    // Build path to marker: <app_name>/Contents/.ghr-source
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        if (apps_dir.openDir(io, app_name, .{ .follow_symlinks = false })) |app_dir_val| {
+            var app_dir = app_dir_val;
+            defer app_dir.close(io);
+            var xattr_buf: [Dir.max_path_bytes]u8 = undefined;
+            const n = darwin_xattr.fgetxattr(app_dir.handle, ghr_source_xattr, &xattr_buf, xattr_buf.len, 0, 0);
+            if (n >= 0) {
+                return std.mem.eql(u8, xattr_buf[0..@intCast(n)], tool_dir_path);
+            }
+        } else |_| {}
+    }
+
+    // Fallback to legacy marker: <app_name>/Contents/.ghr-source
     var path_buf: [Dir.max_path_bytes]u8 = undefined;
     const marker_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ app_name, ghr_marker }) catch return false;
 
@@ -1491,8 +1514,14 @@ fn isLegacyAppSymlink(
     return std.mem.eql(u8, link_target, expected);
 }
 
-/// Write the ghr ownership marker file.
-fn writeMarkerFile(io: Io, dir: Dir, tool_dir_path: []const u8) !void {
+/// Record the ghr ownership marker on a staged .app bundle.
+fn writeAppOwnership(io: Io, dir: Dir, tool_dir_path: []const u8) !void {
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        const rc = darwin_xattr.fsetxattr(dir.handle, ghr_source_xattr, tool_dir_path.ptr, tool_dir_path.len, 0, 0);
+        if (rc != 0) return error.Unexpected;
+        return;
+    }
+    dir.deleteFile(io, ghr_marker) catch {};
     var file = try dir.createFile(io, ghr_marker, .{});
     defer file.close(io);
     try file.writeStreamingAll(io, tool_dir_path);
@@ -5494,15 +5523,17 @@ test "app publication adopts a legacy marker and records the v2 unit" {
         ctx.w,
     );
 
-    var apps_dir = try Dir.openDirAbsolute(ctx.io, store.base, .{});
+    var apps_dir = try Dir.openDirAbsolute(ctx.io, try a.print("{s}/Applications", .{store.base}), .{});
     defer apps_dir.close(ctx.io);
-    const adopted = try apps_dir.readFileAlloc(
-        ctx.io,
-        "Applications/Foo.app/Contents/.ghr-source",
-        a,
-        Io.Limit.limited(Dir.max_path_bytes),
-    );
-    try std.testing.expectEqualStrings(p.unit, adopted);
+    try std.testing.expect(isOwnedAppBundle(ctx.io, apps_dir, "Foo.app", p.unit));
+    if (comptime builtin.target.os.tag.isDarwin()) {
+        // On Darwin, ownership is stored in an xattr on Foo.app rather than
+        // Contents/.ghr-source so the bundle's sealed signature stays intact.
+        try std.testing.expectError(
+            error.FileNotFound,
+            apps_dir.statFile(ctx.io, "Foo.app/Contents/.ghr-source", .{ .follow_symlinks = false }),
+        );
+    }
 }
 
 test "fresh install commits a v2 unit, its metadata, and its commands" {
@@ -7903,6 +7934,10 @@ test "findExecutables only scans Contents/MacOS in .app bundles" {
     // Main executable
     const main_exe = try tmp.dir.createFile(std.testing.io, "MyApp.app/Contents/MacOS/myapp", .{ .permissions = .executable_file });
     main_exe.close(std.testing.io);
+
+    // Hidden wrapper executable inside Contents/MacOS (e.g. .mitmproxy-wrapper, should NOT be found)
+    const hidden_exe = try tmp.dir.createFile(std.testing.io, "MyApp.app/Contents/MacOS/.myapp-wrapper", .{ .permissions = .executable_file });
+    hidden_exe.close(std.testing.io);
 
     // Framework binary (should NOT be found)
     const fw_exe = try tmp.dir.createFile(std.testing.io, "MyApp.app/Contents/Frameworks/QtCore.framework/Versions/A/QtCore", .{ .permissions = .executable_file });
