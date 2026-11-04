@@ -12,7 +12,7 @@ your first tool.
 - [Install](install.md) — install ghr and uninstall it.
 - [Examples](examples.md) — install and manage tools from the command line.
 - [Download](download.md) — fetch, extract, authenticate, and verify release assets.
-- [Caching in GitHub Actions](github-actions.md) — cache ghr installs and downloads in workflows.
+- [GitHub Actions](github-actions.md) — install and cache tools or release assets in workflows.
 - [Directories](directories.md) — default directories and `ghr path add` behavior.
 - [WSL linking](wsl-linking.md) — expose Windows-side tools inside WSL.
 - [Troubleshooting](troubleshooting.md) — Linux name-resolution fallback for long `resolv.conf` files.
@@ -40,10 +40,10 @@ and examples.
 Download one or more GitHub release assets, optionally extracting archives; see
 [Download](download.md).
 
-## Caching in GitHub Actions
+## GitHub Actions
 
-Cache installed tools or downloaded assets in workflows; see
-[Caching in GitHub Actions](github-actions.md),
+Install and cache tools or downloaded assets in workflows; see
+[GitHub Actions](github-actions.md),
 [`actions/setup`](../actions/setup/README.md),
 [`actions/install`](../actions/install/README.md), and
 [`actions/download`](../actions/download/README.md).
