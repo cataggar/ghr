@@ -692,11 +692,14 @@ pub fn wasmFormatRank(name: []const u8) ?u8 {
 /// that ship a companion `<asset.name>.ghr` manifest
 /// (`.tar.zst`/`.tzst` > `.tar.xz`/`.txz` > `.tar.gz`/`.tgz` > `.zip` > `.wasm.zst` > `.wasm.xz` > `.wasm.gz` > `.wasm`).
 pub fn wasmBundleFormatRank(name: []const u8) ?u8 {
-    if (std.mem.endsWith(u8, name, ".tar.zst") or std.mem.endsWith(u8, name, ".tzst")) return 8;
-    if (std.mem.endsWith(u8, name, ".tar.xz") or std.mem.endsWith(u8, name, ".txz")) return 7;
-    if (std.mem.endsWith(u8, name, ".tar.gz") or std.mem.endsWith(u8, name, ".tgz")) return 6;
-    if (std.mem.endsWith(u8, name, ".zip")) return 5;
-    return wasmFormatRank(name);
+    if (wasmFormatRank(name)) |rank| return rank;
+    return switch (archive.detectFormat(name)) {
+        .tar_zst => 8,
+        .tar_xz => 7,
+        .tar_gz => 6,
+        .zip => 5,
+        .wasm_gz, .wasm_xz, .wasm_zst, .deb, .unknown => null,
+    };
 }
 
 /// Returns true if `name` is a single-file WebAssembly module installable by ghr
@@ -729,25 +732,14 @@ pub fn wasmAssetStem(name: []const u8) ?[]const u8 {
 }
 
 /// Strip any directory prefix and the trailing wasm or archive suffix from
-/// `name`, returning the module/bundle stem (e.g. `wazig.tar.zst` -> `wazig`,
-/// `hello.wasm.zst` -> `hello`).
+/// `name`, returning the module/bundle stem (e.g. `wazig.tar.zst` or
+/// `wazig.tzst` -> `wazig`, `hello.wasm.zst` -> `hello`).
 pub fn wasmBundleStem(name: []const u8) ?[]const u8 {
     if (wasmAssetStem(name)) |stem| return stem;
     var base = name;
     if (std.mem.lastIndexOfScalar(u8, base, '/')) |i| base = base[i + 1 ..];
     if (std.mem.lastIndexOfScalar(u8, base, '\\')) |i| base = base[i + 1 ..];
-    const suffixes = [_][]const u8{
-        ".tar.zst", ".tzst",
-        ".tar.xz",  ".txz",
-        ".tar.gz",  ".tgz",
-        ".zip",
-    };
-    for (suffixes) |suffix| {
-        if (std.mem.endsWith(u8, base, suffix)) {
-            return base[0 .. base.len - suffix.len];
-        }
-    }
-    return null;
+    return archive.stripBundleArchiveSuffix(base);
 }
 
 /// Find the companion `<asset_name>.ghr` manifest asset for a wasm asset or
@@ -767,7 +759,8 @@ pub fn findGhrManifestAsset(assets: []const Asset, wasm_name: []const u8) ?Asset
 
 /// Collect every wasm module or archive bundle that ships a companion
 /// `<asset.name>.ghr` manifest, deduplicating by stem with preference
-/// `.tar.zst > .tar.xz > .tar.gz > .zip > .wasm.zst > .wasm.xz > .wasm.gz > .wasm`.
+/// `.tar.zst`/`.tzst` > `.tar.xz`/`.txz` > `.tar.gz`/`.tgz` > `.zip` > `.wasm.zst` > `.wasm.xz` > `.wasm.gz` > `.wasm`
+/// (breaking equal-rank ties via `tieBreakPrefers`).
 /// A bare `ghr install owner/repo` (no file filter) installs all of these so
 /// a release shipping several wasm tools (e.g. `wazig` and `wazigl`, or
 /// `petstore` and `petstore-test`) brings in every one. The returned slice
@@ -795,7 +788,9 @@ pub fn wasmModulesWithManifest(
         }
         if (existing_idx) |idx| {
             const existing_rank = wasmBundleFormatRank(list.items[idx].name) orelse 0;
-            if (rank > existing_rank) {
+            if (rank > existing_rank or
+                (rank == existing_rank and tieBreakPrefers(a.name, list.items[idx].name)))
+            {
                 list.items[idx] = a;
             }
         } else {
@@ -3221,9 +3216,13 @@ test "isInstallableAsset" {
     try std.testing.expect(isInstallableAsset("foo.zip"));
     try std.testing.expect(isInstallableAsset("foo.tar.gz"));
     try std.testing.expect(isInstallableAsset("foo.tgz"));
+    try std.testing.expect(isInstallableAsset("foo.TGZ"));
     try std.testing.expect(isInstallableAsset("foo.tar.xz"));
+    try std.testing.expect(isInstallableAsset("foo.txz"));
+    try std.testing.expect(isInstallableAsset("foo.TXZ"));
     try std.testing.expect(isInstallableAsset("foo.tar.zst"));
     try std.testing.expect(isInstallableAsset("foo.tzst"));
+    try std.testing.expect(isInstallableAsset("foo.TZST"));
     try std.testing.expect(isInstallableAsset("foo.TAR.ZST"));
     try std.testing.expect(isInstallableAsset("foo.deb"));
     try std.testing.expect(isInstallableAsset("cosign-windows-amd64.exe"));
@@ -3276,10 +3275,27 @@ test "isWasmAssetName, wasmBundleStem, and findGhrManifestAsset" {
 
     try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.tar.zst").?);
     try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.tzst").?);
+    try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.TZST").?);
     try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.tar.xz").?);
+    try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.txz").?);
+    try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.TXZ").?);
     try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.tar.gz").?);
+    try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.tgz").?);
+    try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.TGZ").?);
     try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.zip").?);
+    try std.testing.expectEqualStrings("wazig", wasmBundleStem("wazig.ZIP").?);
     try std.testing.expectEqualStrings("hello", wasmBundleStem("hello.wasm.zst").?);
+    // `.wasm*` remains strictly lowercase case-sensitive per install_state invariants.
+    try std.testing.expect(wasmBundleFormatRank("hello.WASM") == null);
+    try std.testing.expect(wasmBundleFormatRank("hello.WASM.ZST") == null);
+    try std.testing.expect(wasmBundleStem("hello.WASM") == null);
+    try std.testing.expect(wasmBundleStem("hello.WASM.ZST") == null);
+    try std.testing.expectEqual(@as(?u8, 8), wasmBundleFormatRank("wazig.tzst"));
+    try std.testing.expectEqual(@as(?u8, 8), wasmBundleFormatRank("wazig.TZST"));
+    try std.testing.expectEqual(@as(?u8, 7), wasmBundleFormatRank("wazig.txz"));
+    try std.testing.expectEqual(@as(?u8, 7), wasmBundleFormatRank("wazig.TXZ"));
+    try std.testing.expectEqual(@as(?u8, 6), wasmBundleFormatRank("wazig.tgz"));
+    try std.testing.expectEqual(@as(?u8, 6), wasmBundleFormatRank("wazig.TGZ"));
 
     const assets = [_]Asset{
         .{ .name = "hello.wasm", .browser_download_url = "u1" },
@@ -3362,6 +3378,43 @@ test "wasmModulesWithManifest deduplicates by stem preferring .tar.zst > .wasm.z
     try std.testing.expectEqualStrings("beta.wasm.xz", mods[1].name);
     try std.testing.expectEqualStrings("gamma.wasm.gz", mods[2].name);
     try std.testing.expectEqualStrings("wazig.tar.zst", mods[3].name);
+}
+
+test "wasmModulesWithManifest ranks .tzst > .txz > .tgz and breaks .tar.* vs .t* ties deterministically" {
+    const a = std.testing.allocator;
+    const assets_short = [_]Asset{
+        .{ .name = "mod.tgz", .browser_download_url = "u1" },
+        .{ .name = "mod.tgz.ghr", .browser_download_url = "u2" },
+        .{ .name = "mod.tzst", .browser_download_url = "u3" },
+        .{ .name = "mod.tzst.ghr", .browser_download_url = "u4" },
+        .{ .name = "mod.txz", .browser_download_url = "u5" },
+        .{ .name = "mod.txz.ghr", .browser_download_url = "u6" },
+    };
+    const mods_short = try wasmModulesWithManifest(a, &assets_short);
+    defer a.free(mods_short);
+    try std.testing.expectEqual(@as(usize, 1), mods_short.len);
+    try std.testing.expectEqualStrings("mod.tzst", mods_short[0].name);
+
+    const long_first = [_]Asset{
+        .{ .name = "wazig.tar.zst", .browser_download_url = "l1" },
+        .{ .name = "wazig.tar.zst.ghr", .browser_download_url = "l2" },
+        .{ .name = "wazig.tzst", .browser_download_url = "s1" },
+        .{ .name = "wazig.tzst.ghr", .browser_download_url = "s2" },
+    };
+    const short_first = [_]Asset{
+        .{ .name = "wazig.tzst", .browser_download_url = "s1" },
+        .{ .name = "wazig.tzst.ghr", .browser_download_url = "s2" },
+        .{ .name = "wazig.tar.zst", .browser_download_url = "l1" },
+        .{ .name = "wazig.tar.zst.ghr", .browser_download_url = "l2" },
+    };
+    const m1 = try wasmModulesWithManifest(a, &long_first);
+    defer a.free(m1);
+    const m2 = try wasmModulesWithManifest(a, &short_first);
+    defer a.free(m2);
+    try std.testing.expectEqual(@as(usize, 1), m1.len);
+    try std.testing.expectEqual(@as(usize, 1), m2.len);
+    try std.testing.expectEqualStrings("wazig.tzst", m1[0].name);
+    try std.testing.expectEqualStrings("wazig.tzst", m2[0].name);
 }
 
 test "wasmModulesWithManifest empty when no wasm modules" {

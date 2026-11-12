@@ -1669,11 +1669,15 @@ test "list --tags reproduces wasm parent IDs instead of appending the stem twice
     };
     records[0].id = "cataggar/zig/wazig";
     records[0].commands = &wasm_cmds;
-    records[0].source.?.asset_selector = "wazig.tar.zst";
-    records[0].resolved.?.asset = "wazig.tar.zst";
-    const bundle = try tListRender(&records, .tags);
-    defer t_list_alloc.free(bundle);
-    try std.testing.expectEqualStrings("cataggar/zig/wazig.tar.zst@zigb-0.16.1\n", bundle);
+    for ([_][]const u8{ "wazig.tar.zst", "wazig.tzst", "wazig.txz", "wazig.tgz", "wazig.TZST" }) |asset_name| {
+        records[0].source.?.asset_selector = asset_name;
+        records[0].resolved.?.asset = asset_name;
+        const bundle = try tListRender(&records, .tags);
+        defer t_list_alloc.free(bundle);
+        const expected = try std.fmt.allocPrint(t_list_alloc, "cataggar/zig/{s}@zigb-0.16.1\n", .{asset_name});
+        defer t_list_alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, bundle);
+    }
 }
 
 test "list --tags falls back to release URLs for selectors not supported by file specs" {

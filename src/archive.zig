@@ -168,18 +168,46 @@ pub const Format = enum {
     unknown,
 };
 
+const SuffixMapping = struct {
+    suffix: []const u8,
+    format: Format,
+    is_bundle_archive: bool = false,
+};
+
+const suffix_mappings = [_]SuffixMapping{
+    .{ .suffix = ".tar.zst", .format = .tar_zst, .is_bundle_archive = true },
+    .{ .suffix = ".tzst", .format = .tar_zst, .is_bundle_archive = true },
+    .{ .suffix = ".tar.xz", .format = .tar_xz, .is_bundle_archive = true },
+    .{ .suffix = ".txz", .format = .tar_xz, .is_bundle_archive = true },
+    .{ .suffix = ".tar.gz", .format = .tar_gz, .is_bundle_archive = true },
+    .{ .suffix = ".tgz", .format = .tar_gz, .is_bundle_archive = true },
+    .{ .suffix = ".zip", .format = .zip, .is_bundle_archive = true },
+    .{ .suffix = ".wasm.zst", .format = .wasm_zst },
+    .{ .suffix = ".wasm.xz", .format = .wasm_xz },
+    .{ .suffix = ".wasm.gz", .format = .wasm_gz },
+    .{ .suffix = ".deb", .format = .deb },
+};
+
 /// Detect archive format from a filename. Returns `.unknown` for anything
 /// that isn't a recognised archive suffix (case-insensitive).
 pub fn detectFormat(name: []const u8) Format {
-    if (endsWithIgnoreCase(name, ".zip")) return .zip;
-    if (endsWithIgnoreCase(name, ".tar.gz") or endsWithIgnoreCase(name, ".tgz")) return .tar_gz;
-    if (endsWithIgnoreCase(name, ".tar.xz") or endsWithIgnoreCase(name, ".txz")) return .tar_xz;
-    if (endsWithIgnoreCase(name, ".tar.zst") or endsWithIgnoreCase(name, ".tzst")) return .tar_zst;
-    if (endsWithIgnoreCase(name, ".wasm.gz")) return .wasm_gz;
-    if (endsWithIgnoreCase(name, ".wasm.xz")) return .wasm_xz;
-    if (endsWithIgnoreCase(name, ".wasm.zst")) return .wasm_zst;
-    if (endsWithIgnoreCase(name, ".deb")) return .deb;
+    for (suffix_mappings) |m| {
+        if (endsWithIgnoreCase(name, m.suffix)) return m.format;
+    }
     return .unknown;
+}
+
+/// Strip a recognised bundle archive suffix (`.tar.zst`, `.tzst`, `.tar.xz`,
+/// `.txz`, `.tar.gz`, `.tgz`, or `.zip`, case-insensitive) from `base`,
+/// returning the stem before the suffix or `null` when none matches.
+pub fn stripBundleArchiveSuffix(base: []const u8) ?[]const u8 {
+    for (suffix_mappings) |m| {
+        if (!m.is_bundle_archive) continue;
+        if (endsWithIgnoreCase(base, m.suffix)) {
+            return base[0 .. base.len - m.suffix.len];
+        }
+    }
+    return null;
 }
 
 fn wasmDecompressedName(archive_path: []const u8, format: Format) ![]const u8 {
@@ -235,12 +263,16 @@ test "detectFormat recognises common archive suffixes" {
     try std.testing.expectEqual(Format.zip, detectFormat("foo.zip"));
     try std.testing.expectEqual(Format.zip, detectFormat("FOO.ZIP"));
     try std.testing.expectEqual(Format.tar_gz, detectFormat("foo.tar.gz"));
+    try std.testing.expectEqual(Format.tar_gz, detectFormat("foo.TAR.GZ"));
     try std.testing.expectEqual(Format.tar_gz, detectFormat("foo.tgz"));
     try std.testing.expectEqual(Format.tar_gz, detectFormat("foo.TGZ"));
     try std.testing.expectEqual(Format.tar_xz, detectFormat("foo.tar.xz"));
+    try std.testing.expectEqual(Format.tar_xz, detectFormat("foo.TAR.XZ"));
     try std.testing.expectEqual(Format.tar_xz, detectFormat("foo.txz"));
+    try std.testing.expectEqual(Format.tar_xz, detectFormat("foo.TXZ"));
     try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.tar.zst"));
     try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.tzst"));
+    try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.TZST"));
     try std.testing.expectEqual(Format.tar_zst, detectFormat("foo.TAR.ZST"));
     try std.testing.expectEqual(Format.wasm_gz, detectFormat("foo.wasm.gz"));
     try std.testing.expectEqual(Format.wasm_gz, detectFormat("foo.WASM.GZ"));
@@ -255,6 +287,21 @@ test "detectFormat recognises common archive suffixes" {
     try std.testing.expectEqual(Format.unknown, detectFormat("foo"));
     try std.testing.expectEqual(Format.unknown, detectFormat(""));
     try std.testing.expectEqual(Format.unknown, detectFormat("foo.tar"));
+
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.tar.zst").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.tzst").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.TZST").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.tar.xz").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.txz").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.TXZ").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.tar.gz").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.tgz").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.TGZ").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.zip").?);
+    try std.testing.expectEqualStrings("wazig", stripBundleArchiveSuffix("wazig.ZIP").?);
+    try std.testing.expect(stripBundleArchiveSuffix("foo.deb") == null);
+    try std.testing.expect(stripBundleArchiveSuffix("foo.wasm.zst") == null);
+    try std.testing.expect(stripBundleArchiveSuffix("foo.tar") == null);
 }
 
 test "isSafePath rejects path traversal and absolute paths" {
@@ -475,6 +522,60 @@ test "extractAuto dispatches on filename and strips components" {
 
     try std.testing.expect((try tmp.dir.statFile(std.testing.io, "inner/tool", .{})).kind == .file);
     try std.testing.expect((try tmp.dir.statFile(std.testing.io, "inner/data.txt", .{})).kind == .file);
+}
+
+test "extractAuto handles shortened .tgz archives" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try createTestTarGz(&tmp, &.{ "wrap/bin/tool", "wrap/README.md" }, &.{ "exec", "readme\n" });
+    file.close(std.testing.io);
+    try tmp.dir.rename("archive.tar.gz", tmp.dir, "archive.tgz", std.testing.io);
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const archive_len = try tmp.dir.realPathFile(std.testing.io, "archive.tgz", &path_buf);
+    const archive_abs = path_buf[0..archive_len];
+
+    try extractAuto(std.testing.allocator, std.testing.io, tmp.dir, archive_abs, 1);
+
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "bin/tool", .{})).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "README.md", .{})).kind == .file);
+}
+
+test "extractAuto handles shortened .txz archives" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try createTestTarXz(&tmp, &.{ "wrap/bin/tool", "wrap/README.md" }, &.{ "exec", "readme\n" });
+    file.close(std.testing.io);
+    try tmp.dir.rename("archive.tar.xz", tmp.dir, "archive.txz", std.testing.io);
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const archive_len = try tmp.dir.realPathFile(std.testing.io, "archive.txz", &path_buf);
+    const archive_abs = path_buf[0..archive_len];
+
+    try extractAuto(std.testing.allocator, std.testing.io, tmp.dir, archive_abs, 1);
+
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "bin/tool", .{})).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "README.md", .{})).kind == .file);
+}
+
+test "extractAuto handles shortened .tzst archives" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try createTestTarZst(&tmp, &.{ "wrap/bin/tool", "wrap/README.md" }, &.{ "exec", "readme\n" });
+    file.close(std.testing.io);
+    try tmp.dir.rename("archive.tar.zst", tmp.dir, "archive.tzst", std.testing.io);
+
+    var path_buf: [Dir.max_path_bytes]u8 = undefined;
+    const archive_len = try tmp.dir.realPathFile(std.testing.io, "archive.tzst", &path_buf);
+    const archive_abs = path_buf[0..archive_len];
+
+    try extractAuto(std.testing.allocator, std.testing.io, tmp.dir, archive_abs, 1);
+
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "bin/tool", .{})).kind == .file);
+    try std.testing.expect((try tmp.dir.statFile(std.testing.io, "README.md", .{})).kind == .file);
 }
 
 fn createTestDeb(tmp: *std.testing.TmpDir) !File {
