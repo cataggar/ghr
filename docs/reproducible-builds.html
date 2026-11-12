@@ -225,9 +225,14 @@ release history this also records the exact release compiler:</p>
 <td><code>cataggar/zig@v0.17.0</code></td>
 <td><code>-Doptimize=safe</code></td>
 </tr>
+<tr>
+<td><code>0.17.1</code></td>
+<td><code>cataggar/zig@v0.17.1</code></td>
+<td><code>-Doptimize=safe</code></td>
+</tr>
 </tbody>
 </table>
-<p>Both installations require the existing trusted minisign key. Missing,
+<p>All installations require the existing trusted minisign key. Missing,
 ambiguous, or unknown manifest versions fail explicitly; there is no silent
 fallback to the newest compiler. Selection stays inline in the workflows
 because old tags do not contain newly added helper scripts. Future compiler
@@ -235,9 +240,9 @@ upgrades must extend this allowlist without changing the historical rows.</p>
 <p>For a local rebuild, first check out the release tag, install its matching
 official compiler, set <code>SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct HEAD)</code>,
 and use that tag's release target, version, strip, and optimization flags.
-Current source builds require official Zig 0.17.0; its optimization enum is
+Current source builds require official Zig 0.17.1; its optimization enum is
 <code>debug</code> / <code>safe</code> / <code>fast</code> / <code>small</code>. Do not pass these new spellings to old
-tags built with Zig 0.16.0, and do not rebuild those tags with Zig 0.17.0.
+tags built with Zig 0.16.0, and do not rebuild those tags with Zig 0.17.
 The compiler selection does not alter archive metadata, packaging scripts,
 or the Windows stripped-signed comparison.</p>
 <h2><a href="#running-the-strip-locally" id="running-the-strip-locally"></a>Running the strip locally</h2>
@@ -255,7 +260,7 @@ $ sha256sum stripped.exe locally-rebuilt-ghr.exe
 </div>
 
   <footer class="layout-footer">
-    Built with <a href="https://github.com/cataggar/merjs">merjs</a> &middot; Zig 0.17.0 &middot;
+    Built with <a href="https://github.com/cataggar/merjs">merjs</a> &middot; Zig 0.17.1 &middot;
     <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
     <span class="attribution">Logo by
       <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,

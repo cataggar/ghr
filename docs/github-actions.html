@@ -194,7 +194,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.1 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
             bytecodealliance/wasmtime@v50.0.1
 </code></pre>
 <p>Each non-empty line in <code>tools:</code> is one install request (<code>owner/repo[@tag]</code>),
@@ -251,7 +251,7 @@ restricts default <code>GITHUB_TOKEN</code> permissions), grant <code>contents: 
   with:
     skip-attestation: true
     tools: |
-      cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      cataggar/zig@v0.17.1 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       bytecodealliance/wasmtime@v50.0.1
 </code></pre>
 <p>(<code>skip-attestation</code> maps to <code>ghr install --skip-attestation</code>. To also bypass
@@ -321,7 +321,7 @@ was created with <code>--encrypt</code>, also pass
 </div>
 
   <footer class="layout-footer">
-    Built with <a href="https://github.com/cataggar/merjs">merjs</a> &middot; Zig 0.17.0 &middot;
+    Built with <a href="https://github.com/cataggar/merjs">merjs</a> &middot; Zig 0.17.1 &middot;
     <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
     <span class="attribution">Logo by
       <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,

@@ -169,7 +169,7 @@
 error: failed to fetch release: error.ResolvConfParseFailed
 </code></pre>
 <p>ghr now carries its own resolv.conf parser and DNS client for exactly this case. The standard resolver stays in charge — IP literals, <code>/etc/hosts</code> and <code>localhost</code> continue to resolve the way they always did, and <code>/etc/hosts</code> still wins over DNS. ghr only takes over the DNS query itself, and only once the standard resolver has reported that it cannot read the file. Lines may be any length; a <code>search</code> list too long to keep in full is truncated at a domain boundary rather than mid-suffix.</p>
-<p>Official Zig 0.17.0 still rejects oversized <code>search</code> and <code>domain</code> lines: its parser reports <code>StreamTooLong</code>, surfaced by host lookup as <code>ResolvConfParseFailed</code>. The fallback therefore remains enabled. The closure of <a href="https://codeberg.org/ziglang/zig/issues/35371">ziglang/zig#35371</a> did not fix this resolver behavior; removal requires a verified standard-library fix, not merely a closed issue.</p>
+<p>Official Zig 0.17.1 still rejects oversized <code>search</code> and <code>domain</code> lines: its parser reports <code>StreamTooLong</code>, surfaced by host lookup as <code>ResolvConfParseFailed</code>. The fallback therefore remains enabled. The closure of <a href="https://codeberg.org/ziglang/zig/issues/35371">ziglang/zig#35371</a> did not fix this resolver behavior; removal requires a verified standard-library fix, not merely a closed issue.</p>
 <p>Nothing needs configuring. If you would rather shorten the list at the source, disable WSL's generated file by adding this to <code>/etc/wsl.conf</code> and writing your own <code>/etc/resolv.conf</code>:</p>
 <pre><code class="language-ini">[network]
 generateResolvConf = false
@@ -178,7 +178,7 @@ generateResolvConf = false
 </div>
 
   <footer class="layout-footer">
-    Built with <a href="https://github.com/cataggar/merjs">merjs</a> &middot; Zig 0.17.0 &middot;
+    Built with <a href="https://github.com/cataggar/merjs">merjs</a> &middot; Zig 0.17.1 &middot;
     <a href="https://github.com/cataggar/ghr">github.com/cataggar/ghr</a><br>
     <span class="attribution">Logo by
       <a href="https://www.instagram.com/my_artistic_sidetrip/">Talia Blasquez</a>,
