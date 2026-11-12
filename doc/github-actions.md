@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install Zig and Wasmtime via ghr
-        uses: cataggar/ghr/actions/install@v0.10.3
+        uses: cataggar/ghr/actions/install@v0.10.4
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -45,7 +45,7 @@ verifies the release's `<asset>.minisig` signature sidecar.
 ### Pinning the action
 
 The actions live in the same repository as `ghr` and share its release tags:
-pinning `@v0.10.3` pins both the action definition and the verified static
+pinning `@v0.10.4` pins both the action definition and the verified static
 `ghr` binary. Pick the latest release from
 [the releases page](https://github.com/cataggar/ghr/releases).
 
@@ -54,7 +54,7 @@ When pinning the action to a commit SHA, specify `ghr-version` explicitly:
 ```yaml
 - uses: cataggar/ghr/actions/install@<commit-sha>
   with:
-    ghr-version: v0.10.3
+    ghr-version: v0.10.4
     tools: bytecodealliance/wasmtime@v50.0.1
 ```
 
@@ -99,7 +99,7 @@ To skip the GitHub artifact attestation lookup for installed tools in
 
 ```yaml
 - name: Install Zig and Wasmtime via ghr
-  uses: cataggar/ghr/actions/install@v0.10.3
+  uses: cataggar/ghr/actions/install@v0.10.4
   env:
     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   with:
@@ -120,7 +120,7 @@ or extracted into a specific directory (`dest`) rather than installed into the
 managed tool directory:
 
 ```yaml
-- uses: cataggar/ghr/actions/download@v0.10.3
+- uses: cataggar/ghr/actions/download@v0.10.4
   env:
     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   with:
@@ -183,7 +183,7 @@ After bootstrapping `ghr` (via `cataggar/ghr/actions/setup`), sign release
 archives directly from the environment secret:
 
 ```yaml
-- uses: cataggar/ghr/actions/setup@v0.10.3
+- uses: cataggar/ghr/actions/setup@v0.10.4
 - run: ghr minisign sign artifact.tar.gz
   env:
     MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
