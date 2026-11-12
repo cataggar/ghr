@@ -36,7 +36,7 @@ jobs:
       - name: Install Zig
         uses: cataggar/ghr/actions/install@v0.9.1
         with:
-          tools: cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+          tools: cataggar/zig@v0.17.1 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build static website
         working-directory: website

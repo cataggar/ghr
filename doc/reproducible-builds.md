@@ -51,8 +51,9 @@ release history this also records the exact release compiler:
 | --- | --- | --- |
 | `0.16.0` | `cataggar/zig@v0.16.0` | `-Doptimize=ReleaseSafe` |
 | `0.17.0` | `cataggar/zig@v0.17.0` | `-Doptimize=safe` |
+| `0.17.1` | `cataggar/zig@v0.17.1` | `-Doptimize=safe` |
 
-Both installations require the existing trusted minisign key. Missing,
+All installations require the existing trusted minisign key. Missing,
 ambiguous, or unknown manifest versions fail explicitly; there is no silent
 fallback to the newest compiler. Selection stays inline in the workflows
 because old tags do not contain newly added helper scripts. Future compiler
@@ -61,9 +62,9 @@ upgrades must extend this allowlist without changing the historical rows.
 For a local rebuild, first check out the release tag, install its matching
 official compiler, set `SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct HEAD)`,
 and use that tag's release target, version, strip, and optimization flags.
-Current source builds require official Zig 0.17.0; its optimization enum is
+Current source builds require official Zig 0.17.1; its optimization enum is
 `debug` / `safe` / `fast` / `small`. Do not pass these new spellings to old
-tags built with Zig 0.16.0, and do not rebuild those tags with Zig 0.17.0.
+tags built with Zig 0.16.0, and do not rebuild those tags with Zig 0.17.
 The compiler selection does not alter archive metadata, packaging scripts,
 or the Windows stripped-signed comparison.
 
