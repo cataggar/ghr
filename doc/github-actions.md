@@ -33,7 +33,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.1 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
             bytecodealliance/wasmtime@v50.0.1
 ```
 
@@ -105,7 +105,7 @@ To skip the GitHub artifact attestation lookup for installed tools in
   with:
     skip-attestation: true
     tools: |
-      cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+      cataggar/zig@v0.17.1 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
       bytecodealliance/wasmtime@v50.0.1
 ```
 

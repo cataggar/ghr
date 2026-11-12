@@ -2,7 +2,7 @@
     .name = .ghr_site,
     .version = "0.1.0",
     .fingerprint = 0xb3fb5661653208ed,
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{
         // Immutable upstream-sync revision with official Zig 0.17 support.
         // The fork retains portable Windows I/O, Threaded I/O on Linux,

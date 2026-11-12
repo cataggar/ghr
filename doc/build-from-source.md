@@ -3,11 +3,11 @@
 This contributor guide is kept in the repository only and is not published
 on the website. Run the commands below from the repository root.
 
-The current source and `website/` require **official Zig 0.17.0**, not a
+The current source and `website/` require **official Zig 0.17.1**, not a
 development/nightly compiler. Install the signed compiler bundles with:
 
 ```sh
-ghr install cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+ghr install cataggar/zig@v0.17.1 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 zig build -Doptimize=safe
 zig build test
 # Static website: Markdown + routes + compilation + prerender into website/dist/

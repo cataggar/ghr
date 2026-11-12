@@ -62,6 +62,7 @@ jobs:
           case "$version" in
             0.16.0) optimize=ReleaseSafe ;;
             0.17.0) optimize=safe ;;
+            0.17.1) optimize=safe ;;
             *)
               echo "::error::Unsupported or missing checked-out Zig version: '$version'" >&2
               exit 1
