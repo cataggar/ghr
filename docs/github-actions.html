@@ -189,7 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install Zig and Wasmtime via ghr
-        uses: cataggar/ghr/actions/install@v0.10.3
+        uses: cataggar/ghr/actions/install@v0.10.4
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -203,13 +203,13 @@ supplied (inline or via the action-level <code>minisign:</code> input), <code>gh
 verifies the release's <code>&lt;asset&gt;.minisig</code> signature sidecar.</p>
 <h3><a href="#pinning-the-action" id="pinning-the-action"></a>Pinning the action</h3>
 <p>The actions live in the same repository as <code>ghr</code> and share its release tags:
-pinning <code>@v0.10.3</code> pins both the action definition and the verified static
+pinning <code>@v0.10.4</code> pins both the action definition and the verified static
 <code>ghr</code> binary. Pick the latest release from
 <a href="https://github.com/cataggar/ghr/releases">the releases page</a>.</p>
 <p>When pinning the action to a commit SHA, specify <code>ghr-version</code> explicitly:</p>
 <pre><code class="language-yaml">- uses: cataggar/ghr/actions/install@&lt;commit-sha&gt;
   with:
-    ghr-version: v0.10.3
+    ghr-version: v0.10.4
     tools: bytecodealliance/wasmtime@v50.0.1
 </code></pre>
 <h2><a href="#attestations" id="attestations"></a>Attestations</h2>
@@ -245,7 +245,7 @@ restricts default <code>GITHUB_TOKEN</code> permissions), grant <code>contents: 
 <code>.sigstore.json</code> sidecar, and Authenticode verification enabled, set
 <code>skip-attestation: true</code>:</p>
 <pre><code class="language-yaml">- name: Install Zig and Wasmtime via ghr
-  uses: cataggar/ghr/actions/install@v0.10.3
+  uses: cataggar/ghr/actions/install@v0.10.4
   env:
     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   with:
@@ -261,7 +261,7 @@ pass a trusted <code>ghr-sha256</code> digest matching the <code>cataggar/ghr</c
 <p>Use <code>cataggar/ghr/actions/download</code> when you want release archives downloaded
 or extracted into a specific directory (<code>dest</code>) rather than installed into the
 managed tool directory:</p>
-<pre><code class="language-yaml">- uses: cataggar/ghr/actions/download@v0.10.3
+<pre><code class="language-yaml">- uses: cataggar/ghr/actions/download@v0.10.4
   env:
     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   with:
@@ -309,7 +309,7 @@ environment and pass <code>--encrypt</code> (<code>ghr minisign generate --encry
 <h3><a href="#2-sign-release-artifacts-in-ci" id="2-sign-release-artifacts-in-ci"></a>2. Sign release artifacts in CI</h3>
 <p>After bootstrapping <code>ghr</code> (via <code>cataggar/ghr/actions/setup</code>), sign release
 archives directly from the environment secret:</p>
-<pre><code class="language-yaml">- uses: cataggar/ghr/actions/setup@v0.10.3
+<pre><code class="language-yaml">- uses: cataggar/ghr/actions/setup@v0.10.4
 - run: ghr minisign sign artifact.tar.gz
   env:
     MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
