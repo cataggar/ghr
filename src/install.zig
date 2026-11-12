@@ -9646,6 +9646,73 @@ test "stageWasmUnit extracts .tar.zst wasm bundle with sibling lib/ and expands 
     try std.testing.expect(!store.binEntryExists("wazig.ghr"));
 }
 
+test "stageWasmUnit extracts shortened .tzst wasm bundle" {
+    if (host_is_windows) return error.SkipZigTest;
+    var store = try TestStore.init();
+    defer store.deinit();
+
+    const bundle_zst = try tBuildUncompressedTarZst(&.{
+        .{ .name = "wazig.wasm", .data = "\x00asm\x01\x00\x00\x00" },
+        .{ .name = "lib/std/std.zig", .data = "pub const std = 1;\n" },
+    });
+    defer t_alloc.free(bundle_zst);
+
+    const bundle_resp = try t_alloc.print(
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ bundle_zst.len, bundle_zst },
+    );
+    defer t_alloc.free(bundle_resp);
+
+    const ghr_body = ".{\n    .version = 1,\n    .runtime = \"wasmtime\",\n}\n";
+    const ghr_resp = try t_alloc.print(
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ ghr_body.len, ghr_body },
+    );
+    defer t_alloc.free(ghr_resp);
+
+    var srv: TestHttpServer = undefined;
+    try srv.start(&.{ bundle_resp, ghr_resp });
+    defer srv.finish();
+
+    const spec: Spec = .{ .owner = "cataggar", .repo = "zig", .tag = "v0.17.0-wazig.2" };
+    const repo: attestation.Repository = .{ .owner = "cataggar", .repo = "zig" };
+    const req: install_request.InstallRequest = .{
+        .id = @constCast("cataggar/zig"),
+        .id_origin = .derived,
+        .source = .{ .github_repo = spec },
+        .config = .{ .aliases = &.{}, .minisign = null },
+        .original_tokens = .{ .source = 0 },
+    };
+
+    const bundle_url = try t_alloc.print("http://127.0.0.1:{d}/wazig.tzst", .{srv.port()});
+    defer t_alloc.free(bundle_url);
+    const ghr_url = try t_alloc.print("http://127.0.0.1:{d}/wazig.tzst.ghr", .{srv.port()});
+    defer t_alloc.free(ghr_url);
+
+    var ctx = store.ctx();
+    ctx.gates.skip_verify = true;
+    const assets = [_]release_mod.Asset{
+        .{ .name = "wazig.tzst", .browser_download_url = bundle_url },
+        .{ .name = "wazig.tzst.ghr", .browser_download_url = ghr_url },
+    };
+    var staged: std.ArrayListUnmanaged(*StagedUnit) = .empty;
+    defer tDestroyStagedUnits(&staged);
+    try stageWasmUnit(&ctx, req, spec, "v0.17.0-wazig.2", &assets, assets[0], null, repo, &staged);
+    try tCommit(&ctx, staged.items);
+
+    try std.testing.expect(store.binEntryExists("wazig"));
+    try std.testing.expect(store.binEntryExists("wazig.ghr"));
+
+    var inv = try tScan(&ctx);
+    defer inv.deinit(t_alloc);
+    const rec = tFindRecord(inv, "cataggar/zig/wazig").?;
+    try std.testing.expectEqualStrings("wazig.tzst", rec.source.?.asset_selector.?);
+    try std.testing.expectEqualStrings("wazig.tzst", rec.resolved.?.asset.?);
+
+    try uninstallUnit(&ctx, "cataggar/zig/wazig");
+    try std.testing.expect(!store.binEntryExists("wazig"));
+}
+
 test "stageGenericUrlRequest cleans up cache on download, verification, extraction failure and after install" {
     if (host_is_windows) return error.SkipZigTest;
     var store = try TestStore.init();

@@ -55,7 +55,7 @@ stages each module as its own unit (`<request-id>/<stem>`). Any
 directory (`unit_path`) when writing the command's `.ghr` manifest (and by the
 shim at runtime if present). When a release publishes multiple variants for the
 same wasm stem, bare `ghr install owner/repo` prefers
-`.tar.zst > .tar.xz > .tar.gz > .zip > .wasm.zst > .wasm.xz > .wasm.gz > .wasm`.
+`.tar.zst`/`.tzst > .tar.xz`/`.txz > .tar.gz`/`.tgz > .zip > .wasm.zst > .wasm.xz > .wasm.gz > .wasm`.
 
 Relative symlink aliases at that level are exposed under their own command
 names when their chains resolve to executable files inside the extracted
