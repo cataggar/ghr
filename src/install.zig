@@ -819,7 +819,7 @@ fn dedupeWindowsExeOverCmdForHost(
     allocator: std.mem.Allocator,
     exes: *std.ArrayListUnmanaged([]const u8),
 ) void {
-    dedupeWindowsExeOverCmd(allocator, exes, release_mod.currentPlatformKeywords().arch);
+    dedupeWindowsExeOverCmd(allocator, exes, release_mod.hostArchKeywords());
 }
 
 /// Mirror Windows `PATHEXT` precedence during archive command discovery: when
@@ -10165,4 +10165,3 @@ test "Windows published native shim executes .cmd target safely with spaces, %~d
         ) != null);
     }
 }
-
