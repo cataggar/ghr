@@ -962,6 +962,27 @@ fn containsTokenIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Like containsTokenIgnoreCase, but treats ASCII digits as part of the token
+/// too so e.g. "linux-arm" matches "go1.23.0.linux-arm.tar.gz" without matching
+/// "tool-linux-arm64.tar.gz".
+fn containsAlnumTokenIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (i > 0 and std.ascii.isAlphanumeric(haystack[i - 1])) continue;
+        if (i + needle.len < haystack.len and std.ascii.isAlphanumeric(haystack[i + needle.len])) continue;
+        var match = true;
+        for (0..needle.len) |j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 /// Returns true if the asset looks installable: archives, Windows .exe, wasm
 /// modules, or bare binaries (extensionless files common in Go/Rust releases).
 fn isInstallableAsset(name: []const u8) bool {
@@ -1192,10 +1213,25 @@ fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
 pub fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
     if (plat_arch.len == 0) return false;
     const all_arch = [_][]const u8{
-        "x86_64",  "x64",   "amd64",
-        "aarch64", "arm64", "armv7l",
-        "armv7",   "armv6", "i386",
-        "i686",    "x86",   "riscv64",
+        "x86_64",    "x64",       "amd64",
+        "aarch64",   "arm64",     "armv7l",
+        "armv7",     "armv6",     "armv5",
+        "armhf",     "armel",     "i386",
+        "i586",      "i686",      "x86",
+        "riscv64",   "riscv32",   "powerpc64le",
+        "powerpc64", "powerpc",   "ppc64le",
+        "ppc64",     "s390x",     "s390",
+        "mips64el",  "mips64",    "mipsel",
+        "mips",      "loongarch", "loong64",
+        "sparc64",   "sparcv9",   "sparc",
+        "m68k",
+    };
+    // Exact alphanumeric-bounded 32-bit ARM triples/tags (must not prefix-match
+    // "arm64", which is why digits are treated as part of the token here).
+    const arm32_exact = [_][]const u8{
+        "arm-unknown", "arm-linux", "linux-arm",
+        "gnueabi",     "gnueabihf", "musleabi",
+        "musleabihf",
     };
     for (plat_arch) |k| {
         if (containsIgnoreCaseBounded(name, k)) return false;
@@ -1210,6 +1246,22 @@ pub fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
         }
         if (is_host) continue;
         if (containsIgnoreCaseBounded(name, t)) return true;
+    }
+    var host_is_arm32 = false;
+    for (plat_arch) |k| {
+        if (std.ascii.eqlIgnoreCase(k, "arm") or
+            std.ascii.eqlIgnoreCase(k, "armv7") or
+            std.ascii.eqlIgnoreCase(k, "armv7l") or
+            std.ascii.eqlIgnoreCase(k, "armv6"))
+        {
+            host_is_arm32 = true;
+            break;
+        }
+    }
+    if (!host_is_arm32) {
+        for (arm32_exact) |t| {
+            if (containsAlnumTokenIgnoreCase(name, t)) return true;
+        }
     }
     return false;
 }
@@ -1275,11 +1327,14 @@ fn linuxPortabilityBonus(name: []const u8, plat: PlatformKeywords) i32 {
     return s;
 }
 
-/// Bonus for archive formats (portable, pre-packaged) over bare binaries.
+/// Bonus for portable archive formats over bare binaries, and mild penalty for
+/// distro-specific `.deb` packages so portable tarballs/zips (including static
+/// `-musl` builds on glibc hosts) always win when both are published.
 fn archiveFormatBonus(name: []const u8) i32 {
     return switch (archive.detectFormat(name)) {
         .zip, .tar_gz, .tar_xz, .tar_zst => 1,
-        .wasm_gz, .wasm_xz, .wasm_zst, .deb, .unknown => 0,
+        .deb => -2,
+        .wasm_gz, .wasm_xz, .wasm_zst, .unknown => 0,
     };
 }
 
@@ -1323,7 +1378,7 @@ fn scoreAsset(name: []const u8, plat: PlatformKeywords) i32 {
     }
     for (plat.arch) |kw| {
         if (containsIgnoreCaseBounded(name, kw)) {
-            score += 5;
+            score += 8;
             break;
         }
     }
@@ -4035,6 +4090,49 @@ test "findBestAsset selects unmarked glibc ghr archive on glibc host and linux-m
         .libc = .musl,
     });
     try std.testing.expectEqualStrings("ghr-0.10.4-linux-musl-arm64.tar.gz", musl_best.name);
+}
+
+test "findBestAsset selects x86_64-unknown-linux-musl for BurntSushi/ripgrep when foreign-arch -gnu tarballs exist (issue #264)" {
+    // BurntSushi/ripgrep publishes x86_64 Linux ONLY as `-musl`, alongside
+    // `-gnu` tarballs for aarch64, i686, powerpc64, s390x, and armv7 plus an
+    // amd64 `.deb`. On x86_64 glibc hosts, foreign-arch `-gnu` tarballs must
+    // be rejected by `isForeignArch` and the portable `x86_64-unknown-linux-musl`
+    // tarball must win over both foreign-arch `-gnu` and `.deb`.
+    const rg_assets = [_]Asset{
+        .{ .name = "ripgrep-14.1.0-aarch64-apple-darwin.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-aarch64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-armv7-unknown-linux-gnueabihf.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-armv7-unknown-linux-musleabihf.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-i686-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-powerpc64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-s390x-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-x86_64-apple-darwin.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-x86_64-pc-windows-msvc.zip", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-x86_64-unknown-linux-musl.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep_14.1.0-1_amd64.deb", .browser_download_url = "" },
+    };
+    const x86_64_arch: []const []const u8 = &.{ "x86_64", "x64", "amd64" };
+    const aarch64_arch: []const []const u8 = &.{ "aarch64", "arm64" };
+
+    try std.testing.expect(isForeignArch("ripgrep-14.1.0-powerpc64-unknown-linux-gnu.tar.gz", x86_64_arch));
+    try std.testing.expect(isForeignArch("ripgrep-14.1.0-s390x-unknown-linux-gnu.tar.gz", x86_64_arch));
+    try std.testing.expect(isForeignArch("fd-v10.2.0-arm-unknown-linux-gnueabihf.tar.gz", aarch64_arch));
+    try std.testing.expect(isForeignArch("go1.23.0.linux-arm.tar.gz", aarch64_arch));
+    try std.testing.expect(!isForeignArch("tool-linux-arm64.tar.gz", aarch64_arch));
+
+    const rg_x64_gnu = try findBestAssetForKeywords(&rg_assets, .{
+        .os = &.{"linux"},
+        .arch = x86_64_arch,
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("ripgrep-14.1.0-x86_64-unknown-linux-musl.tar.gz", rg_x64_gnu.name);
+
+    const rg_arm_gnu = try findBestAssetForKeywords(&rg_assets, .{
+        .os = &.{"linux"},
+        .arch = aarch64_arch,
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("ripgrep-14.1.0-aarch64-unknown-linux-gnu.tar.gz", rg_arm_gnu.name);
 }
 
 test "needsLibcDisambiguation skips single-option and uniform-libc releases (issue #264)" {
