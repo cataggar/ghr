@@ -596,30 +596,310 @@ pub const PlatformKeywords = struct {
     libc: ?Libc = null,
 };
 
-pub fn currentPlatformKeywords() PlatformKeywords {
-    const os_keywords: []const []const u8 = switch (builtin.target.os.tag) {
+pub fn hostOsKeywords() []const []const u8 {
+    return switch (builtin.target.os.tag) {
         .windows => &.{ "windows", "win" },
         .linux => &.{"linux"},
         .macos => &.{ "macos", "darwin", "osx" },
         else => &.{},
     };
-    const arch_keywords: []const []const u8 = switch (builtin.target.cpu.arch) {
+}
+
+pub fn hostArchKeywords() []const []const u8 {
+    return switch (builtin.target.cpu.arch) {
         .x86_64 => &.{ "x86_64", "x64", "amd64" },
         .aarch64 => &.{ "aarch64", "arm64" },
         .x86 => &.{ "x86", "i686", "i386" },
         .riscv64 => &.{ "riscv64gc", "riscv64" },
         else => &.{},
     };
-    // ghr ships a separate glibc and musl binary for each Linux arch, and every
-    // install path places the libc-matched build on the host: install.sh probes
-    // for musl, and the PyPI wheels carry musllinux/manylinux platform tags that
-    // pip resolves per host. So our own compiled ABI is a reliable, zero-I/O
-    // proxy for the host's libc.
-    const libc: ?Libc = switch (builtin.target.os.tag) {
-        .linux => if (std.mem.startsWith(u8, @tagName(builtin.target.abi), "musl")) .musl else .gnu,
-        else => null,
+}
+
+fn compileTimeLinuxLibc() Libc {
+    return if (std.mem.startsWith(u8, @tagName(builtin.target.abi), "musl")) .musl else .gnu;
+}
+
+const AssetLibcTag = enum(u2) {
+    none = 0,
+    gnu = 1,
+    musl = 2,
+    ambiguous = 3,
+};
+
+fn classifyAssetLibc(name: []const u8) AssetLibcTag {
+    const has_musl = containsTokenIgnoreCase(name, "musl") or
+        containsIgnoreCaseBounded(name, "musllinux") or
+        containsIgnoreCaseBounded(name, "musleabi");
+    const has_gnu = containsTokenIgnoreCase(name, "gnu") or
+        containsIgnoreCaseBounded(name, "gnueabi") or
+        containsIgnoreCaseBounded(name, "gnuabi") or
+        containsIgnoreCaseBounded(name, "gnux32") or
+        containsTokenIgnoreCase(name, "glibc") or
+        containsTokenIgnoreCase(name, "manylinux");
+    if (has_musl and has_gnu) return .ambiguous;
+    if (has_musl) return .musl;
+    if (has_gnu) return .gnu;
+    return .none;
+}
+
+const LinuxLibcProbes = struct {
+    has_standard_loader_table: bool = true,
+    has_glibc_loader: bool = false,
+    has_musl_loader: bool = false,
+    userland_interp_libc: ?Libc = null,
+    has_alpine_release: bool = false,
+    compile_time_libc: Libc = .gnu,
+};
+
+fn resolveLinuxHostLibc(probes: LinuxLibcProbes) Libc {
+    if (probes.has_glibc_loader and !probes.has_musl_loader) return .gnu;
+    if (probes.has_musl_loader and !probes.has_glibc_loader) return .musl;
+    if (probes.has_glibc_loader and probes.has_musl_loader) {
+        if (probes.userland_interp_libc) |libc| return libc;
+        return if (probes.has_alpine_release) .musl else .gnu;
+    }
+    // Neither standard FHS loader exists on disk (e.g. `FROM scratch`,
+    // `distroless/static`, or NixOS without `nix-ld`): dynamic binaries linked
+    // against `/lib*/ld-linux*` or `/lib/ld-musl*` cannot execute, so prefer
+    // `.musl` to select static `-musl` builds when available.
+    if (probes.has_standard_loader_table) return .musl;
+    if (probes.userland_interp_libc) |libc| return libc;
+    if (probes.has_alpine_release) return .musl;
+    return probes.compile_time_libc;
+}
+
+fn linuxGlibcLoaderPaths(arch: std.Target.Cpu.Arch) []const []const u8 {
+    return switch (arch) {
+        .x86_64 => &.{
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "/usr/lib64/ld-linux-x86-64.so.2",
+            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        },
+        .aarch64 => &.{
+            "/lib/ld-linux-aarch64.so.1",
+            "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+            "/usr/lib/ld-linux-aarch64.so.1",
+            "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+        },
+        .riscv64 => &.{
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/lib/riscv64-linux-gnu/ld-linux-riscv64-lp64d.so.1",
+            "/usr/lib/ld-linux-riscv64-lp64d.so.1",
+            "/usr/lib/riscv64-linux-gnu/ld-linux-riscv64-lp64d.so.1",
+        },
+        .x86 => &.{
+            "/lib/ld-linux.so.2",
+            "/lib/i386-linux-gnu/ld-linux.so.2",
+            "/usr/lib/ld-linux.so.2",
+            "/usr/lib/i386-linux-gnu/ld-linux.so.2",
+        },
+        else => &.{},
     };
-    return .{ .os = os_keywords, .arch = arch_keywords, .libc = libc };
+}
+
+fn linuxMuslLoaderPaths(arch: std.Target.Cpu.Arch) []const []const u8 {
+    return switch (arch) {
+        .x86_64 => &.{ "/lib/ld-musl-x86_64.so.1", "/usr/lib/ld-musl-x86_64.so.1" },
+        .aarch64 => &.{ "/lib/ld-musl-aarch64.so.1", "/usr/lib/ld-musl-aarch64.so.1" },
+        .riscv64 => &.{ "/lib/ld-musl-riscv64.so.1", "/usr/lib/ld-musl-riscv64.so.1" },
+        .x86 => &.{ "/lib/ld-musl-i386.so.1", "/usr/lib/ld-musl-i386.so.1" },
+        else => &.{},
+    };
+}
+
+fn isGlibcCompatShimTarget(link_target: []const u8) bool {
+    return containsIgnoreCase(link_target, "musl") or
+        containsIgnoreCase(link_target, "gcompat");
+}
+
+fn hasNativeGlibcLoaderPath(io: Io, path: []const u8) bool {
+    Dir.accessAbsolute(io, path, .{}) catch return false;
+    var link_buf: [512]u8 = undefined;
+    if (Dir.readLinkAbsolute(io, path, &link_buf)) |len| {
+        if (isGlibcCompatShimTarget(link_buf[0..len])) return false;
+    } else |_| {}
+    return true;
+}
+
+fn pathExistsAbsolute(io: Io, path: []const u8) bool {
+    Dir.accessAbsolute(io, path, .{}) catch return false;
+    return true;
+}
+
+fn readElfInt(comptime T: type, bytes: []const u8, offset: usize, endian: std.builtin.Endian) ?T {
+    const size = @sizeOf(T);
+    const end = std.math.add(usize, offset, size) catch return null;
+    if (end > bytes.len) return null;
+    return std.mem.readInt(T, @ptrCast(bytes[offset..][0..size]), endian);
+}
+
+fn parseElfPtInterp(bytes: []const u8) ?[]const u8 {
+    if (bytes.len < 52 or !std.mem.eql(u8, bytes[0..4], "\x7fELF")) return null;
+    const ei_class = bytes[4];
+    const endian: std.builtin.Endian = switch (bytes[5]) {
+        1 => .little,
+        2 => .big,
+        else => return null,
+    };
+
+    const pt_interp: u32 = 3;
+    switch (ei_class) {
+        1 => {
+            const phoff: usize = readElfInt(u32, bytes, 28, endian) orelse return null;
+            const phentsize: usize = readElfInt(u16, bytes, 42, endian) orelse return null;
+            const phnum: usize = readElfInt(u16, bytes, 44, endian) orelse return null;
+            if (phentsize < 32) return null;
+            const count = @min(phnum, 64);
+            for (0..count) |idx| {
+                const step = std.math.mul(usize, idx, phentsize) catch return null;
+                const base = std.math.add(usize, phoff, step) catch return null;
+                const p_type = readElfInt(u32, bytes, base, endian) orelse return null;
+                if (p_type != pt_interp) continue;
+                const interp_off: usize = readElfInt(u32, bytes, base + 4, endian) orelse return null;
+                const filesz: usize = readElfInt(u32, bytes, base + 16, endian) orelse return null;
+                if (filesz == 0) return null;
+                const interp_end = std.math.add(usize, interp_off, filesz) catch return null;
+                if (interp_end > bytes.len) return null;
+                const interp = std.mem.sliceTo(bytes[interp_off..interp_end], 0);
+                return if (interp.len > 0) interp else null;
+            }
+        },
+        2 => {
+            if (bytes.len < 64) return null;
+            const phoff_u64 = readElfInt(u64, bytes, 32, endian) orelse return null;
+            const phoff = std.math.cast(usize, phoff_u64) orelse return null;
+            const phentsize: usize = readElfInt(u16, bytes, 54, endian) orelse return null;
+            const phnum: usize = readElfInt(u16, bytes, 56, endian) orelse return null;
+            if (phentsize < 56) return null;
+            const count = @min(phnum, 64);
+            for (0..count) |idx| {
+                const step = std.math.mul(usize, idx, phentsize) catch return null;
+                const base = std.math.add(usize, phoff, step) catch return null;
+                const p_type = readElfInt(u32, bytes, base, endian) orelse return null;
+                if (p_type != pt_interp) continue;
+                const off_u64 = readElfInt(u64, bytes, base + 8, endian) orelse return null;
+                const filesz_u64 = readElfInt(u64, bytes, base + 32, endian) orelse return null;
+                const interp_off = std.math.cast(usize, off_u64) orelse return null;
+                const filesz = std.math.cast(usize, filesz_u64) orelse return null;
+                if (filesz == 0) return null;
+                const interp_end = std.math.add(usize, interp_off, filesz) catch return null;
+                if (interp_end > bytes.len) return null;
+                const interp = std.mem.sliceTo(bytes[interp_off..interp_end], 0);
+                return if (interp.len > 0) interp else null;
+            }
+        },
+        else => return null,
+    }
+    return null;
+}
+
+fn classifyInterpreterLibc(interp: []const u8) ?Libc {
+    if (containsIgnoreCase(interp, "musl")) return .musl;
+    if (containsIgnoreCase(interp, "ld-linux") or
+        containsIgnoreCase(interp, "glibc") or
+        containsIgnoreCase(interp, "gnu") or
+        std.mem.endsWith(u8, interp, "/ld.so.1"))
+    {
+        return .gnu;
+    }
+    return null;
+}
+
+fn readElfInterpreterLibc(io: Io, path: []const u8) ?Libc {
+    var file = Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    var header_buf: [4096]u8 = undefined;
+    const n = file_reader.interface.readSliceShort(&header_buf) catch return null;
+    const interp = parseElfPtInterp(header_buf[0..n]) orelse return null;
+    return classifyInterpreterLibc(interp);
+}
+
+fn detectLinuxUserlandLibc(io: Io) ?Libc {
+    for ([_][]const u8{ "/usr/bin/env", "/bin/sh" }) |candidate| {
+        if (readElfInterpreterLibc(io, candidate)) |libc| return libc;
+    }
+    return null;
+}
+
+fn detectHostLibcUncached(io: Io) Libc {
+    const glibc_paths = linuxGlibcLoaderPaths(builtin.target.cpu.arch);
+    const musl_paths = linuxMuslLoaderPaths(builtin.target.cpu.arch);
+    const has_table = glibc_paths.len > 0 and musl_paths.len > 0;
+
+    var has_glibc = false;
+    for (glibc_paths) |p| {
+        if (hasNativeGlibcLoaderPath(io, p)) {
+            has_glibc = true;
+            break;
+        }
+    }
+    var has_musl = false;
+    for (musl_paths) |p| {
+        if (pathExistsAbsolute(io, p)) {
+            has_musl = true;
+            break;
+        }
+    }
+
+    const need_tiebreak = (has_glibc and has_musl) or !has_table;
+    return resolveLinuxHostLibc(.{
+        .has_standard_loader_table = has_table,
+        .has_glibc_loader = has_glibc,
+        .has_musl_loader = has_musl,
+        .userland_interp_libc = if (need_tiebreak) detectLinuxUserlandLibc(io) else null,
+        .has_alpine_release = if (need_tiebreak) pathExistsAbsolute(io, "/etc/alpine-release") else false,
+        .compile_time_libc = compileTimeLinuxLibc(),
+    });
+}
+
+// 0 = uninitialized, 1 = gnu, 2 = musl.
+var cached_linux_host_libc = std.atomic.Value(u8).init(0);
+
+/// Detect the Linux host's native C library at runtime, memoized once per
+/// process. Static `linux-*-musl` builds of `ghr` legitimately execute on
+/// glibc hosts (e.g. `actions/setup` and portable installs), so compile-time
+/// `builtin.target.abi` cannot be assumed to match the host userland.
+/// Returns `null` on non-Linux hosts.
+pub fn detectHostLibcCached(io: Io) ?Libc {
+    if (builtin.target.os.tag != .linux) return null;
+    return switch (cached_linux_host_libc.load(.acquire)) {
+        1 => .gnu,
+        2 => .musl,
+        else => {
+            const detected = detectHostLibcUncached(io);
+            cached_linux_host_libc.store(switch (detected) {
+                .gnu => 1,
+                .musl => 2,
+            }, .release);
+            return detected;
+        },
+    };
+}
+
+/// Returns true only when `assets` has two or more viable installable
+/// candidates for `plat_os` + `plat_arch` that span different libc buckets
+/// (`none` / `gnu` / `musl` / `ambiguous`). Single-candidate, unmarked-only,
+/// and single-libc releases return `false` so Linux asset selection skips the
+/// filesystem loader probe completely.
+pub fn needsLibcDisambiguation(
+    assets: []const Asset,
+    plat_os: []const []const u8,
+    plat_arch: []const []const u8,
+) bool {
+    var viable_count: usize = 0;
+    var seen_mask: u4 = 0;
+    for (assets) |asset| {
+        if (!isInstallableAsset(asset.name)) continue;
+        if (isWrongPlatform(asset.name, plat_os)) continue;
+        if (isForeignArch(asset.name, plat_arch)) continue;
+        viable_count += 1;
+        seen_mask |= @as(u4, 1) << @backingInt(classifyAssetLibc(asset.name));
+        if (viable_count >= 2 and (seen_mask & (seen_mask - 1)) != 0) return true;
+    }
+    return false;
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -659,10 +939,55 @@ fn containsIgnoreCaseBounded(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+/// Like containsIgnoreCaseBounded, but requires word boundaries on both sides:
+/// neither the character immediately before nor the character immediately after
+/// the match may be an ASCII letter. Digits, '-', '_', and '.' count as
+/// boundaries (so e.g. "glibc2.28" matches "glibc", while "gnuplot" does not
+/// match "gnu" and "profiler" does not match "profile").
+fn containsTokenIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (i > 0 and std.ascii.isAlphabetic(haystack[i - 1])) continue;
+        if (i + needle.len < haystack.len and std.ascii.isAlphabetic(haystack[i + needle.len])) continue;
+        var match = true;
+        for (0..needle.len) |j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+/// Like containsTokenIgnoreCase, but treats ASCII digits as part of the token
+/// too so e.g. "linux-arm" matches "go1.23.0.linux-arm.tar.gz" without matching
+/// "tool-linux-arm64.tar.gz".
+fn containsAlnumTokenIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (i > 0 and std.ascii.isAlphanumeric(haystack[i - 1])) continue;
+        if (i + needle.len < haystack.len and std.ascii.isAlphanumeric(haystack[i + needle.len])) continue;
+        var match = true;
+        for (0..needle.len) |j| {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 /// Returns true if the asset looks installable: archives, Windows .exe, wasm
 /// modules, or bare binaries (extensionless files common in Go/Rust releases).
 fn isInstallableAsset(name: []const u8) bool {
     if (isSidecarAsset(name)) return false;
+    if (isChecksumFile(name)) return false;
     if (isWasmAssetName(name)) return true;
     if (archive.detectFormat(name) != .unknown) return true;
     if (name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe")) return true;
@@ -818,6 +1143,9 @@ fn nonPrimaryPenalty(name: []const u8) u32 {
     const soft = [_][]const u8{
         "static", "min", "minimal",
     };
+    const soft_tokens = [_][]const u8{
+        "profile", "baseline",
+    };
     var penalty: u32 = 0;
     for (strong) |m| if (containsIgnoreCaseBounded(name, m)) {
         penalty += 5;
@@ -826,6 +1154,9 @@ fn nonPrimaryPenalty(name: []const u8) u32 {
         penalty += 3;
     };
     for (soft) |m| if (containsIgnoreCaseBounded(name, m)) {
+        penalty += 1;
+    };
+    for (soft_tokens) |m| if (containsTokenIgnoreCase(name, m)) {
         penalty += 1;
     };
     return penalty;
@@ -882,10 +1213,25 @@ fn isWrongPlatform(name: []const u8, plat_os: []const []const u8) bool {
 pub fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
     if (plat_arch.len == 0) return false;
     const all_arch = [_][]const u8{
-        "x86_64",  "x64",   "amd64",
-        "aarch64", "arm64", "armv7l",
-        "armv7",   "armv6", "i386",
-        "i686",    "x86",   "riscv64",
+        "x86_64",    "x64",       "amd64",
+        "aarch64",   "arm64",     "armv7l",
+        "armv7",     "armv6",     "armv5",
+        "armhf",     "armel",     "i386",
+        "i586",      "i686",      "x86",
+        "riscv64",   "riscv32",   "powerpc64le",
+        "powerpc64", "powerpc",   "ppc64le",
+        "ppc64",     "s390x",     "s390",
+        "mips64el",  "mips64",    "mipsel",
+        "mips",      "loongarch", "loong64",
+        "sparc64",   "sparcv9",   "sparc",
+        "m68k",
+    };
+    // Exact alphanumeric-bounded 32-bit ARM triples/tags (must not prefix-match
+    // "arm64", which is why digits are treated as part of the token here).
+    const arm32_exact = [_][]const u8{
+        "arm-unknown", "arm-linux", "linux-arm",
+        "gnueabi",     "gnueabihf", "musleabi",
+        "musleabihf",
     };
     for (plat_arch) |k| {
         if (containsIgnoreCaseBounded(name, k)) return false;
@@ -900,6 +1246,22 @@ pub fn isForeignArch(name: []const u8, plat_arch: []const []const u8) bool {
         }
         if (is_host) continue;
         if (containsIgnoreCaseBounded(name, t)) return true;
+    }
+    var host_is_arm32 = false;
+    for (plat_arch) |k| {
+        if (std.ascii.eqlIgnoreCase(k, "arm") or
+            std.ascii.eqlIgnoreCase(k, "armv7") or
+            std.ascii.eqlIgnoreCase(k, "armv7l") or
+            std.ascii.eqlIgnoreCase(k, "armv6"))
+        {
+            host_is_arm32 = true;
+            break;
+        }
+    }
+    if (!host_is_arm32) {
+        for (arm32_exact) |t| {
+            if (containsAlnumTokenIgnoreCase(name, t)) return true;
+        }
     }
     return false;
 }
@@ -916,10 +1278,10 @@ pub fn hasHostArch(name: []const u8, plat_arch: []const []const u8) bool {
 }
 
 /// On Linux hosts, prefer portable glibc/musl triples over distro-tagged
-/// variants. Returns a signed bonus to fold into the score.
-fn linuxPortabilityBonus(name: []const u8, plat_os: []const []const u8) i32 {
+/// variants without rewarding an explicit opposite-libc triple.
+fn linuxPortabilityBonus(name: []const u8, plat: PlatformKeywords) i32 {
     var is_linux_host = false;
-    for (plat_os) |k| {
+    for (plat.os) |k| {
         if (std.ascii.eqlIgnoreCase(k, "linux")) {
             is_linux_host = true;
             break;
@@ -927,17 +1289,30 @@ fn linuxPortabilityBonus(name: []const u8, plat_os: []const []const u8) i32 {
     }
     if (!is_linux_host) return 0;
     var s: i32 = 0;
-    const generic = [_][]const u8{
+    const gnu_generic = [_][]const u8{
         "manylinux",
         "unknown-linux-gnu",
-        "unknown-linux-musl",
         "linux-gnu",
+    };
+    const musl_generic = [_][]const u8{
+        "musllinux",
+        "unknown-linux-musl",
         "linux-musl",
     };
-    for (generic) |t| {
-        if (containsIgnoreCaseBounded(name, t)) {
-            s += 2;
-            break;
+    if (plat.libc == null or plat.libc.? == .gnu) {
+        for (gnu_generic) |t| {
+            if (containsIgnoreCaseBounded(name, t)) {
+                s += 2;
+                break;
+            }
+        }
+    }
+    if (s == 0 and (plat.libc == null or plat.libc.? == .musl)) {
+        for (musl_generic) |t| {
+            if (containsIgnoreCaseBounded(name, t)) {
+                s += 2;
+                break;
+            }
         }
     }
     const distros = [_][]const u8{
@@ -952,27 +1327,37 @@ fn linuxPortabilityBonus(name: []const u8, plat_os: []const []const u8) i32 {
     return s;
 }
 
-/// Bonus for archive formats (portable, pre-packaged) over bare binaries.
+/// Bonus for portable archive formats over bare binaries, and mild penalty for
+/// distro-specific `.deb` packages so portable tarballs/zips (including static
+/// `-musl` builds on glibc hosts) always win when both are published.
 fn archiveFormatBonus(name: []const u8) i32 {
     return switch (archive.detectFormat(name)) {
         .zip, .tar_gz, .tar_xz, .tar_zst => 1,
-        .wasm_gz, .wasm_xz, .wasm_zst, .deb, .unknown => 0,
+        .deb => -2,
+        .wasm_gz, .wasm_xz, .wasm_zst, .unknown => 0,
     };
 }
 
-/// On Linux, reward the asset built for the host's C library. Rust target
-/// triples encode this as `-gnu` vs `-musl`. The bonus is intentionally
-/// positive-only: it breaks a gnu-vs-musl tie in favour of the host libc but
-/// never penalizes an asset, so a release that only ships the "wrong" libc (or
-/// names assets without a libc marker) is unaffected and still installable.
+/// On Linux, reward assets matching the host's C library (`+3`), leave unmarked
+/// assets neutral (`0`), and apply a mild penalty (`-2`) when an asset
+/// explicitly names the opposite libc. Keeping unmarked assets at `0` while
+/// softly penalizing explicit opposite-libc builds ensures releases that omit a
+/// `-gnu` suffix on glibc builds (such as `oven-sh/bun` and `cataggar/ghr`)
+/// prefer the plain glibc build on glibc hosts and the `-musl` build on musl
+/// hosts, while single-libc releases (such as musl-only static tools on glibc
+/// hosts) stay well above `0` and remain installable.
 fn libcBonus(name: []const u8, libc: ?Libc) i32 {
     const want = libc orelse return 0;
-    const has_musl = containsIgnoreCaseBounded(name, "musl");
-    const has_gnu = containsIgnoreCaseBounded(name, "gnu");
-    if (has_musl == has_gnu) return 0; // neither marker, or (ambiguously) both
-    return switch (want) {
-        .musl => if (has_musl) 3 else 0,
-        .gnu => if (has_gnu) 3 else 0,
+    return switch (classifyAssetLibc(name)) {
+        .none, .ambiguous => 0,
+        .gnu => switch (want) {
+            .gnu => 3,
+            .musl => -2,
+        },
+        .musl => switch (want) {
+            .musl => 3,
+            .gnu => -2,
+        },
     };
 }
 
@@ -993,12 +1378,12 @@ fn scoreAsset(name: []const u8, plat: PlatformKeywords) i32 {
     }
     for (plat.arch) |kw| {
         if (containsIgnoreCaseBounded(name, kw)) {
-            score += 5;
+            score += 8;
             break;
         }
     }
     score -= @as(i32, @intCast(nonPrimaryPenalty(name)));
-    score += linuxPortabilityBonus(name, plat.os);
+    score += linuxPortabilityBonus(name, plat);
     score += libcBonus(name, plat.libc);
     score += archiveFormatBonus(name);
     // wasm modules are platform-independent; give them a positive score so a
@@ -1043,8 +1428,18 @@ pub fn findBestAssetForKeywords(assets: []const Asset, plat: PlatformKeywords) !
     return error.NoMatchingAsset;
 }
 
-pub fn findBestAsset(assets: []const Asset) !Asset {
-    return findBestAssetForKeywords(assets, currentPlatformKeywords());
+pub fn findBestAsset(io: Io, assets: []const Asset) !Asset {
+    const os = hostOsKeywords();
+    const arch = hostArchKeywords();
+    const libc: ?Libc = if (builtin.target.os.tag == .linux and needsLibcDisambiguation(assets, os, arch))
+        detectHostLibcCached(io)
+    else
+        null;
+    return findBestAssetForKeywords(assets, .{
+        .os = os,
+        .arch = arch,
+        .libc = libc,
+    });
 }
 
 /// Re-exported so install.zig can keep listing only installable assets in
@@ -1365,6 +1760,8 @@ fn isChecksumFile(name: []const u8) bool {
     if (containsIgnoreCase(name, "checksum")) return true;
     if (containsIgnoreCase(name, "sha256sums")) return true;
     if (containsIgnoreCase(name, "sha512sums")) return true;
+    if (containsIgnoreCase(name, "shasums256")) return true;
+    if (containsIgnoreCase(name, "shasums512")) return true;
     if (std.ascii.eqlIgnoreCase(name, "SHA256SUMS")) return true;
     if (std.ascii.eqlIgnoreCase(name, "SHA512SUMS")) return true;
     return false;
@@ -3594,15 +3991,256 @@ test "findBestAsset selects riscv64 build on riscv64 host (issue #116)" {
     try std.testing.expectEqualStrings("rustup-1.29.0-riscv64gc-unknown-linux-gnu.tar.gz", best.name);
 }
 
-test "libcBonus rewards the matching libc and is otherwise neutral (issue #116)" {
+test "libcBonus rewards matching libc, softly penalizes explicit mismatch, and keeps unmarked neutral (issue #116, #264)" {
     // No host libc, or no libc marker in the name: neutral.
     try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-x86_64-unknown-linux-gnu.tar.gz", null));
     try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-linux-x64.tar.gz", .gnu));
-    // Matching libc is rewarded; the mismatching one is never penalized.
+    try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-linux-x64.tar.gz", .musl));
+    // Matching libc is rewarded (+3); explicit opposite libc gets a mild (-2) penalty.
     try std.testing.expectEqual(@as(i32, 3), libcBonus("tool-x86_64-unknown-linux-gnu.tar.gz", .gnu));
-    try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-x86_64-unknown-linux-gnu.tar.gz", .musl));
+    try std.testing.expectEqual(@as(i32, -2), libcBonus("tool-x86_64-unknown-linux-gnu.tar.gz", .musl));
+    try std.testing.expectEqual(@as(i32, 3), libcBonus("WasmEdge-0.16.2-manylinux_2_28_aarch64.tar.gz", .gnu));
+    try std.testing.expectEqual(@as(i32, -2), libcBonus("WasmEdge-0.16.2-manylinux_2_28_aarch64.tar.gz", .musl));
+    try std.testing.expectEqual(@as(i32, 3), libcBonus("tool-glibc2.28-x86_64.tar.gz", .gnu));
     try std.testing.expectEqual(@as(i32, 3), libcBonus("tool-x86_64-unknown-linux-musl.tar.gz", .musl));
-    try std.testing.expectEqual(@as(i32, 0), libcBonus("tool-x86_64-unknown-linux-musl.tar.gz", .gnu));
+    try std.testing.expectEqual(@as(i32, -2), libcBonus("tool-x86_64-unknown-linux-musl.tar.gz", .gnu));
+    try std.testing.expectEqual(@as(i32, 3), libcBonus("wheel-musllinux_1_2_aarch64.tar.gz", .musl));
+    try std.testing.expectEqual(@as(i32, -2), libcBonus("wheel-musllinux_1_2_aarch64.tar.gz", .gnu));
+    // Prefix words like "gnuplot" must not false-match the "gnu" token.
+    try std.testing.expectEqual(@as(i32, 3), libcBonus("gnuplot-linux-x64-musl.tar.gz", .musl));
+    try std.testing.expectEqual(@as(i32, 0), libcBonus("gnuplot-linux-x64.tar.gz", .gnu));
+}
+
+test "findBestAsset selects unmarked glibc over -musl and -profile/-baseline for oven-sh/bun (issue #264)" {
+    const assets = [_]Asset{
+        .{ .name = "bun-darwin-aarch64.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-aarch64-android.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-aarch64-musl-profile.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-aarch64-musl.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-aarch64-profile.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-aarch64.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-x64-baseline-profile.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-x64-baseline.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-x64-musl-baseline.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-x64-musl-profile.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-x64-musl.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-x64-profile.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-x64.zip", .browser_download_url = "" },
+        .{ .name = "bun-windows-x64.zip", .browser_download_url = "" },
+        .{ .name = "SHASUMS256.txt", .browser_download_url = "" },
+        .{ .name = "SHASUMS256.txt.asc", .browser_download_url = "" },
+    };
+    const aarch64_arch: []const []const u8 = &.{ "aarch64", "arm64" };
+    const x86_64_arch: []const []const u8 = &.{ "x86_64", "x64", "amd64" };
+
+    const gnu_arm = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = aarch64_arch,
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("bun-linux-aarch64.zip", gnu_arm.name);
+
+    const musl_arm = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = aarch64_arch,
+        .libc = .musl,
+    });
+    try std.testing.expectEqualStrings("bun-linux-aarch64-musl.zip", musl_arm.name);
+
+    const gnu_x64 = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = x86_64_arch,
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("bun-linux-x64.zip", gnu_x64.name);
+
+    const musl_x64 = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = x86_64_arch,
+        .libc = .musl,
+    });
+    try std.testing.expectEqualStrings("bun-linux-x64-musl.zip", musl_x64.name);
+
+    const checksum = findChecksumAsset(&assets, "bun-linux-aarch64.zip") orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("SHASUMS256.txt", checksum.name);
+}
+
+test "findBestAsset selects unmarked glibc ghr archive on glibc host and linux-musl on musl host (issue #264)" {
+    const assets = [_]Asset{
+        .{ .name = "ghr-0.10.4-linux-arm64.tar.gz", .browser_download_url = "" },
+        .{ .name = "ghr-0.10.4-linux-arm64.tar.gz.minisig", .browser_download_url = "" },
+        .{ .name = "ghr-0.10.4-linux-arm64.tar.gz.sigstore.json", .browser_download_url = "" },
+        .{ .name = "ghr-0.10.4-linux-musl-arm64.tar.gz", .browser_download_url = "" },
+        .{ .name = "ghr-0.10.4-linux-musl-arm64.tar.gz.minisig", .browser_download_url = "" },
+        .{ .name = "ghr-0.10.4-linux-musl-arm64.tar.gz.sigstore.json", .browser_download_url = "" },
+        .{ .name = "ghr-0.10.4-linux-x64.tar.gz", .browser_download_url = "" },
+        .{ .name = "ghr-0.10.4-linux-musl-x64.tar.gz", .browser_download_url = "" },
+    };
+    const aarch64_arch: []const []const u8 = &.{ "aarch64", "arm64" };
+    const gnu_best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = aarch64_arch,
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("ghr-0.10.4-linux-arm64.tar.gz", gnu_best.name);
+
+    const musl_best = try findBestAssetForKeywords(&assets, .{
+        .os = &.{"linux"},
+        .arch = aarch64_arch,
+        .libc = .musl,
+    });
+    try std.testing.expectEqualStrings("ghr-0.10.4-linux-musl-arm64.tar.gz", musl_best.name);
+}
+
+test "findBestAsset selects x86_64-unknown-linux-musl for BurntSushi/ripgrep when foreign-arch -gnu tarballs exist (issue #264)" {
+    // BurntSushi/ripgrep publishes x86_64 Linux ONLY as `-musl`, alongside
+    // `-gnu` tarballs for aarch64, i686, powerpc64, s390x, and armv7 plus an
+    // amd64 `.deb`. On x86_64 glibc hosts, foreign-arch `-gnu` tarballs must
+    // be rejected by `isForeignArch` and the portable `x86_64-unknown-linux-musl`
+    // tarball must win over both foreign-arch `-gnu` and `.deb`.
+    const rg_assets = [_]Asset{
+        .{ .name = "ripgrep-14.1.0-aarch64-apple-darwin.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-aarch64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-armv7-unknown-linux-gnueabihf.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-armv7-unknown-linux-musleabihf.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-i686-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-powerpc64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-s390x-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-x86_64-apple-darwin.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-x86_64-pc-windows-msvc.zip", .browser_download_url = "" },
+        .{ .name = "ripgrep-14.1.0-x86_64-unknown-linux-musl.tar.gz", .browser_download_url = "" },
+        .{ .name = "ripgrep_14.1.0-1_amd64.deb", .browser_download_url = "" },
+    };
+    const x86_64_arch: []const []const u8 = &.{ "x86_64", "x64", "amd64" };
+    const aarch64_arch: []const []const u8 = &.{ "aarch64", "arm64" };
+
+    try std.testing.expect(isForeignArch("ripgrep-14.1.0-powerpc64-unknown-linux-gnu.tar.gz", x86_64_arch));
+    try std.testing.expect(isForeignArch("ripgrep-14.1.0-s390x-unknown-linux-gnu.tar.gz", x86_64_arch));
+    try std.testing.expect(isForeignArch("fd-v10.2.0-arm-unknown-linux-gnueabihf.tar.gz", aarch64_arch));
+    try std.testing.expect(isForeignArch("go1.23.0.linux-arm.tar.gz", aarch64_arch));
+    try std.testing.expect(!isForeignArch("tool-linux-arm64.tar.gz", aarch64_arch));
+
+    const rg_x64_gnu = try findBestAssetForKeywords(&rg_assets, .{
+        .os = &.{"linux"},
+        .arch = x86_64_arch,
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("ripgrep-14.1.0-x86_64-unknown-linux-musl.tar.gz", rg_x64_gnu.name);
+
+    const rg_arm_gnu = try findBestAssetForKeywords(&rg_assets, .{
+        .os = &.{"linux"},
+        .arch = aarch64_arch,
+        .libc = .gnu,
+    });
+    try std.testing.expectEqualStrings("ripgrep-14.1.0-aarch64-unknown-linux-gnu.tar.gz", rg_arm_gnu.name);
+}
+
+test "needsLibcDisambiguation skips single-option and uniform-libc releases (issue #264)" {
+    const linux_os: []const []const u8 = &.{"linux"};
+    const aarch64_arch: []const []const u8 = &.{ "aarch64", "arm64" };
+
+    // Single Linux+arch candidate: no disambiguation needed.
+    const single = [_]Asset{
+        .{ .name = "tool-aarch64-unknown-linux-musl.tar.gz", .browser_download_url = "" },
+        .{ .name = "tool-x86_64-unknown-linux-gnu.tar.gz", .browser_download_url = "" },
+        .{ .name = "tool-aarch64-apple-darwin.tar.gz", .browser_download_url = "" },
+    };
+    try std.testing.expect(!needsLibcDisambiguation(&single, linux_os, aarch64_arch));
+
+    // Multiple Linux+arch candidates, all unmarked: no disambiguation needed.
+    const unmarked_multi = [_]Asset{
+        .{ .name = "wasmtime-v44.0.0-aarch64-linux.tar.xz", .browser_download_url = "" },
+        .{ .name = "wasmtime-v44.0.0-aarch64-linux-c-api.tar.xz", .browser_download_url = "" },
+    };
+    try std.testing.expect(!needsLibcDisambiguation(&unmarked_multi, linux_os, aarch64_arch));
+
+    // Multiple Linux+arch candidates, all musl: no disambiguation needed.
+    const musl_only_multi = [_]Asset{
+        .{ .name = "tool-aarch64-unknown-linux-musl.tar.gz", .browser_download_url = "" },
+        .{ .name = "tool-aarch64-unknown-linux-musl-debug.tar.gz", .browser_download_url = "" },
+    };
+    try std.testing.expect(!needsLibcDisambiguation(&musl_only_multi, linux_os, aarch64_arch));
+
+    // Unmarked + -musl: disambiguation needed.
+    const bun_like = [_]Asset{
+        .{ .name = "bun-linux-aarch64.zip", .browser_download_url = "" },
+        .{ .name = "bun-linux-aarch64-musl.zip", .browser_download_url = "" },
+    };
+    try std.testing.expect(needsLibcDisambiguation(&bun_like, linux_os, aarch64_arch));
+}
+
+test "resolveLinuxHostLibc and parseElfPtInterp cover loader and ELF cases (issue #264)" {
+    // Only glibc loader -> .gnu; only musl loader -> .musl.
+    try std.testing.expectEqual(Libc.gnu, resolveLinuxHostLibc(.{ .has_glibc_loader = true }));
+    try std.testing.expectEqual(Libc.musl, resolveLinuxHostLibc(.{ .has_musl_loader = true }));
+    // Alpine gcompat/musl symlinks are rejected as native glibc loaders.
+    try std.testing.expect(isGlibcCompatShimTarget("/lib/ld-musl-aarch64.so.1"));
+    try std.testing.expect(isGlibcCompatShimTarget("/lib/libgcompat.so.0"));
+    try std.testing.expect(!isGlibcCompatShimTarget("aarch64-linux-gnu/ld-linux-aarch64.so.1"));
+    // Both loaders present -> ELF PT_INTERP wins, falling back to /etc/alpine-release.
+    try std.testing.expectEqual(Libc.gnu, resolveLinuxHostLibc(.{
+        .has_glibc_loader = true,
+        .has_musl_loader = true,
+        .userland_interp_libc = .gnu,
+    }));
+    try std.testing.expectEqual(Libc.musl, resolveLinuxHostLibc(.{
+        .has_glibc_loader = true,
+        .has_musl_loader = true,
+        .userland_interp_libc = .musl,
+    }));
+    try std.testing.expectEqual(Libc.musl, resolveLinuxHostLibc(.{
+        .has_glibc_loader = true,
+        .has_musl_loader = true,
+        .has_alpine_release = true,
+    }));
+    // Scratch / distroless/static (neither loader on known arch) -> .musl.
+    try std.testing.expectEqual(Libc.musl, resolveLinuxHostLibc(.{
+        .has_standard_loader_table = true,
+        .has_glibc_loader = false,
+        .has_musl_loader = false,
+    }));
+
+    // Construct a minimal valid 64-bit little-endian ELF with PT_INTERP.
+    var elf64: [160]u8 = @splat(0);
+    @memcpy(elf64[0..4], "\x7fELF");
+    elf64[4] = 2; // EI_CLASS = ELFCLASS64
+    elf64[5] = 1; // EI_DATA = ELFDATA2LSB
+    std.mem.writeInt(u64, elf64[32..40], 64, .little); // e_phoff
+    std.mem.writeInt(u16, elf64[54..56], 56, .little); // e_phentsize
+    std.mem.writeInt(u16, elf64[56..58], 1, .little); // e_phnum
+    std.mem.writeInt(u32, elf64[64..68], 3, .little); // p_type = PT_INTERP
+    const interp_str = "/lib/ld-linux-aarch64.so.1\x00";
+    std.mem.writeInt(u64, elf64[72..80], 120, .little); // p_offset
+    std.mem.writeInt(u64, elf64[96..104], interp_str.len, .little); // p_filesz
+    @memcpy(elf64[120 .. 120 + interp_str.len], interp_str);
+    const parsed64 = parseElfPtInterp(&elf64) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("/lib/ld-linux-aarch64.so.1", parsed64);
+    try std.testing.expectEqual(Libc.gnu, classifyInterpreterLibc(parsed64).?);
+    try std.testing.expectEqual(Libc.musl, classifyInterpreterLibc("/lib/ld-musl-x86_64.so.1").?);
+
+    // Static ELF with PT_LOAD (1) only -> null.
+    std.mem.writeInt(u32, elf64[64..68], 1, .little);
+    try std.testing.expect(parseElfPtInterp(&elf64) == null);
+
+    // Minimal valid 32-bit big-endian ELF with PT_INTERP.
+    var elf32: [128]u8 = @splat(0);
+    @memcpy(elf32[0..4], "\x7fELF");
+    elf32[4] = 1; // EI_CLASS = ELFCLASS32
+    elf32[5] = 2; // EI_DATA = ELFDATA2MSB
+    std.mem.writeInt(u32, elf32[28..32], 52, .big); // e_phoff
+    std.mem.writeInt(u16, elf32[42..44], 32, .big); // e_phentsize
+    std.mem.writeInt(u16, elf32[44..46], 1, .big); // e_phnum
+    std.mem.writeInt(u32, elf32[52..56], 3, .big); // p_type = PT_INTERP
+    const musl32_interp = "/lib/ld-musl-i386.so.1\x00";
+    std.mem.writeInt(u32, elf32[56..60], 88, .big); // p_offset
+    std.mem.writeInt(u32, elf32[68..72], musl32_interp.len, .big); // p_filesz
+    @memcpy(elf32[88 .. 88 + musl32_interp.len], musl32_interp);
+    const parsed32 = parseElfPtInterp(&elf32) orelse return error.TestUnexpectedNull;
+    try std.testing.expectEqualStrings("/lib/ld-musl-i386.so.1", parsed32);
+    try std.testing.expectEqual(Libc.musl, classifyInterpreterLibc(parsed32).?);
+
+    // Truncated / non-ELF -> null.
+    try std.testing.expect(parseElfPtInterp("not an elf") == null);
 }
 
 test "findBestAsset picks gnu on glibc host and musl on musl host (issue #116)" {
@@ -3914,6 +4552,8 @@ test "isChecksumFile accepts sha256 and sha512 forms, rejects sigs and md5" {
     try std.testing.expect(isChecksumFile("app.tar.gz.sha256"));
     try std.testing.expect(isChecksumFile("checksums.txt"));
     try std.testing.expect(isChecksumFile("SHA256SUMS"));
+    try std.testing.expect(isChecksumFile("SHASUMS256.txt"));
+    try std.testing.expect(isChecksumFile("SHASUMS512.txt"));
     try std.testing.expect(isChecksumFile("project_checksums_v1.0.txt"));
     try std.testing.expect(isChecksumFile("app.tar.gz.sha512"));
     try std.testing.expect(isChecksumFile("SHA512SUMS"));
@@ -3921,7 +4561,11 @@ test "isChecksumFile accepts sha256 and sha512 forms, rejects sigs and md5" {
     try std.testing.expect(!isChecksumFile("app.tar.gz.sig"));
     try std.testing.expect(!isChecksumFile("app.tar.gz.md5"));
     try std.testing.expect(!isChecksumFile("checksums.txt.sig"));
+    try std.testing.expect(!isChecksumFile("SHASUMS256.txt.asc"));
+    try std.testing.expect(!isChecksumFile("SHASUMS.txt"));
     try std.testing.expect(!isChecksumFile("release.pub"));
+    try std.testing.expect(!isInstallableAsset("SHA256SUMS"));
+    try std.testing.expect(!isInstallableAsset("SHASUMS256"));
 }
 
 test "findChecksumAsset prefers sidecar over aggregate" {

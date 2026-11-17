@@ -239,6 +239,7 @@ pub fn main(init: std.process.Init) !void {
         const result = if (print_cache_key)
             install.cmdInstallCacheKey(
                 allocator,
+                io,
                 tokens.items,
                 &stdout.interface,
                 &stderr.interface,

@@ -58,7 +58,8 @@ publishes. Minisign verification additionally needs a caller-supplied key:
   same as a CI-generated sidecar): it attests integrity, not independent
   provenance. Assets uploaded before the rollout carry no digest.
 - **Checksum files** — sidecar `<asset>.sha256` / `<asset>.sha512` files
-  and aggregate `*checksums*` / `SHA256SUMS` / `SHA512SUMS` files are all
+  and aggregate `*checksums*` / `SHA256SUMS` / `SHA512SUMS` /
+  `SHASUMS256.txt` / `SHASUMS512.txt` files are all
   supported, in GNU and BSD formats, and may use SHA-256 (64-hex) or
   SHA-512 (128-hex) digests — the entry's hex width picks the algorithm
   per asset, so a single aggregate file can even mix both (e.g. some
