@@ -625,8 +625,10 @@ It uses the same prefixed, slash-segment encoding principle as install state,
 so IDs such as `a` and `a/b` can coexist and raw IDs are never interpreted as
 paths. The payload records `schema: 2`, `layout_generation: 2`, `kind:
 "wsl-id"`, the canonical `id`, the inventory-relative `unit_path`, the
-diagnostic absolute `source`, and each owned link's exact name and target. The
-ID is the ownership key; `source` is never used to infer identity.
+diagnostic absolute `source`, and each owned link's exact `name`, `target`,
+`target_kind` (`"symlink"` or `"script"`), and optional `wrapper_sha256` (for
+`"script"` wrappers). The ID is the ownership key; `source` is never used to
+infer identity.
 
 `ghr link <id>` resolves exact command ownership from a Windows-platform
 inventory, so aliases remain aliases and are not re-derived from executable
@@ -638,9 +640,10 @@ discovery; if that lookup fails, it refuses the operation rather than guessing
 from the WSL username and requires explicit `--path` or
 `GHR_WIN_TOOLS_DIR`.
 
-Before replacing or retiring any link, reconciliation verifies that its live
-target still equals the target in the owning manifest. A changed link or an
-unmanaged entry blocks the operation before mutation. During lazy import, the
+Before replacing or retiring any link or wrapper, reconciliation verifies that
+its live symlink target or wrapper SHA-256 still equals the entry recorded in
+the owning manifest. A changed entry or an unmanaged file blocks the operation
+before mutation. During lazy import, the
 new ID manifest is written only after links are reconciled; failure rolls link
 changes back, and the old owner/repo manifest is deleted only after the new
 manifest is durable. A legacy manifest can still be unlinked safely after its
@@ -653,7 +656,10 @@ manifest while requiring its final two source components to case-fold to the
 canonical ID. This keeps pre-migration mixed-case installs recoverable without
 allowing a legacy manifest to claim targets outside the Windows tools root.
 
-Native Windows commands link directly to their installed executables. Wasm
+Native Windows `.exe` commands link directly to their installed executables via
+symlinks, while Windows `.cmd` archive commands (such as `npm.cmd` and
+`npx.cmd` alongside `node.exe`) are exposed via `cmd.exe /d /c call` bash
+wrapper scripts (`target_kind: "script"`) tracked by `wrapper_sha256`. Wasm
 commands are refused rather than linked to raw `.wasm` bytes, which are not
 directly executable through WSL interop; a future WSL-aware wasm launcher can
 add that support without emitting broken links today.

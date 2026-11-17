@@ -561,9 +561,10 @@ fn printLinkUsage(w: *Writer) !void {
         \\    ghr link [--path] <name>                     (e.g. 'ghr link git')
         \\
         \\With <id>, reads the exact Windows-side install from ghr's inventory
-        \\and creates Linux symlinks in ghr's bin directory for the commands
-        \\owned by that ID. The links point at the original `.exe` binaries
-        \\(via `/mnt/c/...`), which WSL interop executes transparently.
+        \\and creates entries in ghr's bin directory for the commands owned by
+        \\that ID: Linux symlinks for `.exe` binaries (via `/mnt/c/...`, run
+        \\directly by WSL interop) and `cmd.exe` bash wrappers for `.cmd`
+        \\archive commands.
         \\
         \\Without `--bin`, links every bin advertised by the Windows
         \\install and removes any previously-linked bins that no longer
@@ -606,15 +607,16 @@ fn printLinkUsage(w: *Writer) !void {
 
 fn printUnlinkUsage(w: *Writer) !void {
     try w.print(
-        \\ghr unlink - remove WSL symlinks created by 'ghr link'
+        \\ghr unlink - remove WSL links and wrappers created by 'ghr link'
         \\
         \\USAGE:
         \\    ghr unlink <id> [--bin <name> ...]
         \\    ghr unlink [--path] <name>                   (bare executable form)
         \\
-        \\With <id>, removes every symlink recorded for that exact install ID.
-        \\Verifies each symlink still points where the ID manifest recorded
-        \\before deleting, so a user-rewritten symlink is never clobbered.
+        \\With <id>, removes every symlink or wrapper recorded for that exact
+        \\install ID. Verifies each symlink target or wrapper digest still
+        \\matches the ID manifest before deleting, so a user-edited entry is
+        \\never clobbered.
         \\
         \\With `--bin <name>` filters, only the named entries are
         \\removed.

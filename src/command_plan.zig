@@ -2086,3 +2086,34 @@ fn freeArtifacts(gpa: Allocator, items: []const []const u8) void {
     for (items) |s| gpa.free(s);
     gpa.free(items);
 }
+
+test "Windows .cmd source targets publish native <name>.exe + <stem>.ghr and keep explicit .cmd aliases intact" {
+    const a = testing.allocator;
+    const units = [_]Unit{.{
+        .id = "cataggar/nodejs",
+        .commands = &.{
+            tNative("node.exe"),
+            tNative("npm.cmd"),
+            tNative("npx.cmd"),
+        },
+        .aliases = &.{.{ .source = "npx", .published = "npx-raw.cmd" }},
+    }};
+    var p = try plan(a, &units, empty_inventory, empty_snapshot, .{ .platform = .windows });
+    defer p.deinit();
+
+    try testing.expectEqual(@as(usize, 3), p.commands.len);
+    try testing.expectEqualStrings("node", p.commands[0].final_name);
+    try tExpectNames(&.{ "node.exe", "node.ghr" }, p.commands[0].publish);
+
+    try testing.expectEqualStrings("npm", p.commands[1].final_name);
+    try testing.expectEqualStrings("npm", p.commands[1].source_name);
+    try testing.expectEqualStrings("npm.cmd", p.commands[1].relative_target);
+    try tExpectNames(&.{ "npm.exe", "npm.ghr" }, p.commands[1].publish);
+    try tExpectNames(&.{ "npm.cmd", "npm.shim", "npm.exe.old" }, p.commands[1].cleanup);
+
+    // Explicit `.cmd` in a published alias is NOT stripped by windowsExeStem.
+    try testing.expectEqualStrings("npx-raw.cmd", p.commands[2].final_name);
+    try testing.expectEqualStrings("npx", p.commands[2].source_name);
+    try tExpectNames(&.{ "npx-raw.cmd.exe", "npx-raw.cmd.ghr" }, p.commands[2].publish);
+}
+

@@ -559,7 +559,7 @@ fn isExecutableCandidate(
 ) !bool {
     const name = std.fs.path.basename(relative_path);
     if (isSharedLibrary(name) or isAppleArchiveCruft(name)) return false;
-    if (windows and !hasWindowsExeSuffix(name)) return false;
+    if (windows and !hasWindowsRunnableSuffix(name)) return false;
     return isExecutableTarget(allocator, io, root, relative_path, windows) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.SymLinkLoop, error.NameTooLong => return false,
         else => return err,
@@ -591,6 +591,28 @@ fn hasWindowsExeSuffix(name: []const u8) bool {
     return name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe");
 }
 
+fn hasWindowsCmdSuffix(name: []const u8) bool {
+    return name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".cmd");
+}
+
+/// Windows archive command discovery accepts `.exe` and `.cmd` (excluding
+/// `.bat`/`.ps1` helpers and bare `.exe`/`.cmd` dotfiles with no stem).
+fn hasWindowsRunnableSuffix(name: []const u8) bool {
+    return name.len > 4 and (hasWindowsExeSuffix(name) or hasWindowsCmdSuffix(name));
+}
+
+fn pathListHasWindowsExe(paths: []const []const u8) bool {
+    for (paths) |rel| {
+        const base = std.fs.path.basename(rel);
+        if (base.len > 4 and hasWindowsExeSuffix(base)) return true;
+    }
+    return false;
+}
+
+/// Strip a trailing `.exe` on final published command names. Intentionally
+/// `.exe`-only to stay identical to `command_plan.artifactFamily`: a source
+/// `.cmd` target derives its stem earlier via `install_state.sourceCommandSlice`,
+/// whereas an explicit published alias like `foo.cmd` expands to `foo.cmd.exe`.
 fn windowsExeStem(name: []const u8) []const u8 {
     if (hasWindowsExeSuffix(name)) return name[0 .. name.len - 4];
     return name;
@@ -710,8 +732,13 @@ fn findExecutablesForPlatform(
     dir: Dir,
     windows: bool,
 ) !std.ArrayListUnmanaged([]const u8) {
-    var result: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer deinitPathList(allocator, &result);
+    // On Windows, prefer the shallowest BFS level that contains at least one
+    // `.exe` (returning both `.exe` and `.cmd` siblings from that level, such
+    // as `node.exe` alongside `npm.cmd`/`npx.cmd`) so a top-level `setup.cmd`
+    // or `env.cmd` above `bin/*.exe` cannot shadow the real binaries. Retain
+    // the shallowest `.cmd`-only level as a fallback when no `.exe` exists.
+    var cmd_fallback: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer deinitPathList(allocator, &cmd_fallback);
 
     var current: std.ArrayListUnmanaged([]const u8) = .empty;
     defer deinitPathList(allocator, &current);
@@ -722,6 +749,8 @@ fn findExecutablesForPlatform(
     };
 
     while (current.items.len > 0) {
+        var level_result: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer deinitPathList(allocator, &level_result);
         var next: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer deinitPathList(allocator, &next);
 
@@ -737,23 +766,33 @@ fn findExecutablesForPlatform(
                 io,
                 dir,
                 opened orelse dir,
-                &result,
+                &level_result,
                 &next,
                 prefix,
                 windows,
             );
         }
 
-        if (result.items.len > 0) {
-            deinitPathList(allocator, &next);
-            return result;
+        if (level_result.items.len > 0) {
+            if (!windows or pathListHasWindowsExe(level_result.items)) {
+                deinitPathList(allocator, &cmd_fallback);
+                deinitPathList(allocator, &next);
+                return level_result;
+            }
+            if (cmd_fallback.items.len == 0) {
+                cmd_fallback = level_result;
+            } else {
+                deinitPathList(allocator, &level_result);
+            }
+        } else {
+            deinitPathList(allocator, &level_result);
         }
 
         deinitPathList(allocator, &current);
         current = next;
     }
 
-    return result;
+    return cmd_fallback;
 }
 
 /// Some archives bundle the *same* command compiled for several architectures
@@ -776,10 +815,56 @@ fn dedupeExecutablesByHostArch(
     dedupeExecutablesByArch(allocator, exes, release_mod.currentPlatformKeywords().arch);
 }
 
+fn dedupeWindowsExeOverCmdForHost(
+    allocator: std.mem.Allocator,
+    exes: *std.ArrayListUnmanaged([]const u8),
+) void {
+    dedupeWindowsExeOverCmd(allocator, exes, release_mod.currentPlatformKeywords().arch);
+}
+
+/// Mirror Windows `PATHEXT` precedence during archive command discovery: when
+/// both `<stem>.exe` and `<stem>.cmd` survive at the chosen level, keep
+/// `<stem>.exe` and drop `<stem>.cmd` (unless the `.exe` clearly targets a
+/// foreign architecture while the `.cmd` does not). Distinct `.cmd` copies
+/// sharing a stem are left alone so `command_plan` still fails closed with
+/// `error.DuplicateSourceCommand`.
+fn dedupeWindowsExeOverCmd(
+    allocator: std.mem.Allocator,
+    exes: *std.ArrayListUnmanaged([]const u8),
+    host_arch: []const []const u8,
+) void {
+    if (exes.items.len < 2) return;
+
+    var i: usize = 0;
+    while (i < exes.items.len) {
+        const cand = exes.items[i];
+        if (!hasWindowsCmdSuffix(std.fs.path.basename(cand))) {
+            i += 1;
+            continue;
+        }
+        const cmd_stem = install_state.sourceCommandSlice(cand, .windows);
+        const cmd_is_foreign = host_arch.len > 0 and release_mod.isForeignArch(cand, host_arch);
+
+        var shadowed_by_exe = false;
+        for (exes.items, 0..) |other, j| {
+            if (j == i) continue;
+            if (!hasWindowsExeSuffix(std.fs.path.basename(other))) continue;
+            if (!std.ascii.eqlIgnoreCase(install_state.sourceCommandSlice(other, .windows), cmd_stem)) continue;
+            const exe_is_foreign = host_arch.len > 0 and release_mod.isForeignArch(other, host_arch);
+            if (exe_is_foreign and !cmd_is_foreign) continue;
+            shadowed_by_exe = true;
+            break;
+        }
+        if (shadowed_by_exe) {
+            allocator.free(exes.orderedRemove(i));
+            continue;
+        }
+        i += 1;
+    }
+}
+
 fn installedCommandName(exe_rel_path: []const u8, windows: bool) []const u8 {
-    const base = std.fs.path.basename(exe_rel_path);
-    if (windows) return windowsExeStem(base);
-    return base;
+    return install_state.sourceCommandSlice(exe_rel_path, if (windows) .windows else .posix);
 }
 
 fn commandNamesEqual(a: []const u8, b: []const u8, windows: bool) bool {
@@ -2977,6 +3062,7 @@ fn discoverStagedCommands(
     }
 
     dedupeExecutablesByHostArch(allocator, &exes);
+    if (host_is_windows) dedupeWindowsExeOverCmdForHost(allocator, &exes);
     filterExecutables(allocator, &exes, ctx.bin_filters, host_is_windows, err_w) catch |err| switch (err) {
         error.UnmatchedBinFilter => {
             try err_w.flush();
@@ -7162,6 +7248,111 @@ test "Windows executable discovery and filtering accept uppercase exe suffixes" 
     try std.testing.expectEqualStrings("AzureAuth.EXE", exes.items[0]);
 }
 
+test "Windows executable discovery finds .cmd siblings alongside .exe and excludes .bat/.ps1/extensionless" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "node-v22.0.0-win-x64/node_modules/npm/bin");
+    for ([_][]const u8{
+        "node-v22.0.0-win-x64/node.exe",
+        "node-v22.0.0-win-x64/npm",
+        "node-v22.0.0-win-x64/npm.cmd",
+        "node-v22.0.0-win-x64/npm.ps1",
+        "node-v22.0.0-win-x64/NPX.CMD",
+        "node-v22.0.0-win-x64/npx.ps1",
+        "node-v22.0.0-win-x64/nodevars.bat",
+        "node-v22.0.0-win-x64/install_tools.bat",
+        "node-v22.0.0-win-x64/.cmd",
+        "node-v22.0.0-win-x64/.exe",
+        "node-v22.0.0-win-x64/node_modules/npm/bin/npm-cli.cmd",
+    }) |rel| {
+        try tmp.dir.writeFile(tio, .{ .sub_path = rel, .data = "@echo off\r\n" });
+    }
+
+    var scan_dir = try tmp.dir.openDir(tio, ".", .{ .iterate = true });
+    defer scan_dir.close(tio);
+    var exes = try findExecutablesForPlatform(allocator, tio, scan_dir, true);
+    defer deinitPathList(allocator, &exes);
+    try std.testing.expectEqual(@as(usize, 3), exes.items.len);
+
+    var err_output = std.Io.Writer.Allocating.init(allocator);
+    defer err_output.deinit();
+    try filterExecutables(allocator, &exes, &.{ "npm", "npx" }, true, &err_output.writer);
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+}
+
+test "Windows executable discovery prefers deeper .exe level over top-level .cmd wrapper" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "pkg/bin");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "pkg/env.cmd", .data = "@echo off\r\n" });
+    try tmp.dir.writeFile(tio, .{ .sub_path = "pkg/bin/tool.exe", .data = "MZ" });
+    try tmp.dir.writeFile(tio, .{ .sub_path = "pkg/bin/helper.cmd", .data = "@echo off\r\n" });
+
+    var scan_dir = try tmp.dir.openDir(tio, ".", .{ .iterate = true });
+    defer scan_dir.close(tio);
+    var exes = try findExecutablesForPlatform(allocator, tio, scan_dir, true);
+    defer deinitPathList(allocator, &exes);
+    try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+    for (exes.items) |rel| {
+        const base = std.fs.path.basename(rel);
+        try std.testing.expect(std.mem.eql(u8, base, "tool.exe") or std.mem.eql(u8, base, "helper.cmd"));
+    }
+}
+
+test "Windows executable discovery falls back to shallowest .cmd-only level when archive has no .exe" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(tio, "pkg/bin/internal");
+    try tmp.dir.writeFile(tio, .{ .sub_path = "pkg/bin/gradle.cmd", .data = "@echo off\r\n" });
+    try tmp.dir.writeFile(tio, .{ .sub_path = "pkg/bin/internal/helper.cmd", .data = "@echo off\r\n" });
+
+    var scan_dir = try tmp.dir.openDir(tio, ".", .{ .iterate = true });
+    defer scan_dir.close(tio);
+    var exes = try findExecutablesForPlatform(allocator, tio, scan_dir, true);
+    defer deinitPathList(allocator, &exes);
+    try std.testing.expectEqual(@as(usize, 1), exes.items.len);
+    try std.testing.expectEqualStrings("gradle.cmd", std.fs.path.basename(exes.items[0]));
+}
+
+test "dedupeWindowsExeOverCmd prefers .exe over same-stem .cmd while keeping duplicate .cmd collisions" {
+    const allocator = std.testing.allocator;
+    {
+        var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer deinitPathList(allocator, &exes);
+        try exes.append(allocator, try allocator.dupe(u8, "bin/Foo.CMD"));
+        try exes.append(allocator, try allocator.dupe(u8, "bin/foo.exe"));
+        try exes.append(allocator, try allocator.dupe(u8, "bin/npm.cmd"));
+        dedupeWindowsExeOverCmd(allocator, &exes, &.{ "aarch64", "arm64" });
+        try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+        try std.testing.expectEqualStrings("bin/foo.exe", exes.items[0]);
+        try std.testing.expectEqualStrings("bin/npm.cmd", exes.items[1]);
+    }
+    {
+        // Foreign-arch .exe must not suppress a host-arch .cmd when no host .exe exists.
+        var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer deinitPathList(allocator, &exes);
+        try exes.append(allocator, try allocator.dupe(u8, "x86_64/foo.exe"));
+        try exes.append(allocator, try allocator.dupe(u8, "aarch64/foo.cmd"));
+        dedupeWindowsExeOverCmd(allocator, &exes, &.{ "aarch64", "arm64" });
+        try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+    }
+    {
+        // Two .cmd files sharing a stem are NOT deduplicated so command_plan fails closed.
+        var exes: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer deinitPathList(allocator, &exes);
+        try exes.append(allocator, try allocator.dupe(u8, "a/npm.cmd"));
+        try exes.append(allocator, try allocator.dupe(u8, "b/npm.cmd"));
+        dedupeWindowsExeOverCmd(allocator, &exes, &.{ "aarch64", "arm64" });
+        try std.testing.expectEqual(@as(usize, 2), exes.items.len);
+    }
+}
+
 test "Windows shim and cleanup names strip exe suffix case-insensitively" {
     try std.testing.expectEqualStrings("AzureAuth", windowsExeStem("AzureAuth.EXE"));
     try std.testing.expectEqualStrings("AzureAuth", windowsExeStem("AzureAuth.ExE"));
@@ -9798,3 +9989,129 @@ test "stageGenericUrlRequest cleans up cache on download, verification, extracti
         try std.testing.expect(store.binEntryExists("generic-tool"));
     }
 }
+
+test "Windows published native shim executes .cmd target safely with spaces, %~dp0 sibling, and metacharacters" {
+    if (builtin.os.tag != .windows or builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(tio, "bin");
+    try tmp.dir.createDirPath(tio, "unit with spaces (x64)");
+
+    // Companion marker next to `npm.cmd` verified via `%~dp0` (just like
+    // Node.js `npm.cmd` resolves `%~dp0\node.exe` in directories with spaces
+    // and parentheses). Captures arguments directly with delayed expansion
+    // disabled — avoiding a nested `call ... %*` which would trigger a second
+    // `cmd.exe` expansion pass — then echoes them under delayed expansion so
+    // metacharacters are printed verbatim rather than re-parsed by `echo`.
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "unit with spaces (x64)/node-companion.marker",
+        .data = "ok",
+    });
+    try tmp.dir.writeFile(tio, .{
+        .sub_path = "unit with spaces (x64)/npm.cmd",
+        .data = "@echo off\r\n" ++
+            "setlocal EnableExtensions DisableDelayedExpansion\r\n" ++
+            "if not exist \"%~dp0node-companion.marker\" exit /b 99\r\n" ++
+            "set \"A1=%~1\"\r\n" ++
+            "set \"A2=%~2\"\r\n" ++
+            "set \"A3=%~3\"\r\n" ++
+            "set \"A4=%~4\"\r\n" ++
+            "set \"A5=%~5\"\r\n" ++
+            "setlocal EnableDelayedExpansion\r\n" ++
+            "echo 1:[!A1!]\r\n" ++
+            "echo 2:[!A2!]\r\n" ++
+            "echo 3:[!A3!]\r\n" ++
+            "echo 4:[!A4!]\r\n" ++
+            "echo 5:[!A5!]\r\n" ++
+            "exit /b 42\r\n",
+    });
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+
+    const cmd_target = try std.fs.path.join(allocator, &.{ base, "unit with spaces (x64)", "npm.cmd" });
+    defer allocator.free(cmd_target);
+    const shim_exe_path = try std.fs.path.join(allocator, &.{ base, "bin", "npm.exe" });
+    defer allocator.free(shim_exe_path);
+
+    var bin_dir = try tmp.dir.openDir(tio, "bin", .{});
+    defer bin_dir.close(tio);
+    try publishNativeCommand(tio, bin_dir, "npm", cmd_target, false);
+
+    // 1. Hostile batch metacharacters, env expansion attempts, spaces, and empty
+    //    args are preserved verbatim without injection, and exit code propagates.
+    {
+        const run_res = try std.process.run(allocator, tio, .{
+            .argv = &.{
+                shim_exe_path,
+                "safe&echo INJECTED|calc",
+                "%COMSPEC%",
+                "!COMSPEC!",
+                "",
+                "hello (world) ^ < >",
+            },
+            .stdout_limit = Io.Limit.limited(16 * 1024),
+            .stderr_limit = Io.Limit.limited(16 * 1024),
+        });
+        defer allocator.free(run_res.stdout);
+        defer allocator.free(run_res.stderr);
+
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, run_res.term);
+        try std.testing.expectEqualStrings("", run_res.stderr);
+        try std.testing.expectEqualStrings(
+            "1:[safe&echo INJECTED|calc]\r\n" ++
+                "2:[%COMSPEC%]\r\n" ++
+                "3:[!COMSPEC!]\r\n" ++
+                "4:[]\r\n" ++
+                "5:[hello (world) ^ < >]\r\n",
+            run_res.stdout,
+        );
+    }
+
+    // 2. Embedded newline in batch argument fails closed with exit 1 and a clear message.
+    {
+        const nl_res = try std.process.run(allocator, tio, .{
+            .argv = &.{ shim_exe_path, "line1\nwhoami" },
+            .stdout_limit = Io.Limit.limited(16 * 1024),
+            .stderr_limit = Io.Limit.limited(16 * 1024),
+        });
+        defer allocator.free(nl_res.stdout);
+        defer allocator.free(nl_res.stderr);
+
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, nl_res.term);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            nl_res.stderr,
+            "shim: batch script arguments cannot contain NUL, CR, or LF",
+        ) != null);
+    }
+
+    // 3. `.cmd` target path containing `%` fails closed before invoking `cmd.exe`.
+    {
+        const unsafe_target = try std.fs.path.join(allocator, &.{ base, "dir%COMSPEC%", "npm.cmd" });
+        defer allocator.free(unsafe_target);
+        try publishNativeCommand(tio, bin_dir, "badnpm", unsafe_target, false);
+        const bad_shim = try std.fs.path.join(allocator, &.{ base, "bin", "badnpm.exe" });
+        defer allocator.free(bad_shim);
+
+        const bad_res = try std.process.run(allocator, tio, .{
+            .argv = &.{bad_shim},
+            .stdout_limit = Io.Limit.limited(16 * 1024),
+            .stderr_limit = Io.Limit.limited(16 * 1024),
+        });
+        defer allocator.free(bad_res.stdout);
+        defer allocator.free(bad_res.stderr);
+
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, bad_res.term);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            bad_res.stderr,
+            "shim: unsafe batch script target path",
+        ) != null);
+    }
+}
+

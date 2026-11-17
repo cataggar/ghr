@@ -2,10 +2,14 @@
 
 When ghr is installed on Windows, a parallel WSL distribution can expose the
 same tools without re-downloading them. `ghr link <id>` resolves the exact
-Windows install from ghr's inventory and creates Linux symlinks in
-`~/.local/bin` for that ID's persisted command names. The links point directly
-at the Windows-side `.exe` (via `/mnt/c/...`); WSL interop runs the binary
-transparently.
+Windows install from ghr's inventory and creates entries in `~/.local/bin` for
+that ID's persisted command names:
+
+- `.exe` commands → Linux symlinks pointing directly at the Windows-side `.exe`
+  (via `/mnt/c/...`); WSL interop runs the PE binary transparently.
+- `.cmd` commands → small executable bash wrappers (`target_kind: "script"`)
+  that invoke `cmd.exe /d /c call '<windows-path>' "$@"` via WSL interop (for
+  example `npm` and `npx` alongside `node.exe` in Windows Node.js archives).
 
 ```sh
 # Link an executable already on the Windows %PATH% (no install needed).
@@ -15,8 +19,9 @@ ghr unlink --path az
 
 Notes:
 
-- `ghr link` is a **reconciler**. Without `--bin`, it makes the WSL link set match the current Windows install — adding new bins, updating moved ones, and removing entries that disappeared from `ghr.json`. With `--bin <name>` filters, only the named entries are touched.
-- The symlink target is the real `.exe` under the inventory-selected unit, not the Windows shim. A `C:\…` target would not trigger interop; the WSL path is required.
+- `ghr link` is a **reconciler**. Without `--bin`, it makes the WSL link set match the current Windows install — adding new bins, updating moved ones, and removing entries that disappeared from `ghr.json`. With `--bin <name>` filters (for example `--bin node --bin npm`), only the named entries are touched.
+- For `.exe` commands, the symlink target is the real `.exe` under the inventory-selected unit, not the Windows shim. A `C:\…` symlink target would not trigger interop; the WSL path is required. For `.cmd` commands, the bash wrapper passes the converted Windows drive path (`C:\…`) to `cmd.exe /d /c call` because Linux binfmt interop cannot execute `.cmd` batch scripts directly. Note that `cmd.exe` does not support UNC working directories (`\\wsl.localhost\...`) and resets its working directory to `C:\Windows` when invoked from a Linux-only filesystem path; run workspace-sensitive `.cmd` commands (such as `npm install`) from a mounted Windows drive (`/mnt/c/...`) or install a Linux-native build inside WSL.
+- Note for Node.js / `npm` installs: `npm install -g` defaults to writing global shims inside the extracted unit directory next to `node.exe` (`%~dp0`), which is replaced on `ghr install` upgrades and is not automatically added to `PATH`. Configure a dedicated user global prefix (for example `npm config set prefix "%APPDATA%\npm"`) if you use `npm install -g`.
 - Both commands require `WSL_INTEROP` to be set. They refuse to run outside WSL so you don't accidentally create dangling links on bare Linux or macOS.
 - IDs are canonicalized to lowercase. Multiple IDs sourced from the same repository remain independent.
 - Raw wasm modules are refused because direct symlinks to `.wasm` bytes are not executable through WSL interop.
@@ -147,9 +152,12 @@ For each linked ID, ghr records what it created at
 `a/b` independent. Bare-executable links live in the sibling
 `by-path/<name>.json` tree.
 
-The manifest records the canonical ID and exact published command names.
-`ghr unlink` verifies each live symlink still points where the manifest
-recorded before deleting, so a user-rewritten symlink is never clobbered.
+The manifest records the canonical ID, exact published command names, each
+entry's `target_kind` (`"symlink"` or `"script"`), and for `"script"` entries
+the SHA-256 digest (`wrapper_sha256`) of the generated wrapper script.
+`ghr link` and `ghr unlink` verify each live symlink target or wrapper SHA-256
+still matches what the manifest recorded before replacing or deleting, so a
+user-rewritten symlink or edited wrapper script is never clobbered.
 Validated legacy owner/repo manifests migrate lazily during a full
 reconciliation and can still be unlinked after the Windows install disappears.
 
