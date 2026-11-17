@@ -652,7 +652,7 @@ fn resolveTarget(
             var rel = try fetchRelease(ctx, opts, rs.owner, rs.repo, rs.tag);
             errdefer rel.deinit();
 
-            const asset = release_mod.findBestAsset(rel.parsed.value.assets) catch {
+            const asset = release_mod.findBestAsset(ctx.io, rel.parsed.value.assets) catch {
                 try err_w.print("error: no matching asset for this platform\n", .{});
                 try err_w.print("available assets:\n", .{});
                 for (rel.parsed.value.assets) |a| try err_w.print("  {s}\n", .{a.name});

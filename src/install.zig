@@ -812,7 +812,7 @@ fn dedupeExecutablesByHostArch(
     allocator: std.mem.Allocator,
     exes: *std.ArrayListUnmanaged([]const u8),
 ) void {
-    dedupeExecutablesByArch(allocator, exes, release_mod.currentPlatformKeywords().arch);
+    dedupeExecutablesByArch(allocator, exes, release_mod.hostArchKeywords());
 }
 
 fn dedupeWindowsExeOverCmdForHost(
@@ -2477,6 +2477,7 @@ fn writeInstallCacheMaterial(
     w: *Writer,
     parsed: *const install_request.ParsedRequests,
     options: InstallOptions,
+    host_libc: ?release_mod.Libc,
 ) !void {
     const requests = try allocator.alloc(*const install_request.InstallRequest, parsed.items.len);
     defer allocator.free(requests);
@@ -2489,11 +2490,19 @@ fn writeInstallCacheMaterial(
     std.mem.sort([]const u8, selected, {}, cacheStringLessThan);
 
     try w.print(
-        "{{\"schema\":1,\"form\":\"install-cache-key\",\"target\":{{\"os\":\"{t}\",\"arch\":\"{t}\",\"abi\":\"{t}\"}},\"state_schema\":{d},\"layout_generation\":{d},\"requests\":[",
+        "{{\"schema\":1,\"form\":\"install-cache-key\",\"target\":{{\"os\":\"{t}\",\"arch\":\"{t}\",\"abi\":\"{t}\"",
         .{
             builtin.target.os.tag,
             builtin.target.cpu.arch,
             builtin.target.abi,
+        },
+    );
+    if (host_libc) |libc| {
+        try w.print(",\"host_libc\":\"{t}\"", .{libc});
+    }
+    try w.print(
+        "}},\"state_schema\":{d},\"layout_generation\":{d},\"requests\":[",
+        .{
             install_state_write.schema_version,
             install_state_write.layout_generation,
         },
@@ -2545,10 +2554,12 @@ fn writeInstallCacheMaterial(
 }
 
 /// Print a deterministic SHA-256 cache key for normalized install requests.
-/// This performs no network or filesystem access and shares parsing and
-/// duplicate-ID validation with a real install.
+/// Performs no network access, shares parsing and duplicate-ID validation with
+/// a real install, and on Linux lazily includes the runtime host libc when at
+/// least one request uses platform auto-selection (`.github_repo`).
 pub fn cmdInstallCacheKey(
     allocator: std.mem.Allocator,
+    io: Io,
     tokens: []const []const u8,
     w: *Writer,
     err_w: *Writer,
@@ -2571,9 +2582,21 @@ pub fn cmdInstallCacheKey(
         return error.InvalidInstallRequest;
     }
 
+    var has_auto_repo_request = false;
+    for (parsed.items) |request| {
+        if (request.source == .github_repo) {
+            has_auto_repo_request = true;
+            break;
+        }
+    }
+    const host_libc: ?release_mod.Libc = if (has_auto_repo_request)
+        release_mod.detectHostLibcCached(io)
+    else
+        null;
+
     var material = std.Io.Writer.Allocating.init(allocator);
     defer material.deinit();
-    try writeInstallCacheMaterial(allocator, &material.writer, &parsed, options);
+    try writeInstallCacheMaterial(allocator, &material.writer, &parsed, options, host_libc);
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(material.written(), &digest, .{});
@@ -2872,7 +2895,7 @@ fn selectPrimaryAssets(
     for (wasm_mods) |a| try out.append(allocator, a);
     if (out.items.len > 0) return;
 
-    const a = findBestAsset(release.assets) catch {
+    const a = findBestAsset(ctx.io, release.assets) catch {
         try err_w.print("error: no matching asset for this platform\n", .{});
         try err_w.print("available assets:\n", .{});
         for (release.assets) |av| try err_w.print("  {s}\n", .{av.name});
@@ -6963,7 +6986,7 @@ fn tInstallCacheKey(tokens: []const []const u8, options: InstallOptions) ![]u8 {
     defer out.deinit();
     var err_out = std.Io.Writer.Allocating.init(t_alloc);
     defer err_out.deinit();
-    try cmdInstallCacheKey(t_alloc, tokens, &out.writer, &err_out.writer, options, false);
+    try cmdInstallCacheKey(t_alloc, std.testing.io, tokens, &out.writer, &err_out.writer, options, false);
     try std.testing.expectEqual(@as(usize, 0), err_out.written().len);
     return out.toOwnedSlice();
 }
@@ -7045,6 +7068,7 @@ test "install cache key can require one complete request" {
         error.InvalidInstallRequest,
         cmdInstallCacheKey(
             t_alloc,
+            std.testing.io,
             &.{ "owner/first", "RWATools/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
             &out.writer,
             &err_out.writer,
@@ -7057,6 +7081,33 @@ test "install cache key can require one complete request" {
         err_out.written(),
         "contains 2 install requests; expected exactly one",
     ) != null);
+}
+
+test "install cache material separates gnu and musl host libc and omits it for pinned files (issue #264)" {
+    var err_out = std.Io.Writer.Allocating.init(t_alloc);
+    defer err_out.deinit();
+
+    var repo_parsed = try parseInstallRequests(t_alloc, &.{"oven-sh/bun@bun-v1.4.4"}, &.{}, auth.default_github_host, &err_out.writer);
+    defer repo_parsed.deinit();
+
+    var gnu_mat = std.Io.Writer.Allocating.init(t_alloc);
+    defer gnu_mat.deinit();
+    try writeInstallCacheMaterial(t_alloc, &gnu_mat.writer, &repo_parsed, .{}, .gnu);
+
+    var musl_mat = std.Io.Writer.Allocating.init(t_alloc);
+    defer musl_mat.deinit();
+    try writeInstallCacheMaterial(t_alloc, &musl_mat.writer, &repo_parsed, .{}, .musl);
+
+    try std.testing.expect(!std.mem.eql(u8, gnu_mat.written(), musl_mat.written()));
+    try std.testing.expect(std.mem.indexOf(u8, gnu_mat.written(), "\"host_libc\":\"gnu\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, musl_mat.written(), "\"host_libc\":\"musl\"") != null);
+
+    var file_parsed = try parseInstallRequests(t_alloc, &.{"oven-sh/bun/bun-linux-aarch64.zip@bun-v1.4.4"}, &.{}, auth.default_github_host, &err_out.writer);
+    defer file_parsed.deinit();
+    var file_mat = std.Io.Writer.Allocating.init(t_alloc);
+    defer file_mat.deinit();
+    try writeInstallCacheMaterial(t_alloc, &file_mat.writer, &file_parsed, .{}, null);
+    try std.testing.expect(std.mem.indexOf(u8, file_mat.written(), "\"host_libc\"") == null);
 }
 
 test "install refuses a lone query token before any work happens" {
