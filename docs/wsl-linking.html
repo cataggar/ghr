@@ -166,18 +166,24 @@
 <h1><a href="#wsl-linking-windows-side-bins-ghr-link--ghr-unlink" id="wsl-linking-windows-side-bins-ghr-link--ghr-unlink"></a>WSL: linking Windows-side bins (<code>ghr link</code> / <code>ghr unlink</code>)</h1>
 <p>When ghr is installed on Windows, a parallel WSL distribution can expose the
 same tools without re-downloading them. <code>ghr link &lt;id&gt;</code> resolves the exact
-Windows install from ghr's inventory and creates Linux symlinks in
-<code>~/.local/bin</code> for that ID's persisted command names. The links point directly
-at the Windows-side <code>.exe</code> (via <code>/mnt/c/...</code>); WSL interop runs the binary
-transparently.</p>
+Windows install from ghr's inventory and creates entries in <code>~/.local/bin</code> for
+that ID's persisted command names:</p>
+<ul>
+<li><code>.exe</code> commands → Linux symlinks pointing directly at the Windows-side <code>.exe</code>
+(via <code>/mnt/c/...</code>); WSL interop runs the PE binary transparently.</li>
+<li><code>.cmd</code> commands → small executable bash wrappers (<code>target_kind: &quot;script&quot;</code>)
+that invoke <code>cmd.exe /d /c call '&lt;windows-path&gt;' &quot;$@&quot;</code> via WSL interop (for
+example <code>npm</code> and <code>npx</code> alongside <code>node.exe</code> in Windows Node.js archives).</li>
+</ul>
 <pre><code class="language-sh"># Link an executable already on the Windows %PATH% (no install needed).
 ghr link --path az           # → bash wrapper that runs az.cmd via cmd.exe
 ghr unlink --path az
 </code></pre>
 <p>Notes:</p>
 <ul>
-<li><code>ghr link</code> is a <strong>reconciler</strong>. Without <code>--bin</code>, it makes the WSL link set match the current Windows install — adding new bins, updating moved ones, and removing entries that disappeared from <code>ghr.json</code>. With <code>--bin &lt;name&gt;</code> filters, only the named entries are touched.</li>
-<li>The symlink target is the real <code>.exe</code> under the inventory-selected unit, not the Windows shim. A <code>C:\…</code> target would not trigger interop; the WSL path is required.</li>
+<li><code>ghr link</code> is a <strong>reconciler</strong>. Without <code>--bin</code>, it makes the WSL link set match the current Windows install — adding new bins, updating moved ones, and removing entries that disappeared from <code>ghr.json</code>. With <code>--bin &lt;name&gt;</code> filters (for example <code>--bin node --bin npm</code>), only the named entries are touched.</li>
+<li>For <code>.exe</code> commands, the symlink target is the real <code>.exe</code> under the inventory-selected unit, not the Windows shim. A <code>C:\…</code> symlink target would not trigger interop; the WSL path is required. For <code>.cmd</code> commands, the bash wrapper passes the converted Windows drive path (<code>C:\…</code>) to <code>cmd.exe /d /c call</code> because Linux binfmt interop cannot execute <code>.cmd</code> batch scripts directly. Note that <code>cmd.exe</code> does not support UNC working directories (<code>\\wsl.localhost\...</code>) and resets its working directory to <code>C:\Windows</code> when invoked from a Linux-only filesystem path; run workspace-sensitive <code>.cmd</code> commands (such as <code>npm install</code>) from a mounted Windows drive (<code>/mnt/c/...</code>) or install a Linux-native build inside WSL.</li>
+<li>Note for Node.js / <code>npm</code> installs: <code>npm install -g</code> defaults to writing global shims inside the extracted unit directory next to <code>node.exe</code> (<code>%~dp0</code>), which is replaced on <code>ghr install</code> upgrades and is not automatically added to <code>PATH</code>. Configure a dedicated user global prefix (for example <code>npm config set prefix &quot;%APPDATA%\npm&quot;</code>) if you use <code>npm install -g</code>.</li>
 <li>Both commands require <code>WSL_INTEROP</code> to be set. They refuse to run outside WSL so you don't accidentally create dangling links on bare Linux or macOS.</li>
 <li>IDs are canonicalized to lowercase. Multiple IDs sourced from the same repository remain independent.</li>
 <li>Raw wasm modules are refused because direct symlinks to <code>.wasm</code> bytes are not executable through WSL interop.</li>
@@ -274,9 +280,12 @@ disambiguation does not use this heuristic.</li>
 <code>~/.local/share</code>). The prefixed segment encoding keeps IDs such as <code>a</code> and
 <code>a/b</code> independent. Bare-executable links live in the sibling
 <code>by-path/&lt;name&gt;.json</code> tree.</p>
-<p>The manifest records the canonical ID and exact published command names.
-<code>ghr unlink</code> verifies each live symlink still points where the manifest
-recorded before deleting, so a user-rewritten symlink is never clobbered.
+<p>The manifest records the canonical ID, exact published command names, each
+entry's <code>target_kind</code> (<code>&quot;symlink&quot;</code> or <code>&quot;script&quot;</code>), and for <code>&quot;script&quot;</code> entries
+the SHA-256 digest (<code>wrapper_sha256</code>) of the generated wrapper script.
+<code>ghr link</code> and <code>ghr unlink</code> verify each live symlink target or wrapper SHA-256
+still matches what the manifest recorded before replacing or deleting, so a
+user-rewritten symlink or edited wrapper script is never clobbered.
 Validated legacy owner/repo manifests migrate lazily during a full
 reconciliation and can still be unlinked after the Windows install disappears.</p>
 <h2><a href="#recipe-microsoft-authentication-cli-from-wsl" id="recipe-microsoft-authentication-cli-from-wsl"></a>Recipe: Microsoft Authentication CLI from WSL</h2>
