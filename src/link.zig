@@ -91,6 +91,10 @@ pub const LinkEntry = struct {
     /// Optional in the JSON so existing manifests (owner/repo flow,
     /// pre-existing bare-exec entries) keep parsing as `"symlink"`.
     target_kind: []const u8 = "symlink",
+    /// Lowercase 64-character SHA-256 hex digest of the exact wrapper bytes
+    /// written for `"script"` entries in v2 ID manifests (`wsl-id`). Null for
+    /// `"symlink"` entries and bare-PATH manifests.
+    wrapper_sha256: ?[]const u8 = null,
 };
 
 pub const Manifest = struct {
@@ -220,11 +224,41 @@ fn isSafeManifestTarget(target: []const u8) bool {
     return true;
 }
 
+pub fn isSafeScriptManifestTarget(target: []const u8) bool {
+    if (!looksLikeWindowsPath(target)) return false;
+    for (target) |c| {
+        if (c < 0x20 or c == 0x7f or c == '%' or c == '"') return false;
+    }
+    return true;
+}
+
+pub fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn isValidSha256Hex(s: []const u8) bool {
+    if (s.len != 64) return false;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    }
+    return true;
+}
+
 fn validLinkEntries(links: []const LinkEntry) bool {
     for (links, 0..) |entry, i| {
         if (!install_state.isSafeV2CommandName(entry.name)) return false;
-        if (!isSafeManifestTarget(entry.target)) return false;
-        if (!std.mem.eql(u8, entry.target_kind, "symlink")) return false;
+        if (std.mem.eql(u8, entry.target_kind, "symlink")) {
+            if (!isSafeManifestTarget(entry.target)) return false;
+            if (entry.wrapper_sha256 != null) return false;
+        } else if (std.mem.eql(u8, entry.target_kind, "script")) {
+            if (!isSafeScriptManifestTarget(entry.target)) return false;
+            const digest = entry.wrapper_sha256 orelse return false;
+            if (!isValidSha256Hex(digest)) return false;
+        } else {
+            return false;
+        }
         for (links[0..i]) |prior| {
             if (std.ascii.eqlIgnoreCase(prior.name, entry.name)) return false;
         }
@@ -292,6 +326,10 @@ fn stringifyIdManifest(
         try writeJsonEscaped(w, entry.target);
         try w.writeAll("\",\"target_kind\":\"");
         try writeJsonEscaped(w, entry.target_kind);
+        if (entry.wrapper_sha256) |digest| {
+            try w.writeAll("\",\"wrapper_sha256\":\"");
+            try writeJsonEscaped(w, digest);
+        }
         try w.writeAll("\"}");
     }
     try w.writeAll("]}\n");
@@ -572,9 +610,48 @@ fn queryAppDataViaCmd(allocator: std.mem.Allocator, io: Io) ![]u8 {
     return wslpathToUnix(allocator, io, trimmed);
 }
 
+/// Resolve `wslpath` against `environ.get("PATH")` when present so callers (and
+/// isolated test `EnvironMap`s) do not depend on `Io.Threaded`'s ambient parent
+/// process `PATH` for `argv[0]` lookup.
+fn resolveWslpathArgv0(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: ?*const EnvironMap,
+) ![]u8 {
+    if (environ) |env| {
+        if (env.get("PATH")) |path_env| {
+            var it = std.mem.splitScalar(u8, path_env, std.fs.path.delimiter);
+            while (it.next()) |dir_entry| {
+                if (dir_entry.len == 0 or !std.fs.path.isAbsolute(dir_entry)) continue;
+                const candidate = try std.fs.path.join(allocator, &.{ dir_entry, "wslpath" });
+                if (Dir.openFileAbsolute(io, candidate, .{ .allow_directory = false })) |f| {
+                    f.close(io);
+                    return candidate;
+                } else |_| {
+                    allocator.free(candidate);
+                }
+            }
+            return error.FileNotFound;
+        }
+    }
+    return allocator.dupe(u8, "wslpath");
+}
+
 fn wslpathToUnix(allocator: std.mem.Allocator, io: Io, win_path: []const u8) ![]u8 {
+    return wslpathToUnixWithEnv(allocator, io, null, win_path);
+}
+
+fn wslpathToUnixWithEnv(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: ?*const EnvironMap,
+    win_path: []const u8,
+) ![]u8 {
+    const exe = try resolveWslpathArgv0(allocator, io, environ);
+    defer allocator.free(exe);
     const r = try std.process.run(allocator, io, .{
-        .argv = &.{ "wslpath", "-u", win_path },
+        .argv = &.{ exe, "-u", win_path },
+        .environ_map = environ,
         .stdout_limit = Io.Limit.limited(4096),
         .stderr_limit = Io.Limit.limited(4096),
     });
@@ -589,9 +666,17 @@ fn wslpathToUnix(allocator: std.mem.Allocator, io: Io, win_path: []const u8) ![]
 /// Convert a WSL `/mnt/<drive>/...` path back to the Windows form
 /// (`C:\...`) via `wslpath -w`. Used when composing wrapper scripts
 /// that hand the path to `cmd.exe /c`.
-fn wslpathToWindows(allocator: std.mem.Allocator, io: Io, wsl_path: []const u8) ![]u8 {
+fn wslpathToWindows(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: ?*const EnvironMap,
+    wsl_path: []const u8,
+) ![]u8 {
+    const exe = try resolveWslpathArgv0(allocator, io, environ);
+    defer allocator.free(exe);
     const r = try std.process.run(allocator, io, .{
-        .argv = &.{ "wslpath", "-w", wsl_path },
+        .argv = &.{ exe, "-w", wsl_path },
+        .environ_map = environ,
         .stdout_limit = Io.Limit.limited(4096),
         .stderr_limit = Io.Limit.limited(4096),
     });
@@ -603,17 +688,103 @@ fn wslpathToWindows(allocator: std.mem.Allocator, io: Io, wsl_path: []const u8) 
     return allocator.dupe(u8, trimmed);
 }
 
+/// Pure fallback conversion from a canonical `/mnt/<letter>/...` drvfs path to
+/// `<LETTER>:\...` when `wslpath` is unavailable.
+pub fn drvfsToWindowsPath(allocator: std.mem.Allocator, wsl_path: []const u8) !?[]u8 {
+    if (!looksLikeMntDrvfsPath(wsl_path)) return null;
+    const prefix = "/mnt/";
+    const drive = std.ascii.toUpper(wsl_path[prefix.len]);
+    const rest = wsl_path[prefix.len + 2 ..];
+    var out = try allocator.alloc(u8, 3 + rest.len);
+    out[0] = drive;
+    out[1] = ':';
+    out[2] = '\\';
+    for (rest, 0..) |c, idx| {
+        out[3 + idx] = if (c == '/') '\\' else c;
+    }
+    return out;
+}
+
+const default_wsl_cmd_exe = "/mnt/c/Windows/System32/cmd.exe";
+
+fn resolveWslCmdExePath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+) error{OutOfMemory}![]const u8 {
+    const converted = wslpathToUnixWithEnv(
+        allocator,
+        io,
+        environ,
+        "C:\\Windows\\System32\\cmd.exe",
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return default_wsl_cmd_exe,
+    };
+    if (!isSafeManifestTarget(converted)) {
+        allocator.free(converted);
+        return default_wsl_cmd_exe;
+    }
+    return converted;
+}
+
+fn resolveWindowsScriptTarget(
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: *const EnvironMap,
+    wsl_path: []const u8,
+) ![]u8 {
+    const converted = wslpathToWindows(allocator, io, environ, wsl_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FileNotFound => (try drvfsToWindowsPath(allocator, wsl_path)) orelse return error.WslpathFailed,
+        else => return error.WslpathFailed,
+    };
+    errdefer allocator.free(converted);
+    if (!isSafeScriptManifestTarget(converted)) return error.UnsafeScriptTarget;
+    return converted;
+}
+
 // ---------------------------------------------------------------------------
 // Desired-link computation (pure, testable).
 // ---------------------------------------------------------------------------
 
+pub const DesiredLinkKind = enum {
+    symlink,
+    script,
+
+    pub fn manifestKind(self: DesiredLinkKind) []const u8 {
+        return switch (self) {
+            .symlink => "symlink",
+            .script => "script",
+        };
+    }
+};
+
 pub const DesiredLink = struct {
-    /// Linux-side link name (basename, with trailing `.exe` stripped).
+    /// Linux-side link name (basename, with trailing `.exe`/`.cmd` stripped).
     /// Owned by the arena attached to `ComputedLinks`.
     name: []const u8,
-    /// Absolute symlink target — `<win_tools_root>/<owner>/<repo>/<bin>`
-    /// with `/` separators. Owned by the arena.
+    /// Absolute WSL path — `<win_tools_root>/<unit>/<bin>` with `/` separators.
+    /// For `.symlink` entries this is also the persisted manifest target.
+    /// Owned by the arena.
     target: []const u8,
+    /// Link mechanism: direct WSL interop symlink for `.exe`, or bash `cmd.exe`
+    /// wrapper script for `.cmd`.
+    kind: DesiredLinkKind = .symlink,
+    /// Resolved Windows drive path (`C:\...`) for `.script` entries; persisted
+    /// as `LinkEntry.target`. Null until prepared by `cmdLink` (or for `.symlink`).
+    win_target: ?[]const u8 = null,
+    /// Rendered bash wrapper contents for `.script` entries.
+    script_bytes: ?[]const u8 = null,
+    /// 64-char lowercase SHA-256 hex of `script_bytes` for `.script` entries.
+    wrapper_sha256: ?[]const u8 = null,
+
+    pub fn manifestTarget(self: DesiredLink) []const u8 {
+        return switch (self.kind) {
+            .symlink => self.target,
+            .script => self.win_target.?,
+        };
+    }
 };
 
 pub const ComputedLinks = struct {
@@ -769,7 +940,12 @@ pub fn computeDesiredCommandLinks(
                 return DesiredError.DuplicateLinkName;
         }
         const target = try aa.print("{s}/{s}", .{ tool_dir_abs, normalized_target });
-        try all_links.append(aa, .{ .name = name, .target = target });
+        const is_cmd = normalized_target.len > 4 and std.ascii.endsWithIgnoreCase(normalized_target, ".cmd");
+        try all_links.append(aa, .{
+            .name = name,
+            .target = target,
+            .kind = if (is_cmd) .script else .symlink,
+        });
         try available.append(aa, name);
     }
 
@@ -1025,6 +1201,7 @@ fn validateLegacyManifest(
     }
 
     for (manifest.links) |entry| {
+        if (!std.mem.eql(u8, entry.target_kind, "symlink")) return false;
         const relative = hasPathPrefix(entry.target, manifest.source) orelse return false;
         if (!isSafeRelativeBinPath(relative)) return false;
         if (!std.mem.eql(u8, linkNameForBin(relative), entry.name)) return false;
@@ -1258,11 +1435,47 @@ pub fn cmdLink(
     else
         &.{};
 
+    var has_script_links = false;
+    for (computed.links) |desired| {
+        if (desired.kind == .script) {
+            has_script_links = true;
+            break;
+        }
+    }
+    if (has_script_links) {
+        const aa = computed.arena.allocator();
+        const cmd_exe_wsl = try resolveWslCmdExePath(aa, io, environ);
+        for (computed.links) |*desired| {
+            if (desired.kind != .script) continue;
+            const win_path = resolveWindowsScriptTarget(aa, io, environ, desired.target) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    try err_w.print(
+                        "error: failed to convert '{s}' to a safe Windows drive path for cmd.exe wrapper\n",
+                        .{desired.target},
+                    );
+                    try err_w.flush();
+                    return LinkCmdError.LinkStepFailed;
+                },
+            };
+            const script_bytes = try buildIdWrapperScript(aa, id, desired.name, cmd_exe_wsl, win_path);
+            const digest = sha256Hex(script_bytes);
+            desired.win_target = win_path;
+            desired.script_bytes = script_bytes;
+            desired.wrapper_sha256 = try aa.dupe(u8, &digest);
+        }
+    }
+
     var planned_links = std.ArrayListUnmanaged(LinkEntry).empty;
     defer planned_links.deinit(allocator);
     try planned_links.ensureTotalCapacity(allocator, computed.links.len + prior_links.len);
     for (computed.links) |desired| {
-        planned_links.appendAssumeCapacity(.{ .name = desired.name, .target = desired.target });
+        planned_links.appendAssumeCapacity(.{
+            .name = desired.name,
+            .target = desired.manifestTarget(),
+            .target_kind = desired.kind.manifestKind(),
+            .wrapper_sha256 = desired.wrapper_sha256,
+        });
     }
     if (bin_filters.len > 0) {
         for (prior_links) |old| {
@@ -1308,7 +1521,7 @@ pub fn cmdLink(
 
     // Apply the desired set: add / no-op / replace / record conflicts.
     var applied = std.ArrayListUnmanaged(AppliedLink).empty;
-    defer applied.deinit(allocator);
+    defer deinitAppliedLinks(allocator, &applied);
     try applied.ensureTotalCapacity(allocator, computed.links.len + prior_links.len);
     var manifest_committed = false;
     errdefer if (!manifest_committed) rollbackAppliedLinks(io, bin_dir, applied.items);
@@ -1317,7 +1530,8 @@ pub fn cmdLink(
     const action_w = &action_log.writer;
 
     for (computed.links) |desired| {
-        const outcome = applyOneLink(io, bin_dir, desired, prior_links) catch |err| {
+        const suffix: []const u8 = if (desired.kind == .script) " (via cmd.exe)" else "";
+        const outcome = applyOneLink(allocator, io, bin_dir, desired, prior_links) catch |err| {
             try err_w.print("error: failed to link {s}: {t}\n", .{ desired.name, err });
             try err_w.flush();
             return LinkCmdError.LinkStepFailed;
@@ -1325,16 +1539,17 @@ pub fn cmdLink(
         switch (outcome) {
             .created => {
                 applied.appendAssumeCapacity(.{ .created = desired });
-                try action_w.print("  linked   {s} -> {s}\n", .{ desired.name, desired.target });
+                try action_w.print("  linked   {s} -> {s}{s}\n", .{ desired.name, desired.target, suffix });
             },
-            .replaced => {
+            .replaced => |prior_script_bytes| {
                 applied.appendAssumeCapacity(.{ .replaced = .{
                     .desired = desired,
                     .prior = findPriorLink(prior_links, desired.name).?,
+                    .prior_script_bytes = prior_script_bytes,
                 } });
-                try action_w.print("  updated  {s} -> {s}\n", .{ desired.name, desired.target });
+                try action_w.print("  updated  {s} -> {s}{s}\n", .{ desired.name, desired.target, suffix });
             },
-            .unchanged => try action_w.print("  ok       {s} -> {s}\n", .{ desired.name, desired.target }),
+            .unchanged => try action_w.print("  ok       {s} -> {s}{s}\n", .{ desired.name, desired.target, suffix }),
             .conflict => {
                 try err_w.print(
                     "error: ownership of {s}/{s} changed during reconciliation; refusing to continue\n",
@@ -1359,14 +1574,17 @@ pub fn cmdLink(
                 }
             }
             if (still_desired) continue;
-            const outcome = removeOwnedLink(io, bin_dir, old) catch |err| {
+            const outcome = removeOwnedIdEntry(allocator, io, bin_dir, old) catch |err| {
                 try err_w.print("error: failed to remove stale link {s}: {t}\n", .{ old.name, err });
                 try err_w.flush();
                 return LinkCmdError.LinkStepFailed;
             };
             switch (outcome) {
-                .removed => {
-                    applied.appendAssumeCapacity(.{ .removed = old });
+                .removed => |prior_script_bytes| {
+                    applied.appendAssumeCapacity(.{ .removed = .{
+                        .entry = old,
+                        .prior_script_bytes = prior_script_bytes,
+                    } });
                     try action_w.print("  removed  {s} (no longer owned by {s})\n", .{ old.name, id });
                 },
                 .missing => {}, // already gone, no message
@@ -1409,9 +1627,184 @@ fn findPriorLink(prior_links: []const LinkEntry, name: []const u8) ?LinkEntry {
     return null;
 }
 
+const max_id_wrapper_bytes: u64 = 64 * 1024;
+
+const LiveBinEntry = union(enum) {
+    missing,
+    symlink: usize,
+    regular_sha256: [64]u8,
+    other,
+};
+
+fn inspectLiveBinEntry(
+    io: Io,
+    bin_dir: Dir,
+    name: []const u8,
+    link_buf: *[Dir.max_path_bytes]u8,
+) !LiveBinEntry {
+    if (bin_dir.readLink(io, name, link_buf)) |n| {
+        return .{ .symlink = n };
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotLink => {
+            const stat = bin_dir.statFile(io, name, .{ .follow_symlinks = false }) catch |stat_err| switch (stat_err) {
+                error.FileNotFound => return .missing,
+                else => return stat_err,
+            };
+            if (stat.kind != .file or stat.size > max_id_wrapper_bytes) return .other;
+        },
+        else => return err,
+    }
+
+    var file = bin_dir.openFile(io, name, .{
+        .follow_symlinks = false,
+        .allow_directory = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        error.IsDir, error.SymLinkLoop => return .other,
+        else => return err,
+    };
+    defer file.close(io);
+
+    const fstat = try file.stat(io);
+    if (fstat.kind != .file or fstat.size > max_id_wrapper_bytes) return .other;
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var chunk: [4096]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const n = try reader.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        total += n;
+        if (total > max_id_wrapper_bytes) return .other;
+        hasher.update(chunk[0..n]);
+        if (n < chunk.len) break;
+    }
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return .{ .regular_sha256 = std.fmt.bytesToHex(digest, .lower) };
+}
+
+fn liveEntryMatchesPrior(
+    live: LiveBinEntry,
+    link_buf: *const [Dir.max_path_bytes]u8,
+    prior: LinkEntry,
+) bool {
+    if (std.mem.eql(u8, prior.target_kind, "symlink")) {
+        return switch (live) {
+            .symlink => |n| std.mem.eql(u8, link_buf[0..n], prior.target),
+            else => false,
+        };
+    }
+    if (std.mem.eql(u8, prior.target_kind, "script")) {
+        const expected = prior.wrapper_sha256 orelse return false;
+        return switch (live) {
+            .regular_sha256 => |actual| std.mem.eql(u8, &actual, expected),
+            else => false,
+        };
+    }
+    return false;
+}
+
+fn liveEntryMatchesDesired(
+    live: LiveBinEntry,
+    link_buf: *const [Dir.max_path_bytes]u8,
+    desired: DesiredLink,
+) bool {
+    return switch (desired.kind) {
+        .symlink => switch (live) {
+            .symlink => |n| std.mem.eql(u8, link_buf[0..n], desired.target),
+            else => false,
+        },
+        .script => blk: {
+            const expected = desired.wrapper_sha256 orelse break :blk false;
+            break :blk switch (live) {
+                .regular_sha256 => |actual| std.mem.eql(u8, &actual, expected),
+                else => false,
+            };
+        },
+    };
+}
+
+const VerifiedScriptRead = union(enum) {
+    missing,
+    mismatch,
+    matched: []u8,
+};
+
+/// Read an existing regular wrapper file and verify its SHA-256 against
+/// `expected_sha256` on the exact captured buffer so rollback snapshots and
+/// ownership checks share a single race-free read.
+fn readVerifiedPriorScriptBytes(
+    allocator: std.mem.Allocator,
+    io: Io,
+    bin_dir: Dir,
+    name: []const u8,
+    expected_sha256: []const u8,
+) !VerifiedScriptRead {
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    if (bin_dir.readLink(io, name, &link_buf)) |_| {
+        return .mismatch;
+    } else |err| switch (err) {
+        error.FileNotFound, error.NotLink => {},
+        else => return err,
+    }
+
+    var file = bin_dir.openFile(io, name, .{
+        .follow_symlinks = false,
+        .allow_directory = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        error.IsDir, error.SymLinkLoop => return .mismatch,
+        else => return err,
+    };
+    defer file.close(io);
+
+    const fstat = try file.stat(io);
+    if (fstat.kind != .file or fstat.size > max_id_wrapper_bytes) return .mismatch;
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
+    var chunk: [4096]u8 = undefined;
+    var total: u64 = 0;
+    while (true) {
+        const n = try reader.interface.readSliceShort(&chunk);
+        if (n == 0) break;
+        total += n;
+        if (total > max_id_wrapper_bytes) return .mismatch;
+        try aw.writer.writeAll(chunk[0..n]);
+        if (n < chunk.len) break;
+    }
+
+    const actual = sha256Hex(aw.written());
+    if (!std.mem.eql(u8, &actual, expected_sha256)) return .mismatch;
+    return .{ .matched = try aw.toOwnedSlice() };
+}
+
+fn writeIdWrapperFile(io: Io, bin_dir: Dir, name: []const u8, bytes: []const u8) !void {
+    var tmp_buf: [Dir.max_path_bytes]u8 = undefined;
+    const tmp_name = std.fmt.bufPrint(&tmp_buf, ".ghr-link-tmp.{s}", .{name}) catch return error.PathTooLong;
+    bin_dir.deleteFile(io, tmp_name) catch {};
+    {
+        var f = try bin_dir.createFile(io, tmp_name, .{
+            .exclusive = true,
+            .permissions = .executable_file,
+        });
+        defer f.close(io);
+        try f.writeStreamingAll(io, bytes);
+    }
+    bin_dir.rename(tmp_name, bin_dir, name, io) catch |err| {
+        bin_dir.deleteFile(io, tmp_name) catch {};
+        return err;
+    };
+}
+
 /// Validate every live entry that reconciliation may replace or remove before
 /// the first mutation. A manifest proves ownership only while the live target
-/// still equals the recorded target.
+/// (or wrapper SHA-256) still equals the recorded entry.
 fn preflightLinkReconciliation(
     io: Io,
     bin_dir: Dir,
@@ -1421,22 +1814,12 @@ fn preflightLinkReconciliation(
 ) !?LinkConflict {
     var link_buf: [Dir.max_path_bytes]u8 = undefined;
     for (desired_links) |desired| {
-        if (bin_dir.readLink(io, desired.name, &link_buf)) |n| {
-            const prior = findPriorLink(prior_links, desired.name) orelse
-                return .{ .name = desired.name, .kind = .unmanaged };
-            if (!std.mem.eql(u8, link_buf[0..n], prior.target))
-                return .{ .name = desired.name, .kind = .modified };
-        } else |err| switch (err) {
-            error.FileNotFound => {
-                _ = bin_dir.statFile(io, desired.name, .{}) catch |stat_err| switch (stat_err) {
-                    error.FileNotFound => continue,
-                    else => return stat_err,
-                };
-                return .{ .name = desired.name, .kind = .unmanaged };
-            },
-            error.NotLink => return .{ .name = desired.name, .kind = .unmanaged },
-            else => return err,
-        }
+        const live = try inspectLiveBinEntry(io, bin_dir, desired.name, &link_buf);
+        if (live == .missing) continue;
+        const prior = findPriorLink(prior_links, desired.name) orelse
+            return .{ .name = desired.name, .kind = .unmanaged };
+        if (!liveEntryMatchesPrior(live, &link_buf, prior))
+            return .{ .name = desired.name, .kind = .modified };
     }
 
     if (!reconcile_stale) return null;
@@ -1449,69 +1832,109 @@ fn preflightLinkReconciliation(
             }
         }
         if (desired) continue;
-        if (bin_dir.readLink(io, prior.name, &link_buf)) |n| {
-            if (!std.mem.eql(u8, link_buf[0..n], prior.target))
-                return .{ .name = prior.name, .kind = .modified };
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            error.NotLink => return .{ .name = prior.name, .kind = .modified },
-            else => return err,
-        }
+        const live = try inspectLiveBinEntry(io, bin_dir, prior.name, &link_buf);
+        if (live == .missing) continue;
+        if (!liveEntryMatchesPrior(live, &link_buf, prior))
+            return .{ .name = prior.name, .kind = .modified };
     }
     return null;
 }
 
-const LinkOutcome = enum { created, replaced, unchanged, conflict };
+const LinkOutcome = union(enum) {
+    created,
+    /// Carries the captured prior wrapper bytes when `prior.target_kind` was
+    /// `"script"` so zero-allocation rollback can restore it faithfully.
+    replaced: ?[]u8,
+    unchanged,
+    conflict,
+};
 
 const AppliedLink = union(enum) {
     created: DesiredLink,
     replaced: struct {
         desired: DesiredLink,
         prior: LinkEntry,
+        prior_script_bytes: ?[]u8 = null,
     },
-    removed: LinkEntry,
+    removed: struct {
+        entry: LinkEntry,
+        prior_script_bytes: ?[]u8 = null,
+    },
 };
 
+fn deinitAppliedLinks(
+    allocator: std.mem.Allocator,
+    applied: *std.ArrayListUnmanaged(AppliedLink),
+) void {
+    for (applied.items) |item| {
+        switch (item) {
+            .created => {},
+            .replaced => |r| if (r.prior_script_bytes) |b| allocator.free(b),
+            .removed => |r| if (r.prior_script_bytes) |b| allocator.free(b),
+        }
+    }
+    applied.deinit(allocator);
+}
+
+fn restorePriorLinkEntry(
+    io: Io,
+    bin_dir: Dir,
+    prior: LinkEntry,
+    prior_script_bytes: ?[]const u8,
+) void {
+    if (std.mem.eql(u8, prior.target_kind, "symlink")) {
+        bin_dir.symLink(io, prior.target, prior.name, .{}) catch {};
+    } else if (std.mem.eql(u8, prior.target_kind, "script")) {
+        if (prior_script_bytes) |bytes| {
+            writeIdWrapperFile(io, bin_dir, prior.name, bytes) catch {};
+        }
+    }
+}
+
 fn rollbackAppliedLinks(io: Io, bin_dir: Dir, applied: []const AppliedLink) void {
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
     var i = applied.len;
     while (i > 0) {
         i -= 1;
         switch (applied[i]) {
             .created => |desired| {
-                var link_buf: [Dir.max_path_bytes]u8 = undefined;
-                const n = bin_dir.readLink(io, desired.name, &link_buf) catch continue;
-                if (std.mem.eql(u8, link_buf[0..n], desired.target))
+                const live = inspectLiveBinEntry(io, bin_dir, desired.name, &link_buf) catch continue;
+                if (liveEntryMatchesDesired(live, &link_buf, desired))
                     bin_dir.deleteFile(io, desired.name) catch {};
             },
             .replaced => |replacement| {
-                var link_buf: [Dir.max_path_bytes]u8 = undefined;
-                const n = bin_dir.readLink(io, replacement.desired.name, &link_buf) catch continue;
-                if (!std.mem.eql(u8, link_buf[0..n], replacement.desired.target)) continue;
-                bin_dir.deleteFile(io, replacement.desired.name) catch continue;
-                bin_dir.symLink(
-                    io,
-                    replacement.prior.target,
-                    replacement.prior.name,
-                    .{},
-                ) catch {};
+                const live = inspectLiveBinEntry(io, bin_dir, replacement.desired.name, &link_buf) catch continue;
+                if (!liveEntryMatchesDesired(live, &link_buf, replacement.desired)) continue;
+                if (std.mem.eql(u8, replacement.prior.target_kind, "script")) {
+                    restorePriorLinkEntry(io, bin_dir, replacement.prior, replacement.prior_script_bytes);
+                } else {
+                    bin_dir.deleteFile(io, replacement.desired.name) catch continue;
+                    restorePriorLinkEntry(io, bin_dir, replacement.prior, null);
+                }
             },
-            .removed => |prior| {
-                var link_buf: [Dir.max_path_bytes]u8 = undefined;
-                if (bin_dir.readLink(io, prior.name, &link_buf)) |_| {
-                    continue;
-                } else |err| switch (err) {
-                    error.FileNotFound => bin_dir.symLink(io, prior.target, prior.name, .{}) catch {},
-                    else => {},
+            .removed => |removed| {
+                const live = inspectLiveBinEntry(io, bin_dir, removed.entry.name, &link_buf) catch continue;
+                if (live == .missing) {
+                    restorePriorLinkEntry(io, bin_dir, removed.entry, removed.prior_script_bytes);
                 }
             },
         }
     }
 }
 
-/// Apply one desired link in `bin_dir`. Considers an existing symlink
-/// ghr-owned only if a prior manifest records both its name and its current
-/// target. A changed symlink is user-owned and must never be replaced.
+fn createDesiredEntry(io: Io, bin_dir: Dir, desired: DesiredLink) !void {
+    switch (desired.kind) {
+        .symlink => try bin_dir.symLink(io, desired.target, desired.name, .{}),
+        .script => try writeIdWrapperFile(io, bin_dir, desired.name, desired.script_bytes.?),
+    }
+}
+
+/// Apply one desired link or wrapper in `bin_dir`. Considers an existing entry
+/// ghr-owned only if a prior manifest records its name and its live symlink
+/// target or wrapper SHA-256 still matches. A changed entry is user-owned and
+/// must never be replaced.
 fn applyOneLink(
+    allocator: std.mem.Allocator,
     io: Io,
     bin_dir: Dir,
     desired: DesiredLink,
@@ -1521,35 +1944,94 @@ fn applyOneLink(
     if (bin_dir.readLink(io, desired.name, &link_buf)) |n| {
         const current = link_buf[0..n];
         const prior = findPriorLink(prior_links, desired.name) orelse return .conflict;
+        if (!std.mem.eql(u8, prior.target_kind, "symlink")) return .conflict;
         if (!std.mem.eql(u8, current, prior.target)) return .conflict;
-        if (std.mem.eql(u8, current, desired.target)) return .unchanged;
-        try bin_dir.deleteFile(io, desired.name);
-        bin_dir.symLink(io, desired.target, desired.name, .{}) catch |err| {
-            bin_dir.symLink(io, prior.target, prior.name, .{}) catch {};
-            return err;
-        };
-        return .replaced;
+        if (desired.kind == .symlink and std.mem.eql(u8, current, desired.target))
+            return .unchanged;
+        switch (desired.kind) {
+            .script => {
+                // POSIX rename atomically replaces the existing symlink.
+                try writeIdWrapperFile(io, bin_dir, desired.name, desired.script_bytes.?);
+            },
+            .symlink => {
+                try bin_dir.deleteFile(io, desired.name);
+                bin_dir.symLink(io, desired.target, desired.name, .{}) catch |err| {
+                    bin_dir.symLink(io, prior.target, prior.name, .{}) catch {};
+                    return err;
+                };
+            },
+        }
+        return .{ .replaced = null };
     } else |err| switch (err) {
         error.FileNotFound => {
-            // No symlink — but could be a regular file or directory.
-            _ = bin_dir.statFile(io, desired.name, .{}) catch |stat_err| switch (stat_err) {
+            _ = bin_dir.statFile(io, desired.name, .{ .follow_symlinks = false }) catch |stat_err| switch (stat_err) {
                 error.FileNotFound => {
-                    try bin_dir.symLink(io, desired.target, desired.name, .{});
+                    try createDesiredEntry(io, bin_dir, desired);
                     return .created;
                 },
                 else => return stat_err,
             };
-            return .conflict;
         },
-        // `readLink` of a non-symlink returns this on Linux.
-        error.NotLink => return .conflict,
+        error.NotLink => {},
         else => return err,
     }
+
+    // Existing non-symlink entry on disk: owned only if `prior` is a `"script"`
+    // entry whose recorded SHA-256 matches the live file contents.
+    const prior = findPriorLink(prior_links, desired.name) orelse return .conflict;
+    if (!std.mem.eql(u8, prior.target_kind, "script")) return .conflict;
+    const expected_sha = prior.wrapper_sha256 orelse return .conflict;
+    const prior_bytes = switch (try readVerifiedPriorScriptBytes(allocator, io, bin_dir, desired.name, expected_sha)) {
+        .missing => {
+            try createDesiredEntry(io, bin_dir, desired);
+            return .created;
+        },
+        .mismatch => return .conflict,
+        .matched => |bytes| bytes,
+    };
+    errdefer allocator.free(prior_bytes);
+
+    if (desired.kind == .script and std.mem.eql(u8, prior_bytes, desired.script_bytes.?)) {
+        allocator.free(prior_bytes);
+        return .unchanged;
+    }
+
+    switch (desired.kind) {
+        .script => {
+            try writeIdWrapperFile(io, bin_dir, desired.name, desired.script_bytes.?);
+        },
+        .symlink => {
+            try bin_dir.deleteFile(io, desired.name);
+            bin_dir.symLink(io, desired.target, desired.name, .{}) catch |err| {
+                writeIdWrapperFile(io, bin_dir, prior.name, prior_bytes) catch {};
+                return err;
+            };
+        },
+    }
+    return .{ .replaced = prior_bytes };
 }
 
-/// Outcome of attempting to remove a previously-linked symlink.
+/// Outcome of attempting to remove a previously-linked symlink (bare-PATH mode).
 const RemoveOutcome = enum {
     removed,
+    missing,
+    target_mismatch,
+};
+
+fn removeOwnedLink(io: Io, bin_dir: Dir, entry: LinkEntry) !RemoveOutcome {
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const n = bin_dir.readLink(io, entry.name, &link_buf) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, link_buf[0..n], entry.target)) return .target_mismatch;
+    try bin_dir.deleteFile(io, entry.name);
+    return .removed;
+}
+
+/// Outcome of attempting to remove an ID-owned symlink or wrapper script.
+const IdRemoveOutcome = union(enum) {
+    removed: ?[]u8,
     missing,
     target_mismatch,
 };
@@ -1571,31 +2053,50 @@ fn preflightUnlink(
     var link_buf: [Dir.max_path_bytes]u8 = undefined;
     for (links) |entry| {
         if (!linkWasRequested(entry, filters)) continue;
-        if (bin_dir.readLink(io, entry.name, &link_buf)) |n| {
-            if (!std.mem.eql(u8, link_buf[0..n], entry.target)) return entry.name;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            error.NotLink => return entry.name,
-            else => return err,
-        }
+        const live = try inspectLiveBinEntry(io, bin_dir, entry.name, &link_buf);
+        if (live == .missing) continue;
+        if (!liveEntryMatchesPrior(live, &link_buf, entry)) return entry.name;
     }
     return null;
 }
 
-/// Remove a manifested symlink, but only when its live target still
-/// matches what was recorded. Returns the outcome so the caller can
-/// distinguish "we deleted it" from "we left it alone for safety" —
-/// `cmdUnlink` keeps the entry in the manifest on `target_mismatch`
-/// rather than silently forgetting about the user's rewritten link.
-fn removeOwnedLink(io: Io, bin_dir: Dir, entry: LinkEntry) !RemoveOutcome {
-    var link_buf: [Dir.max_path_bytes]u8 = undefined;
-    const n = bin_dir.readLink(io, entry.name, &link_buf) catch |err| switch (err) {
-        error.FileNotFound => return .missing,
-        else => return err,
-    };
-    if (!std.mem.eql(u8, link_buf[0..n], entry.target)) return .target_mismatch;
-    try bin_dir.deleteFile(io, entry.name);
-    return .removed;
+/// Remove a manifested symlink or wrapper script, but only when its live
+/// target or SHA-256 still matches what was recorded.
+fn removeOwnedIdEntry(
+    allocator: std.mem.Allocator,
+    io: Io,
+    bin_dir: Dir,
+    entry: LinkEntry,
+) !IdRemoveOutcome {
+    if (std.mem.eql(u8, entry.target_kind, "symlink")) {
+        var link_buf: [Dir.max_path_bytes]u8 = undefined;
+        const n = bin_dir.readLink(io, entry.name, &link_buf) catch |err| switch (err) {
+            error.FileNotFound => {
+                _ = bin_dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |stat_err| switch (stat_err) {
+                    error.FileNotFound => return .missing,
+                    else => return stat_err,
+                };
+                return .target_mismatch;
+            },
+            error.NotLink => return .target_mismatch,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, link_buf[0..n], entry.target)) return .target_mismatch;
+        try bin_dir.deleteFile(io, entry.name);
+        return .{ .removed = null };
+    }
+    if (std.mem.eql(u8, entry.target_kind, "script")) {
+        const expected_sha = entry.wrapper_sha256 orelse return .target_mismatch;
+        const prior_bytes = switch (try readVerifiedPriorScriptBytes(allocator, io, bin_dir, entry.name, expected_sha)) {
+            .missing => return .missing,
+            .mismatch => return .target_mismatch,
+            .matched => |bytes| bytes,
+        };
+        errdefer allocator.free(prior_bytes);
+        try bin_dir.deleteFile(io, entry.name);
+        return .{ .removed = prior_bytes };
+    }
+    return .target_mismatch;
 }
 
 pub fn cmdUnlink(
@@ -1766,7 +2267,7 @@ pub fn cmdUnlink(
     defer if (next_manifest_body) |body| allocator.free(body);
 
     var applied = std.ArrayListUnmanaged(AppliedLink).empty;
-    defer applied.deinit(allocator);
+    defer deinitAppliedLinks(allocator, &applied);
     try applied.ensureTotalCapacity(allocator, active_manifest.links.len);
     var manifest_committed = false;
     errdefer if (!manifest_committed) rollbackAppliedLinks(io, bin_dir, applied.items);
@@ -1777,14 +2278,17 @@ pub fn cmdUnlink(
     for (active_manifest.links) |entry| {
         if (!linkWasRequested(entry, bin_filters)) continue;
 
-        const outcome = removeOwnedLink(io, bin_dir, entry) catch |err| {
+        const outcome = removeOwnedIdEntry(allocator, io, bin_dir, entry) catch |err| {
             try err_w.print("error: failed to unlink {s}: {t}\n", .{ entry.name, err });
             try err_w.flush();
             return LinkCmdError.LinkStepFailed;
         };
         switch (outcome) {
-            .removed => {
-                applied.appendAssumeCapacity(.{ .removed = entry });
+            .removed => |prior_script_bytes| {
+                applied.appendAssumeCapacity(.{ .removed = .{
+                    .entry = entry,
+                    .prior_script_bytes = prior_script_bytes,
+                } });
                 try action_w.print("  unlinked {s}\n", .{entry.name});
             },
             .missing => try action_w.print("  ok       {s} (already absent)\n", .{entry.name}),
@@ -2064,9 +2568,51 @@ fn runWhereExe(allocator: std.mem.Allocator, io: Io, query: []const u8) ![]u8 {
     return r.stdout;
 }
 
-// Magic comment that marks a bash wrapper script as created by ghr.
+// Magic comment that marks a bash wrapper script as created by `ghr link --path`.
 // Used at unlink time so we never delete a file the user wrote themselves.
 const WRAPPER_MAGIC = "# ghr-link wrapper";
+
+// Distinct magic comment for `ghr link <id>` wrapper scripts so `--path` mode
+// (`WRAPPER_MAGIC`) can never treat an ID-owned wrapper as bare-PATH owned.
+pub const ID_WRAPPER_MAGIC = "# ghr-link-id wrapper";
+
+fn writeBashSingleQuotedEscaped(w: *Writer, s: []const u8) !void {
+    for (s) |c| {
+        if (c == '\'') {
+            try w.writeAll("'\\''");
+        } else {
+            try w.writeByte(c);
+        }
+    }
+}
+
+/// Build the bash wrapper script bytes for a `.cmd` command owned by a v2
+/// install ID. Uses `cmd.exe /d /c call '<win_path>' "$@"` so AutoRun is
+/// disabled (`/d`) and `cmd.exe` does not strip outer quotes when `<win_path>`
+/// contains spaces (e.g. `C:\Users\John Smith\...`) alongside quoted user args.
+pub fn buildIdWrapperScript(
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    link_name: []const u8,
+    cmd_exe_wsl: []const u8,
+    win_path: []const u8,
+) ![]u8 {
+    var w = std.Io.Writer.Allocating.init(allocator);
+    errdefer w.deinit();
+    try w.writer.print(
+        "#!/usr/bin/env bash\n" ++
+            ID_WRAPPER_MAGIC ++ " for {s} ({s})\n" ++
+            "# Created by 'ghr link {s}'. Edit at your own risk; 'ghr unlink {s}'\n" ++
+            "# refuses to remove a wrapper whose contents have been changed.\n" ++
+            "exec '",
+        .{ id, link_name, id, id },
+    );
+    try writeBashSingleQuotedEscaped(&w.writer, cmd_exe_wsl);
+    try w.writer.writeAll("' /d /c call '");
+    try writeBashSingleQuotedEscaped(&w.writer, win_path);
+    try w.writer.writeAll("' \"$@\"\n");
+    return w.toOwnedSlice();
+}
 
 /// Build the bash wrapper script bytes for a `.cmd`/`.bat` target. The
 /// returned slice is owned by `allocator`.
@@ -3826,3 +4372,470 @@ test "writeBareExeManifest then readManifest round-trip (symlink kind)" {
     );
     try std.testing.expectEqualStrings("symlink", parsed.value.links[0].target_kind);
 }
+
+test "drvfsToWindowsPath: converts /mnt/<letter>/... and rejects non-drvfs" {
+    const a = std.testing.allocator;
+    const win = (try drvfsToWindowsPath(
+        a,
+        "/mnt/c/Users/John Smith/AppData/Roaming/ghr/data/tools/_v2/units/u-nodejs/u-node/_unit/npm.cmd",
+    )).?;
+    defer a.free(win);
+    try std.testing.expectEqualStrings(
+        "C:\\Users\\John Smith\\AppData\\Roaming\\ghr\\data\\tools\\_v2\\units\\u-nodejs\\u-node\\_unit\\npm.cmd",
+        win,
+    );
+
+    const d_drive = (try drvfsToWindowsPath(a, "/mnt/d/tools/npx.CMD")).?;
+    defer a.free(d_drive);
+    try std.testing.expectEqualStrings("D:\\tools\\npx.CMD", d_drive);
+
+    try std.testing.expect((try drvfsToWindowsPath(a, "/mnt/wsl/foo.cmd")) == null);
+    try std.testing.expect((try drvfsToWindowsPath(a, "/usr/local/bin/npm.cmd")) == null);
+}
+
+test "buildIdWrapperScript: uses distinct ID magic and /d /c call quoting" {
+    const a = std.testing.allocator;
+    const win = "C:\\Users\\John O'Neil\\AppData\\Roaming\\ghr\\npm.cmd";
+    const s = try buildIdWrapperScript(
+        a,
+        "nodejs/node",
+        "npm",
+        "/windir/c/Windows/System32/cmd.exe",
+        win,
+    );
+    defer a.free(s);
+
+    try std.testing.expect(std.mem.startsWith(u8, s, "#!/usr/bin/env bash\n"));
+    try std.testing.expect(std.mem.indexOf(u8, s, ID_WRAPPER_MAGIC) != null);
+    // Must NEVER match bare-PATH `WRAPPER_MAGIC` so `ghr link --path` refuses
+    // to overwrite an ID-owned wrapper.
+    try std.testing.expect(std.mem.indexOf(u8, s, WRAPPER_MAGIC) == null);
+    try std.testing.expect(!try wrapperMatches(a, s, win));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        s,
+        "exec '/windir/c/Windows/System32/cmd.exe' /d /c call 'C:\\Users\\John O'\\''Neil\\AppData\\Roaming\\ghr\\npm.cmd' \"$@\"\n",
+    ) != null);
+}
+
+test "computeDesiredCommandLinks classifies .exe as symlink and .cmd as script" {
+    const commands = [_]install_state.OwnedCommand{
+        .{ .name = "node", .source_name = "node", .relative_target = "node.exe", .kind = "native" },
+        .{ .name = "npm", .source_name = "npm", .relative_target = "npm.cmd", .kind = "native" },
+        .{ .name = "npx", .source_name = "npx", .relative_target = "bin\\npx.CMD", .kind = "native" },
+    };
+    var all = try computeDesiredCommandLinks(
+        std.testing.allocator,
+        &commands,
+        "/mnt/c/Users/John Smith/AppData/Roaming/ghr/data/tools/_v2/units/u-nodejs/u-node/_unit",
+        &.{},
+    );
+    defer all.deinit();
+    try std.testing.expectEqual(@as(usize, 3), all.links.len);
+    try std.testing.expectEqual(DesiredLinkKind.symlink, all.links[0].kind);
+    try std.testing.expectEqualStrings("node", all.links[0].name);
+    try std.testing.expectEqual(DesiredLinkKind.script, all.links[1].kind);
+    try std.testing.expectEqualStrings("npm", all.links[1].name);
+    try std.testing.expectEqual(DesiredLinkKind.script, all.links[2].kind);
+    try std.testing.expectEqualStrings("npx", all.links[2].name);
+
+    var filtered = try computeDesiredCommandLinks(
+        std.testing.allocator,
+        &commands,
+        "/mnt/c/tools/_unit",
+        &.{"NPM"},
+    );
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), filtered.links.len);
+    try std.testing.expectEqualStrings("npm", filtered.links[0].name);
+    try std.testing.expectEqual(DesiredLinkKind.script, filtered.links[0].kind);
+}
+
+test "ID manifest round-trips mixed symlink + script entries and rejects unsafe script metadata" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wrapper = try buildIdWrapperScript(
+        allocator,
+        "nodejs/node",
+        "npm",
+        "/mnt/c/Windows/System32/cmd.exe",
+        "C:\\Users\\John Smith\\AppData\\Roaming\\ghr\\npm.cmd",
+    );
+    defer allocator.free(wrapper);
+    const hex = sha256Hex(wrapper);
+
+    const valid_links = [_]LinkEntry{
+        .{
+            .name = "node",
+            .target = "/mnt/c/Users/John Smith/AppData/Roaming/ghr/node.exe",
+            .target_kind = "symlink",
+        },
+        .{
+            .name = "npm",
+            .target = "C:\\Users\\John Smith\\AppData\\Roaming\\ghr\\npm.cmd",
+            .target_kind = "script",
+            .wrapper_sha256 = &hex,
+        },
+    };
+    try std.testing.expect(validLinkEntries(&valid_links));
+
+    const body = try stringifyIdManifest(
+        allocator,
+        "nodejs/node",
+        "_v2/units/u-nodejs/u-node/_unit",
+        "/mnt/c/Users/John Smith/AppData/Roaming/ghr/data/tools/_v2/units/u-nodejs/u-node/_unit",
+        &valid_links,
+    );
+    defer allocator.free(body);
+    try tmp.dir.writeFile(tio, .{ .sub_path = "_manifest.json", .data = body });
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const manifest_abs = try std.fs.path.join(allocator, &.{ base_buf[0..base_len], "_manifest.json" });
+    defer allocator.free(manifest_abs);
+
+    var parsed = (try readIdManifest(allocator, tio, manifest_abs, "nodejs/node")).?;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.links.len);
+    try std.testing.expectEqualStrings("symlink", parsed.value.links[0].target_kind);
+    try std.testing.expect(parsed.value.links[0].wrapper_sha256 == null);
+    try std.testing.expectEqualStrings("script", parsed.value.links[1].target_kind);
+    try std.testing.expectEqualStrings(&hex, parsed.value.links[1].wrapper_sha256.?);
+
+    // Reject script without wrapper_sha256, with uppercase hex, with `%` or UNC target,
+    // and symlink carrying wrapper_sha256.
+    try std.testing.expect(!validLinkEntries(&.{.{
+        .name = "npm",
+        .target = "C:\\Tools\\npm.cmd",
+        .target_kind = "script",
+    }}));
+    try std.testing.expect(!validLinkEntries(&.{.{
+        .name = "npm",
+        .target = "C:\\Tools\\%APPDATA%\\npm.cmd",
+        .target_kind = "script",
+        .wrapper_sha256 = &hex,
+    }}));
+    try std.testing.expect(!validLinkEntries(&.{.{
+        .name = "npm",
+        .target = "\\\\wsl.localhost\\Ubuntu\\tmp\\npm.cmd",
+        .target_kind = "script",
+        .wrapper_sha256 = &hex,
+    }}));
+    try std.testing.expect(!validLinkEntries(&.{.{
+        .name = "node",
+        .target = "/mnt/c/Tools/node.exe",
+        .target_kind = "symlink",
+        .wrapper_sha256 = &hex,
+    }}));
+}
+
+fn writeTestV2MultiCommandUnit(
+    allocator: std.mem.Allocator,
+    io: Io,
+    tools: []const u8,
+    id: []const u8,
+    specs: []const install_state_write.Command,
+) !void {
+    const relative_unit = try install_state.encodeRelPath(allocator, id);
+    defer allocator.free(relative_unit);
+    const unit = try std.fs.path.join(allocator, &.{ tools, relative_unit });
+    defer allocator.free(unit);
+    try install.ensureDirAbsoluteRecursive(io, unit);
+
+    for (specs) |spec| {
+        const target = try std.fs.path.join(allocator, &.{ unit, spec.relative_target });
+        defer allocator.free(target);
+        if (std.fs.path.dirname(target)) |parent| try install.ensureDirAbsoluteRecursive(io, parent);
+        var file = try Dir.createFileAbsolute(io, target, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "test\n");
+    }
+
+    const body = try install_state_write.stringify(allocator, .{
+        .id = id,
+        .source = .{ .kind = .github, .owner = "nodejs", .repo = "node", .tag = "v22.0.0" },
+        .resolved = .{ .tag = "v22.0.0", .asset = "node-v22.0.0-win-x64.zip" },
+        .commands = specs,
+        .verification = .{ .result = "none" },
+    }, .windows);
+    defer allocator.free(body);
+    const metadata = try std.fs.path.join(allocator, &.{ unit, install_state.metadata_file });
+    defer allocator.free(metadata);
+    var file = try Dir.createFileAbsolute(io, metadata, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
+}
+
+fn installFakeWslpath(
+    allocator: std.mem.Allocator,
+    io: Io,
+    base: []const u8,
+    tools_root: []const u8,
+    env: *EnvironMap,
+) !void {
+    const mock_bin = try testAbsoluteChild(allocator, base, "mock-bin");
+    defer allocator.free(mock_bin);
+    try install.ensureDirAbsoluteRecursive(io, mock_bin);
+    var mock_dir = try Dir.openDirAbsolute(io, mock_bin, .{});
+    defer mock_dir.close(io);
+
+    const script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\n" ++
+            "mode=\"$1\"\n" ++
+            "arg=\"$2\"\n" ++
+            "if [ \"$mode\" = \"-u\" ]; then\n" ++
+            "  printf '/windir/c/Windows/System32/cmd.exe\\n'\n" ++
+            "  exit 0\n" ++
+            "fi\n" ++
+            "if [ \"$mode\" = \"-w\" ]; then\n" ++
+            "  rel=\"${{arg#{s}/}}\"\n" ++
+            "  win_rel=$(printf '%s' \"$rel\" | tr '/' '\\\\')\n" ++
+            "  printf 'C:\\\\Users\\\\John Smith\\\\AppData\\\\Roaming\\\\ghr\\\\tools\\\\%s\\n' \"$win_rel\"\n" ++
+            "  exit 0\n" ++
+            "fi\n" ++
+            "exit 1\n",
+        .{tools_root},
+    );
+    defer allocator.free(script);
+
+    {
+        var f = try mock_dir.createFile(io, "wslpath", .{ .permissions = .executable_file });
+        defer f.close(io);
+        try f.writeStreamingAll(io, script);
+    }
+
+    const path_val = try std.fmt.allocPrint(allocator, "{s}:/usr/bin:/bin", .{mock_bin});
+    defer allocator.free(path_val);
+    try env.put("PATH", path_val);
+}
+
+test "WSL ID link/unlink manages mixed .exe symlinks and .cmd wrappers, edits, transitions, and rollback" {
+    if (builtin.target.os.tag == .windows or !File.Permissions.has_executable_bit)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+    const tools = try testAbsoluteChild(allocator, base, "win-tools");
+    defer allocator.free(tools);
+    const bin = try testAbsoluteChild(allocator, base, "bin");
+    defer allocator.free(bin);
+    try install.ensureDirAbsoluteRecursive(tio, tools);
+    try install.ensureDirAbsoluteRecursive(tio, bin);
+
+    try writeTestV2MultiCommandUnit(allocator, tio, tools, "nodejs/node", &.{
+        .{ .name = "node", .relative_target = "node.exe", .kind = .native },
+        .{ .name = "npm", .relative_target = "npm.cmd", .kind = .native },
+        .{ .name = "npx", .relative_target = "npx.cmd", .kind = .native },
+    });
+
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    try initLinkTestEnv(&env, base, tools, bin);
+    try installFakeWslpath(allocator, tio, base, tools, &env);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    var err_out = std.Io.Writer.Allocating.init(allocator);
+    defer err_out.deinit();
+
+    try cmdLink(allocator, tio, &env, "nodejs/node", &.{}, &out.writer, &err_out.writer);
+
+    var bin_dir = try Dir.openDirAbsolute(tio, bin, .{});
+    defer bin_dir.close(tio);
+    var link_buf: [Dir.max_path_bytes]u8 = undefined;
+    const node_len = try bin_dir.readLink(tio, "node", &link_buf);
+    try std.testing.expect(std.mem.endsWith(u8, link_buf[0..node_len], "u-nodejs/u-node/_unit/node.exe"));
+
+    // `npm` and `npx` must be regular executable wrapper scripts using `/d /c call`.
+    try std.testing.expectError(error.NotLink, bin_dir.readLink(tio, "npm", &link_buf));
+    const npm_bytes = try readFileBytes(allocator, tio, bin_dir, "npm", 64 * 1024);
+    defer allocator.free(npm_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, npm_bytes, ID_WRAPPER_MAGIC) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        npm_bytes,
+        "exec '/windir/c/Windows/System32/cmd.exe' /d /c call 'C:\\Users\\John Smith\\AppData\\Roaming\\ghr\\tools\\_v2\\units\\u-nodejs\\u-node\\_unit\\npm.cmd' \"$@\"\n",
+    ) != null);
+
+    // Filtered unlink removes `npm` while keeping `node` and `npx`.
+    out.clearRetainingCapacity();
+    try cmdUnlink(allocator, tio, &env, "nodejs/node", &.{"npm"}, &out.writer, &err_out.writer);
+    try std.testing.expectError(error.FileNotFound, bin_dir.statFile(tio, "npm", .{ .follow_symlinks = false }));
+
+    // User edits 1 byte in `npx` -> both `cmdLink` and `cmdUnlink` refuse to clobber!
+    const npx_orig = try readFileBytes(allocator, tio, bin_dir, "npx", 64 * 1024);
+    defer allocator.free(npx_orig);
+    try bin_dir.writeFile(tio, .{ .sub_path = "npx", .data = "#!/bin/sh\necho user-edited\n" });
+
+    err_out.clearRetainingCapacity();
+    try std.testing.expectError(
+        LinkCmdError.LinkStepFailed,
+        cmdLink(allocator, tio, &env, "nodejs/node", &.{}, &out.writer, &err_out.writer),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "refusing destructive reconciliation") != null);
+
+    err_out.clearRetainingCapacity();
+    try std.testing.expectError(
+        LinkCmdError.LinkStepFailed,
+        cmdUnlink(allocator, tio, &env, "nodejs/node", &.{}, &out.writer, &err_out.writer),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "refusing destructive unlink") != null);
+
+    // Restore original `npx`, then transition `npx` from `.cmd` -> `.exe` (script -> symlink)
+    // and drop `node` to verify stale removal + transition.
+    try writeIdWrapperFile(tio, bin_dir, "npx", npx_orig);
+    try writeTestV2MultiCommandUnit(allocator, tio, tools, "nodejs/node", &.{
+        .{ .name = "npm", .relative_target = "npm.cmd", .kind = .native },
+        .{ .name = "npx", .relative_target = "npx.exe", .kind = .native },
+    });
+    out.clearRetainingCapacity();
+    err_out.clearRetainingCapacity();
+    try cmdLink(allocator, tio, &env, "nodejs/node", &.{}, &out.writer, &err_out.writer);
+    try std.testing.expectError(error.FileNotFound, bin_dir.statFile(tio, "node", .{ .follow_symlinks = false }));
+    const npx_link_len = try bin_dir.readLink(tio, "npx", &link_buf);
+    try std.testing.expect(std.mem.endsWith(u8, link_buf[0..npx_link_len], "u-nodejs/u-node/_unit/npx.exe"));
+
+    // Rollback on manifest deletion failure during full `cmdUnlink` restores `npm` wrapper AND `npx` symlink!
+    const manifest_dir = try idManifestDir(allocator, &env, "nodejs/node");
+    defer allocator.free(manifest_dir);
+    var manifest_dir_handle = try Dir.openDirAbsolute(tio, manifest_dir, .{ .iterate = true });
+    defer manifest_dir_handle.close(tio);
+    try manifest_dir_handle.setPermissions(tio, @fromBackingInt(@intCast(0o500)));
+    var perms_restored = false;
+    defer if (!perms_restored) manifest_dir_handle.setPermissions(tio, @fromBackingInt(@intCast(0o700))) catch {};
+
+    try std.testing.expectError(
+        error.AccessDenied,
+        cmdUnlink(allocator, tio, &env, "nodejs/node", &.{}, &out.writer, &err_out.writer),
+    );
+    const restored_npm = try readFileBytes(allocator, tio, bin_dir, "npm", 64 * 1024);
+    defer allocator.free(restored_npm);
+    try std.testing.expectEqualStrings(npm_bytes, restored_npm);
+    _ = try bin_dir.readLink(tio, "npx", &link_buf);
+
+    try manifest_dir_handle.setPermissions(tio, @fromBackingInt(@intCast(0o700)));
+    perms_restored = true;
+    try cmdUnlink(allocator, tio, &env, "nodejs/node", &.{}, &out.writer, &err_out.writer);
+    try std.testing.expectError(error.FileNotFound, bin_dir.statFile(tio, "npm", .{ .follow_symlinks = false }));
+    try std.testing.expectError(error.FileNotFound, bin_dir.statFile(tio, "npx", .{ .follow_symlinks = false }));
+    try std.testing.expect(!try idManifestEntryExists(allocator, tio, &env, "nodejs/node"));
+}
+
+test "ID script wrapper apply, edit detection, removal, and zero-alloc rollback work cross-platform" {
+    const allocator = std.testing.allocator;
+    const tio = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const v1_bytes = try buildIdWrapperScript(
+        allocator,
+        "nodejs/node",
+        "npm",
+        "/mnt/c/Windows/System32/cmd.exe",
+        "C:\\Users\\John Smith\\AppData\\Roaming\\ghr\\v1\\npm.cmd",
+    );
+    defer allocator.free(v1_bytes);
+    const v1_sha = sha256Hex(v1_bytes);
+
+    const v2_bytes = try buildIdWrapperScript(
+        allocator,
+        "nodejs/node",
+        "npm",
+        "/mnt/c/Windows/System32/cmd.exe",
+        "C:\\Users\\John Smith\\AppData\\Roaming\\ghr\\v2\\npm.cmd",
+    );
+    defer allocator.free(v2_bytes);
+    const v2_sha = sha256Hex(v2_bytes);
+
+    const desired_v1 = DesiredLink{
+        .name = "npm",
+        .target = "/mnt/c/Users/John Smith/AppData/Roaming/ghr/v1/npm.cmd",
+        .kind = .script,
+        .win_target = "C:\\Users\\John Smith\\AppData\\Roaming\\ghr\\v1\\npm.cmd",
+        .script_bytes = v1_bytes,
+        .wrapper_sha256 = &v1_sha,
+    };
+    const desired_v2 = DesiredLink{
+        .name = "npm",
+        .target = "/mnt/c/Users/John Smith/AppData/Roaming/ghr/v2/npm.cmd",
+        .kind = .script,
+        .win_target = "C:\\Users\\John Smith\\AppData\\Roaming\\ghr\\v2\\npm.cmd",
+        .script_bytes = v2_bytes,
+        .wrapper_sha256 = &v2_sha,
+    };
+    const prior_v1 = LinkEntry{
+        .name = "npm",
+        .target = desired_v1.win_target.?,
+        .target_kind = "script",
+        .wrapper_sha256 = &v1_sha,
+    };
+
+    // 1. Fresh creation + unchanged check.
+    try std.testing.expect((try preflightLinkReconciliation(tio, tmp.dir, &.{desired_v1}, &.{}, true)) == null);
+    try std.testing.expect(try applyOneLink(allocator, tio, tmp.dir, desired_v1, &.{}) == .created);
+    try std.testing.expect(try applyOneLink(allocator, tio, tmp.dir, desired_v1, &.{prior_v1}) == .unchanged);
+
+    // 2. Replacement captures prior_script_bytes and zero-alloc rollback restores v1.
+    const replace_outcome = try applyOneLink(allocator, tio, tmp.dir, desired_v2, &.{prior_v1});
+    const captured_v1 = replace_outcome.replaced.?;
+    defer allocator.free(captured_v1);
+    const replaced_applied = [_]AppliedLink{.{ .replaced = .{
+        .desired = desired_v2,
+        .prior = prior_v1,
+        .prior_script_bytes = captured_v1,
+    } }};
+    rollbackAppliedLinks(tio, tmp.dir, &replaced_applied);
+    const after_replace_rb = try readFileBytes(allocator, tio, tmp.dir, "npm", 64 * 1024);
+    defer allocator.free(after_replace_rb);
+    try std.testing.expectEqualStrings(v1_bytes, after_replace_rb);
+
+    // 3. 1-byte user edit triggers `.modified` in preflightLinkReconciliation and preflightUnlink.
+    try tmp.dir.writeFile(tio, .{ .sub_path = "npm", .data = "#!/usr/bin/env bash\necho custom\n" });
+    const conflict = (try preflightLinkReconciliation(tio, tmp.dir, &.{desired_v2}, &.{prior_v1}, true)).?;
+    try std.testing.expectEqual(LinkConflictKind.modified, conflict.kind);
+    try std.testing.expectEqualStrings("npm", (try preflightUnlink(tio, tmp.dir, &.{prior_v1}, &.{})).?);
+
+    // 4. Restore v1, remove via removeOwnedIdEntry, then zero-alloc rollback restores v1.
+    try writeIdWrapperFile(tio, tmp.dir, "npm", v1_bytes);
+    const rm_outcome = try removeOwnedIdEntry(allocator, tio, tmp.dir, prior_v1);
+    const rm_bytes = rm_outcome.removed.?;
+    defer allocator.free(rm_bytes);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(tio, "npm", .{ .follow_symlinks = false }));
+    const removed_applied = [_]AppliedLink{.{ .removed = .{
+        .entry = prior_v1,
+        .prior_script_bytes = rm_bytes,
+    } }};
+    rollbackAppliedLinks(tio, tmp.dir, &removed_applied);
+    const after_rm_rb = try readFileBytes(allocator, tio, tmp.dir, "npm", 64 * 1024);
+    defer allocator.free(after_rm_rb);
+    try std.testing.expectEqualStrings(v1_bytes, after_rm_rb);
+
+    // 5. `resolveWslpathArgv0` honors `environ.get("PATH")` directly (including
+    // returning `FileNotFound` when `PATH` has no `wslpath`).
+    var env = EnvironMap.init(allocator);
+    defer env.deinit();
+    var base_buf: [Dir.max_path_bytes]u8 = undefined;
+    const base_len = try tmp.dir.realPath(tio, &base_buf);
+    const base = base_buf[0..base_len];
+
+    try env.put("PATH", base);
+    try std.testing.expectError(error.FileNotFound, resolveWslpathArgv0(allocator, tio, &env));
+
+    try tmp.dir.writeFile(tio, .{ .sub_path = "wslpath", .data = "#!/bin/sh\n" });
+    const resolved_exe = try resolveWslpathArgv0(allocator, tio, &env);
+    defer allocator.free(resolved_exe);
+    const expected_exe = try std.fs.path.join(allocator, &.{ base, "wslpath" });
+    defer allocator.free(expected_exe);
+    try std.testing.expectEqualStrings(expected_exe, resolved_exe);
+}
+
+

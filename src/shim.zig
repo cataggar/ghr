@@ -30,6 +30,23 @@ extern "kernel32" fn GetModuleFileNameW(
     nSize: u32,
 ) callconv(.winapi) u32;
 
+extern "kernel32" fn SetConsoleCtrlHandler(
+    HandlerRoutine: ?*const fn (u32) callconv(.winapi) i32,
+    Add: i32,
+) callconv(.winapi) i32;
+
+fn windowsIgnoreConsoleCtrl(ctrl_type: u32) callconv(.winapi) i32 {
+    // Ignore CTRL_C_EVENT (0) and CTRL_BREAK_EVENT (1) in the parent shim
+    // while waiting for the child process so interactive targets (such as
+    // `npm run dev` via `cmd.exe`) complete their own shutdown before the shim
+    // exits. Registering a callback instead of `SetConsoleCtrlHandler(null, 1)`
+    // avoids setting the inheritable ignore flag on child processes.
+    return switch (ctrl_type) {
+        0, 1 => 1,
+        else => 0,
+    };
+}
+
 /// WebAssembly runtimes the shim is allowed to launch. A `.ghr` manifest may
 /// only name one of these; anything else is rejected. This hardcoded allow
 /// list is the security boundary — a manifest cannot coerce the shim into
@@ -162,9 +179,17 @@ fn appendUserArgs(
 /// Spawn `argv` (with `argv[0]` an absolute path), wait, and exit with its
 /// status. Never returns.
 fn spawnDirectAndExit(io: Io, stderr: *Io.Writer, argv: []const []const u8) noreturn {
-    var child = std.process.spawn(io, .{ .argv = argv }) catch {
-        exitWithError(stderr, "shim: cannot start {s}\n", .{argv[0]});
+    var child = std.process.spawn(io, .{ .argv = argv }) catch |err| switch (err) {
+        error.InvalidBatchScriptArg => exitWithError(
+            stderr,
+            "shim: batch script arguments cannot contain NUL, CR, or LF\n",
+            .{},
+        ),
+        else => exitWithError(stderr, "shim: cannot start {s}\n", .{argv[0]}),
     };
+    if (builtin.os.tag == .windows) {
+        _ = SetConsoleCtrlHandler(&windowsIgnoreConsoleCtrl, 1);
+    }
     const term = child.wait(io) catch {
         exitWithError(stderr, "shim: wait failed\n", .{});
     };
@@ -172,6 +197,27 @@ fn spawnDirectAndExit(io: Io, stderr: *Io.Writer, argv: []const []const u8) nore
         .exited => |code| std.process.exit(code),
         else => std.process.exit(1),
     }
+}
+
+fn isWindowsBatchScriptTarget(target_path: []const u8) bool {
+    return target_path.len >= 4 and
+        (std.ascii.endsWithIgnoreCase(target_path, ".cmd") or
+        std.ascii.endsWithIgnoreCase(target_path, ".bat"));
+}
+
+fn isSafeWindowsBatchTargetPath(target_path: []const u8) bool {
+    // Zig 0.17 `std.process.spawn` escapes `%` and metacharacters in batch
+    // arguments via `argvToScriptCommandLineWindows`, but copies the script
+    // path itself inside `""<script_path>" ..."` without escaping `%`. Reject
+    // `%`, `"`, NUL, CR, and LF in `.cmd`/`.bat` target paths so `cmd.exe`
+    // cannot expand `%VAR%` or break out of the target quotes.
+    for (target_path) |c| {
+        switch (c) {
+            0, '\r', '\n', '"', '%' => return false,
+            else => {},
+        }
+    }
+    return target_path.len > 0;
 }
 
 /// Expand `${GHR_TOOL_DIR}` placeholders in a runtime argument to `tool_dir`.
@@ -234,6 +280,12 @@ fn runNative(
     target_path: []const u8,
     init: std.process.Init,
 ) noreturn {
+    if (builtin.os.tag == .windows and
+        isWindowsBatchScriptTarget(target_path) and
+        !isSafeWindowsBatchTargetPath(target_path))
+    {
+        exitWithError(stderr, "shim: unsafe batch script target path {s}\n", .{target_path});
+    }
     var argv = std.ArrayListUnmanaged([]const u8).empty;
     argv.append(allocator, target_path) catch {
         exitWithError(stderr, "shim: out of memory\n", .{});
@@ -388,3 +440,17 @@ test "expandToolDir expands ${GHR_TOOL_DIR} including paths with spaces" {
     defer allocator.free(expanded);
     try std.testing.expectEqualStrings("--dir=/tools/my unit/_unit/lib::/lib", expanded);
 }
+
+test "Windows batch target path safety rejects %/quote/control chars while allowing spaces and parens" {
+    try std.testing.expect(isWindowsBatchScriptTarget("C:\\Tools\\npm.cmd"));
+    try std.testing.expect(isWindowsBatchScriptTarget("C:\\Tools\\NPX.CMD"));
+    try std.testing.expect(isWindowsBatchScriptTarget("C:\\Tools\\helper.bat"));
+    try std.testing.expect(!isWindowsBatchScriptTarget("C:\\Tools\\node.exe"));
+
+    try std.testing.expect(isSafeWindowsBatchTargetPath("C:\\Users\\John Smith\\Program Files (x86)\\node\\npm.cmd"));
+    try std.testing.expect(!isSafeWindowsBatchTargetPath(""));
+    try std.testing.expect(!isSafeWindowsBatchTargetPath("C:\\Tools\\%OS%\\npm.cmd"));
+    try std.testing.expect(!isSafeWindowsBatchTargetPath("C:\\Tools\\\"evil\"\\npm.cmd"));
+    try std.testing.expect(!isSafeWindowsBatchTargetPath("C:\\Tools\\bad\r\n\\npm.cmd"));
+}
+

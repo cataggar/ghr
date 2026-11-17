@@ -1078,8 +1078,9 @@ fn basenameSlice(raw: []const u8) []const u8 {
 /// today for a freshly discovered executable, and it is applied exactly once:
 /// take the basename (normalizing `/` and `\`); recognize wasm ONLY by the
 /// case-sensitive lower `.wasm` rule that `release.isWasmAssetName` uses, and
-/// if wasm strip only `.wasm` (never then `.exe`); otherwise, on Windows, strip
-/// one trailing `.exe` case-insensitively. Case is otherwise preserved.
+/// if wasm strip only `.wasm` (never then `.exe` or `.cmd`); otherwise, on
+/// Windows, strip one trailing `.exe` or `.cmd` case-insensitively. Case is
+/// otherwise preserved.
 ///
 /// This derivation applies to RAW TARGETS ONLY. A final published name (a v2
 /// `commands[].name`, or an alias's requested name) is never passed through
@@ -1089,7 +1090,9 @@ pub fn sourceCommandSlice(raw: []const u8, platform: Platform) []const u8 {
     var base = basenameSlice(raw);
     if (release.wasmAssetStem(base)) |stem| {
         base = stem;
-    } else if (platform == .windows and base.len >= 4 and std.ascii.endsWithIgnoreCase(base, ".exe")) {
+    } else if (platform == .windows and base.len >= 4 and
+        (std.ascii.endsWithIgnoreCase(base, ".exe") or std.ascii.endsWithIgnoreCase(base, ".cmd")))
+    {
         base = base[0 .. base.len - 4];
     }
     return base;
@@ -2221,12 +2224,22 @@ test "source command derivation mirrors legacy suffix rules" {
         // `.WASM` is not a `.exe` suffix either, so it is left intact.
         .{ "x/Foo.WASM", Platform.posix, "Foo.WASM" },
         .{ "x/Foo.WASM", Platform.windows, "Foo.WASM" },
-        // wasm strips only `.wasm`; a residual `.exe` is preserved.
+        // wasm strips only `.wasm`; a residual `.exe` or `.cmd` is preserved.
         .{ "tool.exe.wasm", Platform.posix, "tool.exe" },
         .{ "tool.exe.wasm", Platform.windows, "tool.exe" },
-        // native `.exe`: stripped on Windows, preserved on POSIX.
+        .{ "tool.cmd.wasm", Platform.posix, "tool.cmd" },
+        .{ "tool.cmd.wasm", Platform.windows, "tool.cmd" },
+        // native `.exe` / `.cmd`: stripped on Windows, preserved on POSIX.
         .{ "app.exe", Platform.windows, "app" },
         .{ "app.exe", Platform.posix, "app.exe" },
+        .{ "npm.cmd", Platform.windows, "npm" },
+        .{ "bin\\NPX.CMD", Platform.windows, "NPX" },
+        .{ "bin/npm.cmd", Platform.posix, "npm.cmd" },
+        // `.bat` and `.ps1` are never command-suffix stripped.
+        .{ "nodevars.bat", Platform.windows, "nodevars.bat" },
+        .{ "npm.ps1", Platform.windows, "npm.ps1" },
+        // Degenerate bare suffix strips to empty so command safety rejects it.
+        .{ "dir/.cmd", Platform.windows, "" },
     };
     inline for (cases) |c| {
         const got = try sourceCommandName(a, c[0], c[1]);
